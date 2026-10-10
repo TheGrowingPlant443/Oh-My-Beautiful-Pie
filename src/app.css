@@ -1,0 +1,165 @@
+:root {
+  --bg: #0d1117;
+  --bg-2: #131a24;
+  --panel: #161b22;
+  --panel-2: #1c2430;
+  --line: #263040;
+  --line-soft: #1f2836;
+  --text: #dfe6ef;
+  --text-dim: #8b98a9;
+  --text-faint: #61708a;
+  --accent: #4ea1ff;
+  --accent-2: #9a6bff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --radius: 10px;
+  --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  overscroll-behavior: none;
+}
+
+#app { height: 100vh; }
+
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+button:hover:not(:disabled) { background: #263244; border-color: #33415a; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.primary { background: #1f6feb; border-color: #2f7ef2; color: #fff; }
+button.primary:hover:not(:disabled) { background: #2b7cf3; }
+button.danger { color: var(--err); border-color: #4a2626; }
+button.ghost { background: transparent; }
+button.active { background: #22406b; border-color: var(--accent); color: #eaf2ff; }
+
+input, select, textarea {
+  font: inherit;
+  color: var(--text);
+  background: #0b1017;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 6px 9px;
+  outline: none;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #2a3546; border-radius: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+.mono { font-family: var(--mono); }
+.dim { color: var(--text-dim); }
+.err { color: var(--err); }
+.ok { color: var(--ok); }
+.warn { color: var(--warn); }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 17px;
+  background: #1d2733;
+  border: 1px solid var(--line-soft);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.pill.ok { color: #7ee2a1; border-color: #1d4d2c; background: #10231a; }
+.pill.err { color: #ff9d97; border-color: #55262a; background: #261213; }
+.pill.warn { color: #e8c46b; border-color: #57451a; background: #241d0e; }
+.pill.accent { color: #a8cdff; border-color: #234a76; background: #101d2c; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.panel > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  background: #141b25;
+  flex: 0 0 auto;
+}
+.panel > header h3 {
+  margin: 0;
+  font-size: 12px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+.panel > .body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 10px; }
+
+.row { display: flex; align-items: center; gap: 8px; }
+.spacer { flex: 1 1 auto; }
+
+.toast-stack {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 80;
+  max-width: min(420px, 80vw);
+}
+.toast {
+  background: #1b232f;
+  border: 1px solid #34405a;
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 8px 11px;
+  font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.45);
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.toast.error { border-left-color: var(--err); }
+.toast.success { border-left-color: var(--ok); }
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(4,7,12,.66);
+  display: grid;
+  place-items: center;
+  z-index: 60;
+  padding: 16px;
+}
+
+.empty {
+  padding: 18px;
+  color: var(--text-faint);
+  font-size: 13px;
+  text-align: center;
+}

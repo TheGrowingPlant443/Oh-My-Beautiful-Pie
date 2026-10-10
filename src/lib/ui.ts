@@ -1,0 +1,20 @@
+import { open } from "@tauri-apps/plugin-dialog";
+import type { InstanceStatus } from "./api";
+
+export function basename(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  return trimmed.slice(Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\")) + 1);
+}
+export function statusClass(status: InstanceStatus): string {
+  if (status === "running") return "ok";
+  if (status === "starting") return "warn";
+  if (status === "error") return "err";
+  return "";
+}
+export async function pickFolder(): Promise<string | null> {
+  const result = await open({ directory: true, multiple: false, title: "Choose project folder" });
+  return typeof result === "string" ? result : null;
+}
+export async function confirmDanger(message: string): Promise<boolean> {
+  return window.confirm(message);
+}
