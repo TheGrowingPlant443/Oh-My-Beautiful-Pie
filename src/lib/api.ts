@@ -29,6 +29,11 @@ export interface Instance {
   rows: number;
   generation: number;
   exitCode: number | null;
+  kind: "instance" | "manager";
+  managerId: string | null;
+  bridgeReady: boolean;
+  pendingDecisionCount: number;
+  humanRequest: { reason: string; decisionId: string | null } | null;
 }
 export interface SessionInfo {
   id: string;
@@ -49,6 +54,9 @@ export type PtyChunk = ArrayBuffer;
 export const api = {
   listInstances: () => invoke<Instance[]>("list_instances"),
   createInstance: (config: CreateInstanceInput) => invoke<Instance>("create_instance", { config }),
+  createManager: (config: CreateInstanceInput) => invoke<Instance>("create_manager", { config }),
+  setManagerOwner: (id: string, managerId: string | null) => invoke<void>("set_manager_owner", { id, managerId }),
+  returnToManager: (id: string) => invoke<void>("return_to_manager", { id }),
   startInstance: (id: string) => invoke<void>("start_instance", { id }),
   stopInstance: (id: string) => invoke<void>("stop_instance", { id }),
   restartInstance: (id: string) => invoke<void>("restart_instance", { id }),

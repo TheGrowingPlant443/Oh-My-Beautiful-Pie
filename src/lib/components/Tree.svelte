@@ -2,6 +2,7 @@
   import type { Instance } from "../api";
   import { startInstance, stopInstance } from "../stores";
   import { basename } from "../ui";
+  import OwnershipControls from "./OwnershipControls.svelte";
   let { list, onSelect, onSubagent, onPlan }: { list: Instance[]; onSelect: (id: string) => void; onSubagent: (id: string, child: string) => void; onPlan: (id: string) => void } = $props();
   const groups = $derived.by(() => {
     const folders = new Map<string, Instance[]>();
@@ -28,6 +29,7 @@
             {#if instance.planPath}<button onclick={() => onPlan(instance.id)}>View Plan</button>{/if}
             <button onclick={() => instance.status === "running" || instance.status === "starting" ? stopInstance(instance.id) : startInstance(instance.id)}>{instance.status === "running" || instance.status === "starting" ? "Stop" : "Start / reopen"}</button>
           </div>
+          <OwnershipControls {instance} onOpen={() => onSelect(instance.id)} />
           {#if instance.task}<p>{instance.task}</p>{/if}
           <ul class="subagents">{#each instance.subagents as child (child.id)}
             <li><button onclick={() => onSubagent(instance.id, child.id)}>{child.name}</button><span class="dim">{child.agent || "Subagent"} · {child.status}</span></li>

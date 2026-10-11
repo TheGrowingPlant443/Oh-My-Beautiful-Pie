@@ -426,3 +426,36 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+pub fn render_transcript_file(
+    path: &Path,
+    input: &crate::instance::CreateInput,
+) -> Result<String, String> {
+    let program = std::env::var_os("OMP_BIN").unwrap_or_else(|| "omp".into());
+    let mut command = std::process::Command::new(program);
+    command
+        .arg("render")
+        .arg(path)
+        .args(["-w", "120", "--plain"]);
+    command
+        .current_dir(&input.project_path)
+        .env("OMP_PROFILE", &input.profile);
+    let overlays: Vec<PathBuf> = std::env::var_os("PI_CONFIG_FILES")
+        .map(|s| std::env::split_paths(&s).collect())
+        .unwrap_or_default();
+    command.env(
+        "PI_CONFIG_FILES",
+        std::env::join_paths(overlays.iter().chain(input.configs.iter()))
+            .map_err(|e| e.to_string())?,
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command.output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}

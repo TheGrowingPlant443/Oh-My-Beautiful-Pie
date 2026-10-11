@@ -1,23 +1,25 @@
+use crate::instance::{CreateInput, Instance, Origin, Registry};
+use crate::{session, AppState};
 use std::path::Path;
 use std::sync::Arc;
-
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::instance::{CreateInput, Instance, Registry};
-use crate::{session, AppState};
-
 pub type Result<T, E = String> = std::result::Result<T, E>;
-
 fn publish(app: &AppHandle, registry: &Registry) {
     let _ = app.emit("instances", registry.snapshot());
 }
-
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| e.to_string())?
+}
 #[tauri::command]
 pub fn list_instances(state: State<'_, AppState>) -> Vec<Instance> {
     state.registry.snapshot()
 }
-
 #[tauri::command]
 pub fn create_instance(
     app: AppHandle,
@@ -28,33 +30,53 @@ pub fn create_instance(
     publish(&app, &state.registry);
     Ok(instance)
 }
-
+#[tauri::command]
+pub fn create_manager(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: CreateInput,
+) -> Result<Instance> {
+    let instance = state.registry.create_manager(config)?;
+    let result = state.registry.start(&instance.id, Origin::Human);
+    publish(&app, &state.registry);
+    result?;
+    state.registry.inspect(&instance.id, Origin::Human)
+}
+#[tauri::command]
+pub fn set_manager_owner(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    manager_id: Option<String>,
+) -> Result<()> {
+    state
+        .registry
+        .set_manager_owner(&id, manager_id.as_deref())?;
+    publish(&app, &state.registry);
+    Ok(())
+}
+#[tauri::command]
+pub fn return_to_manager(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<()> {
+    state.registry.return_to_manager(&id)?;
+    publish(&app, &state.registry);
+    Ok(())
+}
 #[tauri::command]
 pub fn start_instance(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<()> {
-    let result = state.registry.start(&id);
+    let result = state.registry.start(&id, Origin::Human);
     publish(&app, &state.registry);
     result
 }
-
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T> + Send + 'static,
-) -> Result<T> {
-    tauri::async_runtime::spawn_blocking(work)
-        .await
-        .map_err(|e| e.to_string())?
-}
-
 #[tauri::command]
 pub async fn stop_instance(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<()> {
     let registry = state.registry.clone();
     blocking(move || {
-        registry.stop(&id)?;
+        registry.stop(&id, Origin::Human)?;
         publish(&app, &registry);
         Ok(())
     })
     .await
 }
-
 #[tauri::command]
 pub async fn restart_instance(
     app: AppHandle,
@@ -63,26 +85,24 @@ pub async fn restart_instance(
 ) -> Result<()> {
     let registry = state.registry.clone();
     blocking(move || {
-        registry.stop(&id)?;
+        registry.stop(&id, Origin::Human)?;
         registry.refresh()?;
-        let result = registry.start(&id);
+        let result = registry.start(&id, Origin::Human);
         publish(&app, &registry);
         result
     })
     .await
 }
-
 #[tauri::command]
 pub async fn remove_instance(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<()> {
     let registry = state.registry.clone();
     blocking(move || {
-        registry.remove(&id)?;
+        registry.remove(&id, Origin::Human)?;
         publish(&app, &registry);
         Ok(())
     })
     .await
 }
-
 #[tauri::command]
 pub fn attach_pty(
     state: State<'_, AppState>,
@@ -93,11 +113,11 @@ pub fn attach_pty(
 }
 #[tauri::command]
 pub fn write_pty(state: State<'_, AppState>, id: String, data: String) -> Result<()> {
-    state.registry.write(&id, &data)
+    state.registry.write(&id, &data, Origin::Human)
 }
 #[tauri::command]
 pub fn resize_pty(state: State<'_, AppState>, id: String, cols: u16, rows: u16) -> Result<()> {
-    state.registry.resize(&id, cols, rows)
+    state.registry.resize(&id, cols, rows, Origin::Human)
 }
 #[tauri::command]
 pub fn list_sessions(
@@ -109,7 +129,7 @@ pub fn list_sessions(
 }
 #[tauri::command]
 pub fn read_plan(state: State<'_, AppState>, id: String) -> Result<Option<String>> {
-    state.registry.plan(&id)
+    state.registry.plan(&id, Origin::Human)
 }
 #[tauri::command]
 pub async fn render_transcript(
@@ -117,46 +137,22 @@ pub async fn render_transcript(
     id: String,
     subagent_id: String,
 ) -> Result<String> {
-    let (path, input) = state.registry.transcript_path(&id, &subagent_id)?;
-    blocking(move || {
-        let program = std::env::var_os("OMP_BIN").unwrap_or_else(|| "omp".into());
-        let mut command = std::process::Command::new(program);
-        command
-            .arg("render")
-            .arg(path)
-            .args(["-w", "120", "--plain"]);
-        command.current_dir(&input.project_path);
-        command.env("OMP_PROFILE", &input.profile);
-        let mut overlays: Vec<std::path::PathBuf> = std::env::var_os("PI_CONFIG_FILES")
-            .map(|s| std::env::split_paths(&s).collect())
-            .unwrap_or_default();
-        overlays.extend(input.configs);
-        command.env(
-            "PI_CONFIG_FILES",
-            std::env::join_paths(overlays).map_err(|e| e.to_string())?,
-        );
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        let output = command.output().map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-        }
-        // Native renderer owns formatting/thinking visibility. Never parse message contents here.
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    })
-    .await
+    let (path, input) = state
+        .registry
+        .transcript_path(&id, &subagent_id, Origin::Human)?;
+    blocking(move || session::render_transcript_file(&path, &input)).await
 }
-
 pub fn tick(app: AppHandle, registry: Arc<Registry>, closing: Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {
         while !closing.load(std::sync::atomic::Ordering::Relaxed) {
             if let Err(e) = registry.refresh() {
                 eprintln!("session refresh: {e}");
             }
-            publish(&app, &registry);
+            let rows = registry.snapshot();
+            if let Some(hub) = registry.manager_hub() {
+                hub.observe_processes(&rows);
+            }
+            let _ = app.emit("instances", rows);
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });

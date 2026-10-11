@@ -50,6 +50,8 @@
       term.write(bytes);
     };
     const input = term.onData(data => {
+      // Cursor reports are answered by Rust even when no xterm view is mounted.
+      if (/^\x1b\[\??\d+;\d+R$/.test(data)) return;
       const protocolReply = /^\x1b(?:\[[?>=]?[0-9;]*[Rcnuy]|\])/.test(data);
       if (run === 0 || !ptyBus.isResponder(id, sink)) return;
       if ((replaying && protocolReply) || (!mode && !protocolReply)) return;

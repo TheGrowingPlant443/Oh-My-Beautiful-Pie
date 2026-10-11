@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Instance } from "../api";
   import Term from "./Term.svelte";
+  import OwnershipControls from "./OwnershipControls.svelte";
   import { removeInstance, restartInstance, startInstance, stopInstance } from "../stores";
   import { basename, confirmDanger, statusClass } from "../ui";
   let { instance, onSelect, onPlan, onSubagents }: { instance: Instance; onSelect: (id: string) => void; onPlan: (id: string) => void; onSubagents: (id: string) => void } = $props();
@@ -24,6 +25,7 @@
     <span>{instance.profile || "Default profile"} · {instance.model || "OMP model setup"}</span>
     {#if instance.configs.length}<span title={instance.configs.join("\n")}>{instance.configs.length} config overlay(s)</span>{/if}
     <p>{instance.task || "No active todo task"}{instance.todoTotal ? ` · ${instance.todoDone}/${instance.todoTotal}` : ""}</p>
+    <OwnershipControls {instance} onOpen={() => onSelect(instance.id)} />
   </div>
   <div class="row links">
     <button disabled={!instance.subagents.length} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>

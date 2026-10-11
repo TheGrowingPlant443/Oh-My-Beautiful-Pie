@@ -5,6 +5,7 @@ import { api, type Instance, type PtyChunk } from "./api";
 
 export const instances = writable<Instance[]>([]);
 export const instancesById = derived(instances, list => new Map(list.map(i => [i.id, i])));
+export const managerInstance = derived(instances, list => list.find(instance => instance.kind === "manager"));
 export const toasts = writable<{ id: number; message: string }[]>([]);
 let toastId = 0;
 export function errorText(error: unknown): string {
@@ -111,6 +112,13 @@ export const startInstance = (id: string) => action(id, api.startInstance);
 export const stopInstance = (id: string) => action(id, api.stopInstance);
 export const restartInstance = (id: string) => action(id, api.restartInstance);
 export const removeInstance = (id: string) => action(id, api.removeInstance);
+export function setManagerOwner(id: string, managerId: string | null): Promise<boolean> {
+  return action(id, id => api.setManagerOwner(id, managerId));
+}
+export const returnToManager = (id: string) => action(id, api.returnToManager);
 
 export const previewsEnabled = writable(localStorage.getItem("omp-manager.previews") !== "off");
 previewsEnabled.subscribe(on => localStorage.setItem("omp-manager.previews", on ? "on" : "off"));
+
+export const showManagerTile = writable(localStorage.getItem("omp-manager.show-manager") !== "off");
+showManagerTile.subscribe(show => localStorage.setItem("omp-manager.show-manager", show ? "on" : "off"));

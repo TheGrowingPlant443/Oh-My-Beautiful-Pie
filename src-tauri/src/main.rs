@@ -2,6 +2,7 @@
 
 mod commands;
 mod instance;
+mod manager;
 mod pty;
 mod session;
 
@@ -37,6 +38,19 @@ fn main() {
                 )
                 .map_err(std::io::Error::other)?,
             );
+            let folder = app.path().app_config_dir()?;
+            std::fs::create_dir_all(&folder)?;
+            let extension = folder.join("omp-manager-bridge.mjs");
+            let source = include_str!("../../bridge/omp-manager.mjs");
+            if std::fs::read_to_string(&extension).ok().as_deref() != Some(source) {
+                std::fs::write(&extension, source)?;
+            }
+            let hub = manager::ManagerHub::bind(extension).map_err(std::io::Error::other)?;
+            hub.bind_registry(Arc::downgrade(&registry))
+                .map_err(std::io::Error::other)?;
+            registry
+                .install_manager_hub(hub)
+                .map_err(std::io::Error::other)?;
             registry.refresh().map_err(std::io::Error::other)?;
             let closing = Arc::new(AtomicBool::new(false));
             commands::tick(app.handle().clone(), registry.clone(), closing.clone());
@@ -46,6 +60,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::list_instances,
             commands::create_instance,
+            commands::create_manager,
+            commands::set_manager_owner,
+            commands::return_to_manager,
             commands::start_instance,
             commands::stop_instance,
             commands::restart_instance,

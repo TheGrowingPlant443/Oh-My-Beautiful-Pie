@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Instance } from "../api";
   import Term from "./Term.svelte";
+  import OwnershipControls from "./OwnershipControls.svelte";
   import { restartInstance, startInstance, stopInstance } from "../stores";
   let { instance, instances, onSwitch, onClose, onPlan, onSubagents }: {
     instance: Instance; instances: Instance[]; onSwitch: (id: string) => void;
@@ -27,6 +28,7 @@
     <button disabled={busy} onclick={() => run(() => restartInstance(instance.id))}>Restart</button>
   </header>
   <p class="identity mono">{instance.projectPath}{instance.task ? ` · ${instance.task}` : ""}</p>
+  <OwnershipControls {instance} onOpen={() => onSwitch(instance.id)} />
   {#if instance.lastError}<p class="err" role="alert">{instance.lastError}</p>{/if}
   <div class="screen">
     {#if instance.generation > 0}<Term instanceId={instance.id} interactive cols={instance.cols} rows={instance.rows} generation={instance.generation} scrollback={8000} />
