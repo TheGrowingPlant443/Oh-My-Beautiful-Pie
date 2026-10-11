@@ -19,25 +19,30 @@
   let host = $state<HTMLDivElement>();
   let terminal: Terminal | undefined;
   let relayout: (() => void) | undefined;
+  const terminalId = $derived(instanceId);
+  const processGeneration = $derived(generation);
+  const terminalMode = $derived(interactive);
 
   $effect(() => {
-    const id = instanceId;
+    const id = terminalId;
     const element = host;
-    const run = generation;
+    const run = processGeneration;
+    const mode = terminalMode;
     if (!element) return;
-    const term = new Terminal({
-      cols: untrack(() => cols), rows: untrack(() => rows), fontSize,
+    // Snapshot metadata must not dispose and recreate the terminal.
+    const term = untrack(() => new Terminal({
+      cols, rows, fontSize,
       fontFamily: '"Cascadia Mono", Consolas, monospace', scrollback,
-      cursorBlink: interactive,
+      cursorBlink: mode,
       theme: { background: "#0b1017", foreground: "#dfe6ef" },
-    });
+    }));
     terminal = term;
     const fit = new FitAddon();
-    if (interactive) term.loadAddon(fit);
+    if (mode) term.loadAddon(fit);
     term.open(element);
-    if (interactive) term.focus();
+    if (mode) term.focus();
     // disableStdin also blocks xterm's protocol replies. Block physical keys instead.
-    if (!interactive) term.attachCustomKeyEventHandler(() => false);
+    if (!mode) term.attachCustomKeyEventHandler(() => false);
     let disposed = false;
     let replaying = true;
     const sink = (bytes: Uint8Array | null) => {
@@ -47,19 +52,28 @@
     const input = term.onData(data => {
       const protocolReply = /^\x1b(?:\[[?>=]?[0-9;]*[Rcnuy]|\])/.test(data);
       if (run === 0 || !ptyBus.isResponder(id, sink)) return;
-      if ((replaying && protocolReply) || (!interactive && !protocolReply)) return;
+      if ((replaying && protocolReply) || (!mode && !protocolReply)) return;
       void api.writePty(id, data).catch(error => reportError("Send terminal input", error));
     });
-    const unsubscribe = ptyBus.subscribe(id, sink, interactive);
+    const unsubscribe = ptyBus.subscribe(id, sink, mode);
     term.write("", () => { replaying = false; });
     if (run > 0) void ptyBus.ensureAttached(id).catch(error => reportError("Attach terminal", error));
     let frame = 0;
+    let sentCols = term.cols;
+    let sentRows = term.rows;
     function layout(): void {
       if (disposed || element!.clientWidth === 0) return;
-      if (interactive) {
-        fit.fit();
-        term.resize(Math.min(term.cols, 500), Math.min(term.rows, 200));
-        if (run > 0) void api.resizePty(id, term.cols, term.rows).catch(error => reportError("Resize terminal", error));
+      if (mode) {
+        const dimensions = fit.proposeDimensions();
+        if (!dimensions) return;
+        const nextCols = Math.max(2, Math.min(dimensions.cols, 500));
+        const nextRows = Math.max(2, Math.min(dimensions.rows, 200));
+        if (term.cols !== nextCols || term.rows !== nextRows) term.resize(nextCols, nextRows);
+        if (run > 0 && (sentCols !== nextCols || sentRows !== nextRows)) {
+          sentCols = nextCols;
+          sentRows = nextRows;
+          void api.resizePty(id, nextCols, nextRows).catch(error => reportError("Resize terminal", error));
+        }
       } else {
         const screen = element!.querySelector<HTMLElement>(".xterm-screen");
         if (!screen || screen.offsetWidth === 0) return;
@@ -74,7 +88,7 @@
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(layout);
     });
-    observer.observe(interactive ? element : element.parentElement!);
+    observer.observe(mode ? element : element.parentElement!);
     frame = requestAnimationFrame(layout);
     return () => {
       disposed = true;

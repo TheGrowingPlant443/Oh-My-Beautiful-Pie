@@ -62,4 +62,6 @@ Exercised on Windows: independent real OMP children; terminal handshake, input a
 
 Focus regression checked in the native desktop: with an OMP terminal running, open **New instance**, type in the Name field, resize the window, and let background updates arrive. The modal must retain keyboard focus. Creating the second instance must leave the first running. Terminal resizing never requests keyboard focus; the creation form uses a native modal dialog.
 
+Rendering regression checked in the native desktop: type an unsent draft and leave the focused session open across background updates. The xterm screen, input focus, and draft must remain stable without same-size PTY resize requests. Real window resizing still updates rows/columns once per geometry change, including the 500-column limit; restarting the OMP process intentionally creates a new terminal.
+
 Regression tests cover persisted launch definitions, native todo/plan/subagent decoding, append updates, truncation/replacement, partial UTF-8 records, and local-plan traversal rejection.

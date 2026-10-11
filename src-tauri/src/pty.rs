@@ -121,6 +121,9 @@ impl Pty {
         if !(2..=500).contains(&cols) || !(2..=200).contains(&rows) {
             return Err("invalid terminal dimensions".into());
         }
+        if self.cols == cols && self.rows == rows {
+            return Ok(());
+        }
         self.master
             .resize(PtySize {
                 cols,
