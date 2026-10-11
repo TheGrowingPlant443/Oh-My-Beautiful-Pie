@@ -116,7 +116,8 @@ impl Pty {
         if !input.model.is_empty() {
             cmd.args(["--model", &input.model]);
         }
-        if let Some(path) = &definition.session_path {
+        // OMP creates sessions lazily: a path reported before the first message has no file to resume.
+        if let Some(path) = definition.session_path.as_ref().filter(|p| p.is_file()) {
             cmd.arg("--resume");
             cmd.arg(path);
         }
