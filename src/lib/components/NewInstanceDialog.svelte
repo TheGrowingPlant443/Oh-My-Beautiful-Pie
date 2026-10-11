@@ -15,6 +15,17 @@
   let busy = $state(false);
   let error = $state("");
   let request = 0;
+  let dialog = $state<HTMLDialogElement>();
+
+  $effect(() => {
+    if (!dialog) return;
+    if (open && !dialog.open) {
+      dialog.showModal();
+      dialog.querySelector<HTMLInputElement>("input")?.focus();
+    } else if (!open && dialog.open) {
+      dialog.close();
+    }
+  });
 
   async function loadSessions(path: string, selectedProfile: string): Promise<void> {
     const token = ++request;
@@ -59,8 +70,7 @@
   }
 </script>
 
-{#if open}
-  <div class="backdrop" role="presentation" onclick={e => { if (e.target === e.currentTarget && !busy) onclose(); }}>
+<dialog bind:this={dialog} class="native-dialog" aria-label="New OMP instance" onclose={onclose} oncancel={onclose} onclick={e => { if (e.target === e.currentTarget && !busy) onclose(); }}>
     <form class="dialog panel" onsubmit={submit}>
       <header><h3>New OMP instance</h3><span class="spacer"></span><button type="button" onclick={onclose} disabled={busy}>Close</button></header>
       <div class="body form">
@@ -88,9 +98,10 @@
       </div>
       <footer><button type="submit" class="primary" disabled={busy || !projectPath.trim()}>{busy ? "Creating…" : "Create instance"}</button></footer>
     </form>
-  </div>
-{/if}
+</dialog>
 <style>
+  .native-dialog { border: none; padding: 0; border-radius: var(--radius); background: var(--panel); color: var(--text); max-width: 95vw; max-height: 90vh; }
+  .native-dialog::backdrop { background: rgba(4, 7, 12, .66); }
   .dialog { width: min(650px, 95vw); max-height: 90vh; }
   .form { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
   label, .config-list { display: flex; flex-direction: column; gap: 6px; }

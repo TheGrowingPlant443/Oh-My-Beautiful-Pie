@@ -60,4 +60,6 @@ npm run build
 
 Exercised on Windows: independent real OMP children; terminal handshake, input and response; preview-only startup; stop/restart and saved conversation continuity; application close/reopen with no autostart; native folder picker; native reconnect listing; plan viewing; subagent previews/full transcript; compact tree with no dashboard terminals; and responsive preview sizing.
 
+Focus regression checked in the native desktop: with an OMP terminal running, open **New instance**, type in the Name field, resize the window, and let background updates arrive. The modal must retain keyboard focus. Creating the second instance must leave the first running. Terminal resizing never requests keyboard focus; the creation form uses a native modal dialog.
+
 Regression tests cover persisted launch definitions, native todo/plan/subagent decoding, append updates, truncation/replacement, partial UTF-8 records, and local-plan traversal rejection.

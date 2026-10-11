@@ -35,6 +35,7 @@
     const fit = new FitAddon();
     if (interactive) term.loadAddon(fit);
     term.open(element);
+    if (interactive) term.focus();
     // disableStdin also blocks xterm's protocol replies. Block physical keys instead.
     if (!interactive) term.attachCustomKeyEventHandler(() => false);
     let disposed = false;
@@ -59,7 +60,6 @@
         fit.fit();
         term.resize(Math.min(term.cols, 500), Math.min(term.rows, 200));
         if (run > 0) void api.resizePty(id, term.cols, term.rows).catch(error => reportError("Resize terminal", error));
-        term.focus();
       } else {
         const screen = element!.querySelector<HTMLElement>(".xterm-screen");
         if (!screen || screen.offsetWidth === 0) return;
