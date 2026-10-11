@@ -1,10 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod config;
 mod instance;
 mod manager;
 mod pty;
 mod session;
+mod setup;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,6 +15,7 @@ use tauri::Manager;
 pub struct AppState {
     pub registry: Arc<instance::Registry>,
     pub closing: Arc<AtomicBool>,
+    pub setup: Arc<setup::SetupService>,
 }
 
 fn main() {
@@ -40,6 +43,8 @@ fn main() {
             );
             let folder = app.path().app_config_dir()?;
             std::fs::create_dir_all(&folder)?;
+            config::materialize(&folder).map_err(std::io::Error::other)?;
+            setup::materialize(&folder).map_err(std::io::Error::other)?;
             let extension = folder.join("omp-manager-bridge.mjs");
             let source = include_str!("../../bridge/omp-manager.mjs");
             if std::fs::read_to_string(&extension).ok().as_deref() != Some(source) {
@@ -54,7 +59,11 @@ fn main() {
             registry.refresh().map_err(std::io::Error::other)?;
             let closing = Arc::new(AtomicBool::new(false));
             commands::tick(app.handle().clone(), registry.clone(), closing.clone());
-            app.manage(AppState { registry, closing });
+            app.manage(AppState {
+                registry,
+                closing,
+                setup: Arc::new(setup::SetupService::new(folder)),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -73,6 +82,13 @@ fn main() {
             commands::list_sessions,
             commands::read_plan,
             commands::render_transcript,
+            commands::get_global_config,
+            commands::preview_global_config,
+            commands::save_global_config,
+            commands::get_setup_paths,
+            commands::start_agent_setup,
+            commands::send_agent_setup,
+            commands::open_setup_folder,
         ])
         .build(tauri::generate_context!())
         .expect("could not initialize OMP Manager");

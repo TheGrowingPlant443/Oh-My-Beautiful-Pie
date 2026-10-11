@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::ipc::{Channel, InvokeResponseBody};
 
+use crate::config::GlobalConfigStore;
 use crate::manager::ManagerHub;
 use crate::{pty, session};
 
@@ -35,6 +36,8 @@ pub struct CreateInput {
     #[serde(default)]
     pub model: String,
     pub resume_session_id: Option<String>,
+    #[serde(default)]
+    pub use_global_config: Option<bool>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -215,6 +218,7 @@ pub struct Registry {
     pub home: PathBuf,
     file: PathBuf,
     hub: OnceLock<Arc<ManagerHub>>,
+    pub global_config: GlobalConfigStore,
 }
 
 fn authorize(
@@ -265,11 +269,19 @@ impl Registry {
             Err(e) => return Err(e.to_string()),
         };
         Ok(Self {
+            global_config: GlobalConfigStore::load(
+                file.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf(),
+            ),
             records: Mutex::new(definitions.into_iter().map(Record::new).collect()),
             home,
             file,
             hub: OnceLock::new(),
         })
+    }
+    pub fn config_root(&self) -> &Path {
+        self.file.parent().unwrap_or_else(|| Path::new("."))
     }
     pub fn install_manager_hub(&self, hub: Arc<ManagerHub>) -> Result<(), String> {
         self.hub
@@ -323,6 +335,13 @@ impl Registry {
         }
         if input.profile == "default" {
             input.profile.clear();
+        }
+        if input.use_global_config.unwrap_or(true) {
+            if let Some(path) = self.global_config.current_path()? {
+                if !input.configs.contains(&path) {
+                    input.configs.insert(0, path);
+                }
+            }
         }
         for config in &mut input.configs {
             if !config.is_absolute() {
@@ -854,6 +873,59 @@ mod tests {
         assert_eq!(row.kind, InstanceKind::Instance);
         assert_eq!(row.manager_id, None);
         assert_eq!(row.status, "stopped");
+        fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn new_rows_freeze_defaults_without_changing_existing_sessions() {
+        let (folder, registry) = fixture();
+        let old = registry.create(input(&folder)).unwrap();
+        let a = registry
+            .global_config
+            .publish("modelRoles:\n  default: first\n")
+            .unwrap();
+        let manager = registry.create_manager(input(&folder)).unwrap();
+        let overlay = folder.join("override.yml");
+        fs::write(&overlay, "modelRoles:\n  default: override\n").unwrap();
+        let worker = registry
+            .create_owned(
+                &manager.id,
+                CreateInput {
+                    configs: vec![overlay.clone()],
+                    ..input(&folder)
+                },
+            )
+            .unwrap();
+        assert_eq!(worker.configs, vec![a.clone(), overlay]);
+        assert_eq!(manager.configs, vec![a.clone()]);
+        let b = registry
+            .global_config
+            .publish("modelRoles:\n  default: second\n")
+            .unwrap();
+        let fresh = registry.create(input(&folder)).unwrap();
+        assert_eq!(fresh.configs, vec![b]);
+        let skipped = registry
+            .create(CreateInput {
+                use_global_config: Some(false),
+                ..input(&folder)
+            })
+            .unwrap();
+        assert!(skipped.configs.is_empty());
+        let loaded = Registry::load(folder.join("instances.json"), folder.clone()).unwrap();
+        assert_eq!(
+            loaded.inspect(&worker.id, Origin::Human).unwrap().configs,
+            worker.configs
+        );
+        assert!(loaded
+            .inspect(&old.id, Origin::Human)
+            .unwrap()
+            .configs
+            .is_empty());
+        assert!(loaded.snapshot().iter().all(|row| row.status == "stopped"));
+        fs::remove_file(&a).unwrap();
+        assert_eq!(
+            loaded.inspect(&manager.id, Origin::Human).unwrap().configs,
+            vec![a]
+        );
         fs::remove_dir_all(folder).unwrap();
     }
 }

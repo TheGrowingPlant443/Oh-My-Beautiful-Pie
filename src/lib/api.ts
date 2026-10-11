@@ -48,8 +48,19 @@ export interface CreateInstanceInput {
   configs: string[];
   model: string;
   resumeSessionId: string | null;
+  useGlobalConfig?: boolean;
 }
 export type PtyChunk = ArrayBuffer;
+export interface GlobalConfigInfo { path: string | null; error: string | null; }
+export interface ConfigPreview { yaml: string; modelRoles: Record<string, string | null>; omitted: string[]; }
+export type SetupScope = "global" | "manager";
+export type SetupKind = "agents" | "rules" | "skill" | "tool" | "workflow";
+export type ScriptLanguage = "python" | "bash" | "typescript";
+export interface SetupItem { kind: SetupKind; name: string; description: string; language?: ScriptLanguage; }
+export interface SetupRequest { scope: SetupScope; items: SetupItem[]; }
+export interface SetupDraft { scope: SetupScope | null; items: SetupItem[]; step: number; instanceId: string | null; }
+export interface SetupPaths { globalOmpFolder: string; globalAgentFolder: string; managerFolder: string; }
+export interface SetupAdmission { instance: Instance; promptSent: boolean | null; error: string | null; }
 
 export const api = {
   listInstances: () => invoke<Instance[]>("list_instances"),
@@ -67,4 +78,11 @@ export const api = {
   listSessions: (projectPath: string, profile: string) => invoke<SessionInfo[]>("list_sessions", { projectPath, profile }),
   readPlan: (id: string) => invoke<string | null>("read_plan", { id }),
   renderTranscript: (id: string, subagentId: string) => invoke<string>("render_transcript", { id, subagentId }),
+  getGlobalConfig: () => invoke<GlobalConfigInfo>("get_global_config"),
+  previewGlobalConfig: (sourceId: string | null, importPath: string | null) => invoke<ConfigPreview>("preview_global_config", { sourceId, importPath }),
+  saveGlobalConfig: (yaml: string) => invoke<{ path: string }>("save_global_config", { yaml }),
+  getSetupPaths: () => invoke<SetupPaths>("get_setup_paths"),
+  startAgentSetup: (request: SetupRequest) => invoke<SetupAdmission>("start_agent_setup", { request }),
+  sendAgentSetup: (id: string, request: SetupRequest) => invoke<SetupAdmission>("send_agent_setup", { id, request }),
+  openSetupFolder: (scope: SetupScope) => invoke<void>("open_setup_folder", { scope }),
 };

@@ -43,6 +43,20 @@ Output: `src-tauri/target/release/omp-manager.exe`. It embeds the UI; no Vite se
 
 Example: “Use manage_sessions to create a worker named API in C:/projects/api, ask it to review the failing build, and report when it finishes. Inspect its work before approving further execution.”
 
+### Global config
+
+- **Save as global config** previews non-secret native OMP settings from the selected instance (its `config.yml` plus ordered overlays) or from native default-profile config, then publishes an immutable snapshot under the app-config folder. **Import config** does the same from a `.yml`/`.yaml` file. Neither action writes to or modifies `.omp`.
+- The active snapshot is the default for **new** instances, including Manager-created workers (`useGlobalConfig` defaults on; uncheck **Use global config** or pass `false` to opt out). It is placed before any explicit overlays and the `--model` override, so those win. Existing definitions, running sessions and older snapshots never change.
+- Use a snapshot in another terminal with `omp --config '<saved path>'`; the dialog shows the exact command.
+- Sanitized export/import keeps model roles and other registered non-secret settings. It omits credentials, headers/env maps, unknown settings, and `extensions`, `hooks`, `customTools`, `mcp`, `telemetry`, `auth`, and `shellPath`; excluded paths (never values) are listed. Model catalogs and authentication must exist locally. Requires Bun and the installed OMP SDK (`BUN_BIN`, `OMP_SDK_DIR`, `OMP_BIN` override discovery; the SDK and executable versions must match).
+
+### Agent setup
+
+- **Agent setup** is a full page: choose **Global — default OMP profile** or **Just The Manager**, then describe `AGENTS.md`, `RULES.md`, skills (`SKILL.md` plus a readable `SKILLS.md` catalog), reusable Python/Bash/TypeScript tools (native TS wrapper with `exec` approval), and workflows (always-apply native rules for delegation/review conditions; there is no scheduler). Review the exact target paths, then start the setup agent.
+- Setup runs in a real, unowned OMP session in native plan mode. You review its native plan and choose a native execution option; target files are not written before approval, and The Manager cannot approve it. Completion is whatever the native session reports.
+- Manager-only assets live in the app-owned `manager-setup` folder, loaded only into The Manager through a directory extension. `AGENTS.md`, `RULES.md` and `SKILLS.md` are re-read each Manager turn; new skills/tools/rules need a native reload or reopen. Nothing restarts The Manager automatically.
+- **Open global .omp in VS Code** and **Open Manager folder in VS Code** open the displayed folders with `Code.exe` directly (no shell). Neither creates a missing native folder.
+
 ## Data ownership
 
 The manager stores launch definitions and their native session paths in Tauri's app-config directory (`instances.json`, identifier `dev.udvikler.omp-manager`). OMP owns sessions, chats, plans, configs, models, approvals, tools, and thinking visibility.
@@ -66,7 +80,7 @@ Tile **working/idle** is an output-activity indicator, not an authoritative agen
 
 ```sh
 cargo test --manifest-path src-tauri/Cargo.toml --locked
-node --test bridge/omp-manager.test.mjs
+node --test bridge/omp-manager.test.mjs bridge/omp-config.test.mjs
 npm run check
 npm run build
 ```
@@ -80,5 +94,7 @@ Rendering regression checked in the native desktop: type an unsent draft and lea
 Regression tests cover persisted launch definitions, native todo/plan/subagent decoding, append updates, truncation/replacement, partial UTF-8 records, and local-plan traversal rejection.
 
 Controller verification used isolated native desktop projects and real OMP 18.8.7 sessions with the configured GPT-6.1-Sol: background worker creation without a mounted preview; completion notifications; native always-ask write approval; code/file review; pending-dialog handover without restart; human escalation/return; native plan review and execution using terminal keys; hidden-manager/tree notifications; and stopping/reopening The Manager without stopping workers. Unit checks cover capability rejection, stale/revoked decisions, subscriptions, ownership persistence, native answer validation, and headless cursor reports.
+
+Config and setup verification used an isolated desktop: sanitized preview/save/import; defaults inherited by new instances and a Manager-created worker while running sessions kept their snapshot; explicit overlay precedence and opt-out; complete Global and Manager-only setups reviewed and approved in native plan mode with every file kind generated; native discovery and real execution of the generated Python/Bash/TypeScript tools; a running Manager applying a changed private instruction without restart; both VS Code windows; and narrow-window layout. Unit checks cover the sanitizer, immutable snapshots, creation-time freezing, setup request validation, replay protection, and plan-path correlation.
 
 Controller authorization is not a filesystem sandbox: OMP's ordinary tools retain the user's configured access. Native explicit deny rules, disabled choices, and thinking visibility remain authoritative. Custom/plan overlays are controlled through their real terminal screen and keys, not fabricated approval APIs. Compatibility is grounded in OMP 18.8.7; incompatible native UI contracts surface errors rather than silently bypassing policy.

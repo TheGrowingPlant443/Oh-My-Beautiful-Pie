@@ -122,6 +122,11 @@ impl Pty {
         }
         cmd.arg("--extension");
         cmd.arg(&bridge.extension_path);
+        if definition.kind == crate::instance::InstanceKind::Manager {
+            cmd.arg("--extension");
+            cmd.arg(&bridge.manager_setup_dir);
+            cmd.env("OMP_MANAGER_SETUP_DIR", &bridge.manager_setup_dir);
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("WT_SESSION", &definition.id);

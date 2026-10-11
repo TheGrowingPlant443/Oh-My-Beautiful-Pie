@@ -183,6 +183,8 @@ pub struct TailReader {
     created: Option<SystemTime>,
     plan_uri: Option<String>,
     progress: HashMap<String, Value>,
+    local_writes: HashMap<String, String>,
+    resolved_local: HashMap<String, PathBuf>,
 }
 
 impl TailReader {
@@ -197,11 +199,38 @@ impl TailReader {
         if value["type"] == "custom" && value["customType"] == "user_todo_edit" {
             self.todos(&value["data"]["phases"]);
         }
+        if value["type"] == "message" && value["message"]["role"] == "assistant" {
+            for block in value["message"]["content"].as_array().into_iter().flatten() {
+                if block["type"] == "toolCall" && block["name"] == "write" {
+                    if let (Some(id), Some(uri)) =
+                        (block["id"].as_str(), block["arguments"]["path"].as_str())
+                    {
+                        if uri.starts_with("local://") {
+                            self.local_writes.insert(id.into(), uri.into());
+                        }
+                    }
+                }
+            }
+        }
         if value["type"] != "message" || value["message"]["role"] != "toolResult" {
             return;
         }
         let message = &value["message"];
         match message["toolName"].as_str() {
+            Some("write") => {
+                if let Some(id) = message["toolCallId"].as_str() {
+                    if let Some(uri) = self.local_writes.remove(id) {
+                        if message["isError"] != true {
+                            if let Some(path) = message["details"]["resolvedPath"].as_str() {
+                                let path = PathBuf::from(path);
+                                if path.is_absolute() {
+                                    self.resolved_local.insert(uri, path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Some("todo") => self.todos(&message["details"]["phases"]),
             Some("task") => {
                 for item in message["details"]["progress"]
@@ -284,22 +313,11 @@ impl TailReader {
         self.state.plan_path = self
             .plan_uri
             .as_deref()
-            .and_then(|uri| local_path(path, uri))
+            .and_then(|uri| {
+                local_path(path, uri)
+                    .map(|fallback| self.resolved_local.get(uri).cloned().unwrap_or(fallback))
+            })
             .filter(|p| p.is_file());
-        if self.state.plan_path.is_none() && self.plan_uri.is_some() {
-            let dir = path.with_extension("").join("local");
-            self.state.plan_path = fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.ends_with("-plan.md"))
-                })
-                .max_by_key(|p| fs::metadata(p).ok().and_then(|m| m.modified().ok()));
-        }
         self.state.subagents.clear();
         for entry in fs::read_dir(path.with_extension(""))
             .into_iter()
@@ -397,6 +415,31 @@ mod tests {
         assert_eq!(reader.state.plan_path, None);
         assert!(local_path(&path, "local://../secret").is_none());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plans_use_correlated_native_local_write_paths_not_guessed_artifact_folders() {
+        let root = std::env::temp_dir().join(format!("omp-plan-path-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("native-local")).unwrap();
+        let journal = root.join("session.jsonl");
+        let plan = root.join("native-local/review-plan.md");
+        fs::write(&plan, "# Real native plan\n").unwrap();
+        let call = serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"write-1","name":"write","arguments":{"path":"local://review-plan.md"}}]}});
+        let result = serde_json::json!({"type":"message","message":{"role":"toolResult","toolName":"write","toolCallId":"write-1","details":{"resolvedPath":plan}}});
+        let mode = serde_json::json!({"type":"mode_change","mode":"plan","data":{"planFilePath":"local://review-plan.md"}});
+        fs::write(&journal, format!("{call}\n{result}\n{mode}\n")).unwrap();
+        let mut reader = TailReader::default();
+        reader.update(&journal).unwrap();
+        assert_eq!(reader.state.plan_path, Some(plan.clone()));
+        let malicious = serde_json::json!({"type":"mode_change","data":{"planFilePath":"local://../review-plan.md"}});
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&journal).unwrap(),
+            "{malicious}"
+        )
+        .unwrap();
+        reader.update(&journal).unwrap();
+        assert_eq!(reader.state.plan_path, None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

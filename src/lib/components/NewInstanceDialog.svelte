@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, type SessionInfo } from "../api";
-  import { errorText, refreshInstances, startInstance } from "../stores";
+  import { errorText, refreshInstances, startInstance, globalConfig, refreshGlobalConfig } from "../stores";
   import { basename, pickFolder } from "../ui";
   let { open, onclose, oncreated, purpose = "instance" }: { open: boolean; onclose: () => void; oncreated: (id: string) => void; purpose?: "instance" | "manager" } = $props();
   let projectPath = $state("");
@@ -10,6 +10,7 @@
   let configs = $state<string[]>([]);
   let resume = $state("");
   let startNow = $state(true);
+  let useGlobalConfig = $state(true);
   let sessions = $state<SessionInfo[]>([]);
   let loading = $state(false);
   let busy = $state(false);
@@ -27,6 +28,7 @@
     if (!dialog) return;
     if (open && !dialog.open) {
       dialog.showModal();
+      void refreshGlobalConfig().then(() => { useGlobalConfig = !!$globalConfig.path || !!$globalConfig.error; });
       dialog.querySelector<HTMLInputElement>("input")?.focus();
     } else if (!open && dialog.open) {
       dialog.close();
@@ -66,7 +68,7 @@
     busy = true;
     error = "";
     try {
-      const config = { name: name.trim() || basename(projectPath), projectPath: projectPath.trim(), profile: profile.trim(), model: model.trim(), configs: configs.map(c => c.trim()).filter(Boolean), resumeSessionId: resume || null };
+      const config = { name: name.trim() || basename(projectPath), projectPath: projectPath.trim(), profile: profile.trim(), model: model.trim(), configs: configs.map(c => c.trim()).filter(Boolean), resumeSessionId: resume || null, useGlobalConfig };
       const created = purpose === "manager" ? await api.createManager(config) : await api.createInstance(config);
       if (purpose === "instance" && startNow) await startInstance(created.id);
       await refreshInstances();
@@ -85,6 +87,11 @@
         <label>Name <input bind:value={name} disabled={purpose === "manager"} placeholder={basename(projectPath) || "Project name"} /></label>
         <label>OMP profile <input bind:value={profile} placeholder="Default profile" /></label>
         <label>Model / role override <input bind:value={model} placeholder="Use OMP configuration" /></label>
+        {#if $globalConfig.path || $globalConfig.error}
+          <label class="row"><input type="checkbox" bind:checked={useGlobalConfig} />Use global config</label>
+          {#if $globalConfig.path}<small class="mono">{$globalConfig.path}</small>{/if}
+          {#if $globalConfig.error}<p class="err">{$globalConfig.error} Uncheck to use native OMP configuration.</p>{/if}
+        {/if}
         <div class="config-list">
           <span>Config overlays (applied in order)</span>
           {#each configs as _, index}

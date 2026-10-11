@@ -142,6 +142,88 @@ pub async fn render_transcript(
         .transcript_path(&id, &subagent_id, Origin::Human)?;
     blocking(move || session::render_transcript_file(&path, &input)).await
 }
+#[tauri::command]
+pub fn get_global_config(state: State<'_, AppState>) -> crate::config::GlobalConfigInfo {
+    state.registry.global_config.info()
+}
+#[tauri::command]
+pub async fn preview_global_config(
+    state: State<'_, AppState>,
+    source_id: Option<String>,
+    import_path: Option<String>,
+) -> Result<crate::config::ConfigPreview> {
+    if source_id.is_some() && import_path.is_some() {
+        return Err("Select a source instance or import file, not both".into());
+    }
+    let registry = state.registry.clone();
+    let request = if let Some(path) = import_path {
+        serde_json::json!({"action":"import","path":path,"cwd":registry.home,"profile":"default"})
+    } else if let Some(id) = source_id {
+        let source = registry.inspect(&id, Origin::Human)?;
+        serde_json::json!({"action":"export","cwd":source.project_path,"profile":source.profile,"configFiles":source.configs})
+    } else {
+        serde_json::json!({"action":"export","cwd":registry.home,"profile":"default"})
+    };
+    blocking(move || crate::config::preview(registry.config_root(), &registry.home, request)).await
+}
+#[tauri::command]
+pub async fn save_global_config(
+    state: State<'_, AppState>,
+    yaml: String,
+) -> Result<serde_json::Value> {
+    let registry = state.registry.clone();
+    blocking(move || {
+        let clean = crate::config::preview(registry.config_root(), &registry.home,
+            serde_json::json!({"action":"import","yaml":yaml,"cwd":registry.home,"profile":"default"}))?;
+        let path = registry.global_config.publish(&clean.yaml)?;
+        Ok(serde_json::json!({"path":path}))
+    }).await
+}
+#[tauri::command]
+pub async fn get_setup_paths(state: State<'_, AppState>) -> Result<crate::setup::SetupPaths> {
+    let registry = state.registry.clone();
+    blocking(move || crate::setup::paths(&registry)).await
+}
+#[tauri::command]
+pub async fn open_setup_folder(
+    state: State<'_, AppState>,
+    scope: crate::setup::SetupScope,
+) -> Result<()> {
+    let registry = state.registry.clone();
+    blocking(move || crate::setup::open_folder(&registry, scope)).await
+}
+#[tauri::command]
+pub async fn start_agent_setup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: crate::setup::SetupRequest,
+) -> Result<crate::setup::SetupAdmission> {
+    let registry = state.registry.clone();
+    let setup = state.setup.clone();
+    blocking(move || {
+        let paths = crate::setup::paths(&registry)?;
+        let result = setup.start(&registry, &paths, request);
+        publish(&app, &registry);
+        result
+    })
+    .await
+}
+#[tauri::command]
+pub async fn send_agent_setup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    request: crate::setup::SetupRequest,
+) -> Result<crate::setup::SetupAdmission> {
+    let registry = state.registry.clone();
+    let setup = state.setup.clone();
+    blocking(move || {
+        let result = setup.send(&registry, &id, &request);
+        publish(&app, &registry);
+        result
+    })
+    .await
+}
 pub fn tick(app: AppHandle, registry: Arc<Registry>, closing: Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {
         while !closing.load(std::sync::atomic::Ordering::Relaxed) {

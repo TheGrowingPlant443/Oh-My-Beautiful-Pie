@@ -20,6 +20,7 @@ pub struct BridgeLaunch {
     pub endpoint: String,
     pub token: String,
     pub extension_path: PathBuf,
+    pub manager_setup_dir: PathBuf,
     pub instance_id: String,
     pub generation: u64,
     pub role: InstanceKind,
@@ -187,6 +188,11 @@ impl ManagerHub {
             endpoint: self.endpoint.clone(),
             token,
             extension_path: self.extension_path.clone(),
+            manager_setup_dir: self
+                .extension_path
+                .parent()
+                .ok_or("invalid bridge directory")?
+                .join("manager-setup"),
             instance_id: definition.id.clone(),
             generation,
             role: definition.kind,
@@ -452,6 +458,7 @@ impl ManagerHub {
         lease: &ControlLease,
         action: &str,
         mut payload: Value,
+        origin: Origin<'_>,
     ) -> Result<Value> {
         let stream = self.connection(id, true)?;
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -459,6 +466,10 @@ impl ManagerHub {
         payload["generation"] = json!(lease.generation);
         payload["sessionId"] = json!(lease.session_id);
         payload["ownershipEpoch"] = json!(lease.ownership_epoch);
+        payload["source"] = json!(match origin {
+            Origin::Human => "human",
+            Origin::Manager(_) => "manager",
+        });
         self.state
             .lock()
             .map_err(|e| e.to_string())?
@@ -767,7 +778,7 @@ impl ManagerHub {
             }
         }
     }
-    fn wait_ready(&self, id: &str) -> Result<()> {
+    pub(crate) fn wait_ready(&self, id: &str) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if self.connection(id, true).is_ok() {
@@ -782,6 +793,20 @@ impl ManagerHub {
             std::thread::sleep(Duration::from_millis(50));
         }
         Err("bridge_not_ready".into())
+    }
+    pub fn prompt_human(&self, id: &str, message: &str) -> Result<Value> {
+        let registry = self.registry()?;
+        let lease = registry.lease(id, Origin::Human, true)?;
+        if registry.inspect(id, Origin::Human)?.kind != InstanceKind::Instance {
+            return Err("Setup prompts require an ordinary human-controlled instance".into());
+        }
+        self.control(
+            id,
+            &lease,
+            "prompt",
+            json!({"message":message}),
+            Origin::Human,
+        )
     }
     fn execute(&self, actor: &Actor, frame: &Value) -> Result<Value> {
         if actor.role != InstanceKind::Manager {
@@ -835,6 +860,7 @@ impl ManagerHub {
                         &lease,
                         "prompt",
                         json!({"message":prompt,"delivery":"follow_up"}),
+                        origin,
                     )?;
                 }
             }
@@ -890,6 +916,7 @@ impl ManagerHub {
                     &lease,
                     if action == "send" { "prompt" } else { "abort" },
                     p.clone(),
+                    origin,
                 )
             }
             "subscribe" => {
@@ -976,6 +1003,7 @@ impl ManagerHub {
                     &lease,
                     "reply_ui",
                     json!({"requestId":decision.base_id,"response":p["response"]}),
+                    origin,
                 )
             }
             _ => Err("invalid_action".into()),
@@ -1038,6 +1066,11 @@ mod tests {
             )
             .err()
             .as_deref(),
+            Some("not_controlled")
+        );
+        assert_eq!(
+            hub.execute(&actor, &json!({"action":"send","payload":{"instanceId":human.id,"source":"human","message":"unauthorized"}}))
+                .err().as_deref(),
             Some("not_controlled")
         );
         assert_eq!(registry.snapshot().len(), 2);

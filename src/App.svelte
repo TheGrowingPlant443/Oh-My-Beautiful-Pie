@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api } from "./lib/api";
+  import { api, type SetupDraft, type SetupAdmission } from "./lib/api";
   import { connectInstances, instances, instancesById, previewsEnabled, toasts, dismissToast, reportError, managerInstance, showManagerTile, startInstance } from "./lib/stores";
   import Grid from "./lib/components/Grid.svelte";
   import Tree from "./lib/components/Tree.svelte";
@@ -8,6 +8,14 @@
   import NewInstanceDialog from "./lib/components/NewInstanceDialog.svelte";
   import PlanPanel from "./lib/components/PlanPanel.svelte";
   import SubagentPanel from "./lib/components/SubagentPanel.svelte";
+  import GlobalConfigDialog from "./lib/components/GlobalConfigDialog.svelte";
+  import AgentSetupPage from "./lib/components/AgentSetupPage.svelte";
+  let view = $state<"dashboard" | "agent_setup">("dashboard");
+  let configOpen = $state(false);
+  let configMode = $state<"save" | "import">("save");
+  let setupDraft = $state<SetupDraft>({ scope: null, items: [], step: 0, instanceId: null });
+  let setupAdmission = $state<SetupAdmission | null>(null);
+  let returnToSetup = $state(false);
   let focusedId = $state<string | null>(null);
   let dialogOpen = $state(false);
   let dialogPurpose = $state<"instance" | "manager">("instance");
@@ -18,10 +26,16 @@
   const panelOwner = $derived(panel ? $instancesById.get(panel.id) : undefined);
   const overview = $derived($instances.filter(instance => instance.kind !== "manager" || $showManagerTile));
   const needsHuman = $derived(!!$managerInstance?.pendingDecisionCount || $instances.some(instance => !!instance.humanRequest));
-  function newInstance(): void { dialogPurpose = "instance"; dialogOpen = true; }
+  function newInstance(): void { returnToSetup = false; dialogPurpose = "instance"; dialogOpen = true; }
+  function configureManager(): void { returnToSetup = true; dialogPurpose = "manager"; dialogOpen = true; }
+  function created(id: string): void {
+    if (returnToSetup) { returnToSetup = false; view = "agent_setup"; }
+    else focus(id);
+  }
+  function openConfig(mode: "save" | "import"): void { configMode = mode; configOpen = true; }
   async function openManager(): Promise<void> {
     const manager = $managerInstance;
-    if (!manager) { dialogPurpose = "manager"; dialogOpen = true; return; }
+    if (!manager) { returnToSetup = false; dialogPurpose = "manager"; dialogOpen = true; return; }
     openingManager = true;
     try {
       if (manager.status === "stopped" || manager.status === "error") await startInstance(manager.id);
@@ -32,6 +46,7 @@
     if (focused && focused.generation > 0) {
       void api.resizePty(focused.id, 120, 32).catch(error => reportError("Restore preview dimensions", error));
     }
+    view = "dashboard";
     focusedId = id;
   }
 
@@ -53,10 +68,15 @@
     {#if $previewsEnabled}<select aria-label="Preview size" bind:value={tileMin}><option value={420}>Compact tiles</option><option value={640}>Readable tiles</option><option value={1000}>Large previews</option></select>{/if}
     <button aria-label="The Manager" disabled={openingManager} onclick={openManager}>The Manager{#if needsHuman}<span class="pill warn">Needs you</span>{/if}</button>
     {#if $managerInstance}<label class="manager-toggle"><input type="checkbox" bind:checked={$showManagerTile} />Show Manager tile</label>{/if}
+    <button onclick={() => openConfig("save")}>Save as global config</button>
+    <button onclick={() => openConfig("import")}>Import config</button>
+    <button class:active={view === "agent_setup"} onclick={() => view = "agent_setup"}>Agent setup</button>
     <button class="primary" onclick={newInstance}>New instance</button>
   </header>
-  <main class:focused={!!focused}>
-    {#if focused}
+  <main class:focused={view === "dashboard" && !!focused}>
+    {#if view === "agent_setup"}
+      <AgentSetupPage bind:draft={setupDraft} bind:admission={setupAdmission} onback={() => view = "dashboard"} onSetupManager={configureManager} onOpenManager={openManager} onSelectSession={focus} {onPlan} {onSubagents} />
+    {:else if focused}
       <SessionView instance={focused} instances={$instances} onSwitch={focus} onClose={() => focus(null)} {onPlan} {onSubagents} />
     {:else if $previewsEnabled}
       <Grid instances={overview} onSelect={focus} {onPlan} {onSubagents} {tileMin} onCreate={newInstance} />
@@ -65,7 +85,8 @@
     {/if}
   </main>
 </div>
-<NewInstanceDialog open={dialogOpen} purpose={dialogPurpose} onclose={() => dialogOpen = false} oncreated={focus} />
+<NewInstanceDialog open={dialogOpen} purpose={dialogPurpose} onclose={() => dialogOpen = false} oncreated={created} />
+<GlobalConfigDialog open={configOpen} mode={configMode} initialSourceId={focused?.id || $managerInstance?.id || null} onclose={() => configOpen = false} />
 {#if panel && panelOwner}
   <div class="backdrop" role="presentation" onclick={e => { if (e.target === e.currentTarget) panel = null; }}>
     <div class="viewer panel" role="dialog" aria-modal="true" aria-label={panel.kind === "plan" ? "OMP plan" : "Subagent chats"}>

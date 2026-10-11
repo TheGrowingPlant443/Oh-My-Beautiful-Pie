@@ -1,11 +1,16 @@
 import { writable, derived, get } from "svelte/store";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { api, type Instance, type PtyChunk } from "./api";
+import { api, type Instance, type PtyChunk, type GlobalConfigInfo } from "./api";
 
 export const instances = writable<Instance[]>([]);
 export const instancesById = derived(instances, list => new Map(list.map(i => [i.id, i])));
 export const managerInstance = derived(instances, list => list.find(instance => instance.kind === "manager"));
+export const globalConfig = writable<GlobalConfigInfo>({ path: null, error: null });
+export async function refreshGlobalConfig(): Promise<void> {
+  try { globalConfig.set(await api.getGlobalConfig()); }
+  catch (error) { globalConfig.set({ path: null, error: errorText(error) }); }
+}
 export const toasts = writable<{ id: number; message: string }[]>([]);
 let toastId = 0;
 export function errorText(error: unknown): string {
@@ -101,6 +106,7 @@ export async function refreshInstances(): Promise<void> {
 export async function connectInstances(): Promise<() => void> {
   const unlisten = await listen<Instance[]>("instances", event => applySnapshot(event.payload));
   await refreshInstances();
+  await refreshGlobalConfig();
   return unlisten;
 }
 
