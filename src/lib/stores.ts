@@ -1,12 +1,17 @@
 import { writable, derived, get } from "svelte/store";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { api, type Instance, type PtyChunk, type GlobalConfigInfo } from "./api";
+import { api, type Instance, type PtyChunk, type GlobalConfigInfo, type BrowserInfo } from "./api";
+import { parseAppSettings, type AppSettings } from "./settings";
 
-export const instances = writable<Instance[]>([]);
-export const instancesById = derived(instances, list => new Map(list.map(i => [i.id, i])));
+// Every row the backend reports, including plan agents (looked up by id for the plan view).
+export const allInstances = writable<Instance[]>([]);
+// What dashboards, pickers and counters show: plan agents are never listed as sessions.
+export const instances = derived(allInstances, list => list.filter(row => row.planTarget === null));
+export const instancesById = derived(allInstances, list => new Map(list.map(i => [i.id, i])));
 export const managerInstance = derived(instances, list => list.find(instance => instance.kind === "manager"));
 export const globalConfig = writable<GlobalConfigInfo>({ path: null, error: null });
+export const browserStatuses = writable<ReadonlyMap<string, BrowserInfo>>(new Map());
 export async function refreshGlobalConfig(): Promise<void> {
   try { globalConfig.set(await api.getGlobalConfig()); }
   catch (error) { globalConfig.set({ path: null, error: errorText(error) }); }
@@ -88,7 +93,7 @@ export const ptyBus = {
 };
 
 function applySnapshot(list: Instance[]): void {
-  const previous = get(instances);
+  const previous = get(allInstances);
   for (const row of list) {
     const old = previous.find(i => i.id === row.id);
     if (old && row.generation !== old.generation) ptyBus.reset(row.id);
@@ -97,17 +102,34 @@ function applySnapshot(list: Instance[]): void {
     }
   }
   for (const old of previous) if (!list.some(i => i.id === old.id)) ptyBus.dispose(old.id);
-  instances.set(list);
+  allInstances.set(list);
 }
 export async function refreshInstances(): Promise<void> {
   try { applySnapshot(await api.listInstances()); }
   catch (error) { reportError("Load instances", error); }
 }
 export async function connectInstances(): Promise<() => void> {
-  const unlisten = await listen<Instance[]>("instances", event => applySnapshot(event.payload));
-  await refreshInstances();
-  await refreshGlobalConfig();
-  return unlisten;
+  let disposed = false;
+  let browserEventSeen = false;
+  const unlisten = await listen<Instance[]>("instances", event => { if (!disposed) applySnapshot(event.payload); });
+  let unlistenBrowsers: (() => void) | undefined;
+  function cleanup(): void { disposed = true; unlisten(); unlistenBrowsers?.(); }
+  try {
+    unlistenBrowsers = await listen<BrowserInfo[]>("browser_state", event => {
+      browserEventSeen = true;
+      if (!disposed) browserStatuses.set(new Map(event.payload.map(info => [info.instanceId, info])));
+    });
+    const [list, browsers] = await Promise.all([api.listInstances(), api.listBrowsers()]);
+    if (!disposed) {
+      applySnapshot(list);
+      if (!browserEventSeen) browserStatuses.set(new Map(browsers.map(info => [info.instanceId, info])));
+    }
+    await refreshGlobalConfig();
+    return cleanup;
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
 }
 
 async function action(id: string, command: (id: string) => Promise<void>): Promise<boolean> {
@@ -126,5 +148,19 @@ export const returnToManager = (id: string) => action(id, api.returnToManager);
 export const previewsEnabled = writable(localStorage.getItem("omp-manager.previews") !== "off");
 previewsEnabled.subscribe(on => localStorage.setItem("omp-manager.previews", on ? "on" : "off"));
 
-export const showManagerTile = writable(localStorage.getItem("omp-manager.show-manager") !== "off");
-showManagerTile.subscribe(show => localStorage.setItem("omp-manager.show-manager", show ? "on" : "off"));
+function loadSettings(): AppSettings {
+  try { return parseAppSettings(localStorage.getItem("omp-manager.settings"), localStorage.getItem("omp-manager.show-manager")); }
+  catch (error) { reportError("Load settings", error); return parseAppSettings(null, null); }
+}
+export const appSettings = writable<AppSettings>(loadSettings());
+let settingsSaveFailed = false;
+appSettings.subscribe(settings => {
+  try {
+    localStorage.setItem("omp-manager.settings", JSON.stringify(settings));
+    localStorage.removeItem("omp-manager.show-manager");
+    settingsSaveFailed = false;
+  } catch (error) {
+    if (!settingsSaveFailed) reportError("Save settings", error);
+    settingsSaveFailed = true;
+  }
+});

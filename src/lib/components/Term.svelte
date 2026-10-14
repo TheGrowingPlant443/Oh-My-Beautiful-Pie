@@ -61,8 +61,10 @@
     term.write("", () => { replaying = false; });
     if (run > 0) void ptyBus.ensureAttached(id).catch(error => reportError("Attach terminal", error));
     let frame = 0;
-    let sentCols = term.cols;
-    let sentRows = term.rows;
+    // 0 forces the first layout after mount to report the fitted size: the snapshot's cols/rows can be stale, and the
+    // backend ignores resizes to the size the PTY already has.
+    let sentCols = 0;
+    let sentRows = 0;
     function layout(): void {
       if (disposed || element!.clientWidth === 0) return;
       if (mode) {

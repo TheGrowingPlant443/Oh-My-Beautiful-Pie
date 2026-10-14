@@ -10,6 +10,7 @@ use crate::instance::{
     ControlLease, CreateInput, Definition, Instance, InstanceKind, Origin, Registry,
 };
 use crate::session;
+use crate::plan;
 use serde_json::{json, Value};
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -78,6 +79,7 @@ pub struct ManagerHub {
     endpoint: String,
     extension_path: PathBuf,
     registry: OnceLock<Weak<Registry>>,
+    browser: OnceLock<Arc<crate::browser::BrowserSupervisor>>,
     state: Mutex<HubState>,
     closing: AtomicBool,
 }
@@ -127,6 +129,7 @@ impl ManagerHub {
                 .to_string(),
             extension_path,
             registry: OnceLock::new(),
+            browser: OnceLock::new(),
             state: Mutex::new(HubState::default()),
             closing: AtomicBool::new(false),
         });
@@ -155,6 +158,9 @@ impl ManagerHub {
         self.registry
             .set(registry)
             .map_err(|_| "manager registry already bound".into())
+    }
+    pub fn install_browser_supervisor(&self, browser: Arc<crate::browser::BrowserSupervisor>) -> Result<()> {
+        self.browser.set(browser).map_err(|_| "browser supervisor already installed".into())
     }
     fn registry(&self) -> Result<Arc<Registry>> {
         self.registry
@@ -233,6 +239,9 @@ impl ManagerHub {
                 let _ = stream.shutdown(Shutdown::Both);
             }
         }
+        if let Some(browser) = self.browser.get() {
+            if let Err(error) = browser.revoke(id, generation) { eprintln!("revoke terminal browser: {error}"); }
+        }
     }
     pub fn shutdown(&self) {
         self.closing.store(true, Ordering::Relaxed);
@@ -303,6 +312,8 @@ impl ManagerHub {
             Ok(a) => a,
             Err(_) => return,
         };
+        // The 10 s hello deadline must not outlive authentication: Windows keeps it on the cloned reader.
+        let _ = reader.get_ref().set_read_timeout(None);
         let _ = stream.set_read_timeout(None);
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         let writer = Arc::new(Mutex::new(stream));
@@ -336,7 +347,7 @@ impl ManagerHub {
                 break;
             }
             match frame["type"].as_str() {
-                Some("request") if actor.role == InstanceKind::Manager => {
+                Some("request") => {
                     let hub = self.clone();
                     let actor = actor.clone();
                     let output = writer.clone();
@@ -377,6 +388,10 @@ impl ManagerHub {
                     );
                 }
             }
+        }
+        // A bridge must never keep writing into a connection nobody reads; closing makes it fail fast and reconnect.
+        if let Ok(s) = writer.lock() {
+            let _ = s.shutdown(Shutdown::Both);
         }
         let current = {
             let Ok(mut state) = self.state.lock() else {
@@ -808,16 +823,144 @@ impl ManagerHub {
             Origin::Human,
         )
     }
-    fn execute(&self, actor: &Actor, frame: &Value) -> Result<Value> {
-        if actor.role != InstanceKind::Manager {
-            return Err("unauthorized".into());
+    /// App-originated control of a plan agent's target: `Origin::Human`, so any session (including The Manager)
+    /// can be interrupted and prompted. The target is derived from the registry, never from the payload.
+    fn plan_control(&self, registry: &Registry, target: &str, control: &str, payload: Value) -> Result<Value> {
+        let lease = registry.lease(target, Origin::Human, true)?;
+        self.control(target, &lease, control, payload, Origin::Human)
+            .map_err(|e| if e == "bridge_not_ready" { plan::NOT_RUNNING.into() } else { e })
+    }
+    pub fn restore_plan_backup(&self, target: &str, backup_id: &str) -> Result<()> {
+        let registry = self.registry()?;
+        registry.inspect(target, Origin::Human)?;
+        let backup = plan::read_backup(&registry.plan_folder(target), backup_id)?;
+        match self.plan_control(&registry, target, "abort", json!({})) {
+            Ok(_) => (),
+            Err(e) if e == plan::NOT_RUNNING => (),
+            Err(e) => return Err(e),
         }
+        registry.revise_plan(target, &backup.text)?;
+        Ok(())
+    }
+    fn plan_action(&self, registry: &Arc<Registry>, target: &str, action: &str, p: &Value) -> Result<Value> {
+        let allowed: &[&str] = match action {
+            "plan_status" | "plan_read_plan" | "plan_screen" | "plan_interrupt" | "plan_handoff_info" => &[],
+            "plan_transcript" => &["tail"],
+            "plan_write_plan" => &["text"],
+            "plan_handoff" => &["summary", "revision", "startIfStopped"],
+            _ => return Err("invalid_action".into()),
+        };
+        let object = p.as_object().ok_or_else(|| "invalid_plan_payload: payload must be a JSON object".to_string())?;
+        if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+            return Err(format!("invalid_plan_payload: {action} does not accept '{key}' (allowed: {})", if allowed.is_empty() { "none".into() } else { allowed.join(", ") }));
+        }
+        match action {
+            "plan_status" => {
+                let row = registry.inspect(target, Origin::Human)?;
+                Ok(json!({
+                    "name": row.name, "kind": row.kind, "projectPath": row.project_path, "status": row.status,
+                    "activity": row.activity, "task": row.task, "todoDone": row.todo_done, "todoTotal": row.todo_total,
+                    "planPath": row.plan_path, "planKind": row.plan_kind,
+                    "subagents": row.subagents.iter().map(|s| json!({"name": s.name, "agent": s.agent, "status": s.status, "task": s.task})).collect::<Vec<_>>(),
+                }))
+            }
+            "plan_read_plan" => Ok(json!({"kind": registry.inspect(target, Origin::Human)?.plan_kind, "path": registry.plan_file(target)?, "text": registry.plan(target, Origin::Human)?})),
+            "plan_transcript" => {
+                let tail = object.get("tail").map(|v| v.as_u64().ok_or("invalid_plan_payload")).transpose()?.unwrap_or(20_000).clamp(1_000, 60_000) as usize;
+                let (path, input) = registry.main_transcript(target, Origin::Human)?;
+                Ok(json!({"text": plan::tail(&session::render_transcript_file(&path, &input)?, tail)}))
+            }
+            "plan_screen" => {
+                let screen = registry.screen(target, Origin::Human).map_err(|e| if e == "instance not started" { plan::NOT_RUNNING.to_string() } else { e })?;
+                Ok(json!({"text": plan::tail(screen["text"].as_str().unwrap_or(""), 8_000)}))
+            }
+            "plan_interrupt" => {
+                self.plan_control(registry, target, "abort", json!({}))?;
+                Ok(json!({"interrupted": true}))
+            }
+            "plan_write_plan" => {
+                let text = object.get("text").and_then(Value::as_str)
+                    .filter(|t| !t.trim().is_empty() && t.chars().count() <= 262_144)
+                    .ok_or("plan text must be 1..262144 characters")?;
+                // The session must stop working before its plan changes; a stopped session has nothing to interrupt.
+                let interrupted = match self.plan_control(registry, target, "abort", json!({})) {
+                    Ok(_) => true,
+                    Err(e) if e == plan::NOT_RUNNING => false,
+                    Err(e) => return Err(e),
+                };
+                let backup = registry.revise_plan(target, text)?;
+                Ok(json!({"path": registry.plan_file(target)?, "bytes": text.len(), "interrupted": interrupted, "backup": backup}))
+            }
+            "plan_handoff_info" => {
+                let revision = registry.plan_revision(target)?
+                    .ok_or("There is no plan to hand off; call write_plan first")?;
+                let row = registry.inspect(target, Origin::Human)?;
+                Ok(json!({"name": row.name, "revision": revision.id,
+                    "needsStart": self.connection(target, true).is_err() && !matches!(row.status.as_str(), "running" | "starting")}))
+            }
+            "plan_handoff" => {
+                let summary = object.get("summary").and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty() && s.chars().count() <= 4_000)
+                    .ok_or("summary must be 1..4000 characters")?;
+                let revision = registry.plan_revision(target)?
+                    .ok_or("There is no plan to hand off; call write_plan first")?;
+                if p["revision"].as_str() != Some(revision.id.as_str()) {
+                    return Err("The plan changed; confirm the new revision before handoff".into());
+                }
+                let start = p.get("startIfStopped").map(|v| v.as_bool().ok_or("startIfStopped must be boolean")).transpose()?.unwrap_or(false);
+                if self.connection(target, true).is_err() {
+                    let row = registry.inspect(target, Origin::Human)?;
+                    if !matches!(row.status.as_str(), "running" | "starting") {
+                        if !start { return Err(plan::NOT_RUNNING.into()); }
+                        registry.start(target, Origin::Human)?;
+                    }
+                    self.wait_ready(target)?;
+                }
+                // Starting/resuming may load a different native identity. Never send an unconfirmed revision.
+                let current = registry.plan_revision(target)?.ok_or("The session changed; review the plan before handoff")?;
+                if current.id != revision.id { return Err("The plan changed; confirm the new revision before handoff".into()); }
+                let message = plan::handoff_message(&revision.path, &revision.text, summary);
+                self.plan_control(registry, target, "prompt", json!({"message": message}))?;
+                registry.mark_plan_handoff(target, &revision.id)?;
+                Ok(json!({"accepted": true}))
+            }
+            _ => Err("invalid_action".into()),
+        }
+    }
+    fn execute(&self, actor: &Actor, frame: &Value) -> Result<Value> {
+        let current = self.state.lock().map_err(|e| e.to_string())?.clients.get(&actor.id).is_some_and(|client| client.generation == actor.generation && client.connection_id == actor.connection_id);
+        if !current { return Err("stale_generation".into()); }
         let registry = self.registry()?;
         if registry.lease(&actor.id, Origin::Human, false)?.generation != actor.generation {
             return Err("stale_generation".into());
         }
         let action = text(frame, "action")?;
         let p = &frame["payload"];
+        if matches!(action, "browser_prepare" | "browser_close_tab" | "browser_close_all" | "browser_tabs") {
+            let fields: &[&str] = match action {
+                "browser_close_all" | "browser_tabs" => &[],
+                "browser_prepare" => &["name", "target"],
+                _ => &["name"],
+            };
+            let object = p.as_object().ok_or("invalid_browser_payload")?;
+            if object.keys().any(|key| !fields.contains(&key.as_str())) { return Err("invalid_browser_payload".into()); }
+            let browser = self.browser.get().ok_or("browser supervisor unavailable")?;
+            return match action {
+                "browser_prepare" => {
+                    let target = p.get("target").map(|v| v.as_str().ok_or("invalid_browser_payload")).transpose()?;
+                    browser.prepare_tab(&actor.id, actor.generation, text(p, "name")?, target)
+                }
+                "browser_tabs" => browser.list_tabs(&actor.id, actor.generation),
+                "browser_close_tab" => browser.close_tab(&actor.id, actor.generation, Some(text(p, "name")?)).map(|_| Value::Null),
+                _ => browser.close_tab(&actor.id, actor.generation, None).map(|_| Value::Null),
+            };
+        }
+        if action.starts_with("plan_") {
+            if let Some(target) = registry.plan_target(&actor.id) {
+                return self.plan_action(&registry, &target, action, p);
+            }
+        }
+        if actor.role != InstanceKind::Manager { return Err("unauthorized".into()); }
         let origin = Origin::Manager(&actor.id);
         if action == "list" {
             let rows = registry
@@ -839,8 +982,9 @@ impl ManagerHub {
             if !start && prompt.is_some() {
                 return Err("prompt_requires_start".into());
             }
-            let input: CreateInput =
+            let mut input: CreateInput =
                 serde_json::from_value(p["config"].clone()).map_err(|e| e.to_string())?;
+            input.agent_file = None;
             let row = registry.create_owned(&actor.id, input)?;
             if start {
                 if let Err(error) = registry.start(&row.id, origin) {
@@ -1040,6 +1184,7 @@ mod tests {
             session_path: None,
             kind: InstanceKind::Manager,
             manager_id: None,
+            plan_target: None,
         };
         let launch = hub.launch(&definition, 0).unwrap();
         assert!(hub.authenticate(&json!({"type":"hello","id":"hello","protocol":1,"instanceId":manager.id,"generation":0,"token":"wrong"})).is_err());
@@ -1053,6 +1198,10 @@ mod tests {
         socket.write_all(format!("{hello}\n").as_bytes()).unwrap();
         let welcome = read_frame(&mut BufReader::new(socket)).unwrap().unwrap();
         assert_eq!(welcome["ok"], true);
+        let actor = Actor {
+            connection_id: hub.state.lock().unwrap_or_else(|e| e.into_inner()).clients[&manager.id].connection_id.clone(),
+            ..actor
+        };
         let human = registry
             .create(CreateInput {
                 project_path: folder.to_string_lossy().into(),
@@ -1107,6 +1256,8 @@ mod tests {
             role: InstanceKind::Instance,
             connection_id: String::new(),
         };
+        hub.launch(&Definition { id:manager.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Manager, manager_id:None, plan_target:None }, 0).unwrap();
+        hub.launch(&Definition { id:worker.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Instance, manager_id:Some(manager.id.clone()), plan_target:None }, 0).unwrap();
         let event = json!({"kind":"needs_decision","payload":{"requestId":"native-1","method":"select","title":"Review operation","options":["Approve","Deny"]}});
         hub.event(&worker_actor, &event).unwrap();
         let first_id = {
@@ -1186,6 +1337,193 @@ mod tests {
             hub.event(&stale, &event).err().as_deref(),
             Some("stale_generation")
         );
+        hub.shutdown();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn manager_created_workers_cannot_attach_agent_files() {
+        let folder =
+            std::env::temp_dir().join(format!("omp-manager-persona-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let persona = folder.join("AGENTS.md");
+        std::fs::write(&persona, "be terse").unwrap();
+        let registry =
+            Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let manager = registry
+            .create_manager(CreateInput {
+                project_path: folder.to_string_lossy().into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
+        hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        registry.install_manager_hub(hub.clone()).unwrap();
+        let actor = Actor {
+            id: manager.id.clone(),
+            generation: 0,
+            role: InstanceKind::Manager,
+            connection_id: String::new(),
+        };
+        hub.launch(&Definition { id:manager.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Manager, manager_id:None, plan_target:None }, 0).unwrap();
+        let create = json!({"action":"create","payload":{"start":false,"config":{"name":"W","projectPath":folder,"agentFile":persona}}});
+        hub.execute(&actor, &create).unwrap();
+        let rows = registry.snapshot();
+        let worker = rows.iter().find(|r| r.kind == InstanceKind::Instance).unwrap();
+        assert_eq!(worker.agent_file, None);
+        hub.shutdown();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn worker_browser_actions_are_authenticated_and_cannot_choose_a_peer_owner() {
+        let folder = std::env::temp_dir().join(format!("omp-browser-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let worker = registry.create(CreateInput { project_path:folder.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
+        hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        let browser = crate::browser::BrowserSupervisor::new(folder.clone(), folder.clone());
+        hub.install_browser_supervisor(browser.clone()).unwrap();
+        let launch = hub.launch(&Definition {id:worker.id.clone(),input:CreateInput::default(),session_path:None,kind:InstanceKind::Instance,manager_id:None,plan_target:None},0).unwrap();
+        browser.register(&worker.id,0,&launch.token).unwrap();
+        let actor = Actor {id:worker.id.clone(),generation:0,role:InstanceKind::Instance,connection_id:String::new()};
+        assert_eq!(hub.execute(&actor,&json!({"action":"browser_prepare","payload":{"name":"main","instanceId":"peer"}})).unwrap_err(),"invalid_browser_payload");
+        assert_eq!(hub.execute(&actor,&json!({"action":"browser_prepare","payload":{"name":"main","target":5}})).unwrap_err(),"invalid_browser_payload");
+        assert_eq!(hub.execute(&actor,&json!({"action":"list","payload":{}})).unwrap_err(),"unauthorized");
+        assert_eq!(hub.execute(&actor,&json!({"action":"browser_tabs","payload":{"instanceId":"peer"}})).unwrap_err(),"invalid_browser_payload");
+        assert_eq!(hub.execute(&actor,&json!({"action":"browser_tabs","payload":{}})).unwrap(),json!([]), "no helper means no tabs, and none is started");
+        let replaced = Actor {connection_id:"replaced".into(),..actor.clone()};
+        assert_eq!(hub.execute(&replaced,&json!({"action":"browser_close_all","payload":{}})).unwrap_err(),"stale_generation");
+        hub.invalidate(&worker.id,0);
+        assert!(browser.snapshot().is_empty());
+        assert_eq!(hub.execute(&actor,&json!({"action":"browser_prepare","payload":{"name":"main"}})).unwrap_err(),"stale_generation");
+        browser.shutdown();hub.shutdown();std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn an_authenticated_bridge_connection_stays_readable_after_the_hello_deadline() {
+        let folder = std::env::temp_dir().join(format!("omp-bridge-idle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let worker = registry.create(CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
+        hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        let launch = hub.launch(&Definition {id:worker.id.clone(),input:CreateInput::default(),session_path:None,kind:InstanceKind::Instance,manager_id:None,plan_target:None},0).unwrap();
+        let mut socket = TcpStream::connect(&hub.endpoint).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let hello = json!({"type":"hello","id":"hello","protocol":1,"instanceId":worker.id,"generation":0,"token":launch.token});
+        socket.write_all(format!("{hello}\n").as_bytes()).unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        assert_eq!(read_frame(&mut reader).unwrap().unwrap()["ok"], true);
+        // A quiet bridge (no events for longer than the 10 s hello deadline) must still get answers.
+        std::thread::sleep(Duration::from_secs(11));
+        socket.write_all(format!("{}\n", json!({"type":"request","id":"after-idle","action":"list","payload":{}})).as_bytes()).unwrap();
+        let response = read_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(response["id"], "after-idle");
+        assert_eq!(response["error"], "unauthorized");
+        hub.shutdown();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn planner_actions_are_confined_to_their_target() {
+        let folder = std::env::temp_dir().join(format!("omp-planner-hub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let config = CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() };
+        let target = registry.create(CreateInput { name: "Target".into(), ..config.clone() }).unwrap();
+        let other = registry.create(config.clone()).unwrap();
+        let planner = registry.create_planner(&target.id).unwrap();
+        let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
+        hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        registry.install_manager_hub(hub.clone()).unwrap();
+        let definition = |id: &str, plan_target: Option<String>| Definition { id: id.into(), input: CreateInput::default(), session_path: None, kind: InstanceKind::Instance, manager_id: None, plan_target };
+        let target_launch = hub.launch(&definition(&target.id, None), 0).unwrap();
+        hub.launch(&definition(&planner.id, Some(target.id.clone())), 0).unwrap();
+        hub.launch(&definition(&other.id, None), 0).unwrap();
+        let actor = |id: &str| Actor { id: id.into(), generation: 0, role: InstanceKind::Instance, connection_id: String::new() };
+        let ask = |who: &str, action: &str, payload: Value| hub.execute(&actor(who), &json!({"action": action, "payload": payload}));
+
+        // The target's bridge: records every control frame and accepts it.
+        let mut socket = TcpStream::connect(&hub.endpoint).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        socket.write_all(format!("{}\n", json!({"type":"hello","id":"hello","protocol":1,"instanceId":target.id,"generation":0,"token":target_launch.token})).as_bytes()).unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        assert_eq!(read_frame(&mut reader).unwrap().unwrap()["ok"], true);
+        reader.get_ref().set_read_timeout(None).unwrap();
+        socket.write_all(format!("{}\n", json!({"type":"event","eventId":"1","kind":"ready","payload":{"sessionId":"s","supported":true,"materialized":false}})).as_bytes()).unwrap();
+        let recorded = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let log = recorded.clone();
+        let mut replies = socket.try_clone().unwrap();
+        std::thread::spawn(move || {
+            while let Ok(Some(frame)) = read_frame(&mut reader) {
+                if frame["type"] == "control" {
+                    log.lock().unwrap().push((frame["action"].as_str().unwrap_or_default().into(), frame["payload"].clone()));
+                    let _ = replies.write_all(format!("{}\n", json!({"type":"response","id":frame["id"],"ok":true,"data":{"accepted":true}})).as_bytes());
+                }
+            }
+        });
+        hub.wait_ready(&target.id).unwrap();
+        let controls = |name: &str| recorded.lock().unwrap().iter().filter(|(action, _)| action == name).map(|(_, payload)| payload.clone()).collect::<Vec<_>>();
+
+        assert_eq!(ask(&planner.id, "plan_handoff", json!({"summary": "x"})).unwrap_err(), "There is no plan to hand off; call write_plan first");
+        let written = ask(&planner.id, "plan_write_plan", json!({"text": "# New\nbody"})).unwrap();
+        assert_eq!(written["interrupted"], true);
+        let plan_file = registry.plan_file(&target.id).unwrap();
+        assert_eq!(std::fs::read_to_string(&plan_file).unwrap(), "# New\nbody");
+        assert_eq!(controls("abort").len(), 1);
+        let info = ask(&planner.id, "plan_handoff_info", json!({})).unwrap();
+        assert_eq!(info["needsStart"], false);
+        assert!(ask(&planner.id, "plan_handoff", json!({"summary":"s", "revision":"stale"})).unwrap_err().contains("confirm the new revision"));
+        assert_eq!(controls("prompt").len(), 0);
+        assert_eq!(registry.inspect(&target.id, Origin::Human).unwrap().last_plan_handoff, None);
+        assert_eq!(ask(&planner.id, "plan_handoff", json!({"summary": "dropped the migration", "revision":info["revision"]})).unwrap()["accepted"], true);
+        let handoff_marker = registry.inspect(&target.id, Origin::Human).unwrap().last_plan_handoff.unwrap();
+        let prompts = controls("prompt");
+        assert_eq!(prompts.len(), 1);
+        let message = prompts[0]["message"].as_str().unwrap();
+        assert!(message.starts_with("CHANGE OF PLANS") && message.contains("dropped the migration") && message.contains("# New\nbody"));
+        assert_eq!(prompts[0]["source"], "human");
+        assert_eq!(ask(&planner.id, "plan_interrupt", json!({})).unwrap()["interrupted"], true);
+        assert_eq!(controls("abort").len(), 2);
+        assert_eq!(ask(&planner.id, "plan_status", json!({})).unwrap()["name"], "Target");
+        // The saved revision is visible before the target updates its own todo list.
+        let read = ask(&planner.id, "plan_read_plan", json!({})).unwrap();
+        assert_eq!(read["text"], "# New\nbody");
+        assert_eq!(read["path"], json!(plan_file));
+
+        // Only the listed fields are accepted and a plan agent can never name another session.
+        assert!(ask(&planner.id, "plan_write_plan", json!({"text": "a", "instanceId": other.id})).unwrap_err().starts_with("invalid_plan_payload: plan_write_plan does not accept 'instanceId'"));
+        assert!(ask(&planner.id, "plan_status", json!({"instanceId": other.id})).unwrap_err().starts_with("invalid_plan_payload"));
+        assert_eq!(ask(&planner.id, "plan_write_plan", json!("{\"text\":\"x\"}")).unwrap_err(), "invalid_plan_payload: payload must be a JSON object");
+        assert_eq!(ask(&planner.id, "plan_write_plan", json!({"text": "  "})).unwrap_err(), "plan text must be 1..262144 characters");
+        assert_eq!(ask(&planner.id, "plan_handoff", json!({"summary": ""})).unwrap_err(), "summary must be 1..4000 characters");
+        assert_eq!(ask(&planner.id, "plan_nope", json!({})).unwrap_err(), "invalid_action");
+        assert_eq!(ask(&other.id, "plan_status", json!({})).unwrap_err(), "unauthorized");
+        assert_eq!(std::fs::read_to_string(&plan_file).unwrap(), "# New\nbody");
+        let replacement = ask(&planner.id, "plan_write_plan", json!({"text":"# Another revision"})).unwrap();
+        hub.restore_plan_backup(&target.id, replacement["backup"].as_str().unwrap()).unwrap();
+        assert_eq!(registry.plan(&target.id, Origin::Human).unwrap().as_deref(), Some("# New\nbody"));
+        assert_eq!(controls("prompt").len(), 1, "restoration must not hand off");
+        assert_eq!(registry.inspect(&target.id, Origin::Human).unwrap().last_plan_handoff.as_deref(), Some(handoff_marker.as_str()), "restoration must not navigate away");
+        assert!(plan::list_backups(&registry.plan_folder(&target.id)).unwrap().iter().any(|b| b.text == "# Another revision"));
+        let current_info = ask(&planner.id, "plan_handoff_info", json!({})).unwrap();
+        let handoff = json!({"summary":"send again", "revision":current_info["revision"]});
+        ask(&planner.id, "plan_handoff", handoff.clone()).unwrap();
+        let first = registry.inspect(&target.id, Origin::Human).unwrap().last_plan_handoff.unwrap();
+        ask(&planner.id, "plan_handoff", handoff).unwrap();
+        assert_ne!(registry.inspect(&target.id, Origin::Human).unwrap().last_plan_handoff.as_deref(), Some(first.as_str()), "each successful handoff must trigger navigation, even for the same plan revision");
+
+        // A target whose bridge is not connected cannot be interrupted, but its plan can still be written.
+        let idle = registry.create(config).unwrap();
+        let idle_planner = registry.create_planner(&idle.id).unwrap();
+        hub.launch(&definition(&idle.id, None), 0).unwrap();
+        hub.launch(&definition(&idle_planner.id, Some(idle.id.clone())), 0).unwrap();
+        assert_eq!(ask(&idle_planner.id, "plan_interrupt", json!({})).unwrap_err(), plan::NOT_RUNNING);
+        let offline = ask(&idle_planner.id, "plan_write_plan", json!({"text": "# Offline"})).unwrap();
+        assert_eq!(offline["interrupted"], false);
+        assert_eq!(std::fs::read_to_string(registry.plan_file(&idle.id).unwrap()).unwrap(), "# Offline");
+        let info = ask(&idle_planner.id, "plan_handoff_info", json!({})).unwrap();
+        assert_eq!(info["needsStart"], true);
+        assert_eq!(ask(&idle_planner.id, "plan_handoff", json!({"summary": "s", "revision":info["revision"]})).unwrap_err(), plan::NOT_RUNNING);
+        assert_eq!(registry.inspect(&idle.id, Origin::Human).unwrap().last_plan_handoff, None);
         hub.shutdown();
         std::fs::remove_dir_all(folder).unwrap();
     }

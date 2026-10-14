@@ -5,6 +5,10 @@ export function basename(path: string): string {
   const trimmed = path.replace(/[\\/]+$/, "");
   return trimmed.slice(Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\")) + 1);
 }
+export function agentName(path: string): string {
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  return parts.length >= 2 ? parts[parts.length - 2] : path;
+}
 export function statusClass(status: InstanceStatus): string {
   if (status === "running") return "ok";
   if (status === "starting") return "warn";

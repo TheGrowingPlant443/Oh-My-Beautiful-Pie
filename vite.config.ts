@@ -25,9 +25,13 @@ export default defineConfig({
     },
   },
   envPrefix: ["VITE_", "TAURI_ENV_"],
+  // Monaco's editor worker is a local ES module worker; there is no CDN or remote loader.
+  worker: { format: "es" },
   build: {
     target: "es2022",
     outDir: "dist",
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
+    // The only large chunk is the lazily loaded Monaco editor (Code diff page); the entry bundle stays small.
+    chunkSizeWarningLimit: 3000,
   },
 });

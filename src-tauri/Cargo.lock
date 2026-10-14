@@ -2131,9 +2131,11 @@ dependencies = [
 name = "omp-manager"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "portable-pty",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

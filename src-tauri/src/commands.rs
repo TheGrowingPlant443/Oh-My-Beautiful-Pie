@@ -21,6 +21,69 @@ pub fn list_instances(state: State<'_, AppState>) -> Vec<Instance> {
     state.registry.snapshot()
 }
 #[tauri::command]
+pub async fn configure_browser(window: tauri::WebviewWindow, state: State<'_, AppState>, settings: crate::browser::BrowserSettings) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let browser = state.browser.clone();
+    blocking(move || browser.configure(settings)).await
+}
+#[tauri::command]
+pub fn list_browsers(state: State<'_, AppState>) -> Vec<crate::browser::BrowserInfo> {
+    state.browser.snapshot()
+}
+#[tauri::command]
+pub async fn open_session_browser(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+    generation: u64,
+    restart_headless: bool,
+) -> Result<crate::browser::BrowserInfo> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, browser) = (state.registry.clone(), state.browser.clone());
+    blocking(move || {
+        if registry.lease(&id, Origin::Human, false)?.generation != generation {
+            return Err("stale_generation".into());
+        }
+        browser.open_visible(&id, generation, restart_headless)
+    })
+    .await
+}
+#[tauri::command]
+pub fn set_browser_view(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    instance_id: Option<String>,
+    generation: Option<u64>,
+    rect: Option<crate::browser::BrowserRect>,
+) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    #[cfg(windows)]
+    {
+        let view = match (instance_id, generation, rect) {
+            (None, None, None) => None,
+            (Some(instance_id), Some(generation), Some(rect)) => {
+                if ![rect.x, rect.y, rect.width, rect.height].iter().all(|value| value.is_finite() && *value >= 0.0 && *value < 100_000.0) {
+                    return Err("invalid browser bounds".into());
+                }
+                if state.registry.lease(&instance_id, Origin::Human, false)?.generation != generation {
+                    return Err("stale_generation".into());
+                }
+                let scale = window.scale_factor().map_err(|e| e.to_string())?;
+                Some(crate::browser_window::View {
+                    instance_id,
+                    generation,
+                    rect: crate::browser::BrowserRect { x: rect.x * scale, y: rect.y * scale, width: rect.width * scale, height: rect.height * scale },
+                })
+            }
+            _ => return Err("browser view requires an instance, generation and bounds".into()),
+        };
+        state.browser_host.set_view(view);
+    }
+    #[cfg(not(windows))]
+    let _ = (&state, instance_id, generation, rect);
+    Ok(())
+}
+#[tauri::command]
 pub fn create_instance(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -132,6 +195,20 @@ pub fn read_plan(state: State<'_, AppState>, id: String) -> Result<Option<String
     state.registry.plan(&id, Origin::Human)
 }
 #[tauri::command]
+pub fn list_plan_backups(state: State<'_, AppState>, id: String) -> Result<Vec<crate::plan::PlanBackup>> {
+    state.registry.inspect(&id, Origin::Human)?;
+    crate::plan::list_backups(&state.registry.plan_folder(&id))
+}
+#[tauri::command]
+pub async fn restore_plan_backup(app: AppHandle, state: State<'_, AppState>, id: String, backup_id: String) -> Result<()> {
+    let registry = state.registry.clone();
+    blocking(move || {
+        registry.manager_hub().ok_or("manager bridge not initialized")?.restore_plan_backup(&id, &backup_id)?;
+        publish(&app, &registry);
+        Ok(())
+    }).await
+}
+#[tauri::command]
 pub async fn render_transcript(
     state: State<'_, AppState>,
     id: String,
@@ -179,18 +256,81 @@ pub async fn save_global_config(
         Ok(serde_json::json!({"path":path}))
     }).await
 }
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedConfigs {
+    pub current: Option<std::path::PathBuf>,
+    pub snapshots: Vec<crate::config::SavedConfig>,
+    pub native_global: Option<std::path::PathBuf>,
+    pub error: Option<String>,
+}
+#[tauri::command]
+pub async fn list_saved_configs(state: State<'_, AppState>) -> Result<SavedConfigs> {
+    let registry = state.registry.clone();
+    blocking(move || {
+        let info = registry.global_config.info();
+        let mut error = info.error;
+        let native_global = match crate::setup::paths(&registry) {
+            Ok(paths) => Some(paths.global_agent_folder.join("config.yml")).filter(|p| p.is_file()),
+            Err(message) => {
+                if error.is_none() {
+                    error = Some(message);
+                }
+                None
+            }
+        };
+        Ok(SavedConfigs {
+            current: info.path,
+            snapshots: registry.global_config.list(),
+            native_global,
+            error,
+        })
+    })
+    .await
+}
+#[tauri::command]
+pub async fn activate_global_config(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<serde_json::Value> {
+    let registry = state.registry.clone();
+    blocking(move || {
+        let path = registry.global_config.activate(Path::new(&path))?;
+        Ok(serde_json::json!({"path":path}))
+    })
+    .await
+}
 #[tauri::command]
 pub async fn get_setup_paths(state: State<'_, AppState>) -> Result<crate::setup::SetupPaths> {
     let registry = state.registry.clone();
     blocking(move || crate::setup::paths(&registry)).await
 }
 #[tauri::command]
+pub async fn get_repository_setup_root(
+    state: State<'_, AppState>,
+    project_instance_id: String,
+) -> Result<std::path::PathBuf> {
+    let registry = state.registry.clone();
+    blocking(move || crate::setup::repository_root(&registry, &project_instance_id)).await
+}
+#[tauri::command]
+pub async fn list_agent_files(state: State<'_, AppState>) -> Result<crate::setup::AgentFiles> {
+    let registry = state.registry.clone();
+    blocking(move || Ok(crate::setup::agent_files(&registry))).await
+}
+#[tauri::command]
+pub async fn list_omp_profiles(state: State<'_, AppState>) -> Result<crate::setup::OmpProfiles> {
+    let registry = state.registry.clone();
+    blocking(move || Ok(crate::setup::omp_profiles(&registry))).await
+}
+#[tauri::command]
 pub async fn open_setup_folder(
     state: State<'_, AppState>,
     scope: crate::setup::SetupScope,
+    project_instance_id: Option<String>,
 ) -> Result<()> {
     let registry = state.registry.clone();
-    blocking(move || crate::setup::open_folder(&registry, scope)).await
+    blocking(move || crate::setup::open_folder(&registry, scope, project_instance_id.as_deref())).await
 }
 #[tauri::command]
 pub async fn start_agent_setup(
@@ -224,6 +364,83 @@ pub async fn send_agent_setup(
     })
     .await
 }
+#[tauri::command]
+pub async fn open_plan_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    target_id: String,
+) -> Result<crate::plan::PlanAdmission> {
+    let registry = state.registry.clone();
+    let plan = state.plan.clone();
+    blocking(move || {
+        let result = plan.open(&registry, &target_id);
+        publish(&app, &registry);
+        result
+    })
+    .await
+}
+fn diff_project(registry: &Registry, id: &str) -> Result<String> {
+    Ok(registry.inspect(id, Origin::Human)?.project_path)
+}
+#[tauri::command]
+pub async fn get_code_diff(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, mode: crate::code_diff::DiffMode) -> Result<crate::code_diff::DiffOverview> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, diff) = (state.registry.clone(), state.code_diff.clone());
+    blocking(move || diff.overview(&id, Path::new(&diff_project(&registry, &id)?), mode)).await
+}
+#[tauri::command]
+pub async fn read_code_diff_file(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, snapshot_id: String, path: String, group: Option<crate::code_diff::DiffGroup>) -> Result<crate::code_diff::DiffContent> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, diff) = (state.registry.clone(), state.code_diff.clone());
+    blocking(move || diff.read_file(&id, Path::new(&diff_project(&registry, &id)?), &snapshot_id, &path, group)).await
+}
+#[tauri::command]
+pub async fn save_code_diff_file(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+    snapshot_id: String,
+    path: String,
+    group: Option<crate::code_diff::DiffGroup>,
+    expected_hash: Option<String>,
+    text: String,
+) -> Result<crate::code_diff::DiffContent> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, diff) = (state.registry.clone(), state.code_diff.clone());
+    blocking(move || diff.save_file(&id, Path::new(&diff_project(&registry, &id)?), &snapshot_id, &path, group, expected_hash.as_deref(), &text)).await
+}
+#[tauri::command]
+pub async fn change_code_diff_file(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+    snapshot_id: String,
+    path: String,
+    group: Option<crate::code_diff::DiffGroup>,
+    action: crate::code_diff::FileAction,
+) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, diff) = (state.registry.clone(), state.code_diff.clone());
+    blocking(move || diff.change_file(&id, Path::new(&diff_project(&registry, &id)?), &snapshot_id, &path, group, action)).await
+}
+#[tauri::command]
+pub async fn commit_code_diff(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, snapshot_id: String, message: String) -> Result<crate::code_diff::CommitResult> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, diff) = (state.registry.clone(), state.code_diff.clone());
+    blocking(move || diff.commit(&id, Path::new(&diff_project(&registry, &id)?), &snapshot_id, &message)).await
+}
+#[tauri::command]
+pub async fn publish_code_diff(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, snapshot_id: String, options: crate::code_diff::PublishOptions) -> Result<crate::code_diff::PublishResult> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, diff) = (state.registry.clone(), state.code_diff.clone());
+    blocking(move || diff.publish(&id, Path::new(&diff_project(&registry, &id)?), &snapshot_id, &options)).await
+}
+#[tauri::command]
+pub async fn open_code_diff_pull_request(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let diff = state.code_diff.clone();
+    blocking(move || diff.open_pull_request(&id)).await
+}
 pub fn tick(app: AppHandle, registry: Arc<Registry>, closing: Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {
         while !closing.load(std::sync::atomic::Ordering::Relaxed) {
@@ -235,6 +452,9 @@ pub fn tick(app: AppHandle, registry: Arc<Registry>, closing: Arc<std::sync::ato
                 hub.observe_processes(&rows);
             }
             let _ = app.emit("instances", rows);
+            if let Some(browser) = registry.browser_supervisor() {
+                if let Some(update) = browser.take_update() { let _ = app.emit("browser_state", update); }
+            }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });

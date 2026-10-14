@@ -1,16 +1,16 @@
 <script lang="ts">
   import type { Instance } from "../api";
   import Tile from "./Tile.svelte";
-  let { instances, onSelect, onPlan, onSubagents, onCreate, tileMin = 420 }: {
-    instances: Instance[]; onSelect: (id: string) => void; onPlan: (id: string) => void;
-    onSubagents: (id: string) => void; onCreate: () => void; tileMin?: number;
+  let { instances, onSelect, onOpen, onPlan, onPlanChange, onSubagents, onCreate, tileMin = 420 }: {
+    instances: Instance[]; onSelect: (id: string) => void; onOpen: (id: string) => Promise<void>; onPlan: (id: string) => void;
+    onPlanChange: (id: string) => void; onSubagents: (id: string) => void; onCreate: () => void; tileMin?: number;
   } = $props();
 </script>
 {#if !instances.length}
   <div class="empty-state"><h2>Your OMP workspace</h2><p>Create an independent instance or reopen a saved session.</p><button class="primary" onclick={onCreate}>New instance</button></div>
 {:else}
   <div class="grid" style={`--tile-min:${tileMin}px`}>
-    {#each instances as instance (instance.id)}<Tile {instance} {onSelect} {onPlan} {onSubagents} />{/each}
+    {#each instances as instance (instance.id)}<Tile {instance} {onSelect} {onOpen} {onPlan} {onPlanChange} {onSubagents} />{/each}
   </div>
 {/if}
 <style>

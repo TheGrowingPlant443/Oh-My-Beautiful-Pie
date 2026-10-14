@@ -1,12 +1,19 @@
 <script lang="ts">
-  import { api, type SessionInfo } from "../api";
+  import { untrack } from "svelte";
+  import { api, type AgentFiles, type OmpProfiles, type SessionInfo } from "../api";
   import { errorText, refreshInstances, startInstance, globalConfig, refreshGlobalConfig } from "../stores";
   import { basename, pickFolder } from "../ui";
+  import ConfigPicker from "./ConfigPicker.svelte";
   let { open, onclose, oncreated, purpose = "instance" }: { open: boolean; onclose: () => void; oncreated: (id: string) => void; purpose?: "instance" | "manager" } = $props();
   let projectPath = $state("");
   let name = $state("");
   let profile = $state("");
-  let model = $state("");
+  let advanced = $state(false);
+  let profiles = $state<OmpProfiles>({ profiles: [], error: null });
+  let persona = $state("");
+  let agentFiles = $state<AgentFiles>({ files: [], error: null });
+  let extraConfig = $state("");
+  const selectedProfile = $derived(profiles.profiles.find(p => p.name === profile));
   let configs = $state<string[]>([]);
   let resume = $state("");
   let startNow = $state(true);
@@ -27,12 +34,24 @@
   $effect(() => {
     if (!dialog) return;
     if (open && !dialog.open) {
+      advanced = false;
+      profile = "";
+      persona = "";
+      extraConfig = "";
+      profiles = { profiles: [], error: null };
+      agentFiles = { files: [], error: null };
       dialog.showModal();
-      void refreshGlobalConfig().then(() => { useGlobalConfig = !!$globalConfig.path || !!$globalConfig.error; });
+      void api.listOmpProfiles().then(found => { profiles = found; }).catch(e => { profiles = { profiles: [], error: errorText(e) }; });
+      void api.listAgentFiles().then(found => { agentFiles = found; }).catch(e => { agentFiles = { files: [], error: errorText(e) }; });
+      void refreshGlobalConfig().then(() => { useGlobalConfig = !!$globalConfig.path || !!$globalConfig.error; advanced = !!$globalConfig.error; });
       dialog.querySelector<HTMLInputElement>("input")?.focus();
     } else if (!open && dialog.open) {
       dialog.close();
     }
+  });
+  $effect(() => {
+    const named = profile !== "";
+    useGlobalConfig = !named && untrack(() => !!$globalConfig.path || !!$globalConfig.error);
   });
 
   async function loadSessions(path: string, selectedProfile: string): Promise<void> {
@@ -68,7 +87,7 @@
     busy = true;
     error = "";
     try {
-      const config = { name: name.trim() || basename(projectPath), projectPath: projectPath.trim(), profile: profile.trim(), model: model.trim(), configs: configs.map(c => c.trim()).filter(Boolean), resumeSessionId: resume || null, useGlobalConfig };
+      const config = { name: name.trim() || basename(projectPath), projectPath: projectPath.trim(), profile, model: "", configs: [extraConfig, ...configs.map(c => c.trim())].filter(Boolean), resumeSessionId: resume || null, useGlobalConfig, agentFile: persona || null };
       const created = purpose === "manager" ? await api.createManager(config) : await api.createInstance(config);
       if (purpose === "instance" && startNow) await startInstance(created.id);
       await refreshInstances();
@@ -84,29 +103,49 @@
       <header><h3>{purpose === "manager" ? "Set up The Manager" : "New OMP instance"}</h3><span class="spacer"></span><button type="button" onclick={onclose} disabled={busy}>Close</button></header>
       <div class="body form">
         <label>Working directory <div class="row"><input bind:value={projectPath} required placeholder="C:/path/to/project" /><button type="button" onclick={browse}>Browse…</button></div></label>
-        <label>Name <input bind:value={name} disabled={purpose === "manager"} placeholder={basename(projectPath) || "Project name"} /></label>
-        <label>OMP profile <input bind:value={profile} placeholder="Default profile" /></label>
-        <label>Model / role override <input bind:value={model} placeholder="Use OMP configuration" /></label>
-        {#if $globalConfig.path || $globalConfig.error}
-          <label class="row"><input type="checkbox" bind:checked={useGlobalConfig} />Use global config</label>
-          {#if $globalConfig.path}<small class="mono">{$globalConfig.path}</small>{/if}
-          {#if $globalConfig.error}<p class="err">{$globalConfig.error} Uncheck to use native OMP configuration.</p>{/if}
+        {#if sessions.length > 0}
+          <label>Reconnect to an existing session
+            <div class="row"><select bind:value={resume} disabled={loading}>
+              <option value="">New session</option>
+              {#each sessions as session (session.path)}<option value={session.path}>{session.title} · {new Date(session.modifiedMs).toLocaleString()}</option>{/each}
+            </select><button type="button" disabled={!projectPath || loading} onclick={() => loadSessions(projectPath, profile)}>Refresh</button></div>
+            <small>{loading ? "Reading native OMP sessions…" : `${sessions.length} saved sessions for this project/profile`}</small>
+          </label>
         {/if}
-        <div class="config-list">
-          <span>Config overlays (applied in order)</span>
-          {#each configs as _, index}
-            <div class="row"><input aria-label={`Config overlay ${index + 1}`} bind:value={configs[index]} placeholder="Path to config.yml" /><button type="button" onclick={() => configs = configs.filter((_, i) => i !== index)}>Remove</button></div>
-          {/each}
-          <button type="button" onclick={() => configs = [...configs, ""]}>Add config overlay</button>
-        </div>
-        <label>Reconnect to an existing session
-          <div class="row"><select bind:value={resume} disabled={loading}>
-            <option value="">New session</option>
-            {#each sessions as session (session.path)}<option value={session.path}>{session.title} · {new Date(session.modifiedMs).toLocaleString()}</option>{/each}
-          </select><button type="button" disabled={!projectPath || loading} onclick={() => loadSessions(projectPath, profile)}>Refresh</button></div>
-          <small>{loading ? "Reading native OMP sessions…" : `${sessions.length} saved sessions for this project/profile`}</small>
-        </label>
         {#if purpose === "instance"}<label class="row"><input type="checkbox" bind:checked={startNow} /> Start immediately</label>{/if}
+        <button type="button" aria-expanded={advanced} onclick={() => advanced = !advanced}>{advanced ? "Hide advanced options" : "Show advanced options"}</button>
+        {#if advanced}
+          <label>Name <input bind:value={name} disabled={purpose === "manager"} placeholder={basename(projectPath) || "Project name"} /></label>
+          <label>OMP profile
+            <select bind:value={profile}>
+              <option value="">Default profile</option>
+              {#each profiles.profiles as p (p.name)}<option value={p.name}>{p.name}{p.hasLogin ? "" : " · no saved login"}</option>{/each}
+            </select>
+          </label>
+          {#if profiles.error}<small class="dim">{profiles.error}</small>{/if}
+          {#if selectedProfile && !selectedProfile.hasLogin}<small class="warn">This profile has no saved login. Run /login inside its terminal.</small>{/if}
+          <label>Persona
+            <select bind:value={persona}>
+              <option value="">No persona</option>
+              {#each agentFiles.files as file (file.path)}<option value={file.path}>{file.name} · {file.scope === "global" ? "Global" : "The Manager"}</option>{/each}
+            </select>
+          </label>
+          {#if agentFiles.error}<small class="dim">{agentFiles.error}</small>{/if}
+          <ConfigPicker mode="overlay" bind:value={extraConfig} active={open} label="Model / role override" />
+          <div class="config-list">
+            <span>Config overlays (applied in order)</span>
+            {#each configs as _, index}
+              <div class="row"><input aria-label={`Config overlay ${index + 1}`} bind:value={configs[index]} placeholder="Path to config.yml" /><button type="button" onclick={() => configs = configs.filter((_, i) => i !== index)}>Remove</button></div>
+            {/each}
+            <button type="button" onclick={() => configs = [...configs, ""]}>Add config overlay</button>
+          </div>
+          {#if $globalConfig.path || $globalConfig.error}
+            <label class="row"><input type="checkbox" bind:checked={useGlobalConfig} />Use global config</label>
+            {#if profile}<small class="dim">Off by default for named profiles: the global config would override their own model roles and plan-mode settings.</small>{/if}
+            {#if $globalConfig.path}<small class="mono">{$globalConfig.path}</small>{/if}
+            {#if $globalConfig.error}<p class="err">{$globalConfig.error} Uncheck to use native OMP configuration.</p>{/if}
+          {/if}
+        {/if}
         <p class="dim">Thinking visibility, tools, approvals, and agent behavior remain controlled by OMP.</p>
         {#if purpose === "manager"}<p class="dim">A bundled OMP extension connects through authenticated, app-lifetime localhost IPC. Only created or handed-over sessions are controllable.</p>{/if}
         {#if error}<p role="alert" class="err">{error}</p>{/if}

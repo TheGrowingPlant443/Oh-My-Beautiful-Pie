@@ -37,7 +37,7 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
-fn sdk_dir(home: &Path) -> Result<PathBuf> {
+pub(crate) fn sdk_dir(home: &Path) -> Result<PathBuf> {
     let mut candidates = vec![];
     if let Some(path) = std::env::var_os("OMP_SDK_DIR") {
         candidates.push(PathBuf::from(path));
@@ -130,6 +130,13 @@ pub fn native_request(root: &Path, home: &Path, mut request: Value) -> Result<Va
 
 pub fn preview(root: &Path, home: &Path, request: Value) -> Result<ConfigPreview> {
     serde_json::from_value(native_request(root, home, request)?).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedConfig {
+    pub path: PathBuf,
+    pub modified_ms: u64,
 }
 
 #[derive(Default)]
@@ -242,10 +249,14 @@ impl GlobalConfigStore {
         let path = fs::canonicalize(path).map_err(|e| e.to_string())?;
         let path = PathBuf::from(path.to_string_lossy().trim_start_matches("\\\\?\\"));
         Self::validate_path(&self.root, &path)?;
+        self.write_pointer(&mut state, &path)?;
+        Ok(path)
+    }
+    fn write_pointer(&self, state: &mut DefaultConfigState, path: &Path) -> Result<()> {
         let temporary = self.root.join("global-config.json.tmp");
         let data = serde_json::to_vec_pretty(&Pointer {
             version: 1,
-            path: path.clone(),
+            path: path.to_path_buf(),
         })
         .map_err(|e| e.to_string())?;
         let mut file = fs::OpenOptions::new()
@@ -263,8 +274,41 @@ impl GlobalConfigStore {
             let _ = fs::remove_file(&temporary);
             return Err(error.to_string());
         }
-        state.path = Some(path.clone());
+        state.path = Some(path.to_path_buf());
         state.error = None;
+        Ok(())
+    }
+    fn normalize(path: &Path) -> Result<PathBuf> {
+        let path = fs::canonicalize(path).map_err(|e| format!("Global config is unavailable: {e}"))?;
+        Ok(PathBuf::from(
+            path.to_string_lossy().trim_start_matches("\\\\?\\"),
+        ))
+    }
+    pub fn list(&self) -> Vec<SavedConfig> {
+        let Ok(entries) = fs::read_dir(self.root.join("global-configs")) else {
+            return Vec::new();
+        };
+        let mut found: Vec<SavedConfig> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = Self::normalize(&entry.path().join("config.yml")).ok()?;
+                Self::validate_path(&self.root, &path).ok()?;
+                let modified = fs::metadata(&path).ok()?.modified().ok()?;
+                let modified_ms = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                Some(SavedConfig { path, modified_ms })
+            })
+            .collect();
+        found.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms).then_with(|| a.path.cmp(&b.path)));
+        found
+    }
+    pub fn activate(&self, path: &Path) -> Result<PathBuf> {
+        let mut state = self.state.lock().map_err(|e| e.to_string())?;
+        let path = Self::normalize(path)?;
+        Self::validate_path(&self.root, &path)?;
+        self.write_pointer(&mut state, &path)?;
         Ok(path)
     }
 }
@@ -313,6 +357,31 @@ mod tests {
         fs::create_dir(root.join("global-config.json.tmp")).unwrap();
         assert!(store.publish("plan:\n  enabled: false\n").is_err());
         assert_eq!(store.current_path().unwrap(), Some(original));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn lists_snapshots_newest_first_and_activation_reuses_them() {
+        let root = std::env::temp_dir().join(format!("omp-config-list-{}", uuid::Uuid::new_v4()));
+        let store = GlobalConfigStore::load(root.clone());
+        let a = store.publish("modelRoles:\n  default: first\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let b = store.publish("modelRoles:\n  default: second\n").unwrap();
+        fs::create_dir(root.join("global-configs").join("stray")).unwrap();
+        let listed: Vec<PathBuf> = store.list().into_iter().map(|c| c.path).collect();
+        assert_eq!(listed, vec![b.clone(), a.clone()]);
+        let count = || fs::read_dir(root.join("global-configs")).unwrap().count();
+        let before = count();
+        assert_eq!(store.activate(&a).unwrap(), a);
+        assert_eq!(store.current_path().unwrap(), Some(a.clone()));
+        assert_eq!(count(), before);
+        assert_eq!(
+            GlobalConfigStore::load(root.clone()).current_path().unwrap(),
+            Some(a.clone())
+        );
+        let outside = root.join("outside.yml");
+        fs::write(&outside, "x: 1\n").unwrap();
+        assert!(store.activate(&outside).is_err());
+        assert_eq!(store.current_path().unwrap(), Some(a));
         fs::remove_dir_all(root).unwrap();
     }
 }

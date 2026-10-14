@@ -4,7 +4,7 @@
   import OwnershipControls from "./OwnershipControls.svelte";
   import { removeInstance, restartInstance, startInstance, stopInstance } from "../stores";
   import { basename, confirmDanger, statusClass } from "../ui";
-  let { instance, onSelect, onPlan, onSubagents }: { instance: Instance; onSelect: (id: string) => void; onPlan: (id: string) => void; onSubagents: (id: string) => void } = $props();
+  let { instance, onSelect, onOpen, onPlan, onPlanChange, onSubagents }: { instance: Instance; onSelect: (id: string) => void; onOpen: (id: string) => Promise<void>; onPlan: (id: string) => void; onPlanChange: (id: string) => void; onSubagents: (id: string) => void } = $props();
   let busy = $state(false);
   const live = $derived(instance.status === "running" || instance.status === "starting");
   async function run(action: () => Promise<boolean>): Promise<void> {
@@ -29,9 +29,10 @@
   </div>
   <div class="row links">
     <button disabled={!instance.subagents.length} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>
+    {#if instance.planKind}<button onclick={() => onPlanChange(instance.id)}>Plan</button>{/if}
     {#if instance.planPath}<button onclick={() => onPlan(instance.id)}>View Plan</button>{/if}
   </div>
-  <button class="preview" aria-label={`Open ${instance.name}`} onclick={() => onSelect(instance.id)}>
+  <button class="preview" aria-label={`Open ${instance.name}`} onclick={() => void onOpen(instance.id)}>
     {#if instance.generation > 0}
       <Term instanceId={instance.id} cols={instance.cols} rows={instance.rows} generation={instance.generation} />
     {:else}<span>Start or reopen this OMP session</span>{/if}

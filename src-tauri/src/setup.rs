@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::config;
 use crate::instance::{CreateInput, Instance, InstanceKind, Origin, Registry};
@@ -16,6 +16,7 @@ pub type Result<T, E = String> = std::result::Result<T, E>;
 pub enum SetupScope {
     Global,
     Manager,
+    Repository,
 }
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +26,8 @@ pub enum SetupKind {
     Skill,
     Tool,
     Workflow,
+    Plugin,
+    Profile,
 }
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +48,8 @@ pub struct SetupItem {
 pub struct SetupRequest {
     pub scope: SetupScope,
     pub items: Vec<SetupItem>,
+    #[serde(default, rename = "projectInstanceId")]
+    pub project_instance_id: Option<String>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +68,7 @@ pub struct SetupAdmission {
 struct Job {
     request: SetupRequest,
     paths: SetupPaths,
+    repository_root: Option<PathBuf>,
     admission: Option<bool>,
     sending: bool,
 }
@@ -71,10 +77,50 @@ pub struct SetupService {
     jobs: Mutex<HashMap<String, Job>>,
 }
 
+fn slug(raw: &str) -> Result<String> {
+    let name = raw.trim();
+    if name.contains(['/', '\\']) || name.contains("..") {
+        return Err("Setup names cannot contain paths".into());
+    }
+    let name = name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase();
+    if name.is_empty()
+        || name.starts_with('-')
+        || name.ends_with('-')
+        || name.contains("--")
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    {
+        return Err("Use letters, numbers, and single hyphens for a setup name".into());
+    }
+    let reserved = matches!(name.as_str(), "con" | "prn" | "aux" | "nul")
+        || (name.len() == 4
+            && (name.starts_with("com") || name.starts_with("lpt"))
+            && matches!(name.as_bytes()[3], b'1'..=b'9'));
+    if reserved {
+        return Err("That name is reserved by Windows".into());
+    }
+    Ok(name)
+}
+
 impl SetupRequest {
     pub fn normalize(mut self) -> Result<Self> {
         if self.items.is_empty() {
             return Err("Describe at least one setup item".into());
+        }
+        if self.scope == SetupScope::Repository {
+            if self.project_instance_id.as_ref().is_none_or(|id| id.trim().is_empty()) {
+                return Err("Repository setup requires a project".into());
+            }
+        } else {
+            self.project_instance_id = None;
+        }
+        if self.scope != SetupScope::Global && self.items.iter().any(|i| i.kind == SetupKind::Profile) {
+            return Err("OMP profiles are global; choose the Global scope".into());
         }
         let mut targets = HashSet::new();
         for item in &mut self.items {
@@ -82,35 +128,16 @@ impl SetupRequest {
             if item.description.is_empty() {
                 return Err("Every selected item needs a description".into());
             }
-            if matches!(item.kind, SetupKind::Agents | SetupKind::Rules) {
-                item.name.clear();
-            } else {
-                let name = item.name.trim();
-                if name.contains(['/', '\\']) || name.contains("..") {
-                    return Err("Setup names cannot contain paths".into());
-                }
-                item.name = name
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join("-")
-                    .to_lowercase();
-                if item.name.is_empty()
-                    || item.name.starts_with('-')
-                    || item.name.ends_with('-')
-                    || item.name.contains("--")
-                    || !item
-                        .name
-                        .bytes()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-                {
-                    return Err("Use letters, numbers, and single hyphens for a setup name".into());
-                }
-                let reserved = matches!(item.name.as_str(), "con" | "prn" | "aux" | "nul")
-                    || (item.name.len() == 4
-                        && (item.name.starts_with("com") || item.name.starts_with("lpt"))
-                        && matches!(item.name.as_bytes()[3], b'1'..=b'9'));
-                if reserved {
-                    return Err("That name is reserved by Windows".into());
+            match item.kind {
+                SetupKind::Rules => item.name.clear(),
+                SetupKind::Agents if item.name.trim().is_empty() => item.name.clear(),
+                _ => {
+                    item.name = slug(&item.name)?;
+                    if item.kind == SetupKind::Profile
+                        && (item.name == "default" || !valid_profile_name(&item.name))
+                    {
+                        return Err("Use a valid OMP profile name other than default".into());
+                    }
                 }
             }
             if item.kind == SetupKind::Tool && item.language.is_none() {
@@ -137,29 +164,309 @@ pub fn materialize(root: &Path) -> Result<()> {
     }
     Ok(())
 }
+static GLOBAL_FOLDERS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
 pub fn paths(registry: &Registry) -> Result<SetupPaths> {
-    let native = config::native_request(
-        registry.config_root(),
-        &registry.home,
-        json!({"action":"paths","cwd":registry.home,"profile":"default"}),
-    )?;
-    let global_omp_folder = native["globalOmpFolder"]
-        .as_str()
-        .ok_or("OMP global folder unavailable")?;
-    let global_agent_folder = native["globalAgentFolder"]
-        .as_str()
-        .ok_or("OMP agent folder unavailable")?;
+    let (global_omp_folder, global_agent_folder) = match GLOBAL_FOLDERS.get() {
+        Some(folders) => folders.clone(),
+        None => {
+            let native = config::native_request(
+                registry.config_root(),
+                &registry.home,
+                json!({"action":"paths","cwd":registry.home,"profile":"default"}),
+            )?;
+            let omp = native["globalOmpFolder"]
+                .as_str()
+                .ok_or("OMP global folder unavailable")?;
+            let agent = native["globalAgentFolder"]
+                .as_str()
+                .ok_or("OMP agent folder unavailable")?;
+            let folders = (PathBuf::from(omp), PathBuf::from(agent));
+            let _ = GLOBAL_FOLDERS.set(folders.clone());
+            folders
+        }
+    };
     Ok(SetupPaths {
-        global_omp_folder: global_omp_folder.into(),
-        global_agent_folder: global_agent_folder.into(),
+        global_omp_folder,
+        global_agent_folder,
         manager_folder: registry.config_root().join("manager-setup"),
     })
 }
 
-pub fn open_folder(registry: &Registry, scope: SetupScope) -> Result<()> {
+pub const AGENT_FILES_DIR: &str = "agent-instructions";
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFile {
+    pub name: String,
+    pub scope: SetupScope,
+    pub path: PathBuf,
+}
+#[derive(Serialize)]
+pub struct AgentFiles {
+    pub files: Vec<AgentFile>,
+    pub error: Option<String>,
+}
+fn scan_roots(roots: &[(SetupScope, &Path)]) -> Vec<AgentFile> {
+    let mut found = Vec::new();
+    for (scope, root) in roots {
+        let Ok(entries) = fs::read_dir(root.join(AGENT_FILES_DIR)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path().join("AGENTS.md");
+            if entry.path().is_dir() && path.is_file() {
+                found.push(AgentFile {
+                    name: entry.file_name().to_string_lossy().into(),
+                    scope: *scope,
+                    path,
+                });
+            }
+        }
+    }
+    found.sort_by_key(|f| (f.name.clone(), f.scope != SetupScope::Global));
+    found
+}
+pub fn scan_agent_files(paths: &SetupPaths) -> Vec<AgentFile> {
+    scan_roots(&[
+        (SetupScope::Global, &paths.global_agent_folder),
+        (SetupScope::Manager, &paths.manager_folder),
+    ])
+}
+pub fn agent_files(registry: &Registry) -> AgentFiles {
+    match paths(registry) {
+        Ok(paths) => AgentFiles {
+            files: scan_agent_files(&paths),
+            error: None,
+        },
+        Err(error) => AgentFiles {
+            files: scan_roots(&[(
+                SetupScope::Manager,
+                &registry.config_root().join("manager-setup"),
+            )]),
+            error: Some(error),
+        },
+    }
+}
+pub(crate) fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+    let path = fs::canonicalize(path)?;
+    Ok(PathBuf::from(
+        path.to_string_lossy().trim_start_matches("\\\\?\\"),
+    ))
+}
+pub fn verify_agent_file_in(files: &[AgentFile], path: &Path) -> Result<PathBuf> {
+    let wanted = canonical(path)
+        .map_err(|_| format!("Agent instructions file not found: {}", path.display()))?;
+    if files
+        .iter()
+        .any(|f| canonical(&f.path).is_ok_and(|c| c == wanted))
+    {
+        Ok(wanted)
+    } else {
+        Err("Agent instructions file must be one created by Agent setup".into())
+    }
+}
+pub fn verify_agent_file(registry: &Registry, path: &Path) -> Result<PathBuf> {
+    let found = agent_files(registry);
+    let warning = found.error;
+    verify_agent_file_in(&found.files, path).map_err(|e| match warning {
+        Some(w) => format!("{e} ({w})"),
+        None => e,
+    })
+}
+
+/// A file native `--extension <package>` discovery loads from a package root: a direct `.ts`/`.js` child,
+/// or `<child>/index.{ts,js}`.
+fn discoverable_module(package: &Path, module: &Path) -> bool {
+    let is_script = |file: &Path| file.extension().is_some_and(|e| e == "ts" || e == "js");
+    let parent = module.parent();
+    (parent == Some(package) && is_script(module))
+        || (parent.and_then(Path::parent) == Some(package)
+            && module.file_stem().is_some_and(|s| s == "index")
+            && is_script(module))
+}
+
+/// Plugin packages under `<root>/extensions` that The Manager loads (and only The Manager) through
+/// `--extension`. Never executes anything: malformed packages are reported instead of skipped.
+pub fn manager_plugin_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let folder = root.join("extensions");
+    let entries = match fs::read_dir(&folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Manager plugins folder is unreadable: {e}")),
+    };
+    let base = canonical(&folder).map_err(|e| format!("Manager plugins folder is unreadable: {e}"))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry.map_err(|e| e.to_string())?.file_name().to_string_lossy().into_owned();
+        if !name.starts_with('.') {
+            names.push(name);
+        }
+    }
+    names.sort();
+    let mut packages = Vec::new();
+    for name in names {
+        let package = canonical(&folder.join(&name)).map_err(|e| format!("Manager plugin {name} is unreadable: {e}"))?;
+        if !package.starts_with(&base) {
+            return Err(format!("Manager plugin {name} resolves outside the extensions folder"));
+        }
+        let manifest = package.join("package.json");
+        if !package.is_dir() || !manifest.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&manifest).map_err(|e| format!("Manager plugin {name}: package.json is unreadable: {e}"))?;
+        let json: Value = serde_json::from_str(&text).map_err(|e| format!("Manager plugin {name}: package.json is invalid: {e}"))?;
+        let declared = ["omp", "pi"]
+            .iter()
+            .find_map(|key| json.get(*key).filter(|v| v.is_object()))
+            .and_then(|manifest| manifest.get("extensions"))
+            .and_then(Value::as_array);
+        for entry in declared.into_iter().flatten().filter_map(Value::as_str) {
+            let resolved = canonical(&package.join(entry))
+                .map_err(|_| format!("Manager plugin {name} declares a missing extension module: {entry}"))?;
+            if !resolved.starts_with(&package) {
+                return Err(format!("Manager plugin {name} declares a module outside its package: {entry}"));
+            }
+            let module = if resolved.is_dir() {
+                ["index.ts", "index.js"]
+                    .iter()
+                    .map(|file| resolved.join(file))
+                    .find(|file| file.is_file())
+                    .ok_or_else(|| format!("Manager plugin {name} declares {entry} without an index module"))?
+            } else {
+                resolved
+            };
+            if !discoverable_module(&package, &module) {
+                return Err(format!(
+                    "Manager plugin {name} declares {entry}, which The Manager cannot load; use index.ts at the package root"
+                ));
+            }
+        }
+        packages.push(package);
+    }
+    Ok(packages)
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpProfile {
+    pub name: String,
+    pub has_login: bool,
+}
+#[derive(Serialize)]
+pub struct OmpProfiles {
+    pub profiles: Vec<OmpProfile>,
+    pub error: Option<String>,
+}
+pub fn valid_profile_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 || name.ends_with('.') {
+        return false;
+    }
+    if !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit()) {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or(name);
+    let reserved = matches!(stem, "con" | "prn" | "aux" | "nul")
+        || (stem.len() == 4
+            && (stem.starts_with("com") || stem.starts_with("lpt"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    !reserved
+}
+pub fn scan_profiles(global_omp_folder: &Path) -> Vec<OmpProfile> {
+    let Ok(entries) = fs::read_dir(global_omp_folder.join("profiles")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<OmpProfile> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let agent = entry.path().join("agent");
+            if name == "default" || !valid_profile_name(&name) || !entry.path().is_dir() || !agent.is_dir() {
+                return None;
+            }
+            Some(OmpProfile {
+                has_login: agent.join("agent.db").is_file(),
+                name,
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
+}
+pub fn omp_profiles(registry: &Registry) -> OmpProfiles {
+    match paths(registry) {
+        Ok(paths) => OmpProfiles {
+            profiles: scan_profiles(&paths.global_omp_folder),
+            error: None,
+        },
+        Err(error) => OmpProfiles {
+            profiles: Vec::new(),
+            error: Some(error),
+        },
+    }
+}
+
+fn find_repository_root(cwd: &Path) -> Result<PathBuf> {
+    let cwd = canonical(cwd)
+        .map_err(|_| format!("Project working directory not found: {}", cwd.display()))?;
+    if !cwd.is_dir() {
+        return Err(format!("Project working directory not found: {}", cwd.display()));
+    }
+    for ancestor in cwd.ancestors() {
+        let marker = ancestor.join(".git");
+        match fs::metadata(&marker) {
+            Ok(meta) if meta.is_dir() || meta.is_file() => return Ok(ancestor.to_path_buf()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot inspect repository marker {}: {error}", marker.display())),
+        }
+    }
+    Ok(cwd)
+}
+fn repository_folder(root: &Path) -> Result<PathBuf> {
+    let root = canonical(root).map_err(|error| format!("Repository is unavailable: {error}"))?;
+    if !root.is_dir() {
+        return Err(format!("Repository is not a directory: {}", root.display()));
+    }
+    let folder = root.join(".omp");
+    match fs::symlink_metadata(&folder) {
+        Ok(_) => {
+            let resolved = canonical(&folder).map_err(|error| format!("Repository setup folder is unavailable: {error}"))?;
+            if !resolved.is_dir() {
+                return Err(format!("Repository setup path is not a directory: {}", folder.display()));
+            }
+            if !resolved.starts_with(&root) {
+                return Err("Repository setup folder must stay inside the repository".into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Repository setup folder is unavailable: {error}")),
+    }
+    Ok(folder)
+}
+pub fn repository_root(registry: &Registry, instance_id: &str) -> Result<PathBuf> {
+    let row = registry.inspect(instance_id, Origin::Human)?;
+    if row.kind != InstanceKind::Instance {
+        return Err("Repository setup requires an ordinary project instance".into());
+    }
+    let root = find_repository_root(Path::new(&row.project_path))?;
+    if canonical(&registry.home).is_ok_and(|home| home == root) {
+        return Err("Repository setup cannot target the home directory".into());
+    }
+    repository_folder(&root)?;
+    Ok(root)
+}
+
+pub fn open_folder(registry: &Registry, scope: SetupScope, project_instance_id: Option<&str>) -> Result<()> {
     let folder = match scope {
         SetupScope::Global => paths(registry)?.global_omp_folder,
         SetupScope::Manager => registry.config_root().join("manager-setup"),
+        SetupScope::Repository => repository_root(registry, project_instance_id.ok_or("Repository setup requires a project")?)?,
     };
     open_editor_folder(&folder)
 }
@@ -219,36 +526,79 @@ pub(crate) fn open_editor_folder(folder: &Path) -> Result<()> {
     Ok(())
 }
 
-fn prompt(request: &SetupRequest, paths: &SetupPaths) -> String {
+fn prompt(request: &SetupRequest, paths: &SetupPaths, repository_root: Option<&Path>) -> Result<String> {
+    let repository_target;
     let target = match request.scope {
         SetupScope::Global => &paths.global_agent_folder,
         SetupScope::Manager => &paths.manager_folder,
+        SetupScope::Repository => {
+            repository_target = repository_folder(repository_root.ok_or("Repository setup requires a project")?)?;
+            &repository_target
+        }
     };
     let mut text = format!("Create the user-requested OMP Agent setup below in {}. Scope: {:?}. Platform: {}.\n\nREVIEW FIRST: You are in native plan mode. Read existing assets, preserve unrelated content, and write only your native plan until the human selects a native execution option. Propose the complete plan using write to xd://propose. Do this setup inline; do not use subagents or other models to generate it. The workflows being authored may describe future native delegation, but do not execute those workflows now.\n\nAfter human approval, implement real files and validate their native loading and behavior. Never modify config.yml/config.yaml, auth or credential databases, app default snapshots, bridge/index.ts entrypoints, installed OMP, or unrelated files. Never download or install dependencies/interpreters, add telemetry/updaters/autostart, or run unreviewed external code. Read existing targets before proposing changes. Report actual changed paths and verification; do not claim completion from merely writing files.\n\n", target.display(), request.scope, std::env::consts::OS);
     for item in &request.items {
         let file = match item.kind {
-            SetupKind::Agents => "AGENTS.md".into(),
+            SetupKind::Agents if item.name.is_empty() => "AGENTS.md".into(),
+            SetupKind::Agents => format!("{AGENT_FILES_DIR}/{}/AGENTS.md", item.name),
             SetupKind::Rules => "RULES.md".into(),
             SetupKind::Skill => format!("skills/{}/SKILL.md and SKILLS.md", item.name),
             SetupKind::Tool => format!("tools/{}/index.ts", item.name),
             SetupKind::Workflow => format!("rules/workflow-{}.md", item.name),
+            SetupKind::Plugin => format!("extensions/{0}/package.json and extensions/{0}/index.ts", item.name),
+            SetupKind::Profile => paths
+                .global_omp_folder
+                .join("profiles")
+                .join(&item.name)
+                .join("agent")
+                .join("config.yml")
+                .display()
+                .to_string(),
         };
+        let file = if request.scope == SetupScope::Repository {
+            match item.kind {
+                SetupKind::Skill => format!("{} and {}", target.join(format!("skills/{}/SKILL.md", item.name)).display(), target.join("SKILLS.md").display()),
+                SetupKind::Plugin => format!("{} and {}", target.join(format!("extensions/{}/package.json", item.name)).display(), target.join(format!("extensions/{}/index.ts", item.name)).display()),
+                SetupKind::Tool => {
+                    let mut file = target.join(&file).display().to_string();
+                    let script = match item.language {
+                        Some(ScriptLanguage::Python) => Some("run.py"),
+                        Some(ScriptLanguage::Bash) => Some("run.sh"),
+                        _ => None,
+                    };
+                    if let Some(script) = script {
+                        file.push_str(&format!(" and {}", target.join("tools").join(&item.name).join(script).display()));
+                    }
+                    file
+                }
+                _ => target.join(&file).display().to_string(),
+            }
+        } else { file };
         text.push_str(&format!(
             "Requested {:?}: {file}\nDescription:\n{}\n",
             item.kind, item.description
         ));
         match item.kind {
-            SetupKind::Agents | SetupKind::Rules => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
+            SetupKind::Agents if item.name.is_empty() => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
+            SetupKind::Rules => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
+            SetupKind::Agents if request.scope == SetupScope::Repository => text.push_str("Create a standalone named instruction file, not merged into AGENTS.md. It is not automatically loaded and is not in this GUI's Global/Manager Persona list. Use it through an explicit --append-system-prompt file argument. No frontmatter is required.\n"),
+            SetupKind::Agents => text.push_str("Create a standalone, named instruction file with plain Markdown instructions for an agent. Do not merge it into the scope's AGENTS.md. OMP does not load it automatically: the user selects it per dashboard instance, and OMP appends it to that session's system prompt. No frontmatter is required.\n"),
+            SetupKind::Profile => text.push_str(&format!("Create the native OMP profile `{name}` at {root}/profiles/{name}/agent/. This overrides the general rule against modifying config.yml: write that profile's config.yml with native OMP settings that implement the description (for example plan.enabled: true and plan.defaultOnStartup: true start sessions in plan mode; modelRoles select models). Validate that it loads with native Settings.loadReadOnly using that agent directory. Add AGENTS.md, rules, skills or tools inside that profile only if the description asks. Never create or copy credentials or agent.db and never modify the default profile; tell the human the profile has its own login (run /login inside it). If the profile already exists read it first and make only surgical changes.\n", name = item.name, root = paths.global_omp_folder.display())),
             SetupKind::Skill => text.push_str("Create native SKILL.md with YAML name/description and concrete reusable steps. Update SKILLS.md as a readable catalog pointing to the real skill, preserving other entries. The catalog itself is not a native skill.\n"),
             SetupKind::Workflow => text.push_str("Use native rule frontmatter description, alwaysApply: true, agents: [main]. Describe semantic trigger, native delegation/reviewer steps, required evidence, completion/decision handling, and stop conditions. Use installed native agents; if a required reviewer is unavailable, request human guidance. No scheduler or automatic hooks.\n"),
+            SetupKind::Plugin => text.push_str(&format!("Create the native OMP plugin package `{name}` in the `extensions/{name}/` folder of the target above. package.json must be {{\"name\":\"{name}\",\"version\":\"0.1.0\",\"private\":true,\"type\":\"module\",\"description\":<one line from the request>,\"omp\":{{\"extensions\":[\"index.ts\"]}}}}; index.ts must export a default factory that receives the injected native ExtensionAPI and registers real behavior for the description (api.registerTool, api.registerCommand, api.on hooks as needed). Read the installed OMP's examples/extensions and its ExtensionAPI types first, and use native tool registration (injected zod, execute signature) exactly as the installed version defines it. This overrides the general rule against editing bridge/index.ts entrypoints only for this plugin's own package.json and index.ts; never touch the Manager setup root index.ts. Add package-local skills/ tools/ or rules/ folders only when the description needs them. No import-time side effects, no placeholder or no-op tools, no dependency installation or publishing, no `omp plugin link`/install, and do not edit the installed OMP. If the package already exists read it first and change only the requested behavior; never overwrite a different package. After approval validate that the package loads natively and exercise one harmless behavior with a fixture, then tell the human that running sessions need a native reload or an explicit reopen to load it.\n", name = item.name)),
             SetupKind::Tool => {
                 text.push_str(&format!("Language: {:?}. Native default factory in index.ts uses injected api.zod, approval: 'exec', execute(toolCallId, params, onUpdate, ctx, signal). Validate arguments; return native content/details with true stdout/stderr/error/abort state. No import-time execution. Python/Bash code lives beside it as run.py/run.sh, invoked via api.exec(interpreter, argumentArray, {{cwd:ctx.sessionManager.getCwd(),signal}}). Missing interpreter must fail clearly, never install it. On Windows use installed Git Bash rather than System32/WindowsApps WSL launchers. TypeScript logic stays in the native tool module. Inspect local interpreter locations before selecting one. Validate using a harmless fixture operation after approval.\n", item.language));
             }
         }
         text.push('\n');
     }
-    text.push_str("Global native assets apply to the default OMP profile. Manager-only assets are loaded by a private directory extension, not by worker project .omp folders. Instruction text reloads next Manager turn; skill/tool/rule catalogs need native reload or an explicit user reopen. Do not restart The Manager automatically. This session is human-controlled: wait for human plan review.");
-    text
+    if request.scope == SetupScope::Repository {
+        text.push_str("After native plan approval, write only the requested assets under this repository's .omp folder. Read existing files first and preserve unrelated content. Validate native discovery with cwd equal to the repository root. Never modify Global/Manager setup or copy credentials. Existing project processes are not reloaded or restarted automatically. A nested cwd or nearer .omp can change discovery; use or reopen OMP from the repository root for root-scoped rules/tools. This session is human-controlled: wait for human plan review.");
+    } else {
+        text.push_str("Global native assets apply to the default OMP profile. Manager-only assets are loaded by a private directory extension, not by worker project .omp folders. Instruction text reloads next Manager turn; skill/tool/rule catalogs need native reload or an explicit user reopen. Do not restart The Manager automatically. This session is human-controlled: wait for human plan review.");
+    }
+    Ok(text)
 }
 
 impl SetupService {
@@ -273,6 +623,9 @@ impl SetupService {
         {
             return Err("Set up The Manager before creating Manager-only assets".into());
         }
+        let repository_root = if request.scope == SetupScope::Repository {
+            Some(repository_root(registry, request.project_instance_id.as_deref().ok_or("Repository setup requires a project")?)?)
+        } else { None };
         let folder = self
             .root
             .join("agent-setup/jobs")
@@ -284,12 +637,17 @@ impl SetupService {
             "plan:\n  enabled: true\n  defaultOnStartup: true\n",
         )
         .map_err(|e| e.to_string())?;
-        let title = match request.scope {
-            SetupScope::Global => "Global",
-            SetupScope::Manager => "The Manager",
+        let name = match request.scope {
+            SetupScope::Global => "Agent setup — Global".into(),
+            SetupScope::Manager => "Agent setup — The Manager".into(),
+            SetupScope::Repository => {
+                let root = repository_root.as_ref().ok_or("Repository setup requires a project")?;
+                let basename = root.file_name().map(|name| name.to_string_lossy()).unwrap_or_else(|| root.to_string_lossy());
+                format!("Agent setup — Repository: {basename}")
+            }
         };
         let row = registry.create(CreateInput {
-            name: format!("Agent setup — {title}"),
+            name,
             project_path: folder.to_string_lossy().into(),
             configs: vec![overlay],
             ..Default::default()
@@ -299,6 +657,7 @@ impl SetupService {
             Job {
                 request: request.clone(),
                 paths: paths.clone(),
+                repository_root,
                 admission: Some(false),
                 sending: false,
             },
@@ -319,6 +678,13 @@ impl SetupService {
         request: &SetupRequest,
     ) -> Result<SetupAdmission> {
         let request = request.clone().normalize()?;
+        if request.scope == SetupScope::Repository {
+            let source = registry.inspect(request.project_instance_id.as_deref().ok_or("Repository setup requires a project")?, Origin::Human)
+                .map_err(|_| "Repository project is no longer available".to_string())?;
+            if source.kind != InstanceKind::Instance {
+                return Err("Repository setup requires an ordinary project instance".into());
+            }
+        }
         let row = registry.inspect(id, Origin::Human)?;
         let jobs_root =
             fs::canonicalize(self.root.join("agent-setup/jobs")).map_err(|e| e.to_string())?;
@@ -332,7 +698,7 @@ impl SetupService {
         let hub = registry
             .manager_hub()
             .ok_or("manager bridge not initialized")?;
-        let paths = {
+        let text = {
             let mut jobs = self.jobs.lock().map_err(|e| e.to_string())?;
             let job = jobs
                 .get_mut(id)
@@ -343,12 +709,13 @@ impl SetupService {
                         .into(),
                 );
             }
+            let text = prompt(&request, &job.paths, job.repository_root.as_deref())?;
             job.sending = true;
-            job.paths.clone()
+            text
         };
         let (sent, error) = match hub.wait_ready(id) {
             Err(error) => (Some(false), Some(error)),
-            Ok(()) => match hub.prompt_human(id, &prompt(&request, &paths)) {
+            Ok(()) => match hub.prompt_human(id, &text) {
                 Ok(_) => (Some(true), None),
                 Err(error) => (None, Some(format!("Prompt admission outcome unknown: {error}. Inspect the native session before sending anything else."))),
             },
@@ -371,6 +738,7 @@ mod tests {
     fn request(kind: SetupKind, name: &str) -> SetupRequest {
         SetupRequest {
             scope: SetupScope::Global,
+            project_instance_id: None,
             items: vec![SetupItem {
                 kind,
                 name: name.into(),
@@ -395,14 +763,243 @@ mod tests {
         let empty = SetupRequest {
             scope: SetupScope::Global,
             items: vec![],
+            project_instance_id: None,
         };
         assert!(empty.normalize().is_err());
         let mut no_description = request(SetupKind::Rules, "");
         no_description.items[0].description = "  ".into();
         assert!(no_description.normalize().is_err());
     }
+    fn item(kind: SetupKind, name: &str) -> SetupItem {
+        request(kind, name).items.remove(0)
+    }
+    fn requests(scope: SetupScope, items: Vec<SetupItem>) -> SetupRequest {
+        SetupRequest { scope, items, project_instance_id: None }
+    }
     #[test]
-    fn setup_permissions_and_admission_state_prevent_replay() {
+    fn agents_items_may_be_unnamed_or_named_but_never_collide() {
+        let ok = requests(
+            SetupScope::Global,
+            vec![
+                item(SetupKind::Agents, "  "),
+                item(SetupKind::Agents, "Code Reviewer"),
+                item(SetupKind::Agents, "planner"),
+            ],
+        )
+        .normalize()
+        .unwrap();
+        let names: Vec<_> = ok.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["", "code-reviewer", "planner"]);
+        for bad in [
+            vec![item(SetupKind::Agents, "../x")],
+            vec![item(SetupKind::Agents, "a"), item(SetupKind::Agents, "A")],
+            vec![item(SetupKind::Agents, ""), item(SetupKind::Agents, " ")],
+        ] {
+            assert!(requests(SetupScope::Global, bad).normalize().is_err());
+        }
+    }
+    #[test]
+    fn profile_items_need_valid_native_names_and_global_scope() {
+        let ok = requests(SetupScope::Global, vec![item(SetupKind::Profile, "qa-plan")])
+            .normalize()
+            .unwrap();
+        assert_eq!(ok.items[0].name, "qa-plan");
+        for name in ["default", "con", "", "../x"] {
+            assert!(
+                requests(SetupScope::Global, vec![item(SetupKind::Profile, name)])
+                    .normalize()
+                    .is_err(),
+                "{name}"
+            );
+        }
+        let mut undescribed = item(SetupKind::Profile, "plan");
+        undescribed.description = " ".into();
+        assert!(requests(SetupScope::Global, vec![undescribed]).normalize().is_err());
+        assert!(requests(SetupScope::Manager, vec![item(SetupKind::Profile, "plan")])
+            .normalize()
+            .is_err());
+    }
+    fn touch(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "x").unwrap();
+    }
+    #[test]
+    fn agent_files_are_listed_in_order_and_only_listed_files_verify() {
+        let root = std::env::temp_dir().join(format!("omp-agent-files-{}", uuid::Uuid::new_v4()));
+        let paths = SetupPaths {
+            global_omp_folder: root.join("global"),
+            global_agent_folder: root.join("global/agent"),
+            manager_folder: root.join("manager-setup"),
+        };
+        touch(&paths.global_agent_folder.join("agent-instructions/beta/AGENTS.md"));
+        touch(&paths.global_agent_folder.join("agent-instructions/alpha/AGENTS.md"));
+        touch(&paths.manager_folder.join("agent-instructions/alpha/AGENTS.md"));
+        touch(&paths.global_agent_folder.join("agent-instructions/empty/other.md"));
+        touch(&paths.global_agent_folder.join("agent-instructions/stray.md"));
+        let outside = root.join("elsewhere/AGENTS.md");
+        touch(&outside);
+        let files = scan_agent_files(&paths);
+        let listed: Vec<_> = files.iter().map(|f| (f.name.as_str(), f.scope)).collect();
+        assert_eq!(
+            listed,
+            [
+                ("alpha", SetupScope::Global),
+                ("alpha", SetupScope::Manager),
+                ("beta", SetupScope::Global)
+            ]
+        );
+        let verified = verify_agent_file_in(&files, &files[2].path).unwrap();
+        assert!(verified.is_file());
+        assert!(verify_agent_file_in(&files, &outside).is_err());
+        let missing = root.join("nothing/AGENTS.md");
+        assert!(verify_agent_file_in(&files, &missing)
+            .unwrap_err()
+            .starts_with("Agent instructions file not found"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn profiles_listing_matches_native_naming_and_login_state() {
+        let root = std::env::temp_dir().join(format!("omp-profiles-{}", uuid::Uuid::new_v4()));
+        let profiles = root.join("profiles");
+        touch(&profiles.join("plan/agent/config.yml"));
+        touch(&profiles.join("tiny/agent/agent.db"));
+        // Windows strips trailing dots from directory names, so "x." is checked on the rule itself.
+        assert!(!valid_profile_name("x."));
+        for skipped in ["UPPER", "bad name", "con"] {
+            touch(&profiles.join(skipped).join("agent/config.yml"));
+        }
+        touch(&profiles.join("stray-file"));
+        fs::create_dir_all(profiles.join("noagent")).unwrap();
+        let found = scan_profiles(&root);
+        let listed: Vec<_> = found.iter().map(|p| (p.name.as_str(), p.has_login)).collect();
+        assert_eq!(listed, [("plan", false), ("tiny", true)]);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn repository_roots_use_nearest_git_markers_and_validate_saved_sources() {
+        let root = std::env::temp_dir().join(format!("omp-repo-root-{}", uuid::Uuid::new_v4()));
+        let repo = root.join("repo");
+        let nested = repo.join("src/nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir(repo.join(".git")).unwrap();
+        assert_eq!(find_repository_root(&nested).unwrap(), canonical(&repo).unwrap());
+        fs::write(repo.join("src/.git"), "gitdir: elsewhere").unwrap();
+        assert_eq!(find_repository_root(&nested).unwrap(), canonical(&repo.join("src")).unwrap());
+        fs::remove_file(repo.join("src/.git")).unwrap();
+        let fallback = root.join("unversioned");
+        fs::create_dir(&fallback).unwrap();
+        assert_eq!(find_repository_root(&fallback).unwrap(), canonical(&fallback).unwrap());
+        assert!(find_repository_root(&root.join("missing")).is_err());
+        fs::write(root.join("file"), "not a directory").unwrap();
+        assert!(find_repository_root(&root.join("file")).is_err());
+        let registry = Registry::load(root.join("instances.json"), root.clone()).unwrap();
+        let source = registry.create(CreateInput { project_path: nested.to_string_lossy().into(), ..Default::default() }).unwrap();
+        assert_eq!(repository_root(&registry, &source.id).unwrap(), canonical(&repo).unwrap());
+        assert!(!repo.join(".omp").exists());
+        let manager = registry.create_manager(CreateInput { project_path: nested.to_string_lossy().into(), ..Default::default() }).unwrap();
+        assert!(repository_root(&registry, &manager.id).is_err());
+        assert!(repository_root(&registry, "unknown").is_err());
+        let home = registry.create(CreateInput { project_path: root.to_string_lossy().into(), ..Default::default() }).unwrap();
+        assert_eq!(repository_root(&registry, &home.id).unwrap_err(), "Repository setup cannot target the home directory");
+        fs::write(repo.join(".omp"), "conflict").unwrap();
+        assert!(repository_root(&registry, &source.id).unwrap_err().starts_with("Repository setup path is not a directory"));
+        fs::remove_file(repo.join(".omp")).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn repository_folder_rejects_escape_through_a_link() {
+        let root = std::env::temp_dir().join(format!("omp-repo-link-{}", uuid::Uuid::new_v4()));
+        let repo = root.join("repo");
+        let outside = root.join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let link = repo.join(".omp");
+        #[cfg(windows)]
+        let linked = std::process::Command::new("cmd.exe")
+            .args(["/C", "mklink", "/J"]).arg(&link).arg(&outside)
+            .output().unwrap().status.success();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        if linked {
+            assert_eq!(repository_folder(&repo).unwrap_err(), "Repository setup folder must stay inside the repository");
+            #[cfg(windows)]
+            fs::remove_dir(&link).unwrap();
+            #[cfg(unix)]
+            fs::remove_file(&link).unwrap();
+        } else {
+            eprintln!("Repository junction/symlink containment check unexercised: link creation refused");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn repository_scope_requires_an_identity_and_disallows_profiles() {
+        let mut request = request(SetupKind::Rules, "");
+        request.scope = SetupScope::Repository;
+        assert_eq!(request.clone().normalize().unwrap_err(), "Repository setup requires a project");
+        request.project_instance_id = Some("   ".into());
+        assert!(request.clone().normalize().is_err());
+        request.project_instance_id = Some("project-a".into());
+        assert_eq!(request.clone().normalize().unwrap().project_instance_id.as_deref(), Some("project-a"));
+        for scope in [SetupScope::Global, SetupScope::Manager] {
+            let mut ordinary = request.clone();
+            ordinary.scope = scope;
+            assert_eq!(ordinary.normalize().unwrap().project_instance_id, None);
+        }
+        request.items = vec![item(SetupKind::Profile, "qa-plan")];
+        assert_eq!(request.normalize().unwrap_err(), "OMP profiles are global; choose the Global scope");
+    }
+    #[test]
+    fn repository_prompt_targets_every_asset_inside_the_bound_repo() {
+        let root = std::env::temp_dir().join(format!("omp-repo-prompt-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let paths = SetupPaths { global_omp_folder: root.join("global"), global_agent_folder: root.join("global/agent"), manager_folder: root.join("manager") };
+        let mut request = requests(SetupScope::Repository, vec![
+            item(SetupKind::Agents, ""), item(SetupKind::Agents, "reviewer"),
+            item(SetupKind::Rules, ""), item(SetupKind::Skill, "review"),
+            item(SetupKind::Workflow, "review"),
+            SetupItem { language: Some(ScriptLanguage::Python), ..item(SetupKind::Tool, "helper") },
+        ]);
+        request.project_instance_id = Some("source".into());
+        let request = request.normalize().unwrap();
+        let text = prompt(&request, &paths, Some(&root)).unwrap().replace('\\', "/");
+        for file in ["AGENTS.md", "agent-instructions/reviewer/AGENTS.md", "RULES.md", "skills/review/SKILL.md", "SKILLS.md", "rules/workflow-review.md", "tools/helper/index.ts", "tools/helper/run.py"] {
+            assert!(text.contains(&canonical(&root).unwrap().join(".omp").join(file).display().to_string().replace('\\', "/")), "{file}");
+        }
+        assert!(!text.contains(&paths.global_agent_folder.display().to_string().replace('\\', "/")));
+        assert!(!root.join(".omp").exists());
+        assert!(prompt(&request, &paths, None).is_err());
+        let manager = requests(SetupScope::Manager, vec![item(SetupKind::Rules, "")]);
+        assert!(prompt(&manager, &paths, None).unwrap().contains(&paths.manager_folder.display().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn prompts_target_named_agent_files_and_global_profile_folders() {
+        let paths = SetupPaths {
+            global_omp_folder: PathBuf::from("/g/.omp"),
+            global_agent_folder: PathBuf::from("/g/.omp/agent"),
+            manager_folder: PathBuf::from("/m/manager-setup"),
+        };
+        let text = prompt(
+            &requests(
+                SetupScope::Global,
+                vec![
+                    item(SetupKind::Agents, "reviewer"),
+                    item(SetupKind::Agents, ""),
+                    item(SetupKind::Profile, "qa-plan"),
+                ],
+            )
+            .normalize()
+            .unwrap(),
+            &paths,
+            None,
+        ).unwrap();
+        assert!(text.contains("Requested Agents: agent-instructions/reviewer/AGENTS.md"));
+        assert!(text.contains("Requested Agents: AGENTS.md\n"));
+        let profile = PathBuf::from("/g/.omp").join("profiles").join("qa-plan").join("agent").join("config.yml");
+        assert!(text.contains(&format!("Requested Profile: {}", profile.display())));
+    }
+    #[test]
+    fn setup_permissions_and_admission_state_prevent_replay() -> Result<()> {
         let root = std::env::temp_dir().join(format!("omp-setup-policy-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("agent-setup/jobs/job")).unwrap();
         let registry = Arc::new(Registry::load(root.join("instances.json"), root.clone()).unwrap());
@@ -442,6 +1039,7 @@ mod tests {
                     Job {
                         request: request.clone(),
                         paths: paths.clone(),
+                        repository_root: None,
                         admission,
                         sending: false,
                     },
@@ -462,6 +1060,7 @@ mod tests {
                 Job {
                     request: request.clone(),
                     paths,
+                    repository_root: None,
                     admission: Some(false),
                     sending: true,
                 },
@@ -472,7 +1071,101 @@ mod tests {
             .unwrap()
             .manager_id
             .is_none());
+        let repo_a = root.join("repo-a");
+        let repo_b = root.join("repo-b");
+        fs::create_dir(&repo_a).unwrap();
+        fs::create_dir(&repo_b).unwrap();
+        let source_a = registry.create(CreateInput { project_path: repo_a.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let source_b = registry.create(CreateInput { project_path: repo_b.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let mut bound = request.clone();
+        bound.scope = SetupScope::Repository;
+        bound.project_instance_id = Some(source_a.id.clone());
+        service.jobs.lock().map_err(|error| error.to_string())?.insert(row.id.clone(), Job {
+            request: bound.clone(), paths: SetupPaths { global_omp_folder: root.join("global"), global_agent_folder: root.join("global/agent"), manager_folder: root.join("manager-setup") },
+            repository_root: Some(canonical(&repo_a).unwrap()), admission: Some(false), sending: false,
+        });
+        let mut changed = bound.clone();
+        changed.project_instance_id = Some(source_b.id);
+        assert!(service.send(&registry, &row.id, &changed).is_err());
+        assert!(!service.jobs.lock().map_err(|error| error.to_string())?.get(&row.id).unwrap().sending);
+        for admission in [Some(true), None] {
+            service.jobs.lock().map_err(|error| error.to_string())?.get_mut(&row.id).unwrap().admission = admission;
+            assert!(service.send(&registry, &row.id, &bound).is_err());
+        }
+        {
+            let mut jobs = service.jobs.lock().map_err(|error| error.to_string())?;
+            let job = jobs.get_mut(&row.id).unwrap();
+            job.admission = Some(false);
+            job.sending = true;
+        }
+        assert!(service.send(&registry, &row.id, &bound).is_err());
+        registry.remove(&source_a.id, Origin::Human).unwrap();
+        assert_eq!(service.send(&registry, &row.id, &bound).err().as_deref(), Some("Repository project is no longer available"));
         registry.shutdown();
+        fs::remove_dir_all(root).unwrap();
+        Ok(())
+    }
+    #[test]
+    fn plugins_are_available_in_every_scope_while_profiles_stay_global() {
+        let parsed: SetupRequest = serde_json::from_str(r#"{"scope":"manager","items":[{"kind":"plugin","name":"Release Notes","description":"Summarise changes"}]}"#).unwrap();
+        assert_eq!(parsed.normalize().unwrap().items[0].name, "release-notes");
+        for scope in [SetupScope::Global, SetupScope::Manager, SetupScope::Repository] {
+            let mut plugin = requests(scope, vec![item(SetupKind::Plugin, "release-notes"), item(SetupKind::Skill, "release-notes")]);
+            plugin.project_instance_id = Some("project".into());
+            plugin.items[0].language = Some(ScriptLanguage::Python);
+            let normalized = plugin.normalize().unwrap();
+            assert_eq!(normalized.items[0].language, None, "only tools keep a language");
+        }
+        let mut duplicate = requests(SetupScope::Global, vec![item(SetupKind::Plugin, "a"), item(SetupKind::Plugin, "A")]);
+        assert_eq!(duplicate.clone().normalize().unwrap_err(), "Setup items must have distinct target paths");
+        duplicate.items.pop();
+        duplicate.items.push(item(SetupKind::Profile, "plan-mode"));
+        assert!(duplicate.clone().normalize().is_ok());
+        duplicate.scope = SetupScope::Manager;
+        assert_eq!(duplicate.normalize().unwrap_err(), "OMP profiles are global; choose the Global scope");
+        assert!(request(SetupKind::Plugin, "../escape").normalize().is_err());
+    }
+    #[test]
+    fn plugin_prompts_target_the_scope_extensions_folder() {
+        let paths = SetupPaths { global_omp_folder: "G".into(), global_agent_folder: PathBuf::from("G").join("agent"), manager_folder: PathBuf::from("M") };
+        for (scope, target) in [(SetupScope::Global, PathBuf::from("G").join("agent")), (SetupScope::Manager, PathBuf::from("M"))] {
+            let text = prompt(&requests(scope, vec![item(SetupKind::Plugin, "release-notes")]), &paths, None).unwrap();
+            assert!(text.contains(&target.display().to_string()));
+            assert!(text.contains("extensions/release-notes/package.json and extensions/release-notes/index.ts"));
+            assert!(text.contains("`omp plugin link`"));
+        }
+    }
+    #[test]
+    fn manager_plugins_are_validated_and_ordered_without_executing_them() {
+        let root = std::env::temp_dir().join(format!("omp-manager-plugins-{}", uuid::Uuid::new_v4()));
+        assert!(manager_plugin_paths(&root).unwrap().is_empty());
+        let extensions = root.join("extensions");
+        let write = |relative: &str, text: &str| {
+            let file = extensions.join(relative);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, text).unwrap();
+        };
+        let manifest = r#"{"name":"p","omp":{"extensions":["index.ts"]}}"#;
+        write("zeta/package.json", manifest);
+        write("zeta/index.ts", "throw new Error('must never run')");
+        write("alpha/package.json", r#"{"name":"p","omp":{"extensions":["./src"]}}"#);
+        write("alpha/src/index.js", "");
+        write(".hidden/package.json", "not json");
+        write("loose/index.ts", "");
+        write("note.txt", "");
+        let names = |paths: Vec<PathBuf>| paths.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(names(manager_plugin_paths(&root).unwrap()), ["alpha", "zeta"]);
+        for (text, expected) in [
+            ("{", "package.json is invalid"),
+            (r#"{"omp":{"extensions":["missing.ts"]}}"#, "declares a missing extension module"),
+            (r#"{"omp":{"extensions":["../zeta/index.ts"]}}"#, "outside its package"),
+            (r#"{"omp":{"extensions":["src/main.ts"]}}"#, "cannot load; use index.ts"),
+        ] {
+            write("bad/package.json", text);
+            write("bad/src/main.ts", "");
+            let error = manager_plugin_paths(&root).unwrap_err();
+            assert!(error.starts_with("Manager plugin bad") && error.contains(expected), "{error}");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -121,12 +121,21 @@ impl Pty {
             cmd.arg("--resume");
             cmd.arg(path);
         }
+        if let Some(path) = &input.agent_file {
+            cmd.arg("--append-system-prompt");
+            cmd.arg(path);
+        }
         cmd.arg("--extension");
         cmd.arg(&bridge.extension_path);
         if definition.kind == crate::instance::InstanceKind::Manager {
             cmd.arg("--extension");
             cmd.arg(&bridge.manager_setup_dir);
             cmd.env("OMP_MANAGER_SETUP_DIR", &bridge.manager_setup_dir);
+            // Private plugin packages are loaded only here, never into workers or the global OMP registry.
+            for package in crate::setup::manager_plugin_paths(&bridge.manager_setup_dir)? {
+                cmd.arg("--extension");
+                cmd.arg(package);
+            }
         }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -147,6 +156,13 @@ impl Pty {
                 "instance"
             },
         );
+        cmd.env("OMP_MANAGER_BROWSER_REQUIRED", "1");
+        if definition.plan_target.is_some() {
+            cmd.env("OMP_MANAGER_PLAN_SESSION", "1");
+        }
+        cmd.env("PI_BROWSER_RELAY", "0");
+        cmd.env("PI_BROWSER_TERN", "0");
+        cmd.env("PI_BROWSER_CMUX", "0");
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;

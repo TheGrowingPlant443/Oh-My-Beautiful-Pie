@@ -3,7 +3,7 @@
   import { startInstance, stopInstance } from "../stores";
   import { basename } from "../ui";
   import OwnershipControls from "./OwnershipControls.svelte";
-  let { list, onSelect, onSubagent, onPlan }: { list: Instance[]; onSelect: (id: string) => void; onSubagent: (id: string, child: string) => void; onPlan: (id: string) => void } = $props();
+  let { list, onSelect, onSubagent, onPlan, onPlanChange }: { list: Instance[]; onSelect: (id: string) => void; onSubagent: (id: string, child: string) => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void } = $props();
   const groups = $derived.by(() => {
     const folders = new Map<string, Instance[]>();
     for (const instance of list) {
@@ -26,6 +26,7 @@
             <span class="pill">{instance.status === "running" ? instance.activity : instance.status}</span>
             <span class="dim">{instance.profile || "Default profile"}</span>
             <span class="spacer"></span>
+            {#if instance.planKind}<button onclick={() => onPlanChange(instance.id)}>Plan</button>{/if}
             {#if instance.planPath}<button onclick={() => onPlan(instance.id)}>View Plan</button>{/if}
             <button onclick={() => instance.status === "running" || instance.status === "starting" ? stopInstance(instance.id) : startInstance(instance.id)}>{instance.status === "running" || instance.status === "starting" ? "Stop" : "Start / reopen"}</button>
           </div>

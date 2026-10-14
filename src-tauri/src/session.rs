@@ -27,6 +27,20 @@ pub struct Subagent {
     pub path: PathBuf,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanTask {
+    pub content: String,
+    pub status: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Phase {
+    pub name: String,
+    pub tasks: Vec<PlanTask>,
+}
+
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionState {
@@ -36,6 +50,7 @@ pub struct SessionState {
     pub todo_total: usize,
     pub plan_path: Option<PathBuf>,
     pub subagents: Vec<Subagent>,
+    pub phases: Vec<Phase>,
 }
 
 pub fn now_ms() -> u64 {
@@ -174,6 +189,50 @@ pub fn local_path(session: &Path, uri: &str) -> Option<PathBuf> {
     }
 }
 
+/// The session's todo list as markdown: one `#` heading per phase, one checkbox line per task
+/// (`[x]` completed, `[~]` in progress, `[ ]` otherwise).
+pub fn todo_markdown(phases: &[Phase]) -> String {
+    phases
+        .iter()
+        .map(|phase| {
+            let title = if phase.name.trim().is_empty() { "Plan" } else { phase.name.trim() };
+            let tasks = phase
+                .tasks
+                .iter()
+                .map(|task| {
+                    let mark = match task.status.as_str() {
+                        "completed" => "x",
+                        "in_progress" => "~",
+                        _ => " ",
+                    };
+                    format!("- [{mark}] {}", task.content)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("# {title}\n{tasks}\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The most recently saved native plan file among a project's sessions (newest 10 sessions that have
+/// `local` artifacts). A session that was replaced after plan approval keeps its plan only here.
+pub fn last_saved_plan(sessions: &[SessionInfo]) -> Option<PathBuf> {
+    sessions
+        .iter()
+        .filter(|s| s.path.with_extension("").join("local").is_dir())
+        .take(10)
+        .filter_map(|s| {
+            let mut reader = TailReader::default();
+            reader.update(&s.path).ok()?;
+            let plan = reader.state.plan_path?;
+            let modified = fs::metadata(&plan).ok()?.modified().ok()?;
+            Some((modified, plan))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, plan)| plan)
+}
+
 #[derive(Default)]
 pub struct TailReader {
     pub state: SessionState,
@@ -254,7 +313,9 @@ impl TailReader {
         self.state.task = None;
         self.state.todo_done = 0;
         self.state.todo_total = 0;
+        self.state.phases.clear();
         for phase in phases {
+            let mut tasks = Vec::new();
             for task in phase["tasks"].as_array().into_iter().flatten() {
                 self.state.todo_total += 1;
                 if task["status"] == "completed" {
@@ -263,7 +324,12 @@ impl TailReader {
                 if task["status"] == "in_progress" && self.state.task.is_none() {
                     self.state.task = task["content"].as_str().map(String::from);
                 }
+                tasks.push(PlanTask {
+                    content: task["content"].as_str().unwrap_or_default().into(),
+                    status: task["status"].as_str().unwrap_or("pending").into(),
+                });
             }
+            self.state.phases.push(Phase { name: phase["name"].as_str().unwrap_or_default().into(), tasks });
         }
     }
 
@@ -466,6 +532,49 @@ mod tests {
         fs::write(&path, replacement).unwrap();
         reader.update(&path).unwrap();
         assert_eq!(reader.state.task.as_deref(), Some("tea!"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn the_todo_list_is_kept_by_phase_and_rendered_as_checkboxes() {
+        let dir = std::env::temp_dir().join(format!("omp-todo-md-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let journal = dir.join("s.jsonl");
+        let todo = serde_json::json!({"type":"message","message":{"role":"toolResult","toolName":"todo","details":{"phases":[
+            {"name":"Build","tasks":[{"content":"one","status":"completed"},{"content":"two","status":"in_progress"}]},
+            {"name":"","tasks":[{"content":"three","status":"pending"},{"content":"four","status":"abandoned"}]}]}}});
+        fs::write(&journal, format!("{}\n{todo}\n", serde_json::json!({"type":"session","id":"s","cwd":dir}))).unwrap();
+        let mut reader = TailReader::default();
+        reader.update(&journal).unwrap();
+        assert_eq!((reader.state.todo_done, reader.state.todo_total), (1, 4));
+        assert_eq!(todo_markdown(&reader.state.phases), "# Build\n- [x] one\n- [~] two\n\n# Plan\n- [ ] three\n- [ ] four\n");
+        assert_eq!(todo_markdown(&[]), "");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn the_last_saved_plan_is_the_newest_native_plan_among_sessions_with_artifacts() {
+        let dir = std::env::temp_dir().join(format!("omp-saved-plan-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let session = |name: &str, plan: Option<(&str, &str)>| {
+            let path = dir.join(format!("{name}.jsonl"));
+            let mut text = format!("{}\n", serde_json::json!({"type":"session","id":name,"cwd":dir}));
+            if let Some((uri, body)) = plan {
+                text += &format!("{}\n", serde_json::json!({"type":"mode_change","mode":"plan","data":{"planFilePath":uri}}));
+                let file = local_path(&path, uri).unwrap();
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(file, body).unwrap();
+            }
+            fs::write(&path, text).unwrap();
+            SessionInfo { id: name.into(), path, title: name.into(), modified_ms: 0 }
+        };
+        let old = session("old", Some(("local://old.md", "old")));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let new = session("new", Some(("local://new.md", "new")));
+        let bare = session("bare", None);
+        let picked = last_saved_plan(&[bare.clone(), old.clone(), new.clone()]).unwrap();
+        assert_eq!(fs::read_to_string(picked).unwrap(), "new");
+        assert_eq!(last_saved_plan(&[bare.clone(), old]).map(|p| fs::read_to_string(p).unwrap()).as_deref(), Some("old"));
+        assert_eq!(last_saved_plan(&[bare]), None);
+        assert_eq!(last_saved_plan(&[]), None);
         fs::remove_dir_all(dir).unwrap();
     }
 }

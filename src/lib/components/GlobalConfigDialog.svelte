@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { open as pickFile } from "@tauri-apps/plugin-dialog";
+  import ConfigPicker from "./ConfigPicker.svelte";
   import { api, type ConfigPreview } from "../api";
   import { instances, errorText, refreshGlobalConfig } from "../stores";
   let { open, mode, initialSourceId, onclose }: { open: boolean; mode: "save" | "import"; initialSourceId: string | null; onclose: () => void } = $props();
   let dialog = $state<HTMLDialogElement>();
   let sourceId = $state("");
   let importPath = $state("");
+  let importSource = $state<"current" | "snapshot" | "native" | "custom" | "none">("none");
   let preview = $state<ConfigPreview | null>(null);
   let savedPath = $state("");
   let error = $state("");
@@ -16,6 +17,7 @@
     if (open && !dialog.open) {
       sourceId = initialSourceId || "";
       importPath = "";
+      importSource = "none";
       preview = null;
       savedPath = "";
       error = "";
@@ -23,13 +25,6 @@
       dialog.querySelector<HTMLElement>("select, input, button")?.focus();
     } else if (!open && dialog.open) dialog.close();
   });
-  async function browse(): Promise<void> {
-    error = "";
-    try {
-      const path = await pickFile({ directory: false, multiple: false, title: "Import OMP config", filters: [{ name: "OMP YAML config", extensions: ["yml", "yaml"] }] });
-      if (typeof path === "string") { importPath = path; preview = null; savedPath = ""; }
-    } catch (e) { error = errorText(e); }
-  }
   async function load(): Promise<void> {
     busy = true;
     error = "";
@@ -45,6 +40,15 @@
     error = "";
     try {
       savedPath = (await api.saveGlobalConfig(preview.yaml)).path;
+      await refreshGlobalConfig();
+    } catch (e) { error = errorText(e); }
+    finally { busy = false; }
+  }
+  async function activate(): Promise<void> {
+    busy = true;
+    error = "";
+    try {
+      savedPath = (await api.activateGlobalConfig(importPath)).path;
       await refreshGlobalConfig();
     } catch (e) { error = errorText(e); }
     finally { busy = false; }
@@ -65,9 +69,8 @@
         </label>
         <small class="dim">Reads config.yml and the source's ordered overlays. CLI model overrides and transient terminal model switches are not included.</small>
       {:else}
-        <label>Config file
-          <div class="row"><input bind:value={importPath} placeholder="C:/path/to/config.yml" disabled={busy} oninput={() => { preview = null; savedPath = ""; }} /><button disabled={busy} onclick={browse}>Browse…</button></div>
-        </label>
+        <ConfigPicker mode="import" bind:value={importPath} active={open && mode === "import"} label="Config" disabled={busy} onchange={(_, s) => { importSource = s; preview = null; savedPath = ""; }} />
+        {#if importSource === "current"}<p class="ok">This is already the default for new terminals.</p>{/if}
       {/if}
       <button disabled={busy || (mode === "import" && !importPath.trim())} onclick={load}>{busy ? "Working…" : "Preview config"}</button>
       {#if preview}
@@ -78,7 +81,10 @@
         <label>Sanitized YAML<textarea class="mono" readonly value={preview.yaml} rows="10"></textarea></label>
         {#if preview.omitted.length}<details open><summary>Excluded settings ({preview.omitted.length})</summary><ul>{#each preview.omitted as key}<li class="mono">{key}</li>{/each}</ul></details>{/if}
         <p class="dim">Credentials, unknown namespaces, executable modules/hooks, environment maps, credential routing, telemetry and service configuration are excluded. Model catalogs and authentication must already be available locally.</p>
-        {#if !savedPath}<button class="primary" disabled={busy} onclick={save}>{mode === "save" ? "Save and use for new terminals" : "Import and use for new terminals"}</button>{/if}
+        {#if !savedPath}
+          {#if mode === "import" && importSource === "snapshot"}<button class="primary" disabled={busy} onclick={activate}>Use for new terminals</button>
+          {:else if !(mode === "import" && importSource === "current")}<button class="primary" disabled={busy} onclick={save}>{mode === "save" ? "Save and use for new terminals" : "Import and use for new terminals"}</button>{/if}
+        {/if}
       {/if}
       {#if savedPath}
         <p class="ok">Global default saved. Only new terminals will use this snapshot.</p>
@@ -96,9 +102,6 @@
   .body { padding: 16px; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
   h3, h4, p { margin: 0; }
   label { display: flex; flex-direction: column; gap: 6px; }
-  .row { display: flex; gap: 8px; }
-  .row input { flex: 1; min-width: 0; }
-  .row button { flex-shrink: 0; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
   textarea { resize: vertical; min-height: 150px; }
