@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
-import { installTerminalCommands, HELD_ERROR } from '../omp-terminal.mjs';
+import { installTerminalCommands, registerCommandHistoryTool, HELD_ERROR } from '../omp-terminal.mjs';
 
 // Loaded as an explicit extension by the real OMP CLI in rpc mode. No model is called: the scenario drives the
 // real native Bash/Eval tools of the captured session and observes the real bridge observer through its events.
@@ -21,6 +21,7 @@ export default async function terminalScenario(pi) {
     historyRoot: path.join(root, 'ledger'),
     sdkDir: process.env.OMP_SDK_DIR,
   });
+  registerCommandHistoryTool(pi, observer);
   pi.on('session_start', (_event, ctx) => { observer.attachContext(ctx); void run(); });
   const text = result => result.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
   const commands = () => events.filter(event => event.kind === 'terminal_command').map(event => event.payload.command);
@@ -158,6 +159,33 @@ export default async function terminalScenario(pi) {
         assert.ok(python && latest(python.executionId).endedAt !== null);
         console.log('8 ok: python eval recorded');
       } catch (error) { if (error?.name === 'AssertionError') throw error; console.log('8 skipped: no python runtime', String(error.message).slice(0, 80)); }
+
+      // 8b. A failed command keeps its output; the agent reads its own history through the command_history tool.
+      const outputOf = id => readFile(path.join(ledgerDir, sessions[0], id, 'output.txt'), 'utf8');
+      await bash({ command: 'echo before-fail; exit 7' }).catch(error => error);
+      const failedBash = finals().find(command => command.preview === 'echo before-fail; exit 7');
+      assert.ok(failedBash && failedBash.status === 'failed' && failedBash.hasOutput === true, 'failed bash row says its output was saved');
+      assert.match(await outputOf(failedBash.executionId), /before-fail/);
+      await evaluate({ language: 'js', code: "console.log('eval-out');\nthrow new Error('boom-eval');", title: 'Throws' }).catch(error => error);
+      const failedEval = finals().find(command => command.description === 'Throws');
+      assert.ok(failedEval && failedEval.status === 'failed' && failedEval.hasOutput === true, 'failed eval row says its output was saved');
+      const evalOutput = await outputOf(failedEval.executionId);
+      assert.ok(evalOutput.includes('eval-out') && evalOutput.includes('boom-eval'), `eval output keeps its output and error: ${evalOutput}`);
+      await bash({ command: 'echo fine' });
+      const fine = finals().find(command => command.preview === 'echo fine');
+      assert.equal(fine.status, 'completed'); assert.equal(fine.hasOutput, false);
+      await assert.rejects(outputOf(fine.executionId), 'completed commands keep no output file');
+      const history = (id, params) => session.getToolByName('command_history').execute(id, params, undefined, undefined, undefined);
+      const listed = text(await history('h1', { action: 'list', status: 'failed' }));
+      assert.ok(listed.includes(failedBash.executionId) && listed.includes(failedEval.executionId) && listed.includes('output saved'), listed);
+      assert.ok(!listed.includes(fine.executionId), 'the status filter excludes completed commands');
+      const shown = text(await history('h2', { action: 'show', executionId: failedEval.executionId }));
+      for (const part of ['--- script ---', "throw new Error('boom-eval')", '--- output ---', 'eval-out']) assert.ok(shown.includes(part), `show contains ${part}: ${shown}`);
+      const bad = await history('h3', { action: 'show', executionId: '../x' });
+      assert.equal(bad.isError, true);
+      assert.ok(text(await history('h4', { action: 'show', executionId: fine.executionId })).includes('no output recorded'));
+      assert.ok(text(await history('h5', { action: 'list', query: 'before-fail' })).includes(failedBash.executionId));
+      console.log('8b ok: failed output persisted, command_history lists and shows it');
 
       // 9. Dispose restores every native method exactly, in reverse install order.
       observer.dispose();

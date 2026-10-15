@@ -103,7 +103,7 @@ export type CommandStatus = "running" | "stopping" | "completed" | "failed" | "c
 export interface CommandSummary {
   executionId: string; sessionId: string; sourceSessionId: string; toolCallId: string; agentId: string;
   kind: CommandKind; description: string | null; preview: string; cwd: string;
-  startedAt: number; endedAt: number | null; status: CommandStatus; exitCode: number | null; tab: number | null; historical: boolean;
+  startedAt: number; endedAt: number | null; status: CommandStatus; exitCode: number | null; tab: number | null; historical: boolean; hasOutput: boolean;
 }
 export interface CommandOutput { executionId: string; revision: number; text: string; truncated: boolean; }
 export interface UserShellInfo { shellId: string; cwd: string; cols: number; rows: number; exited: boolean; exitCode: number | null; }
@@ -165,6 +165,7 @@ export const api = {
   listAllTerminals: () => invoke<TerminalOwner[]>("list_all_terminals"),
   listTerminalHistory: (id: string | null, cursor: string | null) => invoke<HistoryPage>("list_terminal_history", { id, cursor }),
   readTerminalScript: (id: string, sessionId: string, executionId: string) => invoke<string>("read_terminal_script", { id, sessionId, executionId }),
+  readTerminalOutput: (id: string, sessionId: string, executionId: string) => invoke<string>("read_terminal_output", { id, sessionId, executionId }),
   attachCommandOutput: (id: string, generation: number, sessionId: string, executionId: string, onData: Channel<CommandOutput>) => invoke<void>("attach_command_output", { id, generation, sessionId, executionId, onData }),
   killTerminalCommand: (id: string, generation: number, sessionId: string, executionId: string) => invoke<void>("kill_terminal_command", { id, generation, sessionId, executionId }),
   openUserTerminal: (id: string) => invoke<UserShellInfo>("open_user_terminal", { id }),

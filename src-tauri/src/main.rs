@@ -152,6 +152,7 @@ fn main() {
             commands::list_all_terminals,
             commands::list_terminal_history,
             commands::read_terminal_script,
+            commands::read_terminal_output,
             commands::attach_command_output,
             commands::kill_terminal_command,
             commands::open_user_terminal,

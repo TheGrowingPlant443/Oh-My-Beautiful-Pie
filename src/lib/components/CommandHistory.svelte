@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api, type HistoryEntry } from "../api";
   import { errorText, terminalOwners } from "../stores";
+  import { stripAnsi } from "../terminal";
 
   // null = every agent's current conversation (Dashboard page), otherwise one agent.
   let { instanceId }: { instanceId: string | null } = $props();
@@ -13,7 +14,7 @@
   let loaded = $state(false);
   let error = $state<string | null>(null);
   let loadingOlder = $state(false);
-  let expanded = $state<Record<string, { text: string | null; error: string | null }>>({});
+  let expanded = $state<Record<string, { text: string | null; output: string | null; error: string | null }>>({});
   let requests = 0;
 
   const rowKey = (entry: HistoryEntry): string => `${entry.instanceId}:${entry.command.executionId}`;
@@ -54,12 +55,15 @@
       expanded = rest;
       return;
     }
-    expanded = { ...expanded, [key]: { text: null, error: null } };
+    expanded = { ...expanded, [key]: { text: null, output: null, error: null } };
     try {
-      const text = await api.readTerminalScript(entry.instanceId, entry.command.sessionId, entry.command.executionId);
-      if (expanded[key]) expanded = { ...expanded, [key]: { text, error: null } };
+      const [text, output] = await Promise.all([
+        api.readTerminalScript(entry.instanceId, entry.command.sessionId, entry.command.executionId),
+        entry.command.hasOutput ? api.readTerminalOutput(entry.instanceId, entry.command.sessionId, entry.command.executionId) : Promise.resolve(null),
+      ]);
+      if (expanded[key]) expanded = { ...expanded, [key]: { text, output, error: null } };
     } catch (failure) {
-      if (expanded[key]) expanded = { ...expanded, [key]: { text: null, error: errorText(failure) } };
+      if (expanded[key]) expanded = { ...expanded, [key]: { text: null, output: null, error: errorText(failure) } };
     }
   }
   const kindName = { bash: "Bash", js: "JavaScript", py: "Python" } as const;
@@ -88,7 +92,13 @@
             <p class="dim mono">{command.cwd}{command.historical ? " · imported from the conversation journal" : ""}</p>
             {#if open.error}<p class="err" role="alert">{open.error}</p>
             {:else if open.text === null}<p class="dim" role="status">Loading…</p>
-            {:else}<pre class="mono">{open.text}</pre>{/if}
+            {:else}
+              <pre class="mono">{open.text}</pre>
+              {#if open.output !== null}
+                <p class="dim output-label">Output of the failed command (last 256 KiB)</p>
+                <pre class="mono failure">{stripAnsi(open.output)}</pre>
+              {/if}
+            {/if}
           </div>
         {/if}
       </li>
@@ -108,5 +118,7 @@
   .detail p { margin: 0 0 6px; overflow-wrap: anywhere; font-size: 12px; }
   .detail .description { max-width: none; font-size: 13px; }
   pre { margin: 0; max-height: 50vh; overflow: auto; white-space: pre; user-select: text; font-size: 12px; }
+  .output-label { margin-top: 8px; }
+  .failure { color: #ff9d97; border-top: 1px solid var(--line); margin-top: 6px; padding-top: 6px; }
   p { margin: 0; }
 </style>

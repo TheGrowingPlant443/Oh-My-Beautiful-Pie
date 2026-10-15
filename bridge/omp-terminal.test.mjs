@@ -6,7 +6,7 @@ import {mkdtemp,rm} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {capTail,previewOf,OUTPUT_LIMIT,installTerminalCommands,TERMINAL_COMPATIBILITY_ERROR} from './omp-terminal.mjs';
+import {capTail,previewOf,OUTPUT_LIMIT,installTerminalCommands,TERMINAL_COMPATIBILITY_ERROR,formatHistory,formatEntry} from './omp-terminal.mjs';
 import {controlAllowed} from './omp-manager.mjs';
 
 test('output tails keep the newest bytes and never split a multi-byte character', () => {
@@ -34,6 +34,36 @@ test('an incompatible runtime reports the integration error instead of a fake st
   assert.equal(observer.snapshot().supported, false);
   assert.equal(observer.snapshot().error, TERMINAL_COMPATIBILITY_ERROR);
   await assert.rejects(observer.kill('id'), {message: TERMINAL_COMPATIBILITY_ERROR});
+  assert.throws(() => observer.history(), {message: TERMINAL_COMPATIBILITY_ERROR});
+  assert.throws(() => observer.entry('x'), {message: TERMINAL_COMPATIBILITY_ERROR});
+});
+
+const row = (executionId, patch = {}) => ({executionId, kind:'bash', description:null, preview:'echo hi', cwd:'C:/p', startedAt:Date.UTC(2026,9,11,12), endedAt:Date.UTC(2026,9,11,12,0,1), status:'completed', exitCode:0, hasOutput:false, ...patch});
+
+test('the history list names every command with its status, exit code and whether output was saved', () => {
+  assert.equal(formatHistory({rows:[], total:0}), 'No commands recorded in this conversation yet.');
+  const text = formatHistory({total:3, rows:[
+    row('a', {status:'failed', exitCode:7, hasOutput:true, description:'Build'}),
+    row('b'),
+  ]});
+  assert.deepEqual(text.split('\n'), [
+    '3 command(s) in this conversation (newest first, showing 2)',
+    '- a | 2026-10-11T12:00:00.000Z | failed (exit 7) | bash | Build | echo hi | output saved',
+    '- b | 2026-10-11T12:00:00.000Z | completed | bash |  | echo hi',
+  ]);
+});
+
+test('a shown command has its script from the start and its output from the end, cut at 65536 characters', () => {
+  const failed = row('f', {status:'failed', exitCode:1, hasOutput:true, description:'Why'});
+  const both = formatEntry({summary:failed, script:'exit 1', output:'boom'});
+  assert.match(both, /^Command f\nStatus: failed \(exit 1\)\nKind: bash\nStarted: 2026-10-11T12:00:00\.000Z\nEnded: 2026-10-11T12:00:01\.000Z\nDirectory: C:\/p\nDescription: Why\n--- script ---\nexit 1\n--- output ---\nboom$/);
+  assert.ok(!formatEntry({summary:failed, script:'exit 1', output:'boom'}, 'script').includes('--- output ---'));
+  assert.ok(!formatEntry({summary:failed, script:'exit 1', output:'boom'}, 'output').includes('--- script ---'));
+  const long = formatEntry({summary:failed, script:`HEAD${'x'.repeat(70000)}`, output:`${'y'.repeat(70000)}TAIL`});
+  assert.ok(long.includes('HEAD') && long.includes('[script truncated; showing the first 65536 characters]'));
+  assert.ok(long.includes('[output truncated; showing the last 65536 characters]\n') && long.endsWith('TAIL'));
+  assert.ok(formatEntry({summary:row('c'), script:'echo', output:null}).includes('no output recorded'));
+  assert.ok(formatEntry({summary:row('r', {status:'running', endedAt:null, exitCode:null}), script:'sleep', output:'so far'}).includes('--- output (live, still running) ---\nso far'));
 });
 
 const nativeSkip = !process.env.OMP_SDK_DIR ? 'Set OMP_SDK_DIR to run isolated native integration' : false;

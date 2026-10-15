@@ -26,6 +26,7 @@ const HISTORY_PAGE: usize = 100;
 const MAX_SCRIPT: u64 = 64 * 1024 * 1024;
 const MAX_META: u64 = 1024 * 1024;
 const MAX_OUTPUT: usize = 2 * 1024 * 1024;
+const MAX_FAILURE_TEXT: usize = 256 * 1024;
 const PREVIEW_CHARS: usize = 256;
 const STATUSES: [&str; 6] = ["running", "stopping", "completed", "failed", "cancelled", "interrupted"];
 const UNAVAILABLE: &str = "Command capture is not active for this session. Restart it to enable capture; it also needs the installed OMP SDK (set OMP_SDK_DIR if it is not found)";
@@ -64,6 +65,8 @@ pub struct CommandSummary {
     pub tab: Option<u32>,
     #[serde(default)]
     pub historical: bool,
+    #[serde(default)]
+    pub has_output: bool,
 }
 
 impl CommandSummary {
@@ -190,6 +193,23 @@ impl UserShell {
 struct Imported {
     stamp: (u64, Option<std::time::SystemTime>),
     rows: Arc<Vec<CommandSummary>>,
+}
+
+struct Journaled {
+    summary: CommandSummary,
+    script: String,
+    output: Option<String>,
+}
+
+fn tail(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
 }
 
 pub struct TerminalService {
@@ -548,37 +568,51 @@ impl TerminalService {
             let path = source.session_path.as_ref().ok_or("This conversation has no saved journal")?;
             return self.imported_script(path, session_id, hash);
         }
-        self.read_script_at(id, session_id, execution_id)
+        self.read_ledger_file(id, session_id, execution_id, "script.txt", "Script", MAX_SCRIPT)
     }
 
-    fn read_script_at(&self, id: &str, session_id: &str, execution_id: &str) -> Result<String> {
+    /// Output saved for a failed command; commands that did not fail keep none.
+    pub fn read_output(&self, id: &str, session_id: &str, execution_id: &str) -> Result<String> {
+        if let Some(hash) = execution_id.strip_prefix("import-") {
+            if !is_execution_id(execution_id) {
+                return Err("invalid execution id".into());
+            }
+            let source = self.source(id)?;
+            let path = source.session_path.as_ref().ok_or("This conversation has no saved journal")?;
+            return self.imported_output(path, session_id, hash);
+        }
+        self.read_ledger_file(id, session_id, execution_id, "output.txt", "Output", MAX_OUTPUT as u64)
+    }
+
+    fn read_ledger_file(&self, id: &str, session_id: &str, execution_id: &str, file: &str, what: &str, limit: u64) -> Result<String> {
         if !is_execution_id(execution_id) {
             return Err("invalid execution id".into());
         }
         let directory = self.instance_dir(id).join(digest(session_id)).join(execution_id);
-        let script = directory.join("script.txt");
+        let path = directory.join(file);
         // The ledger is app-owned; refuse anything that was redirected elsewhere.
-        for part in [&self.root, &self.instance_dir(id), &self.instance_dir(id).join(digest(session_id)), &directory, &script] {
-            let info = fs::symlink_metadata(part).map_err(|e| format!("Script unavailable: {e}"))?;
+        for part in [&self.root, &self.instance_dir(id), &self.instance_dir(id).join(digest(session_id)), &directory, &path] {
+            let info = fs::symlink_metadata(part).map_err(|e| format!("{what} unavailable: {e}"))?;
             if info.file_type().is_symlink() {
-                return Err("Script unavailable: ledger entry was redirected".into());
+                return Err(format!("{what} unavailable: ledger entry was redirected"));
             }
         }
-        let length = fs::metadata(&script).map_err(|e| e.to_string())?.len();
-        if length > MAX_SCRIPT {
-            return Err("Script exceeds the 64 MiB transport limit".into());
+        let length = fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        if length > limit {
+            return Err(format!("{what} exceeds the {} MiB transport limit", limit / (1024 * 1024)));
         }
-        let bytes = fs::read(&script).map_err(|e| format!("Script unavailable: {e}"))?;
+        let bytes = fs::read(&path).map_err(|e| format!("{what} unavailable: {e}"))?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     // ---- read-only journal import ----
 
-    fn journal(path: &Path, session_id: &str) -> Result<Vec<(CommandSummary, String)>> {
+    fn journal(path: &Path, session_id: &str) -> Result<Vec<Journaled>> {
         let file = fs::File::open(path).map_err(|e| format!("Conversation journal unavailable: {e}"))?;
         let default_cwd = crate::session::header(path).and_then(|(h, _)| h["cwd"].as_str().map(String::from)).unwrap_or_default();
-        let mut calls: Vec<(CommandSummary, String)> = Vec::new();
-        let mut results: HashMap<String, (u64, bool, Option<i64>)> = HashMap::new();
+        let mut calls: Vec<Journaled> = Vec::new();
+        // Per tool call: when it ended, whether it failed, its exit code and (failed only) its result text.
+        let mut results: HashMap<String, (u64, bool, Option<i64>, Option<String>)> = HashMap::new();
         for line in BufReader::new(file).split(b'\n') {
             let line = line.map_err(|e| format!("Conversation journal unavailable: {e}"))?;
             let Ok(text) = std::str::from_utf8(&line) else { continue };
@@ -595,7 +629,10 @@ impl TerminalService {
             let stamp = message["timestamp"].as_u64().or_else(|| entry["timestamp"].as_str().and_then(iso_ms)).unwrap_or(0);
             if message["role"] == "toolResult" && ["bash", "eval"].contains(&message["toolName"].as_str().unwrap_or("")) {
                 if let Some(call_id) = message["toolCallId"].as_str() {
-                    results.insert(call_id.into(), (stamp, message["isError"].as_bool() == Some(true), message["details"]["exitCode"].as_i64()));
+                    let failed = message["isError"].as_bool() == Some(true);
+                    let text = message["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
+                    let output = (failed && !text.is_empty()).then(|| tail(text, MAX_FAILURE_TEXT));
+                    results.insert(call_id.into(), (stamp, failed, message["details"]["exitCode"].as_i64(), output));
                 }
             } else if message["role"] == "assistant" {
                 for block in message["content"].as_array().into_iter().flatten() {
@@ -623,8 +660,8 @@ impl TerminalService {
                         Some(cwd) if !cwd.is_empty() => Path::new(&default_cwd).join(cwd).to_string_lossy().into_owned(),
                         _ => default_cwd.clone(),
                     };
-                    calls.push((
-                        CommandSummary {
+                    calls.push(Journaled {
+                        summary: CommandSummary {
                             execution_id: format!("import-{}", digest(&format!("{session_id}:{call_id}"))),
                             session_id: session_id.into(),
                             source_session_id: session_id.into(),
@@ -640,17 +677,21 @@ impl TerminalService {
                             exit_code: None,
                             tab: None,
                             historical: true,
+                            has_output: false,
                         },
-                        script.into(),
-                    ));
+                        script: script.into(),
+                        output: None,
+                    });
                 }
             }
         }
-        for (summary, _) in &mut calls {
-            if let Some((ended, failed, code)) = results.get(&summary.tool_call_id) {
-                summary.ended_at = Some(*ended);
-                summary.status = if *failed { "failed" } else { "completed" }.into();
-                summary.exit_code = *code;
+        for call in &mut calls {
+            if let Some((ended, failed, code, output)) = results.remove(&call.summary.tool_call_id) {
+                call.summary.ended_at = Some(ended);
+                call.summary.status = if failed { "failed" } else { "completed" }.into();
+                call.summary.exit_code = code;
+                call.summary.has_output = output.is_some();
+                call.output = output;
             }
         }
         Ok(calls)
@@ -667,7 +708,7 @@ impl TerminalService {
         if let Some(cached) = self.imports.lock().get(path).filter(|c| c.stamp == stamp) {
             return Ok(cached.rows.clone());
         }
-        let rows = Arc::new(Self::journal(path, session_id)?.into_iter().map(|(summary, _)| summary).collect::<Vec<_>>());
+        let rows = Arc::new(Self::journal(path, session_id)?.into_iter().map(|call| call.summary).collect::<Vec<_>>());
         self.imports.lock().insert(path.into(), Imported { stamp, rows: rows.clone() });
         Ok(rows)
     }
@@ -676,9 +717,18 @@ impl TerminalService {
         let wanted = format!("import-{hash}");
         Self::journal(path, session_id)?
             .into_iter()
-            .find(|(summary, _)| summary.execution_id == wanted)
-            .map(|(_, script)| script)
+            .find(|call| call.summary.execution_id == wanted)
+            .map(|call| call.script)
             .ok_or_else(|| "Script not found in the conversation journal".into())
+    }
+
+    fn imported_output(&self, path: &Path, session_id: &str, hash: &str) -> Result<String> {
+        let wanted = format!("import-{hash}");
+        Self::journal(path, session_id)?
+            .into_iter()
+            .find(|call| call.summary.execution_id == wanted)
+            .and_then(|call| call.output)
+            .ok_or_else(|| "No output was recorded for this command".into())
     }
 
     // ---- user shell (Tab 0) ----
@@ -828,6 +878,7 @@ mod tests {
             exit_code: None,
             tab: None,
             historical: false,
+            has_output: false,
         }
     }
     fn write_row(service: &TerminalService, instance: &str, session: &str, row: &CommandSummary, script: &str) {
@@ -922,7 +973,7 @@ mod tests {
                 {"type":"toolCall","id":"call-3","name":"bash","arguments":{"command":"never finished"}},
                 {"type":"toolCall","id":"call-4","name":"read","arguments":{"path":"x"}}]}}),
             json!({"type":"message","message":{"role":"toolResult","toolCallId":"call-1","toolName":"bash","isError":false,"timestamp":1791744055000u64,"details":{}}}),
-            json!({"type":"message","message":{"role":"toolResult","toolCallId":"call-2","toolName":"eval","isError":true,"timestamp":1791744056000u64}}),
+            json!({"type":"message","message":{"role":"toolResult","toolCallId":"call-2","toolName":"eval","isError":true,"timestamp":1791744056000u64,"content":[{"type":"text","text":"Traceback (most recent call last):\n  File \"x\", line 1\nZeroDivisionError"}]}}),
         ];
         fs::write(&journal, lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
         let rows = service.imported(&journal, "native").unwrap();
@@ -938,6 +989,10 @@ mod tests {
         assert!(unfinished.cwd.replace('\\', "/").ends_with("C:/project") || unfinished.cwd == "C:/project");
         let full = service.imported_script(&journal, "native", first.execution_id.strip_prefix("import-").unwrap()).unwrap();
         assert_eq!(full, script, "the full original code is recoverable");
+        let hash = |row: &CommandSummary| row.execution_id.strip_prefix("import-").unwrap().to_string();
+        assert!(python.has_output && !first.has_output && !unfinished.has_output);
+        assert_eq!(service.imported_output(&journal, "native", &hash(python)).unwrap(), "Traceback (most recent call last):\n  File \"x\", line 1\nZeroDivisionError");
+        assert!(service.imported_output(&journal, "native", &hash(first)).is_err(), "only failed commands carry output");
         // A row captured live for the same tool call suppresses the imported twin.
         let mut captured = summary(&exec(9), "native", 1791744053135, Some(1791744055000), "completed");
         captured.tool_call_id = "call-1".into();
@@ -974,9 +1029,13 @@ mod tests {
         write_row(&service, "a", "s", &row, &long);
         let directory = service.instance_dir("a").join(digest("s")).join(&row.execution_id);
         assert_eq!(fs::read_to_string(directory.join("script.txt")).unwrap(), long, "ledger keeps the untruncated script");
-        assert!(service.read_script_at("a", "../escape", &row.execution_id).is_err());
-        assert!(service.read_script_at("a", "s", "..").is_err());
-        assert_eq!(service.read_script_at("a", "s", &row.execution_id).unwrap(), long);
+        assert!(service.read_ledger_file("a", "../escape", &row.execution_id, "script.txt", "Script", MAX_SCRIPT).is_err());
+        assert!(service.read_ledger_file("a", "s", "..", "script.txt", "Script", MAX_SCRIPT).is_err());
+        assert_eq!(service.read_script("a", "s", &row.execution_id).unwrap(), long);
+        assert!(service.read_output("a", "s", &row.execution_id).is_err(), "no output is saved unless the command failed");
+        fs::write(directory.join("output.txt"), "boom\n  at x").unwrap();
+        assert_eq!(service.read_output("a", "s", &row.execution_id).unwrap(), "boom\n  at x");
+        assert!(service.read_output("a", "s", "..").is_err());
         fs::remove_dir_all(folder).unwrap();
     }
 

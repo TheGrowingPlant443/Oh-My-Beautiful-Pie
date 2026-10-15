@@ -1,7 +1,7 @@
 import net from 'node:net';
 import { existsSync } from 'node:fs';
 import { installTerminalBrowserBridge } from './omp-browser.mjs';
-import { installTerminalCommands } from './omp-terminal.mjs';
+import { installTerminalCommands, registerCommandHistoryTool } from './omp-terminal.mjs';
 
 const MAX_FRAME = 64 * 1024 * 1024;
 const ACTIONS = ['list','create','start','stop','restart','remove','send','interrupt','screen','transcript','plan','subagents','respond','keys','subscribe','request_human'];
@@ -167,6 +167,7 @@ export default function managerBridge(pi) {
       sdkDir: process.env.OMP_MANAGER_SDK_DIR,
     })
     : null;
+  if (terminal?.supported) registerCommandHistoryTool(pi, terminal);
   function resolveTerminalRequests() {
     for (const item of [...pending.values()]) if (['terminal','custom'].includes(item.request.method) && item.advisory) item.finish('native', undefined);
   }

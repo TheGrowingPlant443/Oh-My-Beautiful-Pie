@@ -74,3 +74,8 @@ export function ownerStatus(owner: TerminalOwner | undefined): string | null {
   if (owner.held) return "Agent interrupted — send a new prompt to resume commands";
   return owner.error;
 }
+
+// Saved failure output may contain colour escapes from the command; the History view shows plain text.
+export function stripAnsi(text: string): string {
+  return text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}

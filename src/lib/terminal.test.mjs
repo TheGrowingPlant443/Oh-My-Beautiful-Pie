@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { terminalTabs, nextSelection, outputWrite, shellKey, commandKey, HISTORY_KEY } from './terminal.ts';
+import { terminalTabs, nextSelection, outputWrite, stripAnsi, shellKey, commandKey, HISTORY_KEY } from './terminal.ts';
 
 function command(id, tab, startedAt, description = null) {
-  return { executionId: id, sessionId: 's', sourceSessionId: 's', toolCallId: id, agentId: 'main', kind: 'bash', description, preview: `run ${id}`, cwd: '.', startedAt, endedAt: null, status: 'running', exitCode: null, tab, historical: false };
+  return { executionId: id, sessionId: 's', sourceSessionId: 's', toolCallId: id, agentId: 'main', kind: 'bash', description, preview: `run ${id}`, cwd: '.', startedAt, endedAt: null, status: 'running', exitCode: null, tab, historical: false, hasOutput: false };
 }
 function owner(id, name, active, shell = false) {
   return { instanceId: id, name, generation: 1, sessionId: 's', supported: true, error: null, held: false, revision: 1, active, userShell: shell ? { shellId: 'x', cwd: '.', cols: 80, rows: 24, exited: false, exitCode: null } : null };
@@ -40,4 +40,9 @@ test('output tails append only when they extend the shown text', () => {
   assert.deepEqual(outputWrite('ab', frame('abcd')), { reset: false, data: 'cd' });
   assert.deepEqual(outputWrite('abcd', frame('cdef')), { reset: true, data: 'cdef' });
   assert.deepEqual(outputWrite('', frame('x')), { reset: false, data: 'x' });
+});
+
+test('saved failure output is shown without colour escape sequences', () => {
+  assert.equal(stripAnsi('\u001b[31mred\u001b[0m text'), 'red text');
+  assert.equal(stripAnsi('plain\n  at x (file.js:1:2)'), 'plain\n  at x (file.js:1:2)');
 });

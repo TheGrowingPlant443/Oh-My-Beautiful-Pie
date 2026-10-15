@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -14,6 +14,9 @@ const SERVICE_POLL_MS = 250;
 const KILL_DEADLINE_MS = 25000;
 const PREVIEW_CHARS = 256;
 const LIVE = new Set(['running', 'stopping']);
+const EXECUTION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const META_LIMIT = 1024 * 1024;
+const SHOW_LIMIT = 65536;
 
 export function sha256(value) { return createHash('sha256').update(String(value)).digest('hex'); }
 
@@ -49,6 +52,68 @@ function exitCodeOf(details) {
   return Number.isSafeInteger(code) ? code : null;
 }
 
+const exitNote = row => (row.exitCode !== null && row.exitCode !== undefined && row.exitCode !== 0 ? ` (exit ${row.exitCode})` : '');
+const isoOf = time => new Date(time).toISOString();
+
+export function formatHistory({ rows, total }) {
+  if (!rows.length) return 'No commands recorded in this conversation yet.';
+  const lines = rows.map(row => `- ${row.executionId} | ${isoOf(row.startedAt)} | ${row.status}${exitNote(row)} | ${row.kind} | ${row.description ?? ''} | ${Array.from(row.preview).slice(0, 120).join('')}${row.hasOutput ? ' | output saved' : ''}`);
+  return [`${total} command(s) in this conversation (newest first${total > rows.length ? `, showing ${rows.length}` : ''})`, ...lines].join('\n');
+}
+
+// part: 'script' | 'output' | 'both'. Script is cut to its first SHOW_LIMIT characters, output to its last.
+export function formatEntry({ summary: row, script, output }, part = 'both') {
+  const running = LIVE.has(row.status);
+  const lines = [
+    `Command ${row.executionId}`,
+    `Status: ${row.status}${exitNote(row)}`,
+    `Kind: ${row.kind}`,
+    `Started: ${isoOf(row.startedAt)}`,
+    `Ended: ${row.endedAt === null ? (running ? 'still running' : 'unknown') : isoOf(row.endedAt)}`,
+    `Directory: ${row.cwd}`,
+  ];
+  if (row.description) lines.push(`Description: ${row.description}`);
+  if (part !== 'output') {
+    lines.push('--- script ---');
+    lines.push(script === null ? '(script unavailable)' : script.length > SHOW_LIMIT ? `${script.slice(0, SHOW_LIMIT)}\n[script truncated; showing the first ${SHOW_LIMIT} characters]` : script);
+  }
+  if (part !== 'script') {
+    lines.push(running ? '--- output (live, still running) ---' : '--- output ---');
+    lines.push(output === null ? '(no output recorded: OMP Manager keeps the output of failed commands only)' : output.length > SHOW_LIMIT ? `[output truncated; showing the last ${SHOW_LIMIT} characters]\n${output.slice(-SHOW_LIMIT)}` : output);
+  }
+  return lines.join('\n');
+}
+
+// Read-only model tool over the observer's ledger. Its calls never pass through Bash/Eval, so they are not recorded.
+export function registerCommandHistoryTool(pi, observer) {
+  pi.registerTool({
+    name: 'command_history',
+    label: 'Command History',
+    loadMode: 'essential',
+    description: 'Your own Bash/Eval command history in this conversation, as recorded by OMP Manager. action "list" shows commands newest first (optional filters: status = running|stopping|completed|failed|cancelled|interrupted, query = text found in the description or code, limit 1-100, default 20) with their ids. action "show" with an executionId returns that command\'s exact script and, for failed commands, the saved output (completed commands do not keep output). Use it to recall what you already ran or why a command failed. Read-only; it never runs anything.',
+    parameters: pi.zod.object({
+      action: pi.zod.enum(['list', 'show']),
+      limit: pi.zod.number().int().min(1).max(100).optional(),
+      status: pi.zod.enum(['running', 'stopping', 'completed', 'failed', 'cancelled', 'interrupted']).optional(),
+      query: pi.zod.string().optional(),
+      executionId: pi.zod.string().optional(),
+      part: pi.zod.enum(['script', 'output', 'both']).optional(),
+    }),
+    approval: () => 'read',
+    async execute(_id, params, signal) {
+      if (signal?.aborted) throw signal.reason;
+      try {
+        const text = params.action === 'list'
+          ? formatHistory(observer.history({ limit: params.limit, status: params.status, query: params.query }))
+          : formatEntry(observer.entry(params.executionId ?? ''), params.part ?? 'both');
+        return { content: [{ type: 'text', text }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: String(error.message ?? error) }], isError: true };
+      }
+    },
+  });
+}
+
 // Observes real native Bash/Eval execution. It never replaces the tools or scrapes the agent screen: it wraps
 // the prototype execute methods inside OMP's approval layer, so approval, cancellation and results are native.
 export function installTerminalCommands(pi, options) {
@@ -62,7 +127,11 @@ export function installTerminalCommands(pi, options) {
   const interruptLabel = pi.pi?.USER_INTERRUPT_LABEL;
   const compatible = !!bashDescriptor && !!evalDescriptor && !!infoDescriptor
     && typeof AgentSession.prototype.abort === 'function' && typeof interruptLabel === 'string';
-  const noop = { supported: false, attachContext() {}, snapshot: () => ({ supported: false, error: TERMINAL_COMPATIBILITY_ERROR, held: false, active: [] }), resync() {}, kill: async () => { throw new Error(TERMINAL_COMPATIBILITY_ERROR); }, clearHoldForHuman() {}, dispose() {} };
+  const noop = {
+    supported: false, attachContext() {}, snapshot: () => ({ supported: false, error: TERMINAL_COMPATIBILITY_ERROR, held: false, active: [] }), resync() {},
+    kill: async () => { throw new Error(TERMINAL_COMPATIBILITY_ERROR); }, clearHoldForHuman() {}, dispose() {},
+    history() { throw new Error(TERMINAL_COMPATIBILITY_ERROR); }, entry() { throw new Error(TERMINAL_COMPATIBILITY_ERROR); },
+  };
   if (BashTool?.prototype?.[MARKER]) return { ...BashTool.prototype[MARKER], dispose() {} };
   if (!compatible) return noop;
 
@@ -98,23 +167,27 @@ export function installTerminalCommands(pi, options) {
       executionId: exec.id, sessionId: exec.rootSessionId, sourceSessionId: exec.sourceSessionId, toolCallId: exec.toolCallId,
       agentId: exec.agentId, kind: exec.kind, description: exec.description, preview: exec.preview, cwd: exec.cwd,
       startedAt: exec.startedAt, endedAt: exec.endedAt, status: exec.status, exitCode: exec.exitCode,
-      tab: LIVE.has(exec.status) ? exec.tab : null, historical: false,
+      tab: LIVE.has(exec.status) ? exec.tab : null, historical: false, hasOutput: exec.hasOutput,
     };
   }
 
   function ledgerDirectory(exec) { return path.join(historyRoot, sha256(exec.rootSessionId), exec.id); }
 
-  function writeMeta(exec) {
-    const target = path.join(exec.directory, 'meta.json');
+  function writeLedgerFile(exec, name, data) {
+    const target = path.join(exec.directory, name);
     const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(temporary, JSON.stringify(summary(exec)));
+      writeFileSync(temporary, data);
       renameSync(temporary, target);
+      return true;
     } catch (error) {
       rmSync(temporary, { force: true });
       ledgerError = `Terminal history could not be written: ${error.message ?? error}`;
+      return false;
     }
   }
+
+  function writeMeta(exec) { writeLedgerFile(exec, 'meta.json', JSON.stringify(summary(exec))); }
 
   function lowestFreeTab() {
     const used = new Set([...live.values()].map(exec => exec.tab));
@@ -218,6 +291,11 @@ export function installTerminalCommands(pi, options) {
     serviceTimer.unref?.();
   }
 
+  // Only failed commands keep their final output (already capped to the last OUTPUT_LIMIT bytes).
+  function persistOutput(exec) {
+    if (exec.text) exec.hasOutput = writeLedgerFile(exec, 'output.txt', exec.text);
+  }
+
   function settle(exec, status, exitCode) {
     if (exec.final) return;
     pollJobs();
@@ -229,6 +307,7 @@ export function installTerminalCommands(pi, options) {
     sendOutput(exec);
     exec.restoreOverlay?.();
     live.delete(exec.id);
+    if (status === 'failed') persistOutput(exec);
     writeMeta(exec);
     sendCommand(exec);
     exec.resolveSettled();
@@ -248,7 +327,7 @@ export function installTerminalCommands(pi, options) {
       id: randomUUID(), kind, toolCallId, script, description, preview: previewOf(script), cwd,
       rootSessionId: rootSessionId(), sourceSessionId: session.getSessionId?.() ?? rootSessionId(), agentId: session.getAgentId?.() ?? 'main',
       startedAt: Date.now(), endedAt: null, status: 'running', exitCode: null, tab: lowestFreeTab(),
-      text: '', rawText: '', truncated: false, revision: 0, dirty: false, final: false,
+      text: '', rawText: '', truncated: false, hasOutput: false, revision: 0, dirty: false, final: false,
       controller: new AbortController(), session, manager: undefined, job: undefined, jobId: undefined, service: undefined,
       killRequested: false, interactive: false, settled: settled.promise, resolveSettled: settled.resolve,
     };
@@ -362,6 +441,11 @@ export function installTerminalCommands(pi, options) {
         return result;
       }, error => {
         const cancelled = exec.killRequested || signal?.aborted || exec.controller.signal.aborted;
+        if (!cancelled) {
+          // A tool that throws returns no result text, so the thrown message is the only failure output.
+          const failure = String(error?.message ?? error);
+          setOutput(exec, exec.rawText && !exec.rawText.includes(failure) ? `${exec.rawText}\n${failure}` : failure);
+        }
         settle(exec, cancelled ? 'cancelled' : 'failed', null);
         throw error;
       });
@@ -434,13 +518,63 @@ export function installTerminalCommands(pi, options) {
     for (const exec of live.values()) { sendCommand(exec); exec.dirty = true; sendOutput(exec); }
   }
 
+  function sessionLedger() {
+    const root = rootSessionId();
+    if (!root) throw new Error('No OMP session is active yet');
+    return path.join(historyRoot, sha256(root));
+  }
+
+  // Live rows come from memory; stored rows from meta.json. A stored row that never ended was cut off by a restart.
+  function storedRow(directory, executionId) {
+    const liveExec = live.get(executionId);
+    if (liveExec) return summary(liveExec);
+    try {
+      const file = path.join(directory, executionId, 'meta.json');
+      if (statSync(file).size > META_LIMIT) return null;
+      const row = JSON.parse(readFileSync(file, 'utf8'));
+      if (row?.executionId !== executionId) return null;
+      return { ...row, hasOutput: row.hasOutput === true, status: row.endedAt === null || row.endedAt === undefined ? 'interrupted' : row.status };
+    } catch { return null; }
+  }
+
+  function history({ limit = 20, status, query } = {}) {
+    const directory = sessionLedger();
+    let names;
+    try { names = readdirSync(directory); } catch { return { rows: [], total: 0 }; }
+    const needle = typeof query === 'string' ? query.trim().toLowerCase() : '';
+    const rows = [];
+    for (const name of names) {
+      if (!EXECUTION_ID.test(name)) continue;
+      const row = storedRow(directory, name);
+      if (!row || (status && row.status !== status)) continue;
+      if (needle && !`${row.description ?? ''}\n${row.preview ?? ''}`.toLowerCase().includes(needle)) continue;
+      rows.push(row);
+    }
+    rows.sort((a, b) => b.startedAt - a.startedAt || (a.executionId < b.executionId ? -1 : 1));
+    return { rows: rows.slice(0, Math.min(100, Math.max(1, Math.trunc(limit) || 20))), total: rows.length };
+  }
+
+  function entry(executionId) {
+    if (!EXECUTION_ID.test(executionId)) throw new Error('executionId must be an id returned by action "list"');
+    const directory = sessionLedger();
+    const row = storedRow(directory, executionId);
+    if (!row) throw new Error('No command with that id in this conversation');
+    const liveExec = live.get(executionId);
+    const read = file => { try { return readFileSync(path.join(directory, executionId, file), 'utf8'); } catch { return null; } };
+    return {
+      summary: row,
+      script: liveExec ? liveExec.script : read('script.txt'),
+      output: liveExec ? liveExec.text : row.hasOutput ? read('output.txt') : null,
+    };
+  }
+
   const observer = {
     supported: true,
     attachContext(ctx) {
       context = ctx;
       try { pi.getAllTools?.(); } catch {}
     },
-    snapshot, resync, kill,
+    snapshot, resync, kill, history, entry,
     clearHoldForHuman() { setHeld(false); },
     dispose() {
       if (disposed) return;

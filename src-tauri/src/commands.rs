@@ -201,6 +201,12 @@ pub async fn read_terminal_script(window: tauri::WebviewWindow, state: State<'_,
     blocking(move || terminals.read_script(&id, &session_id, &execution_id)).await
 }
 #[tauri::command]
+pub async fn read_terminal_output(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, session_id: String, execution_id: String) -> Result<String> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.read_output(&id, &session_id, &execution_id)).await
+}
+#[tauri::command]
 pub fn attach_command_output(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, generation: u64, session_id: String, execution_id: String, on_data: Channel<crate::terminal::CommandOutput>) -> Result<()> {
     if window.label() != "main" { return Err("unauthorized window".into()); }
     state.terminals.attach_output(&id, generation, &session_id, &execution_id, on_data)
