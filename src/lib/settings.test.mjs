@@ -51,7 +51,7 @@ test('chosen and latest targets use instance identity and fall back only to Mana
 test('dashboard startup is intentional with or without Manager and preserves saved choices', () => {
   for (const autoStart of [true, false]) {
     const saved = { version: 1, startupTarget: 'dashboard', startupProjectId: 'deleted-project',
-      latestProjectId: 'deleted-latest', autoStart, showPreviousProjects: true, showManagerTile: false, previewSize: 1000, browserHeadless: true, browserEmbedded: false };
+      latestProjectId: 'deleted-latest', autoStart, showPreviousProjects: true, showManagerTile: false, previewSize: 1000, browserHeadless: true, browserEmbedded: false, terminalAutoOpen: true, terminalCreateUser: false };
     const settings = parseAppSettings(JSON.stringify(saved), null);
     assert.deepEqual(settings, saved);
     assert.deepEqual(parseAppSettings(JSON.stringify(settings), null), settings);
@@ -86,4 +86,16 @@ test('browser preferences validate independently and preserve startup choices', 
   const invalidEmbedded = parseAppSettings(JSON.stringify({ version: 1, browserHeadless: true, browserEmbedded: null }), null);
   assert.equal(invalidEmbedded.browserHeadless, true);
   assert.equal(invalidEmbedded.browserEmbedded, true);
+});
+
+test('terminal preferences validate independently and default to a quiet pane with a user shell', () => {
+  const defaults = parseAppSettings(null, null);
+  assert.equal(defaults.terminalAutoOpen, false);
+  assert.equal(defaults.terminalCreateUser, true);
+  const mixed = parseAppSettings(JSON.stringify({ version: 1, terminalAutoOpen: true, terminalCreateUser: 'no' }), null);
+  assert.equal(mixed.terminalAutoOpen, true);
+  assert.equal(mixed.terminalCreateUser, true);
+  const off = parseAppSettings(JSON.stringify({ version: 1, terminalAutoOpen: 1, terminalCreateUser: false }), null);
+  assert.equal(off.terminalAutoOpen, false);
+  assert.equal(off.terminalCreateUser, false);
 });

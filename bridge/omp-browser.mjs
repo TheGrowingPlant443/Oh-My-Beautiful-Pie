@@ -27,7 +27,7 @@ async function listTabs(ticket, context) {
 export function installTerminalBrowserBridge(pi, request) {
   const prototype = pi.pi?.EvalTool?.prototype;
   const original = prototype && Object.getOwnPropertyDescriptor(prototype, 'execute');
-  if (prototype?.[MARKER]) return;
+  if (prototype?.[MARKER]) return () => {};
   const definitions = new Set();
   const wrapped = new WeakMap();
   const tickets = new Map();
@@ -119,7 +119,7 @@ export function installTerminalBrowserBridge(pi, request) {
     pi.on('session_start', (_event,ctx) => { ctx.ui?.notify?.(COMPATIBILITY_ERROR,'error'); });
     pi.registerTool({name:'eval',label:'Eval',description:COMPATIBILITY_ERROR,parameters:pi.zod.object({language:pi.zod.enum(['py','js']),code:pi.zod.string()}).passthrough(),async execute(){throw new Error(COMPATIBILITY_ERROR);}});
   }
-  if (!original?.writable || typeof original.value !== 'function') { incompatible(); return; }
+  if (!original?.writable || typeof original.value !== 'function') { incompatible(); return () => {}; }
   const execute = function(...args) {
     const session = this.session;
     if (!session || typeof session.getEvalPreludes !== 'function') throw new Error(COMPATIBILITY_ERROR);
@@ -131,9 +131,9 @@ export function installTerminalBrowserBridge(pi, request) {
   try {
     Object.defineProperty(prototype,'execute',{...original,value:execute});
     Object.defineProperty(prototype,MARKER,{value:execute,configurable:true});
-  } catch { incompatible(); return; }
-  pi.on('session_shutdown', (_event,ctx) => {
-    if (ctx.agent?.kind !== 'main') return;
+  } catch { incompatible(); return () => {}; }
+  // The caller owns teardown so Browser and Terminal wrappers can be removed in reverse install order.
+  return () => {
     if (Object.getOwnPropertyDescriptor(prototype,'execute')?.value === execute) Object.defineProperty(prototype,'execute',original);
     if (prototype[MARKER] === execute) delete prototype[MARKER];
     for (const definition of definitions) {
@@ -141,5 +141,5 @@ export function installTerminalBrowserBridge(pi, request) {
       if (definition.invoke === patch.callback) { Object.defineProperty(definition,'invoke',patch.descriptor); definition.documentation=patch.documentation; }
     }
     definitions.clear();tickets.clear();urls.clear();
-  });
+  };
 }

@@ -8,6 +8,7 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 
 use crate::config::GlobalConfigStore;
 use crate::manager::ManagerHub;
+use crate::terminal::TerminalService;
 use crate::{pty, session};
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, Debug)]
@@ -270,12 +271,24 @@ struct Saved {
     instances: Vec<Definition>,
 }
 
+/// What the Terminal pane needs to know about one saved agent.
+#[derive(Clone)]
+pub struct TerminalSource {
+    pub id: String,
+    pub name: String,
+    pub project_path: String,
+    pub session_path: Option<PathBuf>,
+    pub session_id: Option<String>,
+    pub generation: u64,
+}
+
 pub struct Registry {
     records: Mutex<Vec<Record>>,
     pub home: PathBuf,
     file: PathBuf,
     hub: OnceLock<Arc<ManagerHub>>,
     browser: OnceLock<Arc<crate::browser::BrowserSupervisor>>,
+    terminals: OnceLock<Arc<TerminalService>>,
     lifecycle: parking_lot::Mutex<()>,
     plan_updates: parking_lot::Mutex<()>,
     pub global_config: GlobalConfigStore,
@@ -339,6 +352,7 @@ impl Registry {
             file,
             hub: OnceLock::new(),
             browser: OnceLock::new(),
+            terminals: OnceLock::new(),
             lifecycle: parking_lot::Mutex::new(()),
             plan_updates: parking_lot::Mutex::new(()),
         })
@@ -359,6 +373,25 @@ impl Registry {
     }
     pub fn browser_supervisor(&self) -> Option<&Arc<crate::browser::BrowserSupervisor>> {
         self.browser.get()
+    }
+    pub fn install_terminal_service(&self, terminals: Arc<TerminalService>) -> Result<(), String> {
+        self.terminals.set(terminals).map_err(|_| "terminal service already initialized".into())
+    }
+    /// Light per-instance facts for the Terminal pane; never starts or touches an agent.
+    pub fn terminal_sources(&self) -> Vec<TerminalSource> {
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|record| TerminalSource {
+                id: record.definition.id.clone(),
+                name: record.definition.input.name.clone(),
+                project_path: record.definition.input.project_path.clone(),
+                session_path: record.definition.session_path.clone(),
+                session_id: record.native_session_id.clone(),
+                generation: record.generation,
+            })
+            .collect()
     }
     fn save(&self, records: &[Record]) -> Result<(), String> {
         let saved = Saved {
@@ -793,6 +826,7 @@ impl Registry {
             hub.shutdown();
         }
         if let Some(browser) = self.browser.get() { browser.shutdown(); }
+        if let Some(terminals) = self.terminals.get() { terminals.shutdown(); }
     }
     pub fn remove(&self, id: &str, origin: Origin<'_>) -> Result<(), String> {
         let _lifecycle = self.lifecycle.lock();
@@ -846,6 +880,9 @@ impl Registry {
                 })
                 .collect::<Vec<_>>()
         };
+        if let Some(terminals) = self.terminals.get() {
+            terminals.close_instance(id);
+        }
         if let Some(hub) = self.hub.get() {
             for (child, lease) in released {
                 hub.ownership_changed(&child, &lease);

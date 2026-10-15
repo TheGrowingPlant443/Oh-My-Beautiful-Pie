@@ -25,7 +25,7 @@ Output: `src-tauri/target/release/omp-manager.exe`. It embeds the UI; no Vite se
 ## Use
 
 - The app opens **The Manager** and starts its saved terminal by default. If it is not configured, its creation dialog opens instead; no working directory is invented.
-- The global toolbar reads Settings, Previews, Import config, Agent setup, **The Manager**, **Previous projects**, **New instance**. **Browser** and **Code diff** belong to a full-screen session's own toolbar.
+- The global toolbar reads Settings, Previews, Import config, Agent setup, **Terminals** (Dashboard only), **The Manager**, **Previous projects**, **New instance**. **Browser**, **Terminal** and **Code diff** belong to a full-screen session's own toolbar.
 - **Previous projects** opens a searchable dropdown of saved instances. Search by name, directory, or profile. Selecting one resumes/starts its saved OMP session and opens its full-screen terminal; an already-running session is only opened, never restarted. Multiple instances in the same directory remain separate entries.
 - **New instance**: select/type a working directory, optional OMP profile, ordered YAML config overlays, and optional model/role override. Empty profile selects OMP's default profile; empty model leaves model resolution to OMP.
 - **Reconnect** lists native saved sessions for the chosen project/profile. It does not attach to an externally running terminal process; the session must not already be open elsewhere.
@@ -88,6 +88,13 @@ Example: “Use manage_sessions to create a worker named API in C:/projects/api,
 - With one commit selected, **Revert** adds a commit undoing it and **Cherry-pick** applies it to the current branch. Both ask first; merge commits use the first parent. Start with a clean index/worktree: existing changes or a Git operation in progress are refused. Conflicts automatically abort this app's operation and show Git's error; an abort failure is reported rather than falsely claiming recovery.
 - **Reset HEAD~1** asks before a mixed reset: HEAD moves to its first parent and the undone changes stay unstaged (added files become untracked). It does not perform a hard reset. **New branch** creates and switches to a named branch at the single selected commit, otherwise at HEAD.
 
+### Terminal pane and Terminals page
+
+- **Terminal** (full-session toolbar, next to **Browser**) toggles a pane on the right of the agent's terminal. It shares that slot with the browser: switching hides the other (a hidden browser's Chrome keeps running, the terminal's shell and AI commands keep running). Tabs: **0 · Terminal** is your own shell (closable; **Settings → Create a user terminal (Tab 0) when opening Terminal**, on by default, only applies when you click the Terminal button, never to an existing shell); **1 · History** lists every script the AI ran (timestamp, the AI's own description when it gave one, status, one-line preview; click a row for the exact full Bash/JavaScript/Python source) with **Load older** for long histories; **2, 3, …** are live, read-only tabs for the AI's currently running commands (concurrent commands, backgrounded jobs and named Bash services included). A tab closes when its process actually ends; its record stays in History. Output shows the last 256 KiB.
+- Every AI tab has one **Kill process** button. It stops that command, interrupts the agent like pressing Esc, and holds new Bash/Eval scripts until you send a new prompt in the agent's terminal (a prompt from The Manager or an extension does not release the hold; the pane says *Agent interrupted — send a new prompt to resume commands*). It is a human-only control: The Manager and models cannot call it.
+- **Follow** (off by default, per view) switches to a command's tab when the AI starts one. **Settings → Automatically show terminal view for AI commands** (off by default) opens the pane of the session on screen when a command starts; it never changes session or page and never creates a user shell.
+- On the Dashboard, **Terminals** (immediately left of **The Manager**) opens one page for every agent (including The Manager, plan agents and stopped agents): merged history labelled by agent, every live AI command and every existing user shell, and the same single **Kill process** button, which interrupts only the command's own agent. **Back to Dashboard** leaves it; nothing is stopped.
+- History and live capture are recorded by the bundled bridge in each managed OMP process by wrapping OMP's real Bash/Eval tools (inside its approval layer; nothing is replaced) and stored under `<app-config>/terminal-sessions/<sha256(instance id)>/<sha256(session id)>/<execution id>/{script.txt,meta.json}`; output is not persisted. Older conversations are imported read-only from their native journal (recorded call, description, timestamps and outcome only; calls nested inside an eval script that the journal never recorded cannot be reconstructed). Sessions started before this feature must be restarted to capture; if the installed OMP SDK cannot be found or is incompatible the pane says so instead of showing fake output. Your shell is the OS default shell (`%ComSpec%` on Windows) started in the project directory, owned by a Windows job object so closing the tab (or the app) ends its whole process tree.
 
 ## Data ownership
 
@@ -114,7 +121,7 @@ Tile **working/idle** is an output-activity indicator, not an authoritative agen
 
 ```sh
 cargo test --manifest-path src-tauri/Cargo.toml --locked
-node --test src/lib/settings.test.mjs bridge/omp-manager.test.mjs bridge/omp-config.test.mjs bridge/omp-browser.test.mjs bridge/omp-browser-service.test.mjs
+node --test src/lib/*.test.mjs bridge/omp-manager.test.mjs bridge/omp-config.test.mjs bridge/omp-browser.test.mjs bridge/omp-browser-service.test.mjs bridge/omp-terminal.test.mjs
 npm run check
 npm run build
 ```

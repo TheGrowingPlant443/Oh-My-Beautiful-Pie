@@ -38,7 +38,7 @@ export default async function controlPlaneScenario(pi) {
   await control('configure',{headless:true,embedded:false});
   await control('register',{instanceId:'terminal',generation:1});
   let controllerOnline=true;
-  installTerminalBrowserBridge(pi,async(action,payload)=>{
+  const disposeBrowser=installTerminalBrowserBridge(pi,async(action,payload)=>{
     if(action==='browser_tabs')return controllerOnline?control('listTabs',{instanceId:'terminal',generation:1}):[];
     if(!controllerOnline)throw new Error('Controller replies are unavailable after browser allocation');
     assert.equal(action,'browser_prepare');
@@ -46,6 +46,7 @@ export default async function controlPlaneScenario(pi) {
     controllerOnline=false;
     return ticket;
   });
+  pi.on('session_shutdown',(_event,ctx)=>{if(ctx.agent?.kind==='main')disposeBrowser();});
   pi.on('session_start',()=>{void run();});
   async function run(){
     let exitCode=0;

@@ -1,8 +1,9 @@
 import { writable, derived, get } from "svelte/store";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { api, type Instance, type PtyChunk, type GlobalConfigInfo, type BrowserInfo } from "./api";
+import { api, type Instance, type PtyChunk, type GlobalConfigInfo, type BrowserInfo, type TerminalOwner } from "./api";
 import { parseAppSettings, type AppSettings } from "./settings";
+import { defaultTerminalUi, shellKey, type TerminalUi } from "./terminal";
 
 // Every row the backend reports, including plan agents (looked up by id for the plan view).
 export const allInstances = writable<Instance[]>([]);
@@ -12,6 +13,24 @@ export const instancesById = derived(allInstances, list => new Map(list.map(i =>
 export const managerInstance = derived(instances, list => list.find(instance => instance.kind === "manager"));
 export const globalConfig = writable<GlobalConfigInfo>({ path: null, error: null });
 export const browserStatuses = writable<ReadonlyMap<string, BrowserInfo>>(new Map());
+// Live AI commands, held state and the user shell per agent, as reported by the backend.
+export const terminalOwners = writable<ReadonlyMap<string, TerminalOwner>>(new Map());
+// Selected pane/tab and Follow per agent (or the Dashboard page); kept so hiding the pane never resets them.
+export const terminalUi = writable<ReadonlyMap<string, TerminalUi>>(new Map());
+export function updateTerminalUi(key: string, patch: Partial<TerminalUi>): void {
+  terminalUi.update(map => new Map(map).set(key, { ...(map.get(key) ?? defaultTerminalUi()), ...patch }));
+}
+// Starts (or returns) the user's shell. The reply updates the owner at once, so selecting its tab cannot race the event.
+export async function openUserTerminal(id: string, select: boolean): Promise<void> {
+  try {
+    const shell = await api.openUserTerminal(id);
+    terminalOwners.update(map => {
+      const owner = map.get(id);
+      return owner ? new Map(map).set(id, { ...owner, userShell: shell }) : map;
+    });
+    if (select) updateTerminalUi(id, { tab: shellKey(id) });
+  } catch (error) { reportError("Open user terminal", error); }
+}
 export async function refreshGlobalConfig(): Promise<void> {
   try { globalConfig.set(await api.getGlobalConfig()); }
   catch (error) { globalConfig.set({ path: null, error: errorText(error) }); }
@@ -102,6 +121,9 @@ function applySnapshot(list: Instance[]): void {
     }
   }
   for (const old of previous) if (!list.some(i => i.id === old.id)) ptyBus.dispose(old.id);
+  const known = new Set(list.map(row => row.id));
+  const owners = get(terminalOwners);
+  if ([...owners.keys()].some(id => !known.has(id))) terminalOwners.set(new Map([...owners].filter(([id]) => known.has(id))));
   allInstances.set(list);
 }
 export async function refreshInstances(): Promise<void> {
@@ -111,18 +133,30 @@ export async function refreshInstances(): Promise<void> {
 export async function connectInstances(): Promise<() => void> {
   let disposed = false;
   let browserEventSeen = false;
+  const terminalEventsSeen = new Set<string>();
   const unlisten = await listen<Instance[]>("instances", event => { if (!disposed) applySnapshot(event.payload); });
   let unlistenBrowsers: (() => void) | undefined;
-  function cleanup(): void { disposed = true; unlisten(); unlistenBrowsers?.(); }
+  let unlistenTerminals: (() => void) | undefined;
+  function cleanup(): void { disposed = true; unlisten(); unlistenBrowsers?.(); unlistenTerminals?.(); }
   try {
     unlistenBrowsers = await listen<BrowserInfo[]>("browser_state", event => {
       browserEventSeen = true;
       if (!disposed) browserStatuses.set(new Map(event.payload.map(info => [info.instanceId, info])));
     });
-    const [list, browsers] = await Promise.all([api.listInstances(), api.listBrowsers()]);
+    // An event is newer than the initial listing that may be requested around it.
+    unlistenTerminals = await listen<TerminalOwner>("terminal_state", event => {
+      terminalEventsSeen.add(event.payload.instanceId);
+      if (!disposed) terminalOwners.update(map => new Map(map).set(event.payload.instanceId, event.payload));
+    });
+    const [list, browsers, terminals] = await Promise.all([api.listInstances(), api.listBrowsers(), api.listAllTerminals()]);
     if (!disposed) {
       applySnapshot(list);
       if (!browserEventSeen) browserStatuses.set(new Map(browsers.map(info => [info.instanceId, info])));
+      terminalOwners.update(map => {
+        const next = new Map(map);
+        for (const owner of terminals) if (!terminalEventsSeen.has(owner.instanceId)) next.set(owner.instanceId, owner);
+        return next;
+      });
     }
     await refreshGlobalConfig();
     return cleanup;

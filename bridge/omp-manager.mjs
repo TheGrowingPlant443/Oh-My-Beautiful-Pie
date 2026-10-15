@@ -1,6 +1,7 @@
 import net from 'node:net';
 import { existsSync } from 'node:fs';
 import { installTerminalBrowserBridge } from './omp-browser.mjs';
+import { installTerminalCommands } from './omp-terminal.mjs';
 
 const MAX_FRAME = 64 * 1024 * 1024;
 const ACTIONS = ['list','create','start','stop','restart','remove','send','interrupt','screen','transcript','plan','subagents','respond','keys','subscribe','request_human'];
@@ -38,7 +39,9 @@ export async function confirmedPlanHandoff(request, ctx, payload, signal) {
 
 // App-originated control (source 'human', set only by the hub from Origin::Human) may abort or prompt any session,
 // including The Manager and unowned workers. Manager-originated control still needs an owned instance.
+// Killing a terminal command also interrupts the agent, so it is never available to a model or a Manager.
 export function controlAllowed({ role, owner, action, source }) {
+  if (action === 'terminal_kill') return source === 'human';
   if (source === 'human') return action === 'prompt' || action === 'abort';
   return role === 'instance' && !!owner;
 }
@@ -129,7 +132,7 @@ export default function managerBridge(pi) {
     const sessionFile = context?.sessionManager.getSessionFile();
     return { sessionId: context?.sessionManager.getSessionId(), sessionFile: sessionFile ?? null,
       cwd: context?.sessionManager.getCwd(), materialized: !!sessionFile && existsSync(sessionFile),
-      supported: true, pendingDecisions: [...pending.values()].map(item => item.request) };
+      supported: true, terminal: terminal?.snapshot() ?? null, pendingDecisions: [...pending.values()].map(item => item.request) };
   }
   function write(frame) {
     if (!socket || socket.destroyed || !authenticated) throw new Error('manager bridge disconnected');
@@ -154,7 +157,16 @@ export default function managerBridge(pi) {
       catch (error) { calls.delete(id); context.clearTimer(timeout); reject(error); }
     });
   }
-  if (process.env.OMP_MANAGER_BROWSER_REQUIRED === '1') installTerminalBrowserBridge(pi, request);
+  const disposeBrowser = process.env.OMP_MANAGER_BROWSER_REQUIRED === '1' ? installTerminalBrowserBridge(pi, request) : () => {};
+  const terminalDir = process.env.OMP_MANAGER_TERMINAL_DIR;
+  const terminal = terminalDir && process.env.OMP_MANAGER_SDK_DIR
+    ? installTerminalCommands(pi, {
+      emit,
+      canSend: () => !!socket && !socket.destroyed && authenticated && socket.writableLength < 1024 * 1024,
+      historyRoot: terminalDir,
+      sdkDir: process.env.OMP_MANAGER_SDK_DIR,
+    })
+    : null;
   function resolveTerminalRequests() {
     for (const item of [...pending.values()]) if (['terminal','custom'].includes(item.request.method) && item.advisory) item.finish('native', undefined);
   }
@@ -210,6 +222,7 @@ export default function managerBridge(pi) {
     context = ctx;
     if (ctx.mode !== 'tui') throw new Error('OMP compatibility: desktop bridge requires native TUI');
     installUi(ctx.ui);
+    terminal?.attachContext(ctx);
     return true;
   }
   async function control(frame) {
@@ -226,12 +239,18 @@ export default function managerBridge(pi) {
     if (!controlAllowed({ role, owner, action: frame.action, source: payload.source })) throw new Error('not_controlled');
     if (frame.action === 'prompt') {
       if (typeof payload.message !== 'string') throw new Error('message is required');
+      // A prompt typed by the human is the only app-originated input that ends a Kill process hold.
+      if (payload.source === 'human' && payload.message.trim()) terminal?.clearHoldForHuman();
       const options = { attribution: 'agent' };
       if (!context.isIdle()) options.deliverAs = payload.delivery === 'steer' ? 'steer' : 'followUp';
       pi.sendUserMessage(payload.message, options);
       return { accepted: true };
     }
     if (frame.action === 'abort') { await context.abort(); return { interrupted: true }; }
+    if (frame.action === 'terminal_kill') {
+      if (!terminal || typeof payload.executionId !== 'string') throw new Error('terminal integration unavailable');
+      return terminal.kill(payload.executionId);
+    }
     if (frame.action === 'reply_ui') {
       const item = pending.get(payload.requestId);
       if (!item) throw new Error('decision_already_resolved');
@@ -248,6 +267,7 @@ export default function managerBridge(pi) {
         authenticated = true;
         emit('ready', identity());
         for (const event of offlineEvents.splice(0)) write(event);
+        terminal?.resync();
         return;
       }
       const call = calls.get(frame.id);
@@ -382,6 +402,9 @@ export default function managerBridge(pi) {
     closing = true;
     if (timer) ctx.clearTimer(timer);
     resolveTerminalRequests();
+    // Reverse install order: the command wrapper sits on top of the browser's Eval wrapper.
+    terminal?.dispose();
+    disposeBrowser();
     for (const patch of patches) {
       for (const [method, descriptor] of patch.original) if (Object.getOwnPropertyDescriptor(patch.ui, method)?.value === patch.wrappers.get(method)) Object.defineProperty(patch.ui, method, descriptor);
       delete patch.ui[PATCH];

@@ -11,6 +11,7 @@ use crate::instance::{
 };
 use crate::session;
 use crate::plan;
+use crate::terminal::TerminalService;
 use serde_json::{json, Value};
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -22,6 +23,8 @@ pub struct BridgeLaunch {
     pub token: String,
     pub extension_path: PathBuf,
     pub manager_setup_dir: PathBuf,
+    pub terminal_dir: PathBuf,
+    pub sdk_dir: Option<PathBuf>,
     pub instance_id: String,
     pub generation: u64,
     pub role: InstanceKind,
@@ -80,6 +83,7 @@ pub struct ManagerHub {
     extension_path: PathBuf,
     registry: OnceLock<Weak<Registry>>,
     browser: OnceLock<Arc<crate::browser::BrowserSupervisor>>,
+    terminals: OnceLock<Arc<TerminalService>>,
     state: Mutex<HubState>,
     closing: AtomicBool,
 }
@@ -130,6 +134,7 @@ impl ManagerHub {
             extension_path,
             registry: OnceLock::new(),
             browser: OnceLock::new(),
+            terminals: OnceLock::new(),
             state: Mutex::new(HubState::default()),
             closing: AtomicBool::new(false),
         });
@@ -162,6 +167,18 @@ impl ManagerHub {
     pub fn install_browser_supervisor(&self, browser: Arc<crate::browser::BrowserSupervisor>) -> Result<()> {
         self.browser.set(browser).map_err(|_| "browser supervisor already installed".into())
     }
+    pub fn install_terminal_service(&self, terminals: Arc<TerminalService>) -> Result<()> {
+        self.terminals.set(terminals).map_err(|_| "terminal service already installed".into())
+    }
+    /// Human-only: kills one command, interrupts its agent like Esc and holds new scripts until a new prompt.
+    pub fn kill_terminal_command(&self, id: &str, generation: u64, session_id: &str, execution_id: &str) -> Result<()> {
+        let lease = self.registry()?.lease(id, Origin::Human, false)?;
+        if lease.generation != generation || lease.session_id.as_deref() != Some(session_id) {
+            return Err("stale_generation".into());
+        }
+        self.control(id, &lease, "terminal_kill", json!({"executionId": execution_id}), Origin::Human)?;
+        Ok(())
+    }
     fn registry(&self) -> Result<Arc<Registry>> {
         self.registry
             .get()
@@ -190,6 +207,7 @@ impl ManagerHub {
             .subscriptions
             .entry(definition.id.clone())
             .or_insert(true);
+        let home = self.registry()?.home.clone();
         Ok(BridgeLaunch {
             endpoint: self.endpoint.clone(),
             token,
@@ -199,6 +217,12 @@ impl ManagerHub {
                 .parent()
                 .ok_or("invalid bridge directory")?
                 .join("manager-setup"),
+            terminal_dir: self
+                .terminals
+                .get()
+                .ok_or("terminal service not initialized")?
+                .instance_dir(&definition.id),
+            sdk_dir: crate::config::sdk_dir(&home).ok(),
             instance_id: definition.id.clone(),
             generation,
             role: definition.kind,
@@ -241,6 +265,9 @@ impl ManagerHub {
         }
         if let Some(browser) = self.browser.get() {
             if let Err(error) = browser.revoke(id, generation) { eprintln!("revoke terminal browser: {error}"); }
+        }
+        if let Some(terminals) = self.terminals.get() {
+            terminals.invalidate(id, generation);
         }
     }
     pub fn shutdown(&self) {
@@ -641,6 +668,11 @@ impl ManagerHub {
         match kind {
             "ready" | "session_changed" => {
                 registry.apply_identity(&actor.id, actor.generation, payload)?;
+                if let Some(terminals) = self.terminals.get() {
+                    if let Err(error) = terminals.apply_snapshot(&actor.id, actor.generation, payload) {
+                        eprintln!("terminal snapshot: {error}");
+                    }
+                }
                 if let Ok(mut state) = self.state.lock() {
                     if let Some(c) = state.clients.get_mut(&actor.id) {
                         c.ready = payload["supported"] != false;
@@ -690,6 +722,14 @@ impl ManagerHub {
                 self.update_decision_count(&actor.id);
             }
             "agent_started" => {}
+            "terminal_command" | "terminal_output" | "terminal_hold" => {
+                let terminals = self.terminals.get().ok_or("terminal service unavailable")?;
+                match kind {
+                    "terminal_command" => terminals.apply_command(&actor.id, actor.generation, payload)?,
+                    "terminal_output" => terminals.apply_output(&actor.id, actor.generation, payload)?,
+                    _ => terminals.apply_hold(&actor.id, actor.generation, payload)?,
+                }
+            }
             "completed" | "turn_error" | "turn_aborted" => {
                 if actor.role == InstanceKind::Instance {
                     self.owner_notification(&actor.id, actor.generation, kind, payload.clone());
@@ -1178,6 +1218,7 @@ mod tests {
             .unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
         let definition = Definition {
             id: manager.id.clone(),
             input: CreateInput::default(),
@@ -1243,6 +1284,7 @@ mod tests {
         let worker = registry.create_owned(&manager.id, config).unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
         registry.install_manager_hub(hub.clone()).unwrap();
         let manager_actor = Actor {
             id: manager.id.clone(),
@@ -1357,6 +1399,7 @@ mod tests {
             .unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
         registry.install_manager_hub(hub.clone()).unwrap();
         let actor = Actor {
             id: manager.id.clone(),
@@ -1381,6 +1424,7 @@ mod tests {
         let worker = registry.create(CreateInput { project_path:folder.to_string_lossy().into(), ..Default::default() }).unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
         let browser = crate::browser::BrowserSupervisor::new(folder.clone(), folder.clone());
         hub.install_browser_supervisor(browser.clone()).unwrap();
         let launch = hub.launch(&Definition {id:worker.id.clone(),input:CreateInput::default(),session_path:None,kind:InstanceKind::Instance,manager_id:None,plan_target:None},0).unwrap();
@@ -1406,6 +1450,7 @@ mod tests {
         let worker = registry.create(CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() }).unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
         let launch = hub.launch(&Definition {id:worker.id.clone(),input:CreateInput::default(),session_path:None,kind:InstanceKind::Instance,manager_id:None,plan_target:None},0).unwrap();
         let mut socket = TcpStream::connect(&hub.endpoint).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1433,6 +1478,7 @@ mod tests {
         let planner = registry.create_planner(&target.id).unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
         registry.install_manager_hub(hub.clone()).unwrap();
         let definition = |id: &str, plan_target: Option<String>| Definition { id: id.into(), input: CreateInput::default(), session_path: None, kind: InstanceKind::Instance, manager_id: None, plan_target };
         let target_launch = hub.launch(&definition(&target.id, None), 0).unwrap();

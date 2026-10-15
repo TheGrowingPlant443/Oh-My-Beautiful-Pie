@@ -15,6 +15,7 @@
   import AgentSetupPage from "./lib/components/AgentSetupPage.svelte";
   import SettingsDialog from "./lib/components/SettingsDialog.svelte";
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
+  import TerminalsPage from "./lib/components/TerminalsPage.svelte";
   import { dashboardInstances, resolveStartupTarget } from "./lib/settings";
   let initializing = $state(true);
   let startupSelected = false;
@@ -44,7 +45,7 @@
   });
   let openedIds = $state<ReadonlySet<string>>(new Set());
   let settingsOpen = $state(false);
-  let view = $state<"dashboard" | "agent_setup" | "code_diff" | "git_graph">("dashboard");
+  let view = $state<"dashboard" | "agent_setup" | "code_diff" | "git_graph" | "terminals">("dashboard");
   let configOpen = $state(false);
   let configMode = $state<"save" | "import">("save");
   let setupDraft = $state<SetupDraft>({ scope: null, kinds: [], items: [], step: 0, instanceId: null, projectInstanceId: null });
@@ -96,6 +97,12 @@
     diffName = target.name;
     void api.setBrowserView(null, null, null).catch(error => reportError("Hide browser", error));
     view = "code_diff";
+  }
+  // A global page, not an agent view: it never starts an agent, and leaving it stops nothing.
+  function openTerminals(): void {
+    planChange = null;
+    void api.setBrowserView(null, null, null).catch(error => reportError("Hide browser", error));
+    view = "terminals";
   }
   function closeCodeDiff(): void {
     const id = diffInstanceId;
@@ -240,16 +247,19 @@
     {#if fullscreen}<button disabled={initializing} onclick={() => openConfig("save")}>Save as global config</button>{/if}
     <button disabled={initializing} onclick={() => openConfig("import")}>Import config</button>
     <button disabled={initializing} class:active={view === "agent_setup"} onclick={() => requestNavigation(openAgentSetup)}>Agent setup</button>
+    {#if view === "dashboard" && !focused && !planChange}<button disabled={initializing} title="Every agent's command history and live commands" onclick={() => requestNavigation(openTerminals)}>Terminals</button>{/if}
     <button aria-label="The Manager" disabled={openingManager || initializing} onclick={() => requestNavigation(openManager)}>The Manager{#if needsHuman}<span class="pill warn">Needs you</span>{/if}</button>
     <ProjectPicker projects={$instances} label="Previous projects" disabled={initializing} onselect={id => requestNavigation(() => openProject(id))} />
     <button disabled={initializing} class="primary" onclick={newInstance}>New instance</button>
   </header>
   {#if browserSettingsError}<p class="err" role="alert">Configure browser: {browserSettingsError}</p>{/if}
-  <main class:focused={(view === "dashboard" && (!!focused || !!planChange)) || view === "code_diff" || view === "git_graph"}>
+  <main class:focused={(view === "dashboard" && (!!focused || !!planChange)) || view === "code_diff" || view === "git_graph" || view === "terminals"}>
     {#if initializing}
       <p role="status">Loading workspace…</p>
     {:else if view === "agent_setup"}
       <AgentSetupPage bind:draft={setupDraft} bind:admission={setupAdmission} projectContext={setupProject} onback={() => view = "dashboard"} onSetupManager={configureManager} onOpenManager={openManager} onSelectSession={focus} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} />
+    {:else if view === "terminals"}
+      <TerminalsPage onBack={() => focus(null)} />
     {:else if view === "git_graph" && diffInstanceId}
       <GitGraphView instanceId={diffInstanceId} name={diffName} onBack={() => view = "code_diff"} />
     {:else if view === "code_diff" && diffInstanceId}

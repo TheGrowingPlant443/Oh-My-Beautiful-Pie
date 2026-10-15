@@ -4,7 +4,9 @@
   import Term from "./Term.svelte";
   import BrowserPane from "./BrowserPane.svelte";
   import OwnershipControls from "./OwnershipControls.svelte";
-  import { restartInstance, startInstance, stopInstance, browserStatuses, errorText, reportError } from "../stores";
+  import { restartInstance, startInstance, stopInstance, browserStatuses, errorText, reportError, appSettings, terminalOwners, terminalUi, updateTerminalUi, openUserTerminal } from "../stores";
+  import { defaultTerminalUi } from "../terminal";
+  import TerminalWorkspace from "./TerminalWorkspace.svelte";
   let { instance, instances, onSwitch, onClose, onPlan, onPlanChange, onSubagents, onCodeDiff, showBrowser = false, browserHidden = false }: {
     instance: Instance; instances: Instance[]; onSwitch: (id: string) => void;
     onClose: () => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void; onSubagents: (id: string) => void;
@@ -12,13 +14,20 @@
   } = $props();
   const TERMINAL_MIN = 160;
   const BROWSER_MIN = 520;
+  const TERMINAL_PANE_MIN = 360;
   let busy = $state(false);
   let ratio = $state(0.5);
   let dragging = $state(false);
   let workspace = $state<HTMLDivElement>();
   const browser = $derived($browserStatuses.get(instance.id));
   const currentBrowser = $derived(browser?.generation === instance.generation && browser.state !== "closed" ? browser : undefined);
-  const paneBrowser = $derived(showBrowser && currentBrowser?.embedded && !currentBrowser.headless ? currentBrowser : undefined);
+  const ui = $derived($terminalUi.get(instance.id) ?? defaultTerminalUi());
+  const terminalOpen = $derived(showBrowser && ui.pane === "terminal");
+  // Browser and Terminal share one right-hand slot; the hidden one keeps running.
+  const paneBrowser = $derived(showBrowser && !terminalOpen && currentBrowser?.embedded && !currentBrowser.headless ? currentBrowser : undefined);
+  const rightPane = $derived(terminalOpen ? "terminal" : paneBrowser ? "browser" : null);
+  const rightMin = $derived(rightPane === "terminal" ? TERMINAL_PANE_MIN : BROWSER_MIN);
+  const owner = $derived($terminalOwners.get(instance.id));
   const live = $derived(instance.status === "running" || instance.status === "starting");
   async function run(action: () => Promise<boolean>): Promise<void> {
     busy = true;
@@ -37,6 +46,7 @@
         info = await api.openSessionBrowser(id, generation, true);
       }
       if (instance.id === id && instance.generation === generation) {
+        updateTerminalUi(id, { pane: "browser" });
         const next = new Map($browserStatuses);
         const current = next.get(id);
         if (!current || current.generation !== info.generation || info.epoch >= current.epoch) next.set(id, info);
@@ -45,9 +55,27 @@
     } catch (error) { reportError("Open session browser", error); }
     finally { busy = false; }
   }
+  async function toggleTerminal(): Promise<void> {
+    if (terminalOpen) { updateTerminalUi(instance.id, { pane: null }); return; }
+    updateTerminalUi(instance.id, { pane: "terminal" });
+    // The user shell exists only when asked for here: auto-open and the Dashboard page never create one.
+    if ($appSettings.terminalCreateUser && !owner?.userShell) await openUserTerminal(instance.id, true);
+  }
+  // A command that starts while this session is on screen shows the pane when the setting is on. Closing it by hand
+  // lasts until the next command starts; this never leaves the open session or creates a shell.
+  let seenCommands = new Set<string>();
+  let autoWas = false;
+  $effect(() => {
+    const autoOpen = showBrowser && $appSettings.terminalAutoOpen;
+    const ids = (owner && owner.generation === instance.generation ? owner.active : []).map(command => command.executionId);
+    const fresh = autoOpen && !autoWas ? ids : ids.filter(id => !seenCommands.has(id));
+    seenCommands = new Set(ids);
+    autoWas = autoOpen;
+    if (autoOpen && fresh.length && ui.pane !== "terminal") updateTerminalUi(instance.id, { pane: "terminal" });
+  });
   function clampRatio(value: number, width: number): number {
-    if (width <= TERMINAL_MIN + BROWSER_MIN + 6) return TERMINAL_MIN / Math.max(width, 1);
-    return Math.min((width - BROWSER_MIN - 6) / width, Math.max(TERMINAL_MIN / width, value));
+    if (width <= TERMINAL_MIN + rightMin + 6) return TERMINAL_MIN / Math.max(width, 1);
+    return Math.min((width - rightMin - 6) / width, Math.max(TERMINAL_MIN / width, value));
   }
   function dragStart(event: PointerEvent): void {
     dragging = true;
@@ -81,6 +109,7 @@
     {/if}
     <button disabled={!instance.subagents.length} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>
     {#if showBrowser}<button disabled={busy || !live} title={live ? "Show this session's browser next to the terminal" : "Start this session first"} onclick={openBrowser}>Browser</button>{/if}
+    {#if showBrowser}<button class:active={terminalOpen} aria-pressed={terminalOpen} title="Your own shell, the AI's command history and its live commands next to the terminal" onclick={toggleTerminal}>Terminal</button>{/if}
     {#if showBrowser}<button title="Review and edit this project's changes" onclick={() => onCodeDiff(instance.id)}>Code diff</button>{/if}
     {#if instance.planKind}<button onclick={() => onPlanChange(instance.id)}>Plan</button>{/if}
     {#if instance.planPath}<button onclick={() => onPlan(instance.id)}>View Plan</button>{/if}
@@ -92,13 +121,17 @@
   {#if instance.lastError}<p class="err" role="alert">{instance.lastError}</p>{/if}
   {#if currentBrowser?.error && !paneBrowser}<p class="browser-error err" role="alert">{currentBrowser.error}</p>{/if}
   <div class="workspace" bind:this={workspace}>
-    <div class="screen" style={paneBrowser ? `flex: 0 0 ${ratio * 100}%` : undefined}>
+    <div class="screen" style={rightPane ? `flex: 0 0 ${ratio * 100}%` : undefined}>
       {#if instance.generation > 0}<Term instanceId={instance.id} interactive cols={instance.cols} rows={instance.rows} generation={instance.generation} scrollback={8000} />
       {:else}<p class="empty">Start this instance to open its native OMP terminal.</p>{/if}
     </div>
-    {#if paneBrowser}
-      <div class="divider" role="slider" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(ratio * 100)} aria-label="Terminal and browser width" tabindex="0" onpointerdown={dragStart} onpointermove={dragMove} onpointerup={dragEnd} onpointercancel={dragEnd} onkeydown={dividerKey}></div>
-      <div class="browser-column"><BrowserPane instanceId={instance.id} generation={instance.generation} info={paneBrowser} hidden={browserHidden || dragging} /></div>
+    {#if rightPane}
+      <div class="divider" role="slider" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(ratio * 100)} aria-label={rightPane === "terminal" ? "Agent and terminal pane width" : "Terminal and browser width"} tabindex="0" onpointerdown={dragStart} onpointermove={dragMove} onpointerup={dragEnd} onpointercancel={dragEnd} onkeydown={dividerKey}></div>
+      {#if rightPane === "terminal"}
+        <div class="terminal-column"><TerminalWorkspace instanceId={instance.id} /></div>
+      {:else if paneBrowser}
+        <div class="browser-column"><BrowserPane instanceId={instance.id} generation={instance.generation} info={paneBrowser} hidden={browserHidden || dragging} /></div>
+      {/if}
     {/if}
   </div>
 </div>
@@ -112,5 +145,6 @@
   .divider { flex: 0 0 6px; cursor: col-resize; background: var(--line); touch-action: none; }
   .divider:hover, .divider:focus-visible { background: var(--accent, #4c8dff); outline: none; }
   .browser-column { flex: 1 1 0; min-width: 520px; min-height: 0; }
+  .terminal-column { flex: 1 1 0; min-width: 360px; min-height: 0; }
   .browser-error { margin: 0; overflow-wrap: anywhere; }
 </style>

@@ -254,7 +254,7 @@ impl BrowserSupervisor {
             .spawn()
             .map_err(|e| format!("Browser requires Bun and the installed OMP SDK: {e}"))?;
         #[cfg(windows)]
-        let job = match process_job(child.id()) {
+        let job = match crate::process_tree::contain(child.id(), "browser helper") {
             Ok(job) => job,
             Err(error) => {
                 let _ = child.kill();
@@ -514,47 +514,3 @@ impl BrowserSupervisor {
     }
 }
 
-#[cfg(windows)]
-fn process_job(pid: u32) -> Result<std::os::windows::io::OwnedHandle> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::System::{JobObjects::*, Threading::*};
-    unsafe {
-        let raw = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if raw.is_null() {
-            return Err(format!(
-                "Create browser job: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let job = OwnedHandle::from_raw_handle(raw);
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if SetInformationJobObject(
-            raw,
-            JobObjectExtendedLimitInformation,
-            &limits as *const _ as *const _,
-            std::mem::size_of_val(&limits) as u32,
-        ) == 0
-        {
-            return Err(format!(
-                "Set browser job limits: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let raw_process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
-        if raw_process.is_null() {
-            return Err(format!(
-                "Open browser helper: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let process = OwnedHandle::from_raw_handle(raw_process);
-        if AssignProcessToJobObject(raw, process.as_raw_handle()) == 0 {
-            return Err(format!(
-                "Assign browser job: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(job)
-    }
-}

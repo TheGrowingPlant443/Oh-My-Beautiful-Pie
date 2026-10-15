@@ -183,6 +183,62 @@ pub fn resize_pty(state: State<'_, AppState>, id: String, cols: u16, rows: u16) 
     state.registry.resize(&id, cols, rows, Origin::Human)
 }
 #[tauri::command]
+pub async fn list_all_terminals(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<Vec<crate::terminal::TerminalOwner>> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.owners()).await
+}
+#[tauri::command]
+pub async fn list_terminal_history(window: tauri::WebviewWindow, state: State<'_, AppState>, id: Option<String>, cursor: Option<String>) -> Result<crate::terminal::HistoryPage> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.history(id.as_deref(), cursor.as_deref())).await
+}
+#[tauri::command]
+pub async fn read_terminal_script(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, session_id: String, execution_id: String) -> Result<String> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.read_script(&id, &session_id, &execution_id)).await
+}
+#[tauri::command]
+pub fn attach_command_output(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, generation: u64, session_id: String, execution_id: String, on_data: Channel<crate::terminal::CommandOutput>) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.terminals.attach_output(&id, generation, &session_id, &execution_id, on_data)
+}
+#[tauri::command]
+pub async fn kill_terminal_command(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, generation: u64, session_id: String, execution_id: String) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.kill(&id, generation, &session_id, &execution_id)).await
+}
+#[tauri::command]
+pub async fn open_user_terminal(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String) -> Result<crate::terminal::UserShellInfo> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.open_user_shell(&id)).await
+}
+#[tauri::command]
+pub fn attach_user_terminal(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, shell_id: String, on_data: Channel<InvokeResponseBody>) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.terminals.attach_user_shell(&id, &shell_id, on_data)
+}
+#[tauri::command]
+pub fn write_user_terminal(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, shell_id: String, data: String) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.terminals.write_user_shell(&id, &shell_id, &data)
+}
+#[tauri::command]
+pub fn resize_user_terminal(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, shell_id: String, cols: u16, rows: u16) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.terminals.resize_user_shell(&id, &shell_id, cols, rows)
+}
+#[tauri::command]
+pub async fn close_user_terminal(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, shell_id: String) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let terminals = state.terminals.clone();
+    blocking(move || terminals.close_user_shell(&id, &shell_id)).await
+}
+#[tauri::command]
 pub fn list_sessions(
     state: State<'_, AppState>,
     project_path: String,
@@ -477,7 +533,7 @@ pub async fn create_branch_at(window: tauri::WebviewWindow, state: State<'_, App
     let registry = state.registry.clone();
     blocking(move || crate::git_graph::create_branch(Path::new(&diff_project(&registry, &id)?), &name, commit.as_deref())).await
 }
-pub fn tick(app: AppHandle, registry: Arc<Registry>, closing: Arc<std::sync::atomic::AtomicBool>) {
+pub fn tick(app: AppHandle, registry: Arc<Registry>, terminals: Arc<crate::terminal::TerminalService>, closing: Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {
         while !closing.load(std::sync::atomic::Ordering::Relaxed) {
             if let Err(e) = registry.refresh() {
@@ -491,6 +547,7 @@ pub fn tick(app: AppHandle, registry: Arc<Registry>, closing: Arc<std::sync::ato
             if let Some(browser) = registry.browser_supervisor() {
                 if let Some(update) = browser.take_update() { let _ = app.emit("browser_state", update); }
             }
+            terminals.poll_shells();
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });

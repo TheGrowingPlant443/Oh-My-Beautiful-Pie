@@ -89,14 +89,7 @@ pub struct Pty {
 impl Pty {
     pub fn spawn(definition: &Definition, bridge: &BridgeLaunch) -> Result<Self, String> {
         let input = &definition.input;
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: DEFAULT_ROWS,
-                cols: DEFAULT_COLS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| e.to_string())?;
+
         let program = std::env::var_os("OMP_BIN").unwrap_or_else(|| "omp".into());
         let mut cmd = CommandBuilder::new(program);
         cmd.cwd(&input.project_path);
@@ -157,12 +150,41 @@ impl Pty {
             },
         );
         cmd.env("OMP_MANAGER_BROWSER_REQUIRED", "1");
+        // Both are required for command capture; without the SDK the bridge reports the feature as unavailable.
+        if let Some(sdk) = &bridge.sdk_dir {
+            cmd.env("OMP_MANAGER_TERMINAL_DIR", &bridge.terminal_dir);
+            cmd.env("OMP_MANAGER_SDK_DIR", sdk);
+        }
         if definition.plan_target.is_some() {
             cmd.env("OMP_MANAGER_PLAN_SESSION", "1");
         }
         cmd.env("PI_BROWSER_RELAY", "0");
         cmd.env("PI_BROWSER_TERN", "0");
         cmd.env("PI_BROWSER_CMUX", "0");
+        Self::start(cmd)
+    }
+    /// The user's own shell: no OMP arguments, no bridge credentials, nothing from the manager environment.
+    pub fn spawn_shell(cwd: &str) -> Result<Self, String> {
+        let mut cmd = CommandBuilder::new_default_prog();
+        cmd.cwd(cwd);
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("OMP_MANAGER_") {
+                cmd.env_remove(name);
+            }
+        }
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        Self::start(cmd)
+    }
+    fn start(cmd: CommandBuilder) -> Result<Self, String> {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: DEFAULT_ROWS,
+                cols: DEFAULT_COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| e.to_string())?;
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
@@ -185,6 +207,18 @@ impl Pty {
             rows: DEFAULT_ROWS,
             exit: None,
         })
+    }
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+    /// Immediate termination for a shell the user closed; OMP uses `stop` for a graceful Ctrl-C first.
+    pub fn kill(&mut self) -> Result<(), String> {
+        if self.poll()?.is_some() {
+            return Ok(());
+        }
+        self.child.kill().map_err(|e| e.to_string())?;
+        self.exit = Some(self.child.wait().map_err(|e| e.to_string())?.exit_code());
+        Ok(())
     }
     pub fn last_output(&self) -> u64 {
         self.shared.last_output.load(Ordering::Relaxed)

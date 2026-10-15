@@ -13,6 +13,9 @@ mod pty;
 mod plan;
 mod session;
 mod setup;
+mod terminal;
+#[cfg(windows)]
+mod process_tree;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,6 +28,7 @@ pub struct AppState {
     pub plan: Arc<plan::PlanService>,
     pub browser: Arc<browser::BrowserSupervisor>,
     pub code_diff: Arc<code_diff::DiffService>,
+    pub terminals: Arc<terminal::TerminalService>,
     #[cfg(windows)]
     pub browser_host: Arc<browser_window::BrowserHost>,
 }
@@ -68,21 +72,28 @@ fn main() {
             if std::fs::read_to_string(&extension).ok().as_deref() != Some(source) {
                 std::fs::write(&extension, source)?;
             }
+            let terminals = terminal::TerminalService::new(&folder);
+            terminal::TerminalService::materialize(&folder).map_err(std::io::Error::other)?;
+            terminals.bind_app(app.handle().clone()).map_err(std::io::Error::other)?;
             let hub = manager::ManagerHub::bind(extension).map_err(std::io::Error::other)?;
             hub.bind_registry(Arc::downgrade(&registry))
                 .map_err(std::io::Error::other)?;
+            terminals.bind_registry(Arc::downgrade(&registry)).map_err(std::io::Error::other)?;
             hub.install_browser_supervisor(browser.clone()).map_err(std::io::Error::other)?;
+            hub.install_terminal_service(terminals.clone()).map_err(std::io::Error::other)?;
+            registry.install_terminal_service(terminals.clone()).map_err(std::io::Error::other)?;
             registry
                 .install_manager_hub(hub)
                 .map_err(std::io::Error::other)?;
             registry.refresh().map_err(std::io::Error::other)?;
             let closing = Arc::new(AtomicBool::new(false));
-            commands::tick(app.handle().clone(), registry.clone(), closing.clone());
+            commands::tick(app.handle().clone(), registry.clone(), terminals.clone(), closing.clone());
             app.manage(AppState {
                 registry,
                 closing,
                 browser: browser.clone(),
                 code_diff: Arc::new(code_diff::DiffService::new()),
+                terminals,
                 #[cfg(windows)]
                 browser_host: browser_host.clone(),
                 setup: Arc::new(setup::SetupService::new(folder)),
@@ -138,6 +149,16 @@ fn main() {
             commands::send_agent_setup,
             commands::open_setup_folder,
             commands::open_plan_session,
+            commands::list_all_terminals,
+            commands::list_terminal_history,
+            commands::read_terminal_script,
+            commands::attach_command_output,
+            commands::kill_terminal_command,
+            commands::open_user_terminal,
+            commands::attach_user_terminal,
+            commands::write_user_terminal,
+            commands::resize_user_terminal,
+            commands::close_user_terminal,
         ])
         .build(tauri::generate_context!())
         .expect("could not initialize OMP Manager");

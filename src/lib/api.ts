@@ -98,6 +98,21 @@ export interface PublishOptions { newBranch: string | null; createPr: boolean; }
 export interface PublishResult { branch: string; remote: string; prUrl: string | null; steps: string[]; }
 export interface GraphCommit { hash: string; parents: string[]; author: string; date: string; subject: string; refs: string[]; }
 export interface GitGraph { root: string; head: string | null; currentBranch: string | null; commits: GraphCommit[]; truncated: boolean; }
+export type CommandKind = "bash" | "js" | "py";
+export type CommandStatus = "running" | "stopping" | "completed" | "failed" | "cancelled" | "interrupted";
+export interface CommandSummary {
+  executionId: string; sessionId: string; sourceSessionId: string; toolCallId: string; agentId: string;
+  kind: CommandKind; description: string | null; preview: string; cwd: string;
+  startedAt: number; endedAt: number | null; status: CommandStatus; exitCode: number | null; tab: number | null; historical: boolean;
+}
+export interface CommandOutput { executionId: string; revision: number; text: string; truncated: boolean; }
+export interface UserShellInfo { shellId: string; cwd: string; cols: number; rows: number; exited: boolean; exitCode: number | null; }
+export interface TerminalOwner {
+  instanceId: string; name: string; generation: number; sessionId: string | null; supported: boolean; error: string | null;
+  held: boolean; revision: number; active: CommandSummary[]; userShell: UserShellInfo | null;
+}
+export interface HistoryEntry { instanceId: string; instanceName: string; command: CommandSummary; }
+export interface HistoryPage { entries: HistoryEntry[]; nextCursor: string | null; }
 
 export const api = {
   listInstances: () => invoke<Instance[]>("list_instances"),
@@ -147,4 +162,14 @@ export const api = {
   sendAgentSetup: (id: string, request: SetupRequest) => invoke<SetupAdmission>("send_agent_setup", { id, request }),
   openSetupFolder: (scope: SetupScope, projectInstanceId: string | null) => invoke<void>("open_setup_folder", { scope, projectInstanceId }),
   openPlanSession: (targetId: string) => invoke<PlanSessionAdmission>("open_plan_session", { targetId }),
+  listAllTerminals: () => invoke<TerminalOwner[]>("list_all_terminals"),
+  listTerminalHistory: (id: string | null, cursor: string | null) => invoke<HistoryPage>("list_terminal_history", { id, cursor }),
+  readTerminalScript: (id: string, sessionId: string, executionId: string) => invoke<string>("read_terminal_script", { id, sessionId, executionId }),
+  attachCommandOutput: (id: string, generation: number, sessionId: string, executionId: string, onData: Channel<CommandOutput>) => invoke<void>("attach_command_output", { id, generation, sessionId, executionId, onData }),
+  killTerminalCommand: (id: string, generation: number, sessionId: string, executionId: string) => invoke<void>("kill_terminal_command", { id, generation, sessionId, executionId }),
+  openUserTerminal: (id: string) => invoke<UserShellInfo>("open_user_terminal", { id }),
+  attachUserTerminal: (id: string, shellId: string, onData: Channel<PtyChunk>) => invoke<void>("attach_user_terminal", { id, shellId, onData }),
+  writeUserTerminal: (id: string, shellId: string, data: string) => invoke<void>("write_user_terminal", { id, shellId, data }),
+  resizeUserTerminal: (id: string, shellId: string, cols: number, rows: number) => invoke<void>("resize_user_terminal", { id, shellId, cols, rows }),
+  closeUserTerminal: (id: string, shellId: string) => invoke<void>("close_user_terminal", { id, shellId }),
 };

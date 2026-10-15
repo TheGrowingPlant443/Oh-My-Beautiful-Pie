@@ -46,6 +46,10 @@
       <small class="dim">Browsers appear on the right of fullscreen terminals. Off opens the same isolated browser in an external window.</small>
       <label class="check"><input type="checkbox" checked={$appSettings.browserHeadless} onchange={e => update("browserHeadless", e.currentTarget.checked)} />Headless browser</label>
       <small class="dim">No browser window or split screen. Applies to the next browser launch; existing browsers keep their mode until closed.</small>
+      <label class="check"><input type="checkbox" checked={$appSettings.terminalAutoOpen} onchange={e => update("terminalAutoOpen", e.currentTarget.checked)} />Automatically show terminal view for AI commands</label>
+      <small class="dim">Off by default. When on, the open session's Terminal pane appears when the AI starts a command. It never switches sessions or pages.</small>
+      <label class="check"><input type="checkbox" checked={$appSettings.terminalCreateUser} onchange={e => update("terminalCreateUser", e.currentTarget.checked)} />Create a user terminal (Tab 0) when opening Terminal</label>
+      <small class="dim">Applies to the next time you open Terminal. An existing user terminal keeps running until you close its tab.</small>
     </div>
   </section>
 </dialog>

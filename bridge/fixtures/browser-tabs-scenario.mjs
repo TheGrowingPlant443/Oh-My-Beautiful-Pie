@@ -33,13 +33,14 @@ export default async function tabsScenario(pi) {
   await ready;
   await control('configure',{headless:false,embedded:true});
   await control('register',{instanceId:'terminal',generation:1});
-  installTerminalBrowserBridge(pi,async(action,payload)=>{
+  const disposeBrowser=installTerminalBrowserBridge(pi,async(action,payload)=>{
     if(action==='browser_prepare')return control('ensureTab',{instanceId:'terminal',generation:1,name:payload.name,...(payload.target===undefined?{}:{target:payload.target})});
     if(action==='browser_close_tab')return control('closeTab',{instanceId:'terminal',generation:1,name:payload.name});
     if(action==='browser_close_all')return control('closeTab',{instanceId:'terminal',generation:1,name:null});
     if(action==='browser_tabs')return control('listTabs',{instanceId:'terminal',generation:1});
     throw new Error('unexpected browser action '+action);
   });
+  pi.on('session_shutdown',(_event,ctx)=>{if(ctx.agent?.kind==='main')disposeBrowser();});
   async function chromePages(){
     const port=(await readFile(path.join(profileDirectory(root,'terminal'),'DevToolsActivePort'),'utf8')).split('\n')[0];
     return {port,list:(await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()).filter(target=>target.type==='page')};

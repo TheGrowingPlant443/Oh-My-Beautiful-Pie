@@ -12,13 +12,17 @@ export interface AppSettings {
   autoStart: boolean;
   browserHeadless: boolean;
   browserEmbedded: boolean;
+  /** Show the Terminal pane by itself when the AI starts a command (never opens another session or page). */
+  terminalAutoOpen: boolean;
+  /** Opening the Terminal pane starts the user's own shell (Tab 0). */
+  terminalCreateUser: boolean;
 }
 
 export function parseAppSettings(raw: string | null, legacyShowManager: string | null): AppSettings {
   const defaults: AppSettings = {
     version: 1, startupTarget: "manager", startupProjectId: null, latestProjectId: null,
     showPreviousProjects: false, showManagerTile: legacyShowManager !== "off", previewSize: 640, autoStart: true,
-    browserHeadless: false, browserEmbedded: true,
+    browserHeadless: false, browserEmbedded: true, terminalAutoOpen: false, terminalCreateUser: true,
   };
   let data: unknown;
   try { data = raw === null ? null : JSON.parse(raw); }
@@ -37,6 +41,8 @@ export function parseAppSettings(raw: string | null, legacyShowManager: string |
     autoStart: typeof value.autoStart === "boolean" ? value.autoStart : defaults.autoStart,
     browserHeadless: typeof value.browserHeadless === "boolean" ? value.browserHeadless : defaults.browserHeadless,
     browserEmbedded: typeof value.browserEmbedded === "boolean" ? value.browserEmbedded : defaults.browserEmbedded,
+    terminalAutoOpen: typeof value.terminalAutoOpen === "boolean" ? value.terminalAutoOpen : defaults.terminalAutoOpen,
+    terminalCreateUser: typeof value.terminalCreateUser === "boolean" ? value.terminalCreateUser : defaults.terminalCreateUser,
   };
 }
 
