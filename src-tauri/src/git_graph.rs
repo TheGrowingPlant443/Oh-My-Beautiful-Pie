@@ -1,4 +1,4 @@
-use crate::code_diff::{git_ok, git_optional, git_timed, repository_root, resolve_commit, text, valid_commit, validate_new_branch, WRITE_LOCK};
+use crate::code_diff::{default_branch, git_ok, git_optional, git_timed, repository_root, resolve_commit, text, valid_commit, validate_new_branch, WRITE_LOCK};
 use serde::Serialize;
 use std::path::Path;
 
@@ -19,6 +19,8 @@ pub struct GraphCommit {
 pub struct GitGraph {
     pub root: String,
     pub head: Option<String>,
+    /// Tip of the default branch; its first-parent chain is the main line pull requests are merged into.
+    pub main_commit: Option<String>,
     pub current_branch: Option<String>,
     pub commits: Vec<GraphCommit>,
     pub truncated: bool,
@@ -46,7 +48,8 @@ pub fn graph(project: &Path, limit: u32) -> Result<GitGraph> {
     }
     let truncated = commits.len() > limit;
     commits.truncate(limit);
-    Ok(GitGraph { root: root.display().to_string(), head,
+    let main_commit = default_branch(&root)?.map(|(_, commit)| commit);
+    Ok(GitGraph { root: root.display().to_string(), head, main_commit,
         current_branch: git_optional(&root, &["symbolic-ref", "--short", "-q", "HEAD"])?.map(text), commits, truncated })
 }
 

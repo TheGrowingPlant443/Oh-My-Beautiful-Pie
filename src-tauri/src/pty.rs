@@ -118,6 +118,11 @@ impl Pty {
             cmd.arg("--append-system-prompt");
             cmd.arg(path);
         }
+        // A helper agent (Code diff / Git tree) has no built-in tools at all; its only tool is repo_inspect.
+        let helper = definition.helper.as_ref();
+        if helper.is_some() {
+            cmd.arg("--no-tools");
+        }
         cmd.arg("--extension");
         cmd.arg(&bridge.extension_path);
         if definition.kind == crate::instance::InstanceKind::Manager {
@@ -149,11 +154,15 @@ impl Pty {
                 "instance"
             },
         );
-        cmd.env("OMP_MANAGER_BROWSER_REQUIRED", "1");
-        // Both are required for command capture; without the SDK the bridge reports the feature as unavailable.
-        if let Some(sdk) = &bridge.sdk_dir {
-            cmd.env("OMP_MANAGER_TERMINAL_DIR", &bridge.terminal_dir);
-            cmd.env("OMP_MANAGER_SDK_DIR", sdk);
+        if let Some(link) = helper {
+            cmd.env("OMP_MANAGER_HELPER_REPO", &link.repo);
+        } else {
+            cmd.env("OMP_MANAGER_BROWSER_REQUIRED", "1");
+            // Both are required for command capture; without the SDK the bridge reports the feature as unavailable.
+            if let Some(sdk) = &bridge.sdk_dir {
+                cmd.env("OMP_MANAGER_TERMINAL_DIR", &bridge.terminal_dir);
+                cmd.env("OMP_MANAGER_SDK_DIR", sdk);
+            }
         }
         if definition.plan_target.is_some() {
             cmd.env("OMP_MANAGER_PLAN_SESSION", "1");

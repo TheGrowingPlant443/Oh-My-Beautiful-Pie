@@ -441,6 +441,24 @@ pub async fn open_plan_session(
     })
     .await
 }
+#[tauri::command]
+pub async fn open_helper(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    target_id: String,
+    purpose: crate::instance::HelperPurpose,
+    request: Option<crate::helper_agent::HelperRequest>,
+    mode: Option<crate::code_diff::DiffMode>,
+) -> Result<crate::helper_agent::HelperAdmission> {
+    let registry = state.registry.clone();
+    let helpers = state.helpers.clone();
+    blocking(move || {
+        let result = helpers.open(&registry, &target_id, purpose, request, mode);
+        publish(&app, &registry);
+        result
+    })
+    .await
+}
 fn diff_project(registry: &Registry, id: &str) -> Result<String> {
     Ok(registry.inspect(id, Origin::Human)?.project_path)
 }
@@ -538,6 +556,12 @@ pub async fn create_branch_at(window: tauri::WebviewWindow, state: State<'_, App
     if window.label() != "main" { return Err("unauthorized window".into()); }
     let registry = state.registry.clone();
     blocking(move || crate::git_graph::create_branch(Path::new(&diff_project(&registry, &id)?), &name, commit.as_deref())).await
+}
+#[tauri::command]
+pub async fn explain_git_change(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, kind: String, base: Option<String>, target: String) -> Result<String> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::explain::explain(&registry, &id, &kind, base.as_deref(), &target)).await
 }
 pub fn tick(app: AppHandle, registry: Arc<Registry>, terminals: Arc<crate::terminal::TerminalService>, closing: Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {

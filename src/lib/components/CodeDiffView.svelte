@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { api, type DiffContent, type DiffFile, type DiffFileAction, type DiffGroup, type DiffMode, type DiffOverview } from "../api";
-  import { errorText, reportError } from "../stores";
+  import { api, type DiffContent, type DiffFile, type DiffFileAction, type DiffGroup, type DiffMode, type DiffOverview, type HelperAdmission } from "../api";
+  import { errorText, instancesById, reportError } from "../stores";
   import { confirmDanger } from "../ui";
   import CodeDiffEditor from "./CodeDiffEditor.svelte";
   import DiffFileTree from "./DiffFileTree.svelte";
+  import HelperPane from "./HelperPane.svelte";
   type Choice = "save" | "discard" | "cancel";
   type Sel = { group: DiffGroup | null; path: string };
   let { instanceId, name, onBack, onGitTree, onGuardChange }: {
@@ -42,6 +43,12 @@
   const stagedCount = $derived(overview?.files.filter(file => file.group === "staged").length ?? 0);
   const canCommit = $derived(!busy && stagedCount > 0 && message.trim().length > 0);
   const canPublish = $derived(!busy && (branchOn ? newBranch.trim().length > 0 : !!overview?.currentBranch));
+  // Explain / Review: a read-only helper agent replaces the diff area. The editor stays mounted behind it so unsaved edits survive.
+  let agent = $state<{ id: string; admission: HelperAdmission } | null>(null);
+  let agentOpen = $state(false);
+  let opening = $state(false);
+  let lastRequest: "explain" | "review" = "explain";
+  const helper = $derived(agent ? $instancesById.get(agent.id) : undefined);
 
   function askLeave(): Promise<Choice> {
     return new Promise(resolve => { pending = resolve; leaveDialog?.showModal(); });
@@ -108,7 +115,9 @@
     }
   }
   async function select(file: DiffFile): Promise<void> {
-    if (busy || !overview || (selected?.path === file.path && selected.group === file.group)) return;
+    if (busy || !overview) return;
+    agentOpen = false;
+    if (selected?.path === file.path && selected.group === file.group) return;
     if (await beforeLeave()) await loadFile({ group: file.group, path: file.path }, overview.snapshotId);
   }
   async function switchMode(event: Event): Promise<void> {
@@ -123,6 +132,24 @@
   }
   async function gitTree(): Promise<void> {
     if (!busy && await beforeLeave()) onGitTree();
+  }
+  async function openAgent(request: "explain" | "review"): Promise<void> {
+    if (opening || mode === "commits") return;
+    lastRequest = request;
+    opening = true;
+    try {
+      const admission = await api.openHelper(instanceId, "diff", request, mode);
+      agent = { id: admission.helper.id, admission };
+      agentOpen = true;
+    } catch (e) {
+      error = errorText(e);
+    } finally {
+      opening = false;
+    }
+  }
+  async function toggleExplain(): Promise<void> {
+    if (agentOpen) agentOpen = false;
+    else await openAgent("explain");
   }
   async function back(): Promise<void> {
     if (!saving && !acting && await beforeLeave()) onBack();
@@ -221,6 +248,8 @@
     <span class="spacer"></span>
     {#if dirty}<span class="pill warn">Unsaved changes</span>{/if}
     <button disabled={busy} onclick={refresh}>Refresh</button>
+    <button aria-pressed={agentOpen} class:active={agentOpen} disabled={saving || acting || opening} title="Short overall explanation of these changes by a read-only agent; type All there for every file" onclick={toggleExplain}>Explain</button>
+    <button disabled={saving || acting || opening} title="Ask a read-only agent to review these changes" onclick={() => openAgent("review")}>Review</button>
     <button disabled={busy} onclick={gitTree}>Git tree</button>
     <button class="primary" disabled={!dirty || saving} onclick={() => save()}>{saving ? "Saving…" : "Save"}</button>
   </header>
@@ -279,7 +308,7 @@
       {#if overview && !overview.files.length}<p class="dim note">No changed files for this comparison</p>{/if}
       {#if loading && !overview}<p class="dim note" role="status">Loading changes…</p>{/if}
     </aside>
-    <div class="main">
+    <div class="main" hidden={agentOpen}>
       {#if content && selectedFile}
         <div class="labels">
           <span><strong>{content.originalLabel}</strong></span><span><strong>{content.modifiedLabel}</strong>{#if content.eol === "crlf"} · CRLF{/if}{#if content.bom} · UTF-8 BOM{/if}</span>
@@ -301,6 +330,9 @@
         <p class="empty dim">Code diff is unavailable for this session.</p>
       {/if}
     </div>
+    {#if agentOpen && agent}
+      <div class="main"><HelperPane {helper} admission={agent.admission} onRetry={() => openAgent(lastRequest)} /></div>
+    {/if}
   </div>
 </section>
 <dialog bind:this={leaveDialog} aria-labelledby="leave-title" oncancel={event => { event.preventDefault(); choose("cancel"); }}>
@@ -332,6 +364,7 @@
   .group-head { width: 100%; text-align: left; border-color: transparent; background: transparent; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; color: var(--text-dim); }
   .note { margin: 0; font-size: 12px; }
   .main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+  .main[hidden] { display: none; }
   .labels { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-dim); }
   .editor-slot { flex: 1; min-height: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
   .empty { margin: 24px; }

@@ -267,7 +267,7 @@
     {:else if planChange && planTarget && planner}
       <PlanChangeView target={planTarget} {planner} admission={planChange.admission} onBack={() => planChange = null} onRetry={retryPlanContext} />
     {:else if focused}
-      <SessionView instance={focused} instances={$instances} onSwitch={focus} onClose={() => focus(null)} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} showBrowser browserHidden={browserHidden} />
+      <SessionView instance={focused} instances={$instances} onSwitch={id => void openProject(id)} onClose={() => focus(null)} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} showBrowser browserHidden={browserHidden} />
     {:else if $previewsEnabled}
       <Grid instances={overview} onSelect={focus} onOpen={openProject} {onPlan} onPlanChange={openPlanChange} {onSubagents} tileMin={$appSettings.previewSize} onCreate={newInstance} />
     {:else}

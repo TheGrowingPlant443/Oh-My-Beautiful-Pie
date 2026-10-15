@@ -35,6 +35,7 @@ export interface Instance {
   kind: "instance" | "manager";
   managerId: string | null;
   planTarget: string | null;
+  helper: { target: string; purpose: "diff" | "git"; repo: string } | null;
   bridgeReady: boolean;
   pendingDecisionCount: number;
   humanRequest: { reason: string; decisionId: string | null } | null;
@@ -66,6 +67,7 @@ export interface SetupItem { kind: SetupKind; name: string; description: string;
 export interface SetupRequest { scope: SetupScope; items: SetupItem[]; projectInstanceId: string | null; }
 export interface SetupDraft { scope: SetupScope | null; kinds: SetupKind[]; items: SetupItem[]; step: number; instanceId: string | null; projectInstanceId: string | null; }
 export interface PlanSessionAdmission { planner: Instance; promptSent: boolean | null; error: string | null; }
+export interface HelperAdmission { helper: Instance; promptSent: boolean | null; error: string | null; }
 export interface SetupPaths { globalOmpFolder: string; globalAgentFolder: string; managerFolder: string; }
 export interface SetupAdmission { instance: Instance; promptSent: boolean | null; error: string | null; }
 export interface SavedConfig { path: string; modifiedMs: number; }
@@ -97,7 +99,7 @@ export interface CommitResult { commit: string; summary: string; }
 export interface PublishOptions { newBranch: string | null; createPr: boolean; }
 export interface PublishResult { branch: string; remote: string; prUrl: string | null; steps: string[]; }
 export interface GraphCommit { hash: string; parents: string[]; author: string; date: string; subject: string; refs: string[]; }
-export interface GitGraph { root: string; head: string | null; currentBranch: string | null; commits: GraphCommit[]; truncated: boolean; }
+export interface GitGraph { root: string; head: string | null; mainCommit: string | null; currentBranch: string | null; commits: GraphCommit[]; truncated: boolean; }
 export type CommandKind = "bash" | "js" | "py";
 export type CommandStatus = "running" | "stopping" | "completed" | "failed" | "cancelled" | "interrupted";
 export interface CommandSummary {
@@ -132,6 +134,8 @@ export const api = {
   cherryPickCommit: (id: string, commit: string) => invoke<string>("cherry_pick_commit", { id, commit }),
   resetLastCommit: (id: string) => invoke<string>("reset_last_commit", { id }),
   createBranchAt: (id: string, name: string, commit: string | null) => invoke<string>("create_branch_at", { id, name, commit }),
+  explainGitChange: (id: string, kind: "pr" | "commit" | "range", base: string | null, target: string) => invoke<string>("explain_git_change", { id, kind, base, target }),
+  openHelper: (targetId: string, purpose: "diff" | "git", request: "explain" | "review" | null, mode: Exclude<DiffMode, "commits"> | null) => invoke<HelperAdmission>("open_helper", { targetId, purpose, request, mode }),
   setBrowserView: (instanceId: string | null, generation: number | null, rect: BrowserRect | null) => invoke<void>("set_browser_view", { instanceId, generation, rect }),
   createInstance: (config: CreateInstanceInput) => invoke<Instance>("create_instance", { config }),
   createManager: (config: CreateInstanceInput) => invoke<Instance>("create_manager", { config }),

@@ -19,6 +19,32 @@ pub enum InstanceKind {
     Manager,
 }
 
+/// What a helper agent is for: the Code diff page (explain / review the changes) or the Git tree (search history).
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum HelperPurpose {
+    Diff,
+    Git,
+}
+
+impl HelperPurpose {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Diff => "diff",
+            Self::Git => "git",
+        }
+    }
+}
+
+/// A read-only helper agent for `target`'s repository (`repo` is its root when the helper was created).
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct HelperLink {
+    pub target: String,
+    pub purpose: HelperPurpose,
+    pub repo: String,
+}
+
 #[derive(Clone, Copy)]
 pub enum Origin<'a> {
     Human,
@@ -56,6 +82,8 @@ pub struct Definition {
     pub manager_id: Option<String>,
     #[serde(default)]
     pub plan_target: Option<String>,
+    #[serde(default)]
+    pub helper: Option<HelperLink>,
 }
 
 #[derive(Clone, Serialize)]
@@ -95,6 +123,7 @@ pub struct Instance {
     pub kind: InstanceKind,
     pub manager_id: Option<String>,
     pub plan_target: Option<String>,
+    pub helper: Option<HelperLink>,
     pub bridge_ready: bool,
     pub pending_decision_count: usize,
     pub human_request: Option<HumanRequest>,
@@ -258,6 +287,7 @@ impl Record {
             kind: self.definition.kind,
             manager_id: self.definition.manager_id.clone(),
             plan_target: self.definition.plan_target.clone(),
+            helper: self.definition.helper.clone(),
             bridge_ready: self.bridge_ready,
             pending_decision_count: self.pending_decision_count,
             human_request: self.human_request.clone(),
@@ -409,14 +439,14 @@ impl Registry {
         fs::rename(temporary, &self.file).map_err(|e| e.to_string())
     }
     pub fn create(&self, input: CreateInput) -> Result<Instance, String> {
-        self.create_definition(input, InstanceKind::Instance, None, None)
+        self.create_definition(input, InstanceKind::Instance, None, None, None)
     }
     pub fn create_manager(&self, mut input: CreateInput) -> Result<Instance, String> {
         input.name = "The Manager".into();
-        self.create_definition(input, InstanceKind::Manager, None, None)
+        self.create_definition(input, InstanceKind::Manager, None, None, None)
     }
     pub fn create_owned(&self, manager_id: &str, input: CreateInput) -> Result<Instance, String> {
-        self.create_definition(input, InstanceKind::Instance, Some(manager_id.into()), None)
+        self.create_definition(input, InstanceKind::Instance, Some(manager_id.into()), None, None)
     }
     pub fn plan_folder(&self, target_id: &str) -> PathBuf {
         self.config_root().join("plan-changes").join(target_id)
@@ -443,7 +473,45 @@ impl Registry {
             InstanceKind::Instance,
             None,
             Some(target_id.into()),
+            None,
         )
+    }
+    pub fn helper_folder(&self, target_id: &str, purpose: HelperPurpose) -> PathBuf {
+        self.config_root().join("helpers").join(target_id).join(purpose.name())
+    }
+    /// A helper agent is an ordinary human-controlled instance linked to a project. Like a plan agent its cwd is an
+    /// app-owned folder, so its sessions never appear in the project's OMP session list.
+    pub fn create_helper(&self, target_id: &str, purpose: HelperPurpose, repo: String) -> Result<Instance, String> {
+        let target = self.inspect(target_id, Origin::Human)?;
+        let folder = self.helper_folder(target_id, purpose);
+        fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+        let label = match purpose {
+            HelperPurpose::Diff => "Diff",
+            HelperPurpose::Git => "Git",
+        };
+        self.create_definition(
+            CreateInput {
+                name: format!("{label} helper — {}", target.name),
+                project_path: folder.to_string_lossy().into(),
+                profile: target.profile,
+                configs: target.configs,
+                model: target.model,
+                use_global_config: Some(false),
+                ..Default::default()
+            },
+            InstanceKind::Instance,
+            None,
+            None,
+            Some(HelperLink { target: target_id.into(), purpose, repo }),
+        )
+    }
+    pub fn helper_for(&self, target: &str, purpose: HelperPurpose) -> Option<String> {
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|r| r.definition.helper.as_ref().is_some_and(|h| h.target == target && h.purpose == purpose))
+            .map(|r| r.definition.id.clone())
     }
     pub fn planner_for(&self, target: &str) -> Option<String> {
         self.records
@@ -481,6 +549,7 @@ impl Registry {
         kind: InstanceKind,
         manager_id: Option<String>,
         plan_target: Option<String>,
+        helper: Option<HelperLink>,
     ) -> Result<Instance, String> {
         let cwd = fs::canonicalize(&input.project_path).map_err(|e| e.to_string())?;
         if !cwd.is_dir() {
@@ -534,6 +603,7 @@ impl Registry {
             kind,
             manager_id,
             plan_target,
+            helper,
         };
         let mut records = self.records.lock().map_err(|e| e.to_string())?;
         if kind == InstanceKind::Manager && records.iter().any(|r| r.definition.kind == kind) {
@@ -548,11 +618,19 @@ impl Registry {
             }
         }
         if let Some(target) = &definition.plan_target {
-            if !records.iter().any(|r| r.definition.id == *target && r.definition.plan_target.is_none()) {
+            if !records.iter().any(|r| r.definition.id == *target && r.definition.plan_target.is_none() && r.definition.helper.is_none()) {
                 return Err("unknown instance".into());
             }
             if records.iter().any(|r| r.definition.plan_target.as_deref() == Some(target.as_str())) {
                 return Err("A plan agent already exists for this session".into());
+            }
+        }
+        if let Some(link) = &definition.helper {
+            if !records.iter().any(|r| r.definition.id == link.target && r.definition.plan_target.is_none() && r.definition.helper.is_none()) {
+                return Err("unknown instance".into());
+            }
+            if records.iter().any(|r| r.definition.helper.as_ref().is_some_and(|h| h.target == link.target && h.purpose == link.purpose)) {
+                return Err(format!("A {} helper already exists for this session", link.purpose.name()));
             }
         }
         let mut record = Record::new(definition);
@@ -620,6 +698,7 @@ impl Registry {
                 .iter_mut()
                 .filter(|r| {
                     r.definition.plan_target.is_none()
+                        && r.definition.helper.is_none()
                         && r.reader.state.todo_total == 0
                         && r.reader.state.plan_path.is_none()
                         && (r.saved_for != r.definition.session_path
@@ -830,22 +909,23 @@ impl Registry {
     }
     pub fn remove(&self, id: &str, origin: Origin<'_>) -> Result<(), String> {
         let _lifecycle = self.lifecycle.lock();
-        let planners: Vec<String> = {
+        // Plan agents and helper agents of this session go first so none can outlive it.
+        let dependants: Vec<String> = {
             let records = self.records.lock().map_err(|e| e.to_string())?;
             let i = index(&records, id)?;
             authorize(&records, i, origin, true)?;
             records
                 .iter()
-                .filter(|r| r.definition.plan_target.as_deref() == Some(id))
+                .filter(|r| r.definition.plan_target.as_deref() == Some(id) || r.definition.helper.as_ref().is_some_and(|h| h.target == id))
                 .map(|r| r.definition.id.clone())
                 .collect()
         };
-        // Planners first so no plan agent can outlive the session it plans.
-        for planner in planners {
-            self.remove_locked(&planner, Origin::Human)?;
+        for dependant in dependants {
+            self.remove_locked(&dependant, Origin::Human)?;
         }
         self.remove_locked(id, origin)?;
         let _ = fs::remove_dir_all(self.plan_folder(id));
+        let _ = fs::remove_dir_all(self.config_root().join("helpers").join(id));
         Ok(())
     }
     fn remove_locked(&self, id: &str, origin: Origin<'_>) -> Result<(), String> {
@@ -1351,6 +1431,31 @@ mod tests {
         assert_eq!(ids, vec![kept.id]);
         assert!(!ids.contains(&planner.id));
         assert!(!registry.plan_folder(&target.id).exists());
+        fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn helper_agents_are_hidden_links_to_one_project_per_purpose_and_go_with_it() {
+        let (folder, registry) = fixture();
+        let target = registry.create(input(&folder)).unwrap();
+        let diff = registry.create_helper(&target.id, HelperPurpose::Diff, "C:/repo".into()).unwrap();
+        assert_eq!(diff.helper, Some(HelperLink { target: target.id.clone(), purpose: HelperPurpose::Diff, repo: "C:/repo".into() }));
+        assert_eq!(diff.name, "Diff helper — Project");
+        assert_eq!(diff.plan_target, None);
+        let expected = fs::canonicalize(registry.helper_folder(&target.id, HelperPurpose::Diff)).unwrap();
+        assert_eq!(diff.project_path, expected.to_string_lossy().trim_start_matches("\\\\?\\"), "its cwd is app-owned, not the project");
+        assert_eq!(registry.create_helper(&target.id, HelperPurpose::Diff, "C:/repo".into()).err().as_deref(), Some("A diff helper already exists for this session"));
+        let git = registry.create_helper(&target.id, HelperPurpose::Git, "C:/repo".into()).unwrap();
+        assert_eq!(registry.helper_for(&target.id, HelperPurpose::Git), Some(git.id.clone()));
+        assert_eq!(registry.helper_for(&target.id, HelperPurpose::Diff), Some(diff.id.clone()));
+        // A helper is not a session: it can have neither helpers nor a plan agent.
+        assert_eq!(registry.create_helper(&diff.id, HelperPurpose::Git, "C:/repo".into()).err().as_deref(), Some("unknown instance"));
+        assert_eq!(registry.create_planner(&diff.id).err().as_deref(), Some("unknown instance"));
+        let loaded = Registry::load(folder.join("instances.json"), folder.clone()).unwrap();
+        assert_eq!(loaded.helper_for(&target.id, HelperPurpose::Git), Some(git.id.clone()));
+        assert_eq!(loaded.inspect(&git.id, Origin::Human).unwrap().helper.map(|link| link.repo), Some("C:/repo".into()));
+        registry.remove(&target.id, Origin::Human).unwrap();
+        assert!(registry.snapshot().is_empty(), "removing the project removes its helpers");
+        assert!(!folder.join("helpers").join(&target.id).exists());
         fs::remove_dir_all(folder).unwrap();
     }
     #[test]

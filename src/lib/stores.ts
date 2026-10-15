@@ -7,8 +7,8 @@ import { defaultTerminalUi, shellKey, type TerminalUi } from "./terminal";
 
 // Every row the backend reports, including plan agents (looked up by id for the plan view).
 export const allInstances = writable<Instance[]>([]);
-// What dashboards, pickers and counters show: plan agents are never listed as sessions.
-export const instances = derived(allInstances, list => list.filter(row => row.planTarget === null));
+// What dashboards, pickers and counters show: plan and helper agents are never listed as sessions.
+export const instances = derived(allInstances, list => list.filter(row => row.planTarget === null && row.helper === null));
 export const instancesById = derived(allInstances, list => new Map(list.map(i => [i.id, i])));
 export const managerInstance = derived(instances, list => list.find(instance => instance.kind === "manager"));
 export const globalConfig = writable<GlobalConfigInfo>({ path: null, error: null });

@@ -6,7 +6,9 @@ mod browser_window;
 mod code_diff;
 mod commands;
 mod config;
+mod explain;
 mod git_graph;
+mod helper_agent;
 mod instance;
 mod manager;
 mod pty;
@@ -26,6 +28,7 @@ pub struct AppState {
     pub closing: Arc<AtomicBool>,
     pub setup: Arc<setup::SetupService>,
     pub plan: Arc<plan::PlanService>,
+    pub helpers: Arc<helper_agent::HelperService>,
     pub browser: Arc<browser::BrowserSupervisor>,
     pub code_diff: Arc<code_diff::DiffService>,
     pub terminals: Arc<terminal::TerminalService>,
@@ -74,6 +77,7 @@ fn main() {
             }
             let terminals = terminal::TerminalService::new(&folder);
             terminal::TerminalService::materialize(&folder).map_err(std::io::Error::other)?;
+            helper_agent::materialize(&folder).map_err(std::io::Error::other)?;
             terminals.bind_app(app.handle().clone()).map_err(std::io::Error::other)?;
             let hub = manager::ManagerHub::bind(extension).map_err(std::io::Error::other)?;
             hub.bind_registry(Arc::downgrade(&registry))
@@ -98,6 +102,7 @@ fn main() {
                 browser_host: browser_host.clone(),
                 setup: Arc::new(setup::SetupService::new(folder)),
                 plan: Arc::new(plan::PlanService::new()),
+                helpers: Arc::new(helper_agent::HelperService::new()),
             });
             Ok(())
         })
@@ -152,6 +157,8 @@ fn main() {
             commands::list_all_terminals,
             commands::list_terminal_history,
             commands::read_terminal_script,
+            commands::explain_git_change,
+            commands::open_helper,
             commands::read_terminal_output,
             commands::attach_command_output,
             commands::kill_terminal_command,

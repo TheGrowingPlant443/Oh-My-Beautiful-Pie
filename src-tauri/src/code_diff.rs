@@ -152,7 +152,7 @@ fn git_command(dir: &Path, args: &[&str]) -> Command {
     no_console(&mut cmd);
     cmd
 }
-fn no_console(cmd: &mut Command) {
+pub(crate) fn no_console(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -171,7 +171,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
     })
 }
 /// Runs `cmd` with optional stdin and a deadline; the child is killed when the deadline passes.
-fn run_timed(mut cmd: Command, stdin: Option<&[u8]>, limit: Duration, not_found: &str) -> Result<std::process::Output> {
+pub(crate) fn run_timed(mut cmd: Command, stdin: Option<&[u8]>, limit: Duration, not_found: &str) -> Result<std::process::Output> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound { not_found.to_string() } else { format!("Could not start the command: {e}") }
@@ -294,7 +294,7 @@ fn short_name(reference: &str) -> String {
     reference.strip_prefix("refs/heads/").or_else(|| reference.strip_prefix("refs/remotes/")).unwrap_or(reference).to_string()
 }
 /// master first, then the repository's recorded default branch, then main. Only local refs are read.
-fn default_branch(root: &Path) -> Result<Option<(String, String)>> {
+pub(crate) fn default_branch(root: &Path) -> Result<Option<(String, String)>> {
     let found = |reference: String| -> Result<Option<(String, String)>> {
         Ok(resolve_commit(root, &reference)?.map(|commit| (short_name(&reference), commit)))
     };
@@ -594,6 +594,50 @@ impl Default for DiffService {
     fn default() -> Self {
         Self::with_gh("gh".into())
     }
+}
+
+pub(crate) fn current_branch(root: &Path) -> Result<Option<String>> {
+    Ok(git_optional(root, &["symbolic-ref", "--short", "-q", "HEAD"])?.map(text).filter(|b| !b.is_empty()))
+}
+
+/// What a helper agent is told about the comparison the Code diff page shows.
+#[derive(Debug)]
+pub struct Comparison {
+    pub base_commit: Option<String>,
+    pub label: String,
+    pub branch: Option<String>,
+    /// Changes exactly when the change set does: the same request is not sent to a helper twice.
+    pub fingerprint: String,
+}
+
+/// Unlike `DiffService::overview` this keeps no snapshot, so asking never invalidates the open page's own view.
+pub fn comparison(project: &Path, mode: DiffMode) -> Result<Comparison> {
+    let root = repository_root(project)?;
+    let head = resolve_commit(&root, "HEAD")?;
+    let (base_commit, label) = match mode {
+        DiffMode::Head => (head, "Since the last commit (HEAD)".to_string()),
+        DiffMode::Uncommitted => (head, "Uncommitted changes (staged and unstaged, against HEAD)".to_string()),
+        DiffMode::Branch => {
+            let (name, commit) = default_branch(&root)?.ok_or("No master or default branch was found in this repository")?;
+            (Some(commit), format!("Compared with {name}"))
+        }
+        DiffMode::Commits => return Err("Use the commit comparison command for historical diffs".into()),
+    };
+    let patch = match &base_commit {
+        Some(base) => git_timed(&root, &["diff", "--no-ext-diff", "--no-textconv", base, "--"], None, 60)?,
+        None => git_timed(&root, &["diff", "--no-ext-diff", "--no-textconv", "--cached", "--"], None, 60)?,
+    };
+    let untracked = git_timed(&root, &["ls-files", "--others", "--exclude-standard", "-z"], None, 30)?;
+    // Untracked files are not in the patch: their names, sizes and modification times stand in for their content.
+    let mut seen = String::new();
+    for name in untracked.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let name = String::from_utf8_lossy(name);
+        let (len, modified) = fs::metadata(root.join(&*name)).map_or((0, 0), |m| (m.len(), m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis())));
+        seen.push_str(&format!("{name}:{len}:{modified}\n"));
+    }
+    let fingerprint = crate::terminal::digest(&format!("{mode:?}|{}|{}|{seen}", base_commit.as_deref().unwrap_or("-"), String::from_utf8_lossy(&patch)));
+    let branch = current_branch(&root)?;
+    Ok(Comparison { base_commit, label, branch, fingerprint })
 }
 
 impl DiffService {
@@ -1207,6 +1251,39 @@ mod tests {
         assert_eq!(shared.original.as_deref(), Some("base\n"));
         assert_eq!(shared.modified.as_deref(), Some("base\nfeature commit\nworking edit\n"));
         assert!(service.read_file("a", &repo.0, &head.snapshot_id, "shared.txt", None).is_err(), "a new overview invalidates the older snapshot");
+    }
+
+    #[test]
+    fn a_comparison_has_no_side_effects_and_its_fingerprint_follows_the_change_set() {
+        let repo = Repo::new("master");
+        repo.write("a.txt", b"one\n");
+        repo.commit("base");
+        repo.write("a.txt", b"one\nedit\n");
+        let service = DiffService::new();
+        let overview = service.overview("a", &repo.0, DiffMode::Head).unwrap();
+        let first = comparison(&repo.0, DiffMode::Uncommitted).unwrap();
+        assert_eq!(first.label, "Uncommitted changes (staged and unstaged, against HEAD)");
+        assert_eq!((first.base_commit.as_deref(), first.branch.as_deref()), (overview.base_commit.as_deref(), Some("master")));
+        assert!(service.read_file("a", &repo.0, &overview.snapshot_id, "a.txt", None).is_ok(), "asking for a comparison keeps the page's snapshot valid");
+        assert_eq!(comparison(&repo.0, DiffMode::Uncommitted).unwrap().fingerprint, first.fingerprint);
+        assert_ne!(comparison(&repo.0, DiffMode::Head).unwrap().fingerprint, first.fingerprint, "the mode is part of it");
+        repo.write("a.txt", b"one\ntwo\n");
+        let edited = comparison(&repo.0, DiffMode::Uncommitted).unwrap().fingerprint;
+        assert_ne!(edited, first.fingerprint);
+        repo.write("new.txt", b"x\n");
+        let untracked = comparison(&repo.0, DiffMode::Uncommitted).unwrap().fingerprint;
+        assert_ne!(untracked, edited);
+        repo.write("new.txt", b"changed content\n");
+        assert_ne!(comparison(&repo.0, DiffMode::Uncommitted).unwrap().fingerprint, untracked, "editing an untracked file counts");
+        assert_eq!(comparison(&repo.0, DiffMode::Branch).unwrap().label, "Compared with master");
+        assert_eq!(comparison(&repo.0, DiffMode::Commits).err().as_deref(), Some("Use the commit comparison command for historical diffs"));
+
+        let trunk = Repo::new("trunk");
+        trunk.write("a.txt", b"1\n");
+        assert_eq!(comparison(&trunk.0, DiffMode::Head).unwrap().base_commit, None, "no commits yet");
+        trunk.commit("base");
+        assert!(comparison(&trunk.0, DiffMode::Branch).unwrap_err().contains("No master or default branch"));
+        assert!(comparison(&trunk.0, DiffMode::Head).is_ok());
     }
 
     #[test]

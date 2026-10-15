@@ -1226,6 +1226,7 @@ mod tests {
             kind: InstanceKind::Manager,
             manager_id: None,
             plan_target: None,
+            helper: None,
         };
         let launch = hub.launch(&definition, 0).unwrap();
         assert!(hub.authenticate(&json!({"type":"hello","id":"hello","protocol":1,"instanceId":manager.id,"generation":0,"token":"wrong"})).is_err());
@@ -1298,8 +1299,8 @@ mod tests {
             role: InstanceKind::Instance,
             connection_id: String::new(),
         };
-        hub.launch(&Definition { id:manager.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Manager, manager_id:None, plan_target:None }, 0).unwrap();
-        hub.launch(&Definition { id:worker.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Instance, manager_id:Some(manager.id.clone()), plan_target:None }, 0).unwrap();
+        hub.launch(&Definition { id:manager.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Manager, manager_id:None, plan_target:None, helper:None }, 0).unwrap();
+        hub.launch(&Definition { id:worker.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Instance, manager_id:Some(manager.id.clone()), plan_target:None, helper:None }, 0).unwrap();
         let event = json!({"kind":"needs_decision","payload":{"requestId":"native-1","method":"select","title":"Review operation","options":["Approve","Deny"]}});
         hub.event(&worker_actor, &event).unwrap();
         let first_id = {
@@ -1407,7 +1408,7 @@ mod tests {
             role: InstanceKind::Manager,
             connection_id: String::new(),
         };
-        hub.launch(&Definition { id:manager.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Manager, manager_id:None, plan_target:None }, 0).unwrap();
+        hub.launch(&Definition { id:manager.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Manager, manager_id:None, plan_target:None, helper:None }, 0).unwrap();
         let create = json!({"action":"create","payload":{"start":false,"config":{"name":"W","projectPath":folder,"agentFile":persona}}});
         hub.execute(&actor, &create).unwrap();
         let rows = registry.snapshot();
@@ -1427,7 +1428,7 @@ mod tests {
         hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
         let browser = crate::browser::BrowserSupervisor::new(folder.clone(), folder.clone());
         hub.install_browser_supervisor(browser.clone()).unwrap();
-        let launch = hub.launch(&Definition {id:worker.id.clone(),input:CreateInput::default(),session_path:None,kind:InstanceKind::Instance,manager_id:None,plan_target:None},0).unwrap();
+        let launch = hub.launch(&Definition {id:worker.id.clone(),input:CreateInput::default(),session_path:None,kind:InstanceKind::Instance,manager_id:None,plan_target:None,helper:None},0).unwrap();
         browser.register(&worker.id,0,&launch.token).unwrap();
         let actor = Actor {id:worker.id.clone(),generation:0,role:InstanceKind::Instance,connection_id:String::new()};
         assert_eq!(hub.execute(&actor,&json!({"action":"browser_prepare","payload":{"name":"main","instanceId":"peer"}})).unwrap_err(),"invalid_browser_payload");
@@ -1451,7 +1452,7 @@ mod tests {
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
         hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
-        let launch = hub.launch(&Definition {id:worker.id.clone(),input:CreateInput::default(),session_path:None,kind:InstanceKind::Instance,manager_id:None,plan_target:None},0).unwrap();
+        let launch = hub.launch(&Definition {id:worker.id.clone(),input:CreateInput::default(),session_path:None,kind:InstanceKind::Instance,manager_id:None,plan_target:None,helper:None},0).unwrap();
         let mut socket = TcpStream::connect(&hub.endpoint).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let hello = json!({"type":"hello","id":"hello","protocol":1,"instanceId":worker.id,"generation":0,"token":launch.token});
@@ -1480,7 +1481,7 @@ mod tests {
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
         hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
         registry.install_manager_hub(hub.clone()).unwrap();
-        let definition = |id: &str, plan_target: Option<String>| Definition { id: id.into(), input: CreateInput::default(), session_path: None, kind: InstanceKind::Instance, manager_id: None, plan_target };
+        let definition = |id: &str, plan_target: Option<String>| Definition { id: id.into(), input: CreateInput::default(), session_path: None, kind: InstanceKind::Instance, manager_id: None, plan_target, helper: None };
         let target_launch = hub.launch(&definition(&target.id, None), 0).unwrap();
         hub.launch(&definition(&planner.id, Some(target.id.clone())), 0).unwrap();
         hub.launch(&definition(&other.id, None), 0).unwrap();
