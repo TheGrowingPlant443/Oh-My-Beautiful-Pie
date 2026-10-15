@@ -6,6 +6,7 @@ mod browser_window;
 mod code_diff;
 mod commands;
 mod config;
+mod git_graph;
 mod instance;
 mod manager;
 mod pty;
@@ -102,6 +103,12 @@ fn main() {
             commands::commit_code_diff,
             commands::publish_code_diff,
             commands::open_code_diff_pull_request,
+            commands::get_git_graph,
+            commands::get_commit_diff,
+            commands::revert_commit,
+            commands::cherry_pick_commit,
+            commands::reset_last_commit,
+            commands::create_branch_at,
             commands::create_instance,
             commands::create_manager,
             commands::set_manager_owner,

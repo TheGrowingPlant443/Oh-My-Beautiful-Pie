@@ -441,6 +441,42 @@ pub async fn open_code_diff_pull_request(window: tauri::WebviewWindow, state: St
     let diff = state.code_diff.clone();
     blocking(move || diff.open_pull_request(&id)).await
 }
+#[tauri::command]
+pub async fn get_git_graph(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, limit: u32) -> Result<crate::git_graph::GitGraph> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::git_graph::graph(Path::new(&diff_project(&registry, &id)?), limit)).await
+}
+#[tauri::command]
+pub async fn get_commit_diff(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, base: Option<String>, target: String) -> Result<crate::code_diff::DiffOverview> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, diff) = (state.registry.clone(), state.code_diff.clone());
+    blocking(move || diff.commit_overview(&id, Path::new(&diff_project(&registry, &id)?), base.as_deref(), &target)).await
+}
+#[tauri::command]
+pub async fn revert_commit(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, commit: String) -> Result<String> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::git_graph::revert(Path::new(&diff_project(&registry, &id)?), &commit)).await
+}
+#[tauri::command]
+pub async fn cherry_pick_commit(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, commit: String) -> Result<String> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::git_graph::cherry_pick(Path::new(&diff_project(&registry, &id)?), &commit)).await
+}
+#[tauri::command]
+pub async fn reset_last_commit(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String) -> Result<String> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::git_graph::reset_last(Path::new(&diff_project(&registry, &id)?))).await
+}
+#[tauri::command]
+pub async fn create_branch_at(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, name: String, commit: Option<String>) -> Result<String> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::git_graph::create_branch(Path::new(&diff_project(&registry, &id)?), &name, commit.as_deref())).await
+}
 pub fn tick(app: AppHandle, registry: Arc<Registry>, closing: Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {
         while !closing.load(std::sync::atomic::Ordering::Relaxed) {

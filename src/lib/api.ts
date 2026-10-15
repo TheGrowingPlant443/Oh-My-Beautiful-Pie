@@ -81,7 +81,7 @@ export interface BrowserInfo {
   headless: boolean; embedded: boolean; pid: number | null; error: string | null;
 }
 export interface BrowserRect { x: number; y: number; width: number; height: number; }
-export type DiffMode = "head" | "branch" | "uncommitted";
+export type DiffMode = "head" | "branch" | "uncommitted" | "commits";
 export type DiffGroup = "staged" | "changes";
 export type DiffFileAction = "stage" | "unstage" | "revert";
 export interface DiffFile { path: string; oldPath: string | null; status: string; group: DiffGroup | null; }
@@ -96,6 +96,8 @@ export interface DiffContent {
 export interface CommitResult { commit: string; summary: string; }
 export interface PublishOptions { newBranch: string | null; createPr: boolean; }
 export interface PublishResult { branch: string; remote: string; prUrl: string | null; steps: string[]; }
+export interface GraphCommit { hash: string; parents: string[]; author: string; date: string; subject: string; refs: string[]; }
+export interface GitGraph { root: string; head: string | null; currentBranch: string | null; commits: GraphCommit[]; truncated: boolean; }
 
 export const api = {
   listInstances: () => invoke<Instance[]>("list_instances"),
@@ -109,6 +111,12 @@ export const api = {
   commitCodeDiff: (id: string, snapshotId: string, message: string) => invoke<CommitResult>("commit_code_diff", { id, snapshotId, message }),
   publishCodeDiff: (id: string, snapshotId: string, options: PublishOptions) => invoke<PublishResult>("publish_code_diff", { id, snapshotId, options }),
   openCodeDiffPullRequest: (id: string) => invoke<void>("open_code_diff_pull_request", { id }),
+  getGitGraph: (id: string, limit: number) => invoke<GitGraph>("get_git_graph", { id, limit }),
+  getCommitDiff: (id: string, base: string | null, target: string) => invoke<DiffOverview>("get_commit_diff", { id, base, target }),
+  revertCommit: (id: string, commit: string) => invoke<string>("revert_commit", { id, commit }),
+  cherryPickCommit: (id: string, commit: string) => invoke<string>("cherry_pick_commit", { id, commit }),
+  resetLastCommit: (id: string) => invoke<string>("reset_last_commit", { id }),
+  createBranchAt: (id: string, name: string, commit: string | null) => invoke<string>("create_branch_at", { id, name, commit }),
   setBrowserView: (instanceId: string | null, generation: number | null, rect: BrowserRect | null) => invoke<void>("set_browser_view", { instanceId, generation, rect }),
   createInstance: (config: CreateInstanceInput) => invoke<Instance>("create_instance", { config }),
   createManager: (config: CreateInstanceInput) => invoke<Instance>("create_manager", { config }),

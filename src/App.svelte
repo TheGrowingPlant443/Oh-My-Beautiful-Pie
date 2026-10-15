@@ -10,6 +10,7 @@
   import SubagentPanel from "./lib/components/SubagentPanel.svelte";
   import PlanChangeView from "./lib/components/PlanChangeView.svelte";
   import CodeDiffView from "./lib/components/CodeDiffView.svelte";
+  import GitGraphView from "./lib/components/GitGraphView.svelte";
   import GlobalConfigDialog from "./lib/components/GlobalConfigDialog.svelte";
   import AgentSetupPage from "./lib/components/AgentSetupPage.svelte";
   import SettingsDialog from "./lib/components/SettingsDialog.svelte";
@@ -43,7 +44,7 @@
   });
   let openedIds = $state<ReadonlySet<string>>(new Set());
   let settingsOpen = $state(false);
-  let view = $state<"dashboard" | "agent_setup" | "code_diff">("dashboard");
+  let view = $state<"dashboard" | "agent_setup" | "code_diff" | "git_graph">("dashboard");
   let configOpen = $state(false);
   let configMode = $state<"save" | "import">("save");
   let setupDraft = $state<SetupDraft>({ scope: null, kinds: [], items: [], step: 0, instanceId: null, projectInstanceId: null });
@@ -74,7 +75,7 @@
   function openAgentSetup(): void {
     if (view === "agent_setup") return;
     planChange = null;
-    const sourceId = fullscreen ? focused?.id : view === "code_diff" ? diffInstanceId : null;
+    const sourceId = fullscreen ? focused?.id : (view === "code_diff" || view === "git_graph") ? diffInstanceId : null;
     setupContextId = sourceId && $instancesById.get(sourceId)?.kind === "instance" ? sourceId : null;
     if (!setupDraft.instanceId) {
       if (setupDraft.projectInstanceId !== setupContextId && setupDraft.scope === "repository") setupDraft.scope = null;
@@ -244,13 +245,15 @@
     <button disabled={initializing} class="primary" onclick={newInstance}>New instance</button>
   </header>
   {#if browserSettingsError}<p class="err" role="alert">Configure browser: {browserSettingsError}</p>{/if}
-  <main class:focused={(view === "dashboard" && (!!focused || !!planChange)) || view === "code_diff"}>
+  <main class:focused={(view === "dashboard" && (!!focused || !!planChange)) || view === "code_diff" || view === "git_graph"}>
     {#if initializing}
       <p role="status">Loading workspace…</p>
     {:else if view === "agent_setup"}
       <AgentSetupPage bind:draft={setupDraft} bind:admission={setupAdmission} projectContext={setupProject} onback={() => view = "dashboard"} onSetupManager={configureManager} onOpenManager={openManager} onSelectSession={focus} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} />
+    {:else if view === "git_graph" && diffInstanceId}
+      <GitGraphView instanceId={diffInstanceId} name={diffName} onBack={() => view = "code_diff"} />
     {:else if view === "code_diff" && diffInstanceId}
-      <CodeDiffView instanceId={diffInstanceId} name={diffName} onBack={closeCodeDiff} onGuardChange={guard => diffGuard = guard} />
+      <CodeDiffView instanceId={diffInstanceId} name={diffName} onBack={closeCodeDiff} onGitTree={() => view = "git_graph"} onGuardChange={guard => diffGuard = guard} />
     {:else if planChange && planTarget && planner}
       <PlanChangeView target={planTarget} {planner} admission={planChange.admission} onBack={() => planChange = null} onRetry={retryPlanContext} />
     {:else if focused}

@@ -8,8 +8,8 @@
   import DiffFileTree from "./DiffFileTree.svelte";
   type Choice = "save" | "discard" | "cancel";
   type Sel = { group: DiffGroup | null; path: string };
-  let { instanceId, name, onBack, onGuardChange }: {
-    instanceId: string; name: string; onBack: () => void; onGuardChange: (guard: (() => Promise<boolean>) | null) => void;
+  let { instanceId, name, onBack, onGitTree, onGuardChange }: {
+    instanceId: string; name: string; onBack: () => void; onGitTree: () => void; onGuardChange: (guard: (() => Promise<boolean>) | null) => void;
   } = $props();
   const GROUPS: { group: DiffGroup; label: string }[] = [{ group: "staged", label: "Staged Changes" }, { group: "changes", label: "Changes" }];
   let mode = $state<DiffMode>("head");
@@ -121,6 +121,9 @@
     if (busy) return;
     if (await beforeLeave()) await loadOverview(mode, selected);
   }
+  async function gitTree(): Promise<void> {
+    if (!busy && await beforeLeave()) onGitTree();
+  }
   async function back(): Promise<void> {
     if (!saving && !acting && await beforeLeave()) onBack();
   }
@@ -218,6 +221,7 @@
     <span class="spacer"></span>
     {#if dirty}<span class="pill warn">Unsaved changes</span>{/if}
     <button disabled={busy} onclick={refresh}>Refresh</button>
+    <button disabled={busy} onclick={gitTree}>Git tree</button>
     <button class="primary" disabled={!dirty || saving} onclick={() => save()}>{saving ? "Saving…" : "Save"}</button>
   </header>
   {#if error}

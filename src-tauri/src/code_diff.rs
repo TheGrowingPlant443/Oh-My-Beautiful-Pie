@@ -29,6 +29,7 @@ pub enum DiffMode {
     Head,
     Branch,
     Uncommitted,
+    Commits,
 }
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -109,17 +110,19 @@ struct Snapshot {
     base_commit: Option<String>,
     /// The baseline (HEAD or branch) label shown on the original side.
     base_label: String,
+    target_commit: Option<String>,
+    target_label: String,
     files: HashMap<String, DiffFile>,
 }
 pub struct DiffService {
     snapshots: Mutex<HashMap<String, Arc<Snapshot>>>,
-    /// Serialises saves and every Git mutation this app performs.
-    write_lock: Mutex<()>,
     /// Last pull request created per instance (the only URL `open_pull_request` will open).
     prs: Mutex<HashMap<String, String>>,
     /// GitHub CLI program ("gh"; replaceable in tests).
     gh: std::ffi::OsString,
 }
+// File saves, index changes and history operations share the same in-process writer lock.
+pub(crate) static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 fn file_key(group: Option<DiffGroup>, path: &str) -> String {
     let tag = match group {
@@ -158,7 +161,7 @@ fn no_console(cmd: &mut Command) {
     #[cfg(not(windows))]
     let _ = cmd;
 }
-fn git(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
     git_command(dir, args).output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             GIT_MISSING.to_string()
@@ -203,7 +206,7 @@ fn run_timed(mut cmd: Command, stdin: Option<&[u8]>, limit: Duration, not_found:
     };
     Ok(std::process::Output { status, stdout: out_thread.join().unwrap_or_default(), stderr: err_thread.join().unwrap_or_default() })
 }
-fn failure_text(out: &std::process::Output) -> String {
+pub(crate) fn failure_text(out: &std::process::Output) -> String {
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
     match (err.is_empty(), stdout.is_empty()) {
@@ -214,7 +217,7 @@ fn failure_text(out: &std::process::Output) -> String {
     }
 }
 /// Git with a deadline and optional stdin; success returns stdout.
-fn git_timed(dir: &Path, args: &[&str], stdin: Option<&[u8]>, secs: u64) -> Result<Vec<u8>> {
+pub(crate) fn git_timed(dir: &Path, args: &[&str], stdin: Option<&[u8]>, secs: u64) -> Result<Vec<u8>> {
     let out = run_timed(git_command(dir, args), stdin, Duration::from_secs(secs), GIT_MISSING)?;
     if out.status.success() { Ok(out.stdout) } else { Err(failure_text(&out)) }
 }
@@ -244,7 +247,7 @@ fn open_url(url: &str) -> Result<()> {
     no_console(&mut cmd);
     cmd.spawn().map(|_| ()).map_err(|e| format!("Could not open the link: {e}"))
 }
-fn git_ok(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn git_ok(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = git(dir, args)?;
     if out.status.success() {
         return Ok(out.stdout);
@@ -256,7 +259,7 @@ fn git_ok(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Err(if message.is_empty() { format!("Git failed ({})", out.status) } else { message })
 }
 /// `Ok(None)` when Git answers "no such object" (exit 1); real failures stay errors.
-fn git_optional(dir: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
+pub(crate) fn git_optional(dir: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
     let out = git(dir, args)?;
     if out.status.success() {
         return Ok(Some(out.stdout));
@@ -267,19 +270,25 @@ fn git_optional(dir: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
     let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
     Err(if message.is_empty() { format!("Git failed ({})", out.status) } else { message })
 }
-fn text(bytes: Vec<u8>) -> String {
+pub(crate) fn text(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).trim().to_string()
 }
-fn repository_root(project: &Path) -> Result<PathBuf> {
+pub(crate) fn repository_root(project: &Path) -> Result<PathBuf> {
     let top = text(git_ok(project, &["rev-parse", "--show-toplevel"])?);
     if top.is_empty() {
         return Err("This project is not inside a Git repository".into());
     }
     crate::setup::canonical(Path::new(&top)).map_err(|e| format!("Repository root is unreadable: {e}"))
 }
-fn resolve_commit(root: &Path, reference: &str) -> Result<Option<String>> {
+pub(crate) fn resolve_commit(root: &Path, reference: &str) -> Result<Option<String>> {
     let spec = format!("{reference}^{{commit}}");
     Ok(git_optional(root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &spec])?.map(text))
+}
+pub(crate) fn valid_commit(root: &Path, hash: &str) -> Result<()> {
+    if !matches!(hash.len(), 40 | 64) || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) || resolve_commit(root, hash)?.is_none() {
+        return Err(format!("Not a commit: {hash}"));
+    }
+    Ok(())
 }
 fn short_name(reference: &str) -> String {
     reference.strip_prefix("refs/heads/").or_else(|| reference.strip_prefix("refs/remotes/")).unwrap_or(reference).to_string()
@@ -593,7 +602,7 @@ impl DiffService {
     }
     /// `gh` is a parameter so tests can substitute a fake program.
     pub fn with_gh(gh: std::ffi::OsString) -> Self {
-        Self { snapshots: Mutex::new(HashMap::new()), write_lock: Mutex::new(()), prs: Mutex::new(HashMap::new()), gh }
+        Self { snapshots: Mutex::new(HashMap::new()), prs: Mutex::new(HashMap::new()), gh }
     }
     pub fn overview(&self, id: &str, project: &Path, mode: DiffMode) -> Result<DiffOverview> {
         let root = repository_root(project)?;
@@ -605,6 +614,7 @@ impl DiffService {
         let (base_ref, base_commit, base_label, side_label) = match mode {
             DiffMode::Head => (head_ref, head.clone(), head_label.clone(), head_label),
             DiffMode::Uncommitted => (head_ref, head.clone(), "Uncommitted changes".to_string(), head_label),
+            DiffMode::Commits => return Err("Use the commit comparison command for historical diffs".into()),
             DiffMode::Branch => {
                 let (name, commit) = branch.clone().ok_or("No master or default branch was found in this repository")?;
                 let label = format!("Compared with {name}");
@@ -623,6 +633,8 @@ impl DiffService {
             mode,
             base_commit: base_commit.clone(),
             base_label: side_label,
+            target_commit: None,
+            target_label: "Working tree".into(),
             files: files.iter().map(|f| (file_key(f.group, &f.path), f.clone())).collect(),
         });
         let overview = DiffOverview {
@@ -636,6 +648,43 @@ impl DiffService {
             current_branch,
             upstream,
             files,
+        };
+        self.snapshots.lock().insert(id.into(), snapshot);
+        Ok(overview)
+    }
+    pub fn commit_overview(&self, id: &str, project: &Path, base: Option<&str>, target: &str) -> Result<DiffOverview> {
+        let root = repository_root(project)?;
+        valid_commit(&root, target)?;
+        let base = if let Some(base) = base {
+            valid_commit(&root, base)?;
+            Some(base.to_string())
+        } else {
+            resolve_commit(&root, &format!("{target}^1"))?
+        };
+        let left = match &base {
+            Some(hash) => hash.clone(),
+            None => text(git_timed(&root, &["hash-object", "-t", "tree", "--stdin"], Some(b""), 10)?),
+        };
+        let files = parse_name_status(&git_ok(&root, &["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "--find-renames", &left, target, "--"])?);
+        let base_label = match &base {
+            Some(hash) => text(git_ok(&root, &["log", "-1", "--format=%h %s", hash])?),
+            None => "Empty tree".into(),
+        };
+        let target_label = text(git_ok(&root, &["log", "-1", "--format=%h %s", target])?);
+        let snapshot = Arc::new(Snapshot {
+            id: uuid::Uuid::new_v4().to_string(), root: root.clone(), mode: DiffMode::Commits,
+            base_commit: base.clone(), base_label: base_label.clone(),
+            target_commit: Some(target.into()), target_label,
+            files: files.iter().map(|f| (file_key(None, &f.path), f.clone())).collect(),
+        });
+        let current_branch = git_optional(&root, &["symbolic-ref", "--short", "-q", "HEAD"])?.map(text);
+        let upstream = match &current_branch {
+            Some(name) => Some(text(git_ok(&root, &["for-each-ref", "--format=%(upstream:short)", &format!("refs/heads/{name}")])?)).filter(|u| !u.is_empty()),
+            None => None,
+        };
+        let overview = DiffOverview {
+            snapshot_id: snapshot.id.clone(), root: root.display().to_string(), mode: DiffMode::Commits,
+            base_ref: base.clone(), base_commit: base, base_label, branch_ref: None, current_branch, upstream, files,
         };
         self.snapshots.lock().insert(id.into(), snapshot);
         Ok(overview)
@@ -673,7 +722,7 @@ impl DiffService {
     ) -> Result<DiffContent> {
         let snapshot = self.snapshot(id, project, snapshot_id)?;
         let file = entry(&snapshot, group, path)?;
-        let _serial = self.write_lock.lock();
+        let _serial = WRITE_LOCK.lock();
         let loaded = load(&snapshot, file)?;
         if let Some(reason) = &loaded.content.read_only_reason {
             return Err(reason.clone());
@@ -703,7 +752,7 @@ impl DiffService {
     pub fn change_file(&self, id: &str, project: &Path, snapshot_id: &str, path: &str, group: Option<DiffGroup>, action: FileAction) -> Result<()> {
         let snapshot = self.action_snapshot(id, project, snapshot_id)?;
         let file = entry(&snapshot, group, path)?;
-        let _serial = self.write_lock.lock();
+        let _serial = WRITE_LOCK.lock();
         let result = apply_file_action(&snapshot, file, action);
         // The index or working tree changed, so every entry of this snapshot may be stale.
         self.snapshots.lock().remove(id);
@@ -718,7 +767,7 @@ impl DiffService {
         if message.len() > 100_000 {
             return Err("Commit message is too long".into());
         }
-        let _serial = self.write_lock.lock();
+        let _serial = WRITE_LOCK.lock();
         let root = &snapshot.root;
         let result = (|| {
             let staged = git(root, &["diff", "--cached", "--quiet"])?;
@@ -736,7 +785,7 @@ impl DiffService {
     }
     pub fn publish(&self, id: &str, project: &Path, snapshot_id: &str, options: &PublishOptions) -> Result<PublishResult> {
         let snapshot = self.action_snapshot(id, project, snapshot_id)?;
-        let _serial = self.write_lock.lock();
+        let _serial = WRITE_LOCK.lock();
         let result = self.publish_steps(id, &snapshot.root, options);
         // The branch may have changed even when a later step failed.
         self.snapshots.lock().remove(id);
@@ -785,7 +834,7 @@ impl DiffService {
 fn entry<'a>(snapshot: &'a Snapshot, group: Option<DiffGroup>, path: &str) -> Result<&'a DiffFile> {
     snapshot.files.get(&file_key(group, path)).ok_or_else(|| "That file is not part of this comparison".to_string())
 }
-fn validate_new_branch(root: &Path, name: &str) -> Result<()> {
+pub(crate) fn validate_new_branch(root: &Path, name: &str) -> Result<()> {
     let valid = !name.starts_with('-')
         && !name.chars().any(char::is_whitespace)
         && git(root, &["check-ref-format", "--branch", name])?.status.success();
@@ -893,9 +942,12 @@ fn load(snapshot: &Snapshot, file: &DiffFile) -> Result<Loaded> {
         note("File type changes are shown read-only");
     }
     let root = &snapshot.root;
+    let commits = snapshot.mode == DiffMode::Commits;
     let staged = snapshot.mode == DiffMode::Uncommitted && file.group == Some(DiffGroup::Staged);
     let in_changes = snapshot.mode == DiffMode::Uncommitted && file.group == Some(DiffGroup::Changes);
-    let (original_label, modified_label) = if in_changes {
+    let (original_label, modified_label) = if commits {
+        (snapshot.base_label.clone(), snapshot.target_label.clone())
+    } else if in_changes {
         ("Staged (index)".to_string(), "Working tree".to_string())
     } else if staged {
         (snapshot.base_label.clone(), "Staged (index)".to_string())
@@ -926,7 +978,13 @@ fn load(snapshot: &Snapshot, file: &DiffFile) -> Result<Loaded> {
     }
     let mut modified = Some(String::new());
     let (mut working_hash, mut crlf, mut bom) = (None, false, false);
-    if staged {
+    if commits {
+        if file.status != "D" {
+            let target = snapshot.target_commit.as_deref().ok_or("Missing target commit")?;
+            let blob = base_blob(root, target, &file.path)?.ok_or_else(|| format!("{} is not in the commit; refresh", file.path))?;
+            modified = side_text(root, &blob, &mut note)?;
+        }
+    } else if staged {
         if file.status != "D" {
             match index_blob(root, &file.path)? {
                 None => return Err(format!("{} is not in the index; refresh Code diff", file.path)),
@@ -969,6 +1027,9 @@ fn load(snapshot: &Snapshot, file: &DiffFile) -> Result<Loaded> {
     if staged {
         // Last, so a blob problem (binary, submodule, ...) is the reason shown when there is one.
         note(STAGED_READ_ONLY);
+    }
+    if commits {
+        note("Commit diffs are read-only");
     }
     Ok(Loaded {
         content: DiffContent {
@@ -1525,7 +1586,7 @@ mod tests {
         assert_eq!(repo.git(&["ls-files", "--cached"]).trim(), "", "with no commit, unstaging removes the index entry");
         assert_eq!(repo.read("f.txt"), b"first\n");
 
-        let snapshot = Snapshot { id: "s".into(), root: repo.0.clone(), mode: DiffMode::Uncommitted, base_commit: None, base_label: "x".into(), files: HashMap::new() };
+        let snapshot = Snapshot { id: "s".into(), root: repo.0.clone(), mode: DiffMode::Uncommitted, base_commit: None, base_label: "x".into(), target_commit: None, target_label: "Working tree".into(), files: HashMap::new() };
         for (status, message) in [("U", "Resolve merge conflicts with Git first"), ("A", "Intent-to-add files can only be unstaged with Git")] {
             let file = DiffFile { path: "f.txt".into(), old_path: None, status: status.into(), group: Some(DiffGroup::Changes) };
             assert_eq!(apply_file_action(&snapshot, &file, FileAction::Revert).unwrap_err(), message);
@@ -1725,5 +1786,46 @@ mod tests {
         assert_eq!(run_timed(cmd, None, Duration::from_secs(1), "missing").unwrap_err(), "Timed out after 1 s");
         assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(run_timed(Command::new("definitely-not-a-program-omp"), None, Duration::from_secs(1), "missing").unwrap_err(), "missing");
+    }
+
+    #[test]
+    fn historical_diffs_pin_blobs_and_never_read_or_save_the_working_tree() {
+        let repo = Repo::new("master");
+        repo.write("edit.txt", b"before\n");
+        repo.write("delete.txt", b"gone\n");
+        repo.write("old.txt", b"stable renamed content\nmore lines here\n");
+        repo.commit("initial");
+        let first = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.write("edit.txt", b"after\n");
+        repo.write("add.txt", b"new\n");
+        fs::remove_file(repo.0.join("delete.txt")).unwrap();
+        repo.git(&["mv", "old.txt", "renamed.txt"]);
+        repo.commit("changes");
+        let second = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.write("edit.txt", b"unrelated disk edit\n");
+        let service = DiffService::new();
+        let overview = service.commit_overview("a", &repo.0, None, &second).unwrap();
+        assert_eq!(overview.base_commit.as_deref(), Some(first.as_str()));
+        assert_eq!(statuses(&overview), [("add.txt", "A"), ("delete.txt", "D"), ("edit.txt", "M"), ("renamed.txt", "R")].map(|(p,s)| (p.into(),s.into())));
+        for (path, original, modified) in [("edit.txt", "before\n", "after\n"), ("add.txt", "", "new\n"), ("delete.txt", "gone\n", ""), ("renamed.txt", "stable renamed content\nmore lines here\n", "stable renamed content\nmore lines here\n")] {
+            let content = service.read_file("a", &repo.0, &overview.snapshot_id, path, None).unwrap();
+            assert_eq!((content.original.as_deref(), content.modified.as_deref()), (Some(original), Some(modified)));
+            assert_eq!(content.read_only_reason.as_deref(), Some("Commit diffs are read-only"));
+            assert!(content.original_label.ends_with(" initial") && content.modified_label.ends_with(" changes"));
+            assert!(content.working_hash.is_none());
+        }
+        assert_eq!(service.save_file("a", &repo.0, &overview.snapshot_id, "edit.txt", None, None, "bad").unwrap_err(), "Commit diffs are read-only");
+        assert_eq!(repo.read("edit.txt"), b"unrelated disk edit\n");
+        let root = service.commit_overview("a", &repo.0, None, &first).unwrap();
+        assert_eq!(root.base_label, "Empty tree");
+        assert!(root.files.iter().all(|f| f.status == "A"));
+        let content = service.read_file("a", &repo.0, &root.snapshot_id, "edit.txt", None).unwrap();
+        assert_eq!((content.original.as_deref(), content.modified.as_deref()), (Some(""), Some("before\n")));
+        repo.write("edit.txt", b"third\n");repo.commit("third");
+        let third = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        let pair = service.commit_overview("a", &repo.0, Some(&first), &third).unwrap();
+        let content = service.read_file("a", &repo.0, &pair.snapshot_id, "edit.txt", None).unwrap();
+        assert_eq!((content.original.as_deref(), content.modified.as_deref()), (Some("before\n"), Some("third\n")));
+        for bad in ["HEAD", "--all", "not-a-hash"] { assert!(service.commit_overview("a", &repo.0, None, bad).unwrap_err().starts_with("Not a commit:")); }
     }
 }
