@@ -4,8 +4,9 @@
   import Term from "./Term.svelte";
   import BrowserPane from "./BrowserPane.svelte";
   import OwnershipControls from "./OwnershipControls.svelte";
-  import { restartInstance, startInstance, stopInstance, browserStatuses, errorText, reportError, appSettings, terminalOwners, terminalUi, updateTerminalUi, openUserTerminal } from "../stores";
+  import { restartInstance, startInstance, stopInstance, browserStatuses, errorText, reportError, appSettings, terminalOwners, terminalUi, updateTerminalUi, openUserTerminal, allInstances } from "../stores";
   import { defaultTerminalUi } from "../terminal";
+  import { sameRepoAgents } from "../repo-agents";
   import TerminalWorkspace from "./TerminalWorkspace.svelte";
   let { instance, instances, onSwitch, onClose, onPlan, onPlanChange, onSubagents, onCodeDiff, showBrowser = false, browserHidden = false }: {
     instance: Instance; instances: Instance[]; onSwitch: (id: string) => void;
@@ -19,6 +20,7 @@
   let ratio = $state(0.5);
   let dragging = $state(false);
   let workspace = $state<HTMLDivElement>();
+  const sameRepo = $derived(sameRepoAgents($allInstances, instance));
   const browser = $derived($browserStatuses.get(instance.id));
   const currentBrowser = $derived(browser?.generation === instance.generation && browser.state !== "closed" ? browser : undefined);
   const ui = $derived($terminalUi.get(instance.id) ?? defaultTerminalUi());
@@ -100,8 +102,15 @@
   <header class="panel topbar">
     <button onclick={onClose}>Dashboard</button>
     <select aria-label="Switch session" title="Ctrl+Tab / Ctrl+Shift+Tab: next / previous running terminal" value={instance.id} onchange={e => onSwitch(e.currentTarget.value)}>
+      {#if !instances.some(row => row.id === instance.id)}<option value={instance.id}>{instance.name} · {instance.status}</option>{/if}
       {#each instances as row (row.id)}<option value={row.id}>{row.name} · {row.status}</option>{/each}
     </select>
+    {#if sameRepo.length}
+      <select aria-label="Agents on this repository" title="Other agents working on this repository right now: sessions in the same folder and the Code diff / Git tree helpers" value="" onchange={e => { const id = e.currentTarget.value; e.currentTarget.value = ""; if (id) onSwitch(id); }}>
+        <option value="">Same repository · {sameRepo.length}</option>
+        {#each sameRepo as row (row.id)}<option value={row.id}>{row.name} · {row.status}</option>{/each}
+      </select>
+    {/if}
     <span class="pill">{live ? instance.activity : instance.status}</span>
     <span class="dim">{instance.profile || "Default profile"}{instance.agentFile ? ` · ${agentName(instance.agentFile)}` : ""}</span><span class="spacer"></span>
     {#if currentBrowser && !paneBrowser}
@@ -117,7 +126,7 @@
     <button disabled={busy} onclick={() => run(() => restartInstance(instance.id))}>Restart</button>
   </header>
   <p class="identity mono">{instance.projectPath}{instance.task ? ` · ${instance.task}` : ""}</p>
-  <OwnershipControls {instance} onOpen={() => onSwitch(instance.id)} />
+  {#if !instance.helper}<OwnershipControls {instance} onOpen={() => onSwitch(instance.id)} />{/if}
   {#if instance.lastError}<p class="err" role="alert">{instance.lastError}</p>{/if}
   {#if currentBrowser?.error && !paneBrowser}<p class="browser-error err" role="alert">{currentBrowser.error}</p>{/if}
   <div class="workspace" bind:this={workspace}>

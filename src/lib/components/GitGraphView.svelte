@@ -40,7 +40,7 @@
   let helperOpen = $state(false);
   let opening = $state(false);
   const helper = $derived(agent ? $instancesById.get(agent.id) : undefined);
-  const prByCommit = $derived(new Map(prs.flatMap(pr => [pr.merge, ...pr.members].map(hash => [hash, pr] as const))));
+  const prByMerge = $derived(new Map(prs.map(pr => [pr.merge, pr] as const)));
   let explain = $state<{ title: string; x: number; y: number; status: "loading" | "done" | "error"; text: string } | null>(null);
   const explained = new Map<string, string>();
   let explainSeq = 0;
@@ -63,27 +63,22 @@
       if (seq === explainSeq && explain) explain = { ...explain, status: "error", text: errorText(e) };
     }
   }
-  // Ctrl+Shift+click: a commit, or the difference between the two selected commits. Ctrl+click on a merged PR branch: the PR.
-  // Both stop the click before it reaches the node's own selection handler; anything else stays a normal multi-select.
+  // Ctrl+Shift+click: the difference between the two selected commits, a merged PR (its merge commit), or a commit.
+  // It stops the click before the node's own selection handler; plain Ctrl+click stays a normal multi-select.
   function modifierClick(event: MouseEvent, hash: string): void {
-    if (!(event.ctrlKey || event.metaKey) || !graph) return;
-    if (event.shiftKey) {
-      event.preventDefault();
-      event.stopPropagation();
-      if (selected.length === 2 && selected.includes(hash)) {
-        const pair = graph.commits.filter(commit => selected.includes(commit.hash));
-        void showExplanation(event, "range", pair[1].hash, pair[0].hash, `${shortHash(pair[1].hash)}..${shortHash(pair[0].hash)}`);
-      } else {
-        const commit = graph.commits.find(candidate => candidate.hash === hash);
-        void showExplanation(event, "commit", null, hash, `${shortHash(hash)} ${commit?.subject ?? ""}`.trim());
-      }
-      return;
-    }
-    const pr = prByCommit.get(hash);
-    if (!pr) return;
+    if (!(event.ctrlKey || event.metaKey) || !event.shiftKey || !graph) return;
     event.preventDefault();
     event.stopPropagation();
-    void showExplanation(event, "pr", null, pr.merge, pr.subject);
+    const pr = prByMerge.get(hash);
+    if (selected.length === 2 && selected.includes(hash)) {
+      const pair = graph.commits.filter(commit => selected.includes(commit.hash));
+      void showExplanation(event, "range", pair[1].hash, pair[0].hash, `${shortHash(pair[1].hash)}..${shortHash(pair[0].hash)}`);
+    } else if (pr) {
+      void showExplanation(event, "pr", null, pr.merge, pr.subject);
+    } else {
+      const commit = graph.commits.find(candidate => candidate.hash === hash);
+      void showExplanation(event, "commit", null, hash, `${shortHash(hash)} ${commit?.subject ?? ""}`.trim());
+    }
   }
 
   function openCommit(hash: string): void {
@@ -213,7 +208,7 @@
         {#each legend as entry}<li><span class="swatch" style:background={entry.color}></span>{entry.label}</li>{/each}
       </ul>
     {/if}
-    <p class="hint">Click a commit to select it. Ctrl+click (or Shift+click) to select several. Double-click a commit to see its changes. Ctrl+click a pull-request branch for a one-line summary of the PR; Ctrl+Shift+click a commit for a one-line summary of it (with two commits selected: of the difference between them). Drag to pan; scroll to zoom.</p>
+    <p class="hint">Click a commit to select it. Ctrl+click to select several, then Compare selected. Double-click a commit to see its changes. Ctrl+Shift+click a commit for a one-line summary of it, a merged pull request's merge commit (the PR badge) for a summary of the whole PR, or, with two commits selected, one of them for a summary of the difference between them. Drag to pan; scroll to zoom.</p>
     {#if error}<p class="alert err" role="alert">{error}</p>{/if}
     {#if notice}<p class="notice" role="status">{notice}</p>{/if}
     {#if loading}<p role="status">Loading history…</p>{/if}
@@ -222,7 +217,7 @@
       {#if graph?.commits.length}
         {#key loadCount}
           <SvelteFlow bind:nodes bind:edges {nodeTypes} colorMode="dark" fitView fitViewOptions={{ nodes: nodes.slice(0, INITIAL_FIT_NODES).map(node => ({ id: node.id })), maxZoom: 1, padding: 0.1 }} minZoom={0.2}
-            nodesDraggable={false} nodesConnectable={false} deleteKey={null} zoomOnDoubleClick={false} multiSelectionKey={["Control", "Shift"]}
+            nodesDraggable={false} nodesConnectable={false} deleteKey={null} zoomOnDoubleClick={false}
             onselectionchange={({ nodes: selection }) => selected = selection.map(node => node.id)}>
             <Controls showLock={false} />
           </SvelteFlow>

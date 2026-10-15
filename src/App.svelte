@@ -131,7 +131,7 @@
     planChange = null;
     const target = id === null ? undefined : $instancesById.get(id);
     if (id !== null && !target) { reportError("Open project", "Project is no longer available"); return; }
-    if (target?.kind === "instance") {
+    if (target?.kind === "instance" && !target.helper) {
       if (!openedIds.has(target.id)) openedIds = new Set([...openedIds, target.id]);
       if ($appSettings.latestProjectId !== target.id) appSettings.update(settings => ({ ...settings, latestProjectId: target.id }));
     }
@@ -267,7 +267,7 @@
     {:else if planChange && planTarget && planner}
       <PlanChangeView target={planTarget} {planner} admission={planChange.admission} onBack={() => planChange = null} onRetry={retryPlanContext} />
     {:else if focused}
-      <SessionView instance={focused} instances={$instances} onSwitch={id => void openProject(id)} onClose={() => focus(null)} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} showBrowser browserHidden={browserHidden} />
+      <SessionView instance={focused} instances={$instances} onSwitch={id => void openProject(id)} onClose={() => focus(null)} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} showBrowser={!focused.helper} browserHidden={browserHidden} />
     {:else if $previewsEnabled}
       <Grid instances={overview} onSelect={focus} onOpen={openProject} {onPlan} onPlanChange={openPlanChange} {onSubagents} tileMin={$appSettings.previewSize} onCreate={newInstance} />
     {:else}
