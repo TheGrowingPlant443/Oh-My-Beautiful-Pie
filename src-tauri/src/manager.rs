@@ -23,6 +23,7 @@ pub struct BridgeLaunch {
     pub token: String,
     pub extension_path: PathBuf,
     pub manager_setup_dir: PathBuf,
+    pub architect_dir: PathBuf,
     pub terminal_dir: PathBuf,
     pub sdk_dir: Option<PathBuf>,
     pub instance_id: String,
@@ -217,6 +218,11 @@ impl ManagerHub {
                 .parent()
                 .ok_or("invalid bridge directory")?
                 .join("manager-setup"),
+            architect_dir: self
+                .extension_path
+                .parent()
+                .ok_or("invalid bridge directory")?
+                .join("architect"),
             terminal_dir: self
                 .terminals
                 .get()
@@ -852,7 +858,7 @@ impl ManagerHub {
     pub fn prompt_human(&self, id: &str, message: &str) -> Result<Value> {
         let registry = self.registry()?;
         let lease = registry.lease(id, Origin::Human, true)?;
-        if registry.inspect(id, Origin::Human)?.kind != InstanceKind::Instance {
+        if registry.inspect(id, Origin::Human)?.kind == InstanceKind::Manager {
             return Err("Setup prompts require an ordinary human-controlled instance".into());
         }
         self.control(

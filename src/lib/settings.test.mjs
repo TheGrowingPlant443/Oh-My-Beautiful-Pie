@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAppSettings, resolveStartupTarget, dashboardInstances } from './settings.ts';
+import { parseAppSettings, resolveStartupTarget, dashboardInstances, startsFresh } from './settings.ts';
 
 const rows = [
   { id: 'M', kind: 'manager', status: 'stopped' },
@@ -51,7 +51,7 @@ test('chosen and latest targets use instance identity and fall back only to Mana
 test('dashboard startup is intentional with or without Manager and preserves saved choices', () => {
   for (const autoStart of [true, false]) {
     const saved = { version: 1, startupTarget: 'dashboard', startupProjectId: 'deleted-project',
-      latestProjectId: 'deleted-latest', autoStart, showPreviousProjects: true, showManagerTile: false, previewSize: 1000, browserHeadless: true, browserEmbedded: false, terminalAutoOpen: true, terminalCreateUser: false };
+      latestProjectId: 'deleted-latest', autoStart, showPreviousProjects: true, showManagerTile: false, previewSize: 1000, browserHeadless: true, browserEmbedded: false, terminalAutoOpen: true, terminalCreateUser: false, alwaysNewSession: true };
     const settings = parseAppSettings(JSON.stringify(saved), null);
     assert.deepEqual(settings, saved);
     assert.deepEqual(parseAppSettings(JSON.stringify(settings), null), settings);
@@ -98,4 +98,22 @@ test('terminal preferences validate independently and default to a quiet pane wi
   const off = parseAppSettings(JSON.stringify({ version: 1, terminalAutoOpen: 1, terminalCreateUser: false }), null);
   assert.equal(off.terminalAutoOpen, false);
   assert.equal(off.terminalCreateUser, false);
+});
+
+test('the new-session preference defaults to resuming and ignores non-boolean values', () => {
+  assert.equal(parseAppSettings(null, null).alwaysNewSession, false);
+  assert.equal(parseAppSettings(JSON.stringify({ version: 1, alwaysNewSession: 'yes' }), null).alwaysNewSession, false);
+  assert.equal(parseAppSettings(JSON.stringify({ version: 1, alwaysNewSession: true }), null).alwaysNewSession, true);
+});
+
+test('a new session is started only for ordinary agents without an explicitly chosen session', () => {
+  const on = parseAppSettings(JSON.stringify({ version: 1, alwaysNewSession: true }), null);
+  const off = parseAppSettings(null, null);
+  const ordinary = { planTarget: null, helper: null };
+  assert.equal(startsFresh(off, ordinary, false), false);
+  assert.equal(startsFresh(on, ordinary, false), true);
+  assert.equal(startsFresh(on, ordinary, true), false);
+  assert.equal(startsFresh(on, { planTarget: null, helper: { target: 'a', purpose: 'git', repo: 'x' } }, false), false);
+  assert.equal(startsFresh(on, { planTarget: 'x', helper: null }, false), false);
+  assert.equal(startsFresh(on, undefined, false), false);
 });

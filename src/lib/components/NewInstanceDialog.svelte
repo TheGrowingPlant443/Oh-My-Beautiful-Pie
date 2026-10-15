@@ -4,7 +4,7 @@
   import { errorText, refreshInstances, startInstance, globalConfig, refreshGlobalConfig } from "../stores";
   import { basename, pickFolder } from "../ui";
   import ConfigPicker from "./ConfigPicker.svelte";
-  let { open, onclose, oncreated, purpose = "instance" }: { open: boolean; onclose: () => void; oncreated: (id: string) => void; purpose?: "instance" | "manager" } = $props();
+  let { open, onclose, oncreated, purpose = "instance" }: { open: boolean; onclose: () => void; oncreated: (id: string) => void; purpose?: "instance" | "manager" | "architect" } = $props();
   let projectPath = $state("");
   let name = $state("");
   let profile = $state("");
@@ -28,7 +28,7 @@
   $effect(() => {
     if (purpose === previousPurpose) return;
     previousPurpose = purpose;
-    name = purpose === "manager" ? "The Manager" : "";
+    name = purpose === "manager" ? "The Manager" : purpose === "architect" ? "The Architect" : "";
   });
 
   $effect(() => {
@@ -88,8 +88,8 @@
     error = "";
     try {
       const config = { name: name.trim() || basename(projectPath), projectPath: projectPath.trim(), profile, model: "", configs: [extraConfig, ...configs.map(c => c.trim())].filter(Boolean), resumeSessionId: resume || null, useGlobalConfig, agentFile: persona || null };
-      const created = purpose === "manager" ? await api.createManager(config) : await api.createInstance(config);
-      if (purpose === "instance" && startNow) await startInstance(created.id);
+      const created = purpose === "manager" ? await api.createManager(config) : purpose === "architect" ? await api.createArchitect(config) : await api.createInstance(config);
+      if (purpose === "instance" && startNow) await startInstance(created.id, !!resume);
       await refreshInstances();
       oncreated(created.id);
       onclose();
@@ -98,9 +98,9 @@
   }
 </script>
 
-<dialog bind:this={dialog} class="native-dialog" aria-label={purpose === "manager" ? "Set up The Manager" : "New OMP instance"} onclose={onclose} oncancel={onclose} onclick={e => { if (e.target === e.currentTarget && !busy) onclose(); }}>
+<dialog bind:this={dialog} class="native-dialog" aria-label={purpose === "manager" ? "Set up The Manager" : purpose === "architect" ? "Set up The Architect" : "New OMP instance"} onclose={onclose} oncancel={onclose} onclick={e => { if (e.target === e.currentTarget && !busy) onclose(); }}>
     <form class="dialog panel" onsubmit={submit}>
-      <header><h3>{purpose === "manager" ? "Set up The Manager" : "New OMP instance"}</h3><span class="spacer"></span><button type="button" onclick={onclose} disabled={busy}>Close</button></header>
+      <header><h3>{purpose === "manager" ? "Set up The Manager" : purpose === "architect" ? "Set up The Architect" : "New OMP instance"}</h3><span class="spacer"></span><button type="button" onclick={onclose} disabled={busy}>Close</button></header>
       <div class="body form">
         <label>Working directory <div class="row"><input bind:value={projectPath} required placeholder="C:/path/to/project" /><button type="button" onclick={browse}>Browse…</button></div></label>
         {#if sessions.length > 0}
@@ -115,7 +115,7 @@
         {#if purpose === "instance"}<label class="row"><input type="checkbox" bind:checked={startNow} /> Start immediately</label>{/if}
         <button type="button" aria-expanded={advanced} onclick={() => advanced = !advanced}>{advanced ? "Hide advanced options" : "Show advanced options"}</button>
         {#if advanced}
-          <label>Name <input bind:value={name} disabled={purpose === "manager"} placeholder={basename(projectPath) || "Project name"} /></label>
+          <label>Name <input bind:value={name} disabled={purpose !== "instance"} placeholder={basename(projectPath) || "Project name"} /></label>
           <label>OMP profile
             <select bind:value={profile}>
               <option value="">Default profile</option>
@@ -148,9 +148,10 @@
         {/if}
         <p class="dim">Thinking visibility, tools, approvals, and agent behavior remain controlled by OMP.</p>
         {#if purpose === "manager"}<p class="dim">A bundled OMP extension connects through authenticated, app-lifetime localhost IPC. Only created or handed-over sessions are controllable.</p>{/if}
+        {#if purpose === "architect"}<p class="dim">The Architect is an ordinary agent that you ask about a project's architecture. Its Dependency tree button analyses a folder you choose.</p>{/if}
         {#if error}<p role="alert" class="err">{error}</p>{/if}
       </div>
-      <footer><button type="submit" class="primary" disabled={busy || !projectPath.trim()}>{busy ? "Creating…" : purpose === "manager" ? "Create The Manager" : "Create instance"}</button></footer>
+      <footer><button type="submit" class="primary" disabled={busy || !projectPath.trim()}>{busy ? "Creating…" : purpose === "manager" ? "Create The Manager" : purpose === "architect" ? "Create The Architect" : "Create instance"}</button></footer>
     </form>
 </dialog>
 <style>

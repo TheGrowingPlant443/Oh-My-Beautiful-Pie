@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { installTerminalBrowserBridge } from './omp-browser.mjs';
 import { installTerminalCommands, registerCommandHistoryTool } from './omp-terminal.mjs';
 import { registerRepoInspectTool } from './omp-repo.mjs';
+import { registerClassifyTool } from './omp-architect.mjs';
 
 const MAX_FRAME = 64 * 1024 * 1024;
 const ACTIONS = ['list','create','start','stop','restart','remove','send','interrupt','screen','transcript','plan','subagents','respond','keys','subscribe','request_human'];
@@ -171,6 +172,8 @@ export default function managerBridge(pi) {
   if (terminal?.supported) registerCommandHistoryTool(pi, terminal);
   // Set only for a helper agent (Code diff / Git tree): read-only Git access, nothing else.
   if (process.env.OMP_MANAGER_HELPER_REPO) registerRepoInspectTool(pi, process.env.OMP_MANAGER_HELPER_REPO);
+  // Set only for The Architect: the one tool that saves its basic/chosen dependency judgements.
+  if (process.env.OMP_MANAGER_ARCHITECT_DIR) registerClassifyTool(pi, process.env.OMP_MANAGER_ARCHITECT_DIR);
   function resolveTerminalRequests() {
     for (const item of [...pending.values()]) if (['terminal','custom'].includes(item.request.method) && item.advisory) item.finish('native', undefined);
   }

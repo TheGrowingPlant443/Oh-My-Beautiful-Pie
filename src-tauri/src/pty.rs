@@ -154,6 +154,9 @@ impl Pty {
                 "instance"
             },
         );
+        if definition.kind == InstanceKind::Architect {
+            cmd.env("OMP_MANAGER_ARCHITECT_DIR", &bridge.architect_dir);
+        }
         if let Some(link) = helper {
             cmd.env("OMP_MANAGER_HELPER_REPO", &link.repo);
         } else {

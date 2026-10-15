@@ -106,6 +106,41 @@ pub fn create_manager(
     state.registry.inspect(&instance.id, Origin::Human)
 }
 #[tauri::command]
+pub fn create_architect(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: CreateInput,
+) -> Result<Instance> {
+    let instance = state.registry.create_architect(config)?;
+    let result = state.registry.start(&instance.id, Origin::Human);
+    publish(&app, &state.registry);
+    result?;
+    state.registry.inspect(&instance.id, Origin::Human)
+}
+#[tauri::command]
+pub async fn scan_dependencies(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String) -> Result<crate::dependencies::DependencyGraph> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::dependencies::scan(Path::new(&folder), &registry.home, true)).await
+}
+#[tauri::command]
+pub async fn get_dependency_classification(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String) -> Result<crate::architect::Classification> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::architect::classification_for(&registry, Path::new(&folder))).await
+}
+#[tauri::command]
+pub async fn classify_dependencies(app: AppHandle, window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String) -> Result<crate::architect::ClassifyAdmission> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || {
+        let result = crate::architect::classify(&registry, Path::new(&folder));
+        publish(&app, &registry);
+        result
+    })
+    .await
+}
+#[tauri::command]
 pub fn set_manager_owner(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -125,8 +160,8 @@ pub fn return_to_manager(app: AppHandle, state: State<'_, AppState>, id: String)
     Ok(())
 }
 #[tauri::command]
-pub fn start_instance(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<()> {
-    let result = state.registry.start(&id, Origin::Human);
+pub fn start_instance(app: AppHandle, state: State<'_, AppState>, id: String, fresh: Option<bool>) -> Result<()> {
+    let result = state.registry.start_with(&id, Origin::Human, fresh.unwrap_or(false));
     publish(&app, &state.registry);
     result
 }

@@ -4,14 +4,14 @@
   import Term from "./Term.svelte";
   import BrowserPane from "./BrowserPane.svelte";
   import OwnershipControls from "./OwnershipControls.svelte";
-  import { restartInstance, startInstance, stopInstance, browserStatuses, errorText, reportError, appSettings, terminalOwners, terminalUi, updateTerminalUi, openUserTerminal, allInstances } from "../stores";
+  import { restartInstance, startInstance, browserStatuses, errorText, reportError, appSettings, terminalOwners, terminalUi, updateTerminalUi, openUserTerminal, allInstances } from "../stores";
   import { defaultTerminalUi } from "../terminal";
   import { sameRepoAgents } from "../repo-agents";
   import TerminalWorkspace from "./TerminalWorkspace.svelte";
-  let { instance, instances, onSwitch, onClose, onPlan, onPlanChange, onSubagents, onCodeDiff, showBrowser = false, browserHidden = false }: {
+  let { instance, instances, onSwitch, onClose, onPlan, onPlanChange, onSubagents, onCodeDiff, onDependencyTree, showBrowser = false, browserHidden = false }: {
     instance: Instance; instances: Instance[]; onSwitch: (id: string) => void;
     onClose: () => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void; onSubagents: (id: string) => void;
-    onCodeDiff: (id: string) => void; showBrowser?: boolean; browserHidden?: boolean;
+    onCodeDiff: (id: string) => void; onDependencyTree?: (id: string) => void; showBrowser?: boolean; browserHidden?: boolean;
   } = $props();
   const TERMINAL_MIN = 160;
   const BROWSER_MIN = 520;
@@ -119,10 +119,11 @@
     <button disabled={!instance.subagents.length} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>
     {#if showBrowser}<button disabled={busy || !live} title={live ? "Show this session's browser next to the terminal" : "Start this session first"} onclick={openBrowser}>Browser</button>{/if}
     {#if showBrowser}<button class:active={terminalOpen} aria-pressed={terminalOpen} title="Your own shell, the AI's command history and its live commands next to the terminal" onclick={toggleTerminal}>Terminal</button>{/if}
+    {#if instance.kind === "architect" && onDependencyTree}<button title="Diagram of this project's dependencies" onclick={() => onDependencyTree(instance.id)}>Dependency tree</button>{/if}
     {#if showBrowser}<button title="Review and edit this project's changes" onclick={() => onCodeDiff(instance.id)}>Code diff</button>{/if}
     {#if instance.planKind}<button onclick={() => onPlanChange(instance.id)}>Plan</button>{/if}
     {#if instance.planPath}<button onclick={() => onPlan(instance.id)}>View Plan</button>{/if}
-    <button disabled={busy} onclick={() => run(() => live ? stopInstance(instance.id) : startInstance(instance.id))}>{live ? "Stop" : "Start / reopen"}</button>
+    {#if !live}<button disabled={busy} onclick={() => run(() => startInstance(instance.id))}>Start / reopen</button>{/if}
     <button disabled={busy} onclick={() => run(() => restartInstance(instance.id))}>Restart</button>
   </header>
   <p class="identity mono">{instance.projectPath}{instance.task ? ` · ${instance.task}` : ""}</p>

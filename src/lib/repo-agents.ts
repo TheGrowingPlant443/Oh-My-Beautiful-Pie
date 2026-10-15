@@ -2,6 +2,17 @@ import type { Instance } from "./api";
 
 export const repoKey = (path: string): string => path.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 
+/** Project folders of the saved sessions, one per folder (slash style, case and a trailing slash are ignored). */
+export function projectFolders(rows: readonly { kind: string; projectPath: string }[]): string[] {
+  const seen = new Map<string, string>();
+  for (const row of rows) {
+    if (row.kind !== "instance") continue;
+    const key = repoKey(row.projectPath);
+    if (!seen.has(key)) seen.set(key, row.projectPath);
+  }
+  return [...seen.values()].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+}
+
 // Other agents working right now on the same project folder as `current`: sessions on that folder and the
 // Code diff / Git tree helpers of those sessions. Subagents are not instances and plan agents are skipped.
 export function sameRepoAgents(all: readonly Instance[], current: Instance): Instance[] {

@@ -1,4 +1,5 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
+import type { Classification, DependencyGraph } from "./dependency-graph";
 
 export type InstanceStatus = "stopped" | "starting" | "running" | "error";
 export interface Subagent {
@@ -32,7 +33,7 @@ export interface Instance {
   rows: number;
   generation: number;
   exitCode: number | null;
-  kind: "instance" | "manager";
+  kind: "instance" | "manager" | "architect";
   managerId: string | null;
   planTarget: string | null;
   helper: { target: string; purpose: "diff" | "git"; repo: string } | null;
@@ -68,6 +69,7 @@ export interface SetupRequest { scope: SetupScope; items: SetupItem[]; projectIn
 export interface SetupDraft { scope: SetupScope | null; kinds: SetupKind[]; items: SetupItem[]; step: number; instanceId: string | null; projectInstanceId: string | null; }
 export interface PlanSessionAdmission { planner: Instance; promptSent: boolean | null; error: string | null; }
 export interface HelperAdmission { helper: Instance; promptSent: boolean | null; error: string | null; }
+export interface ClassifyAdmission { architect: Instance | null; promptSent: boolean | null; requested: number; error: string | null; }
 export interface SetupPaths { globalOmpFolder: string; globalAgentFolder: string; managerFolder: string; }
 export interface SetupAdmission { instance: Instance; promptSent: boolean | null; error: string | null; }
 export interface SavedConfig { path: string; modifiedMs: number; }
@@ -136,12 +138,16 @@ export const api = {
   createBranchAt: (id: string, name: string, commit: string | null) => invoke<string>("create_branch_at", { id, name, commit }),
   explainGitChange: (id: string, kind: "pr" | "commit" | "range", base: string | null, target: string) => invoke<string>("explain_git_change", { id, kind, base, target }),
   openHelper: (targetId: string, purpose: "diff" | "git", request: "explain" | "review" | null, mode: Exclude<DiffMode, "commits"> | null) => invoke<HelperAdmission>("open_helper", { targetId, purpose, request, mode }),
+  scanDependencies: (folder: string) => invoke<DependencyGraph>("scan_dependencies", { folder }),
+  getDependencyClassification: (folder: string) => invoke<Classification>("get_dependency_classification", { folder }),
+  classifyDependencies: (folder: string) => invoke<ClassifyAdmission>("classify_dependencies", { folder }),
   setBrowserView: (instanceId: string | null, generation: number | null, rect: BrowserRect | null) => invoke<void>("set_browser_view", { instanceId, generation, rect }),
   createInstance: (config: CreateInstanceInput) => invoke<Instance>("create_instance", { config }),
   createManager: (config: CreateInstanceInput) => invoke<Instance>("create_manager", { config }),
+  createArchitect: (config: CreateInstanceInput) => invoke<Instance>("create_architect", { config }),
   setManagerOwner: (id: string, managerId: string | null) => invoke<void>("set_manager_owner", { id, managerId }),
   returnToManager: (id: string) => invoke<void>("return_to_manager", { id }),
-  startInstance: (id: string) => invoke<void>("start_instance", { id }),
+  startInstance: (id: string, fresh: boolean) => invoke<void>("start_instance", { id, fresh }),
   stopInstance: (id: string) => invoke<void>("stop_instance", { id }),
   restartInstance: (id: string) => invoke<void>("restart_instance", { id }),
   removeInstance: (id: string) => invoke<void>("remove_instance", { id }),

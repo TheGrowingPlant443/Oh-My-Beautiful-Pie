@@ -2,7 +2,7 @@ import { writable, derived, get } from "svelte/store";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { api, type Instance, type PtyChunk, type GlobalConfigInfo, type BrowserInfo, type TerminalOwner } from "./api";
-import { parseAppSettings, type AppSettings } from "./settings";
+import { parseAppSettings, startsFresh, type AppSettings } from "./settings";
 import { defaultTerminalUi, shellKey, type TerminalUi } from "./terminal";
 
 // Every row the backend reports, including plan agents (looked up by id for the plan view).
@@ -11,6 +11,7 @@ export const allInstances = writable<Instance[]>([]);
 export const instances = derived(allInstances, list => list.filter(row => row.planTarget === null && row.helper === null));
 export const instancesById = derived(allInstances, list => new Map(list.map(i => [i.id, i])));
 export const managerInstance = derived(instances, list => list.find(instance => instance.kind === "manager"));
+export const architectInstance = derived(instances, list => list.find(instance => instance.kind === "architect"));
 export const globalConfig = writable<GlobalConfigInfo>({ path: null, error: null });
 export const browserStatuses = writable<ReadonlyMap<string, BrowserInfo>>(new Map());
 // Live AI commands, held state and the user shell per agent, as reported by the backend.
@@ -170,7 +171,10 @@ async function action(id: string, command: (id: string) => Promise<void>): Promi
   try { await command(id); await refreshInstances(); return true; }
   catch (error) { reportError("Instance action", error); return false; }
 }
-export const startInstance = (id: string) => action(id, api.startInstance);
+export function startInstance(id: string, keepSession = false): Promise<boolean> {
+  const fresh = startsFresh(get(appSettings), get(instancesById).get(id), keepSession);
+  return action(id, id => api.startInstance(id, fresh));
+}
 export const stopInstance = (id: string) => action(id, api.stopInstance);
 export const restartInstance = (id: string) => action(id, api.restartInstance);
 export const removeInstance = (id: string) => action(id, api.removeInstance);

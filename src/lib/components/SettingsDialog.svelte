@@ -34,6 +34,8 @@
       {/if}
       <label class="check"><input type="checkbox" checked={$appSettings.autoStart} disabled={$appSettings.startupTarget === "dashboard"} onchange={e => update("autoStart", e.currentTarget.checked)} />Automatically start startup target</label>
       <small class="dim">{$appSettings.startupTarget === "dashboard" ? "Dashboard opens without starting any terminals." : "This setting controls app startup only. Opening a previous project starts its terminal independently."}</small>
+      <label class="check"><input type="checkbox" checked={$appSettings.alwaysNewSession} onchange={e => update("alwaysNewSession", e.currentTarget.checked)} />Always start a new session</label>
+      <small class="dim">Off (default): starting an agent resumes its previous session. On: Start / reopen, opening a stopped agent and startup auto-start begin a fresh session; the old one stays in OMP's session list (Reconnect). Restart always keeps the session.</small>
       <label class="check"><input type="checkbox" checked={$appSettings.showPreviousProjects} onchange={e => update("showPreviousProjects", e.currentTarget.checked)} />Show previous projects on dashboard</label>
       <small class="dim">Hidden projects remain searchable. Projects opened or created this launch still appear.</small>
       <label class="check"><input type="checkbox" checked={$appSettings.showManagerTile} onchange={e => update("showManagerTile", e.currentTarget.checked)} />Show Manager tile</label>

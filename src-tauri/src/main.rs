@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod architect;
 mod browser;
 #[cfg(windows)]
 mod browser_window;
 mod code_diff;
 mod commands;
 mod config;
+mod dependencies;
 mod explain;
 mod git_graph;
 mod helper_agent;
@@ -78,6 +80,7 @@ fn main() {
             let terminals = terminal::TerminalService::new(&folder);
             terminal::TerminalService::materialize(&folder).map_err(std::io::Error::other)?;
             helper_agent::materialize(&folder).map_err(std::io::Error::other)?;
+            architect::materialize(&folder).map_err(std::io::Error::other)?;
             terminals.bind_app(app.handle().clone()).map_err(std::io::Error::other)?;
             let hub = manager::ManagerHub::bind(extension).map_err(std::io::Error::other)?;
             hub.bind_registry(Arc::downgrade(&registry))
@@ -127,6 +130,10 @@ fn main() {
             commands::create_branch_at,
             commands::create_instance,
             commands::create_manager,
+            commands::create_architect,
+            commands::scan_dependencies,
+            commands::get_dependency_classification,
+            commands::classify_dependencies,
             commands::set_manager_owner,
             commands::return_to_manager,
             commands::start_instance,

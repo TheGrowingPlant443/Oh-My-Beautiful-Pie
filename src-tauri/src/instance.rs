@@ -17,6 +17,7 @@ pub enum InstanceKind {
     #[default]
     Instance,
     Manager,
+    Architect,
 }
 
 /// What a helper agent is for: the Code diff page (explain / review the changes) or the Git tree (search history).
@@ -193,6 +194,13 @@ impl Record {
             saved_for: None,
             last_plan_handoff: None,
         }
+    }
+    /// The next launch starts a new OMP session: nothing is resumed and the old session's state is dropped.
+    fn forget_session(&mut self) {
+        self.definition.session_path = None;
+        self.reader = session::TailReader::default();
+        self.native_session_id = None;
+        self.materialized = false;
     }
     fn lease(&self) -> ControlLease {
         ControlLease {
@@ -445,6 +453,10 @@ impl Registry {
         input.name = "The Manager".into();
         self.create_definition(input, InstanceKind::Manager, None, None, None)
     }
+    pub fn create_architect(&self, mut input: CreateInput) -> Result<Instance, String> {
+        input.name = "The Architect".into();
+        self.create_definition(input, InstanceKind::Architect, None, None, None)
+    }
     pub fn create_owned(&self, manager_id: &str, input: CreateInput) -> Result<Instance, String> {
         self.create_definition(input, InstanceKind::Instance, Some(manager_id.into()), None, None)
     }
@@ -606,8 +618,8 @@ impl Registry {
             helper,
         };
         let mut records = self.records.lock().map_err(|e| e.to_string())?;
-        if kind == InstanceKind::Manager && records.iter().any(|r| r.definition.kind == kind) {
-            return Err("The Manager already exists".into());
+        if kind != InstanceKind::Instance && records.iter().any(|r| r.definition.kind == kind) {
+            return Err(format!("{} already exists", if kind == InstanceKind::Manager { "The Manager" } else { "The Architect" }));
         }
         if let Some(owner) = &definition.manager_id {
             if !records
@@ -834,6 +846,10 @@ impl Registry {
         }
     }
     pub fn start(&self, id: &str, origin: Origin<'_>) -> Result<(), String> {
+        self.start_with(id, origin, false)
+    }
+    /// `fresh` begins a new OMP session instead of resuming the saved one.
+    pub fn start_with(&self, id: &str, origin: Origin<'_>, fresh: bool) -> Result<(), String> {
         let _lifecycle = self.lifecycle.lock();
         let (definition, generation, hub) = {
             let mut records = self.records.lock().map_err(|e| e.to_string())?;
@@ -850,13 +866,20 @@ impl Registry {
                     return Err(message);
                 }
             }
+            if fresh {
+                record.forget_session();
+            }
             let hub = self.hub.get().ok_or("manager bridge not initialized")?;
             record.process = None;
             record.generation += 1;
             record.error = None;
             record.bridge_ready = false;
             record.pending_decision_count = 0;
-            (record.definition.clone(), record.generation, hub)
+            let launch = (record.definition.clone(), record.generation, hub);
+            if fresh {
+                self.save(&records)?;
+            }
+            launch
         };
         // launch/invalidate can tear down a previous browser: never hold records.
         let result = (|| {
@@ -1521,6 +1544,23 @@ mod tests {
         registry.revise_plan(&target.id, &backup.text).unwrap();
         assert_eq!(fs::read_to_string(&native).unwrap(), "# Original");
         assert!(crate::plan::list_backups(&registry.plan_folder(&target.id)).unwrap().iter().any(|b| b.text == "# New"));
+        fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn forgetting_the_session_makes_the_next_launch_a_new_one() {
+        let (folder, registry) = fixture();
+        registry.create(input(&folder)).unwrap();
+        let file = folder.join("old.jsonl");
+        fs::write(&file, "{}\n").unwrap();
+        let mut records = registry.records.lock().unwrap();
+        records[0].definition.session_path = Some(file);
+        records[0].materialized = true;
+        records[0].native_session_id = Some("old".into());
+        records[0].forget_session();
+        assert!(records[0].definition.session_path.is_none());
+        assert!(!records[0].materialized);
+        assert!(records[0].native_session_id.is_none());
+        drop(records);
         fs::remove_dir_all(folder).unwrap();
     }
 }

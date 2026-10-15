@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api, type SetupDraft, type SetupAdmission, type PlanSessionAdmission } from "./lib/api";
-  import { connectInstances, instances, instancesById, previewsEnabled, toasts, dismissToast, reportError, managerInstance, appSettings, startInstance, errorText, refreshInstances } from "./lib/stores";
+  import { connectInstances, instances, instancesById, previewsEnabled, toasts, dismissToast, reportError, managerInstance, architectInstance, appSettings, startInstance, errorText, refreshInstances } from "./lib/stores";
   import Grid from "./lib/components/Grid.svelte";
   import Tree from "./lib/components/Tree.svelte";
   import SessionView from "./lib/components/SessionView.svelte";
@@ -16,6 +16,7 @@
   import SettingsDialog from "./lib/components/SettingsDialog.svelte";
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
   import TerminalsPage from "./lib/components/TerminalsPage.svelte";
+  import DependencyTreePage from "./lib/components/DependencyTreePage.svelte";
   import { dashboardInstances, resolveStartupTarget } from "./lib/settings";
   let initializing = $state(true);
   let startupSelected = false;
@@ -45,7 +46,7 @@
   });
   let openedIds = $state<ReadonlySet<string>>(new Set());
   let settingsOpen = $state(false);
-  let view = $state<"dashboard" | "agent_setup" | "code_diff" | "git_graph" | "terminals">("dashboard");
+  let view = $state<"dashboard" | "agent_setup" | "code_diff" | "git_graph" | "terminals" | "dependency_tree">("dashboard");
   let configOpen = $state(false);
   let configMode = $state<"save" | "import">("save");
   let setupDraft = $state<SetupDraft>({ scope: null, kinds: [], items: [], step: 0, instanceId: null, projectInstanceId: null });
@@ -54,8 +55,9 @@
   let returnToSetup = $state(false);
   let focusedId = $state<string | null>(null);
   let dialogOpen = $state(false);
-  let dialogPurpose = $state<"instance" | "manager">("instance");
+  let dialogPurpose = $state<"instance" | "manager" | "architect">("instance");
   let openingManager = $state(false);
+  let openingArchitect = $state(false);
   let panel = $state<{ kind: "plan" | "subagents"; id: string; child?: string } | null>(null);
   let planChange = $state<{ targetId: string; plannerId: string; admission: PlanSessionAdmission; handoffAtOpen: string | null } | null>(null);
   let planOpening = false;
@@ -98,6 +100,12 @@
     void api.setBrowserView(null, null, null).catch(error => reportError("Hide browser", error));
     view = "code_diff";
   }
+  // A global page, not an agent view: leaving it returns to The Architect's terminal.
+  function openDependencyTree(): void {
+    planChange = null;
+    void api.setBrowserView(null, null, null).catch(error => reportError("Hide browser", error));
+    view = "dependency_tree";
+  }
   // A global page, not an agent view: it never starts an agent, and leaving it stops nothing.
   function openTerminals(): void {
     planChange = null;
@@ -126,6 +134,15 @@
       if (manager.status === "stopped" || manager.status === "error") await startInstance(manager.id);
       focus(manager.id);
     } finally { openingManager = false; }
+  }
+  async function openArchitect(): Promise<void> {
+    const architect = $architectInstance;
+    if (!architect) { returnToSetup = false; dialogPurpose = "architect"; dialogOpen = true; return; }
+    openingArchitect = true;
+    try {
+      if (architect.status === "stopped" || architect.status === "error") await startInstance(architect.id);
+      focus(architect.id);
+    } finally { openingArchitect = false; }
   }
   function focus(id: string | null): void {
     planChange = null;
@@ -248,18 +265,21 @@
     <button disabled={initializing} onclick={() => openConfig("import")}>Import config</button>
     <button disabled={initializing} class:active={view === "agent_setup"} onclick={() => requestNavigation(openAgentSetup)}>Agent setup</button>
     {#if view === "dashboard" && !focused && !planChange}<button disabled={initializing} title="Every agent's command history and live commands" onclick={() => requestNavigation(openTerminals)}>Terminals</button>{/if}
+    <button aria-label="The Architect" disabled={openingArchitect || initializing} onclick={() => requestNavigation(openArchitect)}>The Architect</button>
     <button aria-label="The Manager" disabled={openingManager || initializing} onclick={() => requestNavigation(openManager)}>The Manager{#if needsHuman}<span class="pill warn">Needs you</span>{/if}</button>
     <ProjectPicker projects={$instances} label="Previous projects" disabled={initializing} onselect={id => requestNavigation(() => openProject(id))} />
     <button disabled={initializing} class="primary" onclick={newInstance}>New instance</button>
   </header>
   {#if browserSettingsError}<p class="err" role="alert">Configure browser: {browserSettingsError}</p>{/if}
-  <main class:focused={(view === "dashboard" && (!!focused || !!planChange)) || view === "code_diff" || view === "git_graph" || view === "terminals"}>
+  <main class:focused={(view === "dashboard" && (!!focused || !!planChange)) || view === "code_diff" || view === "git_graph" || view === "terminals" || view === "dependency_tree"}>
     {#if initializing}
       <p role="status">Loading workspace…</p>
     {:else if view === "agent_setup"}
       <AgentSetupPage bind:draft={setupDraft} bind:admission={setupAdmission} projectContext={setupProject} onback={() => view = "dashboard"} onSetupManager={configureManager} onOpenManager={openManager} onSelectSession={focus} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} />
     {:else if view === "terminals"}
       <TerminalsPage onBack={() => focus(null)} />
+    {:else if view === "dependency_tree"}
+      <DependencyTreePage onBack={() => focus($architectInstance?.id ?? null)} />
     {:else if view === "git_graph" && diffInstanceId}
       <GitGraphView instanceId={diffInstanceId} name={diffName} onBack={() => view = "code_diff"} />
     {:else if view === "code_diff" && diffInstanceId}
@@ -267,7 +287,7 @@
     {:else if planChange && planTarget && planner}
       <PlanChangeView target={planTarget} {planner} admission={planChange.admission} onBack={() => planChange = null} onRetry={retryPlanContext} />
     {:else if focused}
-      <SessionView instance={focused} instances={$instances} onSwitch={id => void openProject(id)} onClose={() => focus(null)} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} showBrowser={!focused.helper} browserHidden={browserHidden} />
+      <SessionView instance={focused} instances={$instances} onSwitch={id => void openProject(id)} onClose={() => focus(null)} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} onDependencyTree={() => openDependencyTree()} showBrowser={!focused.helper} browserHidden={browserHidden} />
     {:else if $previewsEnabled}
       <Grid instances={overview} onSelect={focus} onOpen={openProject} {onPlan} onPlanChange={openPlanChange} {onSubagents} tileMin={$appSettings.previewSize} onCreate={newInstance} />
     {:else}

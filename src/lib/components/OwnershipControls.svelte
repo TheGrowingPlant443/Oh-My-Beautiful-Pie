@@ -16,6 +16,8 @@
   {#if instance.kind === "manager"}
     <span class="pill">The Manager</span><span class="dim">{instance.bridgeReady ? "Controller connected" : "Bridge connecting / offline"}</span>
     {#if instance.pendingDecisionCount}<button class="warn" onclick={onOpen}>Needs you · {instance.pendingDecisionCount}</button>{/if}
+  {:else if instance.kind === "architect"}
+    <span class="pill">The Architect</span>
   {:else}
     {#if instance.managerId}
       <span class="pill">Managed by The Manager</span>

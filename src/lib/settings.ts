@@ -16,13 +16,15 @@ export interface AppSettings {
   terminalAutoOpen: boolean;
   /** Opening the Terminal pane starts the user's own shell (Tab 0). */
   terminalCreateUser: boolean;
+  /** Starting an agent begins a new session instead of resuming the previous one. */
+  alwaysNewSession: boolean;
 }
 
 export function parseAppSettings(raw: string | null, legacyShowManager: string | null): AppSettings {
   const defaults: AppSettings = {
     version: 1, startupTarget: "manager", startupProjectId: null, latestProjectId: null,
     showPreviousProjects: false, showManagerTile: legacyShowManager !== "off", previewSize: 640, autoStart: true,
-    browserHeadless: false, browserEmbedded: true, terminalAutoOpen: false, terminalCreateUser: true,
+    browserHeadless: false, browserEmbedded: true, terminalAutoOpen: false, terminalCreateUser: true, alwaysNewSession: false,
   };
   let data: unknown;
   try { data = raw === null ? null : JSON.parse(raw); }
@@ -43,7 +45,13 @@ export function parseAppSettings(raw: string | null, legacyShowManager: string |
     browserEmbedded: typeof value.browserEmbedded === "boolean" ? value.browserEmbedded : defaults.browserEmbedded,
     terminalAutoOpen: typeof value.terminalAutoOpen === "boolean" ? value.terminalAutoOpen : defaults.terminalAutoOpen,
     terminalCreateUser: typeof value.terminalCreateUser === "boolean" ? value.terminalCreateUser : defaults.terminalCreateUser,
+    alwaysNewSession: typeof value.alwaysNewSession === "boolean" ? value.alwaysNewSession : defaults.alwaysNewSession,
   };
+}
+
+// Helper and plan agents keep their conversation; an explicitly chosen session is always resumed.
+export function startsFresh(settings: AppSettings, row: Pick<Instance, "planTarget" | "helper"> | undefined, keepSession: boolean): boolean {
+  return settings.alwaysNewSession && !keepSession && !!row && row.planTarget === null && row.helper === null;
 }
 
 export function resolveStartupTarget(settings: AppSettings, list: readonly Instance[]): {
