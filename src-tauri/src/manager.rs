@@ -14,6 +14,20 @@ use crate::plan;
 use crate::terminal::TerminalService;
 use serde_json::{json, Value};
 
+/// Identity of the Architect launch/session that produces a dependency result. `launch_id` is a SHA-256 of the
+/// private bridge token, never the token itself.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyProducer {
+    pub instance_id: String,
+    pub generation: u64,
+    pub launch_id: String,
+    pub session_id: String,
+}
+fn launch_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 type Connection = Arc<Mutex<TcpStream>>;
 pub type Result<T, E = String> = std::result::Result<T, E>;
@@ -78,6 +92,14 @@ struct HubState {
     subscriptions: HashMap<String, bool>,
     queues: HashMap<String, VecDeque<Value>>,
     exited: HashSet<(String, u64)>,
+}
+/// Result of sending an approved dependency update plan to The Manager.
+#[derive(Debug)]
+pub(crate) enum UpdatePlanSendError {
+    /// The plan prompt was provably not dispatched, so the revision may be retried after an explicit confirmation.
+    NotSent(String),
+    /// The prompt may have reached The Manager; it must never be resent automatically.
+    Uncertain(String),
 }
 pub struct ManagerHub {
     endpoint: String,
@@ -868,6 +890,97 @@ impl ManagerHub {
             json!({"message":message}),
             Origin::Human,
         )
+    }
+    /// Bind a submitted report request to the same process generation that will receive its prompt.
+    pub(crate) fn prompt_human_generation(
+        &self,
+        id: &str,
+        generation: u64,
+        message: &str,
+    ) -> Result<Value> {
+        let registry = self.registry()?;
+        let lease = registry.lease(id, Origin::Human, true)?;
+        if lease.generation != generation {
+            return Err("stale_generation".into());
+        }
+        if registry.inspect(id, Origin::Human)?.kind == InstanceKind::Manager {
+            return Err("Setup prompts require an ordinary human-controlled instance".into());
+        }
+        self.control(id, &lease, "prompt", json!({"message":message}), Origin::Human)
+    }
+    /// Restart-safe producer identity for dependency jobs: the generation alone resets across app launches, so the
+    /// request is also bound to a hash of this launch's private bridge token and the native main-session id.
+    pub fn dependency_producer(&self, id: &str, generation: u64) -> Result<DependencyProducer> {
+        let registry = self.registry()?;
+        let lease = registry.lease(id, Origin::Human, false)?;
+        if lease.generation != generation {
+            return Err("stale_generation".into());
+        }
+        if registry.inspect(id, Origin::Human)?.kind != InstanceKind::Architect {
+            return Err("The Architect is no longer available".into());
+        }
+        let session_id = lease.session_id.ok_or("The Architect session is not ready yet")?;
+        let state = self.state.lock().map_err(|e| e.to_string())?;
+        let client = state.clients.get(id).ok_or("bridge_not_ready")?;
+        if client.generation != generation || !client.ready || client.role != InstanceKind::Architect {
+            return Err("bridge_not_ready".into());
+        }
+        Ok(DependencyProducer { instance_id: id.into(), generation, launch_id: launch_hash(&client.token), session_id })
+    }
+    /// False once the producer's process, launch or native session was stopped, replaced or switched.
+    pub fn dependency_producer_live(&self, producer: &DependencyProducer) -> bool {
+        let Ok(registry) = self.registry() else { return false; };
+        let Ok(lease) = registry.lease(&producer.instance_id, Origin::Human, false) else { return false; };
+        if lease.generation != producer.generation || lease.session_id.as_deref().is_some_and(|session| session != producer.session_id) {
+            return false;
+        }
+        self.state.lock().ok().is_some_and(|state| state.clients.get(&producer.instance_id)
+            .is_some_and(|client| client.generation == producer.generation && launch_hash(&client.token) == producer.launch_id))
+    }
+    /// Display-only: the bridge reads the saved app-owned result by UUID/kind and prints it when Architect is idle.
+    /// No path, text or model prompt is accepted.
+    pub fn show_dependency_result(&self, architect_id: &str, generation: u64, request_id: &str, kind: &str, replay: bool) -> Result<()> {
+        if !["security", "usage", "project", "updatePlan"].contains(&kind) || uuid::Uuid::parse_str(request_id).map(|id| id.to_string() != request_id).unwrap_or(true) {
+            return Err("Invalid dependency result request".into());
+        }
+        let registry = self.registry()?;
+        let lease = registry.lease(architect_id, Origin::Human, true)?;
+        if lease.generation != generation {
+            return Err("stale_generation".into());
+        }
+        if registry.inspect(architect_id, Origin::Human)?.kind != InstanceKind::Architect {
+            return Err("The Architect is no longer available".into());
+        }
+        self.control(architect_id, &lease, "dependency_result", json!({"requestId": request_id, "kind": kind, "replay": replay}), Origin::Human)
+            .map(|_| ())
+    }
+    /// Backend-only dispatch of a human-approved dependency update plan to The Manager. It is not a bridge/Architect
+    /// action. The caller supplies the exact lease it confirmed; the target must still be The Manager with that lease
+    /// before the (explicitly confirmed) abort and again before the single Human-origin prompt.
+    pub(crate) fn send_dependency_update_plan(&self, manager_id: &str, lease: &ControlLease, message: &str) -> std::result::Result<(), UpdatePlanSendError> {
+        use UpdatePlanSendError::{NotSent, Uncertain};
+        let registry = self.registry().map_err(NotSent)?;
+        let check = || -> Result<()> {
+            if registry.inspect(manager_id, Origin::Human)?.kind != InstanceKind::Manager {
+                return Err("The target is not The Manager".into());
+            }
+            let current = registry.lease(manager_id, Origin::Human, true)?;
+            if current.generation != lease.generation || current.session_id != lease.session_id || current.ownership_epoch != lease.ownership_epoch {
+                return Err("stale_generation".into());
+            }
+            Ok(())
+        };
+        check().map_err(NotSent)?;
+        self.control(manager_id, lease, "abort", json!({}), Origin::Human)
+            .map_err(|e| NotSent(format!("The Manager could not be interrupted: {e}")))?;
+        check().map_err(|e| NotSent(format!("The Manager was interrupted but the plan was not sent: {e}")))?;
+        self.control(manager_id, lease, "prompt", json!({"message": message}), Origin::Human)
+            .map(|_| ())
+            .map_err(|e| if e == "bridge_not_ready" || e == "stale_generation" {
+                NotSent(format!("The Manager was interrupted but the plan was not sent: {e}"))
+            } else {
+                Uncertain(e)
+            })
     }
     /// App-originated control of a plan agent's target: `Origin::Human`, so any session (including The Manager)
     /// can be interrupted and prompted. The target is derived from the registry, never from the payload.

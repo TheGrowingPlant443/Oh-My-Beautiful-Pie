@@ -1,0 +1,2 @@
+# Use Bandit correctness/security defaults; no excluded security tests.
+exclude_dirs: [node_modules, .venv, venv]

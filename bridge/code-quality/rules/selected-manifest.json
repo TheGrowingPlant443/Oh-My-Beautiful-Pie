@@ -1,0 +1,2016 @@
+{
+  "version": 1,
+  "originalRules": {
+    "path": "omp-quality.yml",
+    "sha256": "83ce82628351eb02fdf91bd270d0ab345dee77eb1248f35968bda3a8543fa912",
+    "license": "MIT",
+    "count": 7,
+    "languages": ["javascript", "typescript", "python"]
+  },
+  "repository": "https://github.com/opengrep/opengrep-rules",
+  "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+  "archiveUrl": "https://codeload.github.com/opengrep/opengrep-rules/tar.gz/f1d2b562b414783763fd02a6ed2736eaed622efa",
+  "archiveSha256": "9a5f1cd5c625418cc1c776120123e2d4371df9bb66e099426b17c3488e13619d",
+  "license": "LGPL-2.1 + Commons Clause",
+  "selection": {
+    "category": "security",
+    "confidence": "HIGH",
+    "severities": [
+      "ERROR",
+      "WARNING"
+    ]
+  },
+  "rules": [
+    {
+      "path": "apex/lang/security/ncino/dml/ApexCSRFConstructor.yaml",
+      "id": "apex-csrf-constructor",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "d9752eb5906955dc749da4a46f33e9169bbae6031f3617f8460c31af078b8f80",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "apex"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "apex/lang/security/ncino/endpoints/NamedCredentialsConstantMatch.yaml",
+      "id": "named-credentials-constant-match",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "2a70d3fded552caa0c1ef341f07fb40b3b0ce53f1d89303db9918d6d2deeda60",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "apex"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "apex/lang/security/ncino/endpoints/NamedCredentialsStringMatch.yaml",
+      "id": "named-credentials-string-match",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "d1dd286a120cb1afa4bb639ff3f6218793b1462b071a0f1dfd8bb55f8ac71869",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "apex"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "apex/lang/security/ncino/injection/ApexSOQLInjectionFromUnescapedURLParam.yaml",
+      "id": "soql-injection-unescaped-url-param",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "6affffb8c09972df7bc9aa88bbf7e8c15be57535e818320a3989928579bad881",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "apex"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "apex/lang/security/ncino/injection/ApexSOQLInjectionUnescapedParam.yaml",
+      "id": "soql-injection-unescaped-param",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "21a077ce73134f84e030c88d15481433cfb2169ad99aa69567c9b79f9850d986",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "apex"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "apex/lang/security/ncino/sharing/SpecifySharingLevel.yaml",
+      "id": "specify-sharing-level",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "09e7fcc0106a97164e5e2f57fceae69e07fab057c31da9213b825cf87731fc76",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "apex"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "apex/lang/security/ncino/system/SystemDebug.yaml",
+      "id": "system-debug",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "3564c9ccaf16872bc19a460050511e3d77e649a058e02cb0a09e2fe0ca768ed8",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "apex"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "clojure/lang/security/documentbuilderfactory-xxe.yaml",
+      "id": "documentbuilderfactory-xxe",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "181e179ddd742a602dbd9fa00af92546a2fd1ca1d237756e87515a8d9e0a08eb",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "clojure"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "clojure/lang/security/use-of-md5.yaml",
+      "id": "use-of-md5",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "7eb6273c8da453e78ebbe24928f575be37cd631ffed439605a09f9e8f44a0410",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "clojure"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "clojure/lang/security/use-of-sha1.yaml",
+      "id": "use-of-sha1",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "366db7f7dddeaf2634415570eb7226eaeb37aa8f6779ba7c2da7117a23d0d9aa",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "clojure"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "csharp/dotnet/security/use_ecb_mode.yaml",
+      "id": "use_ecb_mode",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c0f6afff8c3de2d34b353783a55fe1a19953d403c9d8a86ebf59e2ea61575ccc",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "csharp"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "csharp/dotnet/security/use_weak_rng_for_keygeneration.yaml",
+      "id": "use_weak_rng_for_keygeneration",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "86fd1a2fa0e54fdcd117e7a2c3b678d9f0049aaff21449a7d53fb1e61843902d",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "csharp"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "csharp/lang/security/ad/jwt-tokenvalidationparameters-no-expiry-validation.yaml",
+      "id": "jwt-tokenvalidationparameters-no-expiry-validation",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "d6cbd6afb303578b67bd38111c723fe32400844f6eda166de0a952910f0412cc",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "csharp"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "csharp/lang/security/insecure-deserialization/binary-formatter.yaml",
+      "id": "insecure-binaryformatter-deserialization",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "3608031894449e4d547e3ba51e2762092318b6ba09d93f4584551d348b49c2c5",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "C#"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "csharp/lang/security/stacktrace-disclosure.yaml",
+      "id": "stacktrace-disclosure",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "6473bf17c40118b63378105d1b68bdba6ead449dc4edf7d0cd653c7bfdec5c76",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "csharp"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "dockerfile/security/dockerd-socket-mount.yaml",
+      "id": "dockerfile-dockerd-socket-mount",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "b09780dba60b64d3d5740efe051de712bee20f6dabbfb774b27f3aa1ae8b42e8",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "dockerfile",
+        "yaml"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "dockerfile/security/no-sudo-in-dockerfile.yaml",
+      "id": "no-sudo-in-dockerfile",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "51603ff5031f32f63e94692c20c6c584c25d92d37fe79c54d779479dee72fe11",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "dockerfile"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "generic/secrets/security/detected-onfido-live-api-token.yaml",
+      "id": "detected-onfido-live-api-token",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "34b896758fec8f010f1be0fa153d62a5f893e3b5eb3c912517eea78eb98c4761",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "regex"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "go/gorm/security/audit/gorm-dangerous-methods-usage.yaml",
+      "id": "gorm-dangerous-method-usage",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "8f2eb1d9d93c80bf1f4178a713128c6a922183b9a08d355018ddb0e975d31957",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "go/grpc/security/grpc-client-insecure-connection.yaml",
+      "id": "grpc-client-insecure-connection",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "3e729fd86c3a742e5f77641f422e98f03c2e33c154cfb76c4425653ccb0f34c9",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "go/grpc/security/grpc-server-insecure-connection.yaml",
+      "id": "grpc-server-insecure-connection",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "5e03cef7e331cdd61ddf645fb8ab37e180dfefe07d38f2144bf6c3cd014a4311",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "go/jwt-go/security/jwt-none-alg.yaml",
+      "id": "jwt-go-none-algorithm",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "9ed779d783198779d3945bf256842b87d2282609588a02891b9cd4ae548fc334",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "go/lang/security/audit/crypto/missing-ssl-minversion.yaml",
+      "id": "missing-ssl-minversion",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "a5445e6048e93560e98e2d88bfe2fe2a553f991aafa784d87792a4d4f299ee28",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "go/lang/security/audit/crypto/ssl.yaml",
+      "id": "ssl-v3-is-insecure",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "19ba452e73fcba2486bf37c373c4ed0ed85ce67b8d58443067636095661d079c",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "go/lang/security/audit/crypto/tls.yaml",
+      "id": "tls-with-insecure-cipher",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "e7a18aef0a58df7de702055bc9ae31934d888517bc2a9208f24a536ed0f8391f",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "go/lang/security/audit/crypto/use_of_weak_rsa_key.yaml",
+      "id": "use-of-weak-rsa-key",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "a91c2566284c0059fb979cb0cdfde9279d27041e24670fb34d2f174af7cf0557",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "go/lang/security/audit/net/bind_all.yaml",
+      "id": "avoid-bind-to-all-interfaces",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "11d7eefb3d8e87e2b68801cc8b2dc64d773e7e9971b7be49a0fa22efcbc7fbd1",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "go/lang/security/injection/open-redirect.yaml",
+      "id": "open-redirect",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "ba7e36674682ebba3e085557280c7204f01ae55971f512aed0171bb6c0b89a2e",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "go/lang/security/injection/tainted-sql-string.yaml",
+      "id": "tainted-sql-string",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "5b15d0df279ed9ab3a1973b0bc39724dd6dd015892be47b58e6a63deece7af80",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "go/lang/security/injection/tainted-url-host.yaml",
+      "id": "tainted-url-host",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "ee3f40f885be45b63e265975e87bb65a79d29463f172d3e2e1d2f0bb37d6ad97",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "html/security/plaintext-http-link.yaml",
+      "id": "plaintext-http-link",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "776019982ff57a92431e3562a637366e62174006e21579a554ab02712a573d91",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "html"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/java-jwt/security/jwt-hardcode.yaml",
+      "id": "java-jwt-hardcoded-secret",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "43b29d8defe37519f5ad138627fb29524bb8a896f8d66021ee32da901b8374f4",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/java-jwt/security/jwt-none-alg.yaml",
+      "id": "java-jwt-none-alg",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c549a7d76e01c56fa18da16906093d609aafa0bf13e2198fa2ac31c222470a82",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "java/lang/security/audit/blowfish-insufficient-key-size.yaml",
+      "id": "blowfish-insufficient-key-size",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c035055af9b5cb57a3daf78fb915bd0f662d16dd9c478bf5c865d7d765ca149e",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/cbc-padding-oracle.yaml",
+      "id": "cbc-padding-oracle",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "cdfd613367d208175812bac2eeda2c98311d7c813470e121e98c4c226c68a449",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/des-is-deprecated.yaml",
+      "id": "des-is-deprecated",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "bb12401b8b0abec1291292e0edca31be36349d9b503d59a717acfc4dbc0d5b46",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java",
+        "kt"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/desede-is-deprecated.yaml",
+      "id": "desede-is-deprecated",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "a670a8372543a15b536aba56065d85e5f29c92bdb0f46508c7d968a1b7722a44",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java",
+        "kt"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/ecb-cipher.yaml",
+      "id": "ecb-cipher",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "a99202b8cf8aacb68198de00b4b20b4325d8f7a0d2fe92008465beb72c496b39",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/gcm-nonce-reuse.yaml",
+      "id": "gcm-nonce-reuse",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "64d2d3a828f281ae26810c3464dfa695d6ca03ce73f34bcf317927c6dbaef6e2",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/no-null-cipher.yaml",
+      "id": "no-null-cipher",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "6f0ea51cc475a7a1baa0017f1bfc68c882c2afe971ca5b2891410fe735549713",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/no-static-initialization-vector.yaml",
+      "id": "no-static-initialization-vector",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "fb637f8772d34e5edad197fee4c89ad173e11520209e572b014e465f6cd66271",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/rsa-no-padding.yaml",
+      "id": "rsa-no-padding",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "a2e9e9c5a4681a6cfc4cb671424f35daa2fd984a93149b0adf6666949181ff04",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java",
+        "kt"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/unencrypted-socket.yaml",
+      "id": "unencrypted-socket",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "62ac8789701913a3b5e95a63848886836eed04975ff2af4e44173da4b7f9417b",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/use-of-aes-ecb.yaml",
+      "id": "use-of-aes-ecb",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "0e1da99b6e3a5f6f92682487566ab3ae7f1f5ec7bde45dffef79f5bb504b1b43",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/use-of-blowfish.yaml",
+      "id": "use-of-blowfish",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "2c3984bcdb4d4d61074ee9f35a62131e371596c048c1271fde3ed564dc80674a",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/use-of-default-aes.yaml",
+      "id": "use-of-default-aes",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "46ebffa69d1843cc4e687d44ecda8bf9ec38fd1e8bd45e31c0d8eaae818a5c5c",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/use-of-md5-digest-utils.yaml",
+      "id": "use-of-md5-digest-utils",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "3cc4c7c9e10e0a6e1483f9c5162cdb5c380357a303d08a8db4ddcaa9b9e28978",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/use-of-md5.yaml",
+      "id": "use-of-md5",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "801fcfb4b09c5ef5e08a22d4c35351649e6df671f7561298fc95c675ae9552f2",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/use-of-rc2.yaml",
+      "id": "use-of-rc2",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "ff6aa4084cc548e5f02cab58ff1e87df7553016207f9b530b83c6b6c2c6a4125",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/use-of-rc4.yaml",
+      "id": "use-of-rc4",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "4a65bfd5a1d84597444a77fb8ef1a4d8060c241a8d0e435e975353c0fd9d0ef2",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/use-of-sha1.yaml",
+      "id": "use-of-sha1",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "6b848e73367f78232cd629630167c2b770395bb1a2465e3bd5f43ce6ba3a2cd8",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/crypto/weak-rsa.yaml",
+      "id": "use-of-weak-rsa-key",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c73af1c4a3435222d99700a173c1348e48a94006e4c19ad9649b74e9bf2dfab8",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/sqli/tainted-sql-from-http-request.yaml",
+      "id": "tainted-sql-from-http-request",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "491b635315456101c260bbe7f761685258b427170711c0f349b10420513a589e",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/weak-ssl-context.yaml",
+      "id": "weak-ssl-context",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "267b662f88235193052d1c3ba021dd3b53a88291a62069e305b73206a79b8d85",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "java/lang/security/audit/xxe/documentbuilderfactory-disallow-doctype-decl-false.yaml",
+      "id": "documentbuilderfactory-disallow-doctype-decl-false",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "fccfca9bf071896ea0c38afca0dcf0c756aff1c3f739e0ca5ac8a2f4881492d2",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "java/lang/security/audit/xxe/documentbuilderfactory-disallow-doctype-decl-missing.yaml",
+      "id": "documentbuilderfactory-disallow-doctype-decl-missing",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "66833037219cb8a4991267494d4fa734061d0fe5d554d2d19f4e70eb6508fb47",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "java/lang/security/audit/xxe/documentbuilderfactory-external-general-entities-true.yaml",
+      "id": "documentbuilderfactory-external-general-entities-true",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "ce7b0709b37566da96db206841539f646b8d2107ee7bb56a8c49dcda1d07f745",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "java/lang/security/audit/xxe/documentbuilderfactory-external-parameter-entities-true.yaml",
+      "id": "documentbuilderfactory-external-parameter-entities-true",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "8becc488e39934339dad015a39336f5dadd02189f7a4f23aa87dad3cfcff506a",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "java/lang/security/audit/xxe/saxparserfactory-disallow-doctype-decl-missing.yaml",
+      "id": "saxparserfactory-disallow-doctype-decl-missing",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c72c437e486a7c424372b86eae53a85699e6efcf75dfc7976bd40c1e78e39f1e",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "java/lang/security/audit/xxe/transformerfactory-dtds-not-disabled.yaml",
+      "id": "transformerfactory-dtds-not-disabled",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "999388d5c379825f053a7ae3e34ed49a2f12365fc035d6501185b298e7fbe630",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "java/spring/security/injection/tainted-file-path.yaml",
+      "id": "tainted-file-path",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "73235f03f394b2dce46b5f6762538a41ad610dac0a89d7a019095db609d0a36d",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "java/spring/security/injection/tainted-system-command.yaml",
+      "id": "tainted-system-command",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "5721878ed0154f1e131e20ef63f1bbbc4e16c0a2aab668a4c510a66fbb2faab3",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "java"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "javascript/angular/security/detect-angular-sce-disabled.yaml",
+      "id": "detect-angular-sce-disabled",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "7f3ea0c25fbf2533b3607e59fb8e5cade1e7f89619752103e150bd1e5be4cac0",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "javascript/browser/security/open-redirect.yaml",
+      "id": "js-open-redirect",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "e3e18b1d44f2dcc855e096e5c41eb5a1cb477bf2f633f03d44654d194f576c98",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "javascript/express/security/audit/express-libxml-noent.yaml",
+      "id": "express-libxml-noent",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "42a1887f1637b83e2ef9852b6bfeb42baf5c9e100113c271dc16b170a8e54051",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "javascript/express/security/audit/express-open-redirect.yaml",
+      "id": "express-open-redirect",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "e90822b43a4168127b3f8cd1878ff6b3ff3d3fd69b3fa53994aa19050c91cefb",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "javascript/express/security/audit/express-session-hardcoded-secret.yaml",
+      "id": "express-session-hardcoded-secret",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "b9b1f05d486d02f0329785b1c2f5756d9b110808dfee423d8e9ce198b8b214c0",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "javascript/express/security/audit/express-third-party-object-deserialization.yaml",
+      "id": "express-third-party-object-deserialization",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "0198240cee14d3143afe64ab308c3e9d52e2680455712bb18eb336487edbb421",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "javascript/express/security/express-jwt-hardcoded-secret.yaml",
+      "id": "express-jwt-hardcoded-secret",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "0a16d219e9a7fcf6e85d3e40da2f44f19218c564417454a50a66f95eac6104d2",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "javascript/jose/security/jwt-hardcode.yaml",
+      "id": "hardcoded-jwt-secret",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "0c4c6a060840c8002accb3d546caad883a9914ccb3737cc261887f79efff7bf9",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "javascript/jose/security/jwt-none-alg.yaml",
+      "id": "jwt-none-alg",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "913e08b5082737f08ba3daadc9b3c4f46fe51e34d8919b7df9c3dea083eb2025",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "javascript/jsonwebtoken/security/jwt-hardcode.yaml",
+      "id": "hardcoded-jwt-secret",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c4261803d095b1dd38f088a5b6b1c95fc98d5b984ba7c4016f455a7b51ed222c",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "javascript/jwt-simple/security/jwt-simple-noverify.yaml",
+      "id": "jwt-simple-noverify",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c6c06aa9840a961f8d03a9c102c466ea303ad517d5ea79275fc5d1a62141cab1",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "javascript/lang/security/audit/code-string-concat.yaml",
+      "id": "code-string-concat",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "6b2dfb499259f993eb755891d73cba8062a84104e737b448d3f8f8b4ba99582d",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "javascript/node-crypto/security/aead-no-final.yaml",
+      "id": "aead-no-final",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "5e53ab9bef8b5bba106e7a4e21c5a4b1e98e24cc9d3b205424d0c31f78b67203",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "javascript/node-crypto/security/create-de-cipher-no-iv.yaml",
+      "id": "create-de-cipher-no-iv",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "4b922a0df84b85469500b92eb4a8023bf64e0aca889c85ba5fdf3d23ffa2f406",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "javascript/passport-jwt/security/passport-hardcode.yaml",
+      "id": "hardcoded-passport-secret",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "0faa9e98af57af3a48f17973d83f71a0f2f70e3555ebb244e43d1da018449ddc",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "javascript/sequelize/security/audit/sequelize-injection-express.yaml",
+      "id": "express-sequelize-injection",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c3f97d2add6f1d5e5f39105a01385c4cc62103708eee390e4028c2bd7acc29c1",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "kotlin/lang/security/weak-rsa.yaml",
+      "id": "use-of-weak-rsa-key",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "031807bfc5d2fe246ddcd56b7e6a4ab8150eb7d234e990df28408a0c510edc4e",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "kt"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "php/lang/security/assert-use.yaml",
+      "id": "assert-use",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "09279ef414348248062f95fb894201efcfc52e15352a08807101106b1d4cf27f",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "php"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "php/lang/security/base-convert-loses-precision.yaml",
+      "id": "base-convert-loses-precision",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "709734ca2083303d0b6ee76aa6a1e6f62a3169b8810cd00bb127e34dbb535fb2",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "php"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "php/lang/security/openssl-cbc-static-iv.yaml",
+      "id": "openssl-cbc-static-iv",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "a14a458963600fd12e1c84f025f2a8b420ffdc38e12cc95634711208711da675",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "php"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "problem-based-packs/insecure-transport/go-stdlib/disallow-old-tls-versions.yaml",
+      "id": "disallow-old-tls-versions",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "45fa025350f0dd829ab465c428d43996773d5e09e401e6135856e8d6e2062f67",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/django/security/hashids-with-django-secret.yaml",
+      "id": "hashids-with-django-secret",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "24bebbe0b49d320b786a1c67e7578668d082cc6dc068a2053f4463526ef36c3e",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "python/django/security/injection/command/subprocess-injection.yaml",
+      "id": "subprocess-injection",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "ab89b5a85e844f099bf7a8b604db013ba2253c92e01ec49814e9fff50e773f04",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "python/flask/security/audit/app-run-param-config.yaml",
+      "id": "avoid_app_run_with_bad_host",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "50ab86780483ac8841cf2593816d62274ddfd16fb2c91df47eebd266f5cc5751",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/flask/security/audit/debug-enabled.yaml",
+      "id": "debug-enabled",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "3d5a239402b422a1c24be1bc69e45fb852d94526ef2df57aabddf222a79ca4ff",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/flask/security/hashids-with-flask-secret.yaml",
+      "id": "hashids-with-flask-secret",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "420cf776d6ae34b05e3b764efa931f3803b0ad3820419d659a4bdf04f51c724c",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "python/flask/security/injection/subprocess-injection.yaml",
+      "id": "subprocess-injection",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "f87021c0ded500de080918eedd1d78fe93f3af34d8c53efa41a5872d5d3fa26a",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "python/jwt/security/jwt-hardcode.yaml",
+      "id": "jwt-python-hardcoded-secret",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "a7987bc35b3b670a48a9887f3bb436f768422c4a2f98bbd9955dd0a15dc80df1",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "python/pycryptodome/security/insecure-cipher-algorithm-blowfish.yaml",
+      "id": "insecure-cipher-algorithm-blowfish",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "65360f06c076f4792a8e688ce9c30a41adf43fd44670b3b22c23d92a57567779",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/pycryptodome/security/insecure-cipher-algorithm-des.yaml",
+      "id": "insecure-cipher-algorithm-des",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "97b42400287b3f176c6b5fb1ab8a7b40303f7e625617d2952995edac594292a9",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/pycryptodome/security/insecure-cipher-algorithm-rc2.yaml",
+      "id": "insecure-cipher-algorithm-rc2",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "af615f8bcfd7633e173722e7247027db82fbb8a8bb6e02b528f08522aa9ead44",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/pycryptodome/security/insecure-cipher-algorithm-rc4.yaml",
+      "id": "insecure-cipher-algorithm-rc4",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "62bc34ed37c5880d6a95f322da13a72734228a492ec9c4421dead809a4389072",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/pycryptodome/security/insecure-hash-algorithm-md2.yaml",
+      "id": "insecure-hash-algorithm-md2",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "ddb77723a5cae37cac530d2b731227ed677d72213e9ec8f4d1759e3bf5b72735",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/pycryptodome/security/insecure-hash-algorithm-md4.yaml",
+      "id": "insecure-hash-algorithm-md4",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "b275227d75801048bbe78ed50c9ea84594c885168a2463c25f1a5220b2db950b",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/pycryptodome/security/insecure-hash-algorithm-md5.yaml",
+      "id": "insecure-hash-algorithm-md5",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "87160028a1fcb48b2916a2c7df1c0e44e94e24bd47c435d7810e7b5c2864ccf0",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/pycryptodome/security/insufficient-dsa-key-size.yaml",
+      "id": "insufficient-dsa-key-size",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "31ea55a0a5fe8702555f9c28747535ee525096136f94abe9b7215325b9698b15",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "python/pycryptodome/security/insufficient-rsa-key-size.yaml",
+      "id": "insufficient-rsa-key-size",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "a3b7a697bbef725753084cc2583feb9624171b7e146b25128156c5616520ac11",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "python"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "ruby/lang/security/force-ssl-false.yaml",
+      "id": "force-ssl-false",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "05377964759d602d5b54f242d96743d40620c706c427a8268030dc3b7ec09ed0",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "ruby"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "ruby/lang/security/hardcoded-http-auth-in-controller.yaml",
+      "id": "hardcoded-http-auth-in-controller",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "9b6f677ee24d33b13fc0bdd8bd13df8f0be0d1ff56113e29f70837c4382336b8",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "ruby"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "ruby/lang/security/hardcoded-secret-rsa-passphrase.yaml",
+      "id": "hardcoded-secret-rsa-passphrase",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "4fba2b8606f8821e3df439f91a05a0d0a0c33e72cf01eefc6a047d6ef93067c7",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "ruby"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "ruby/lang/security/insufficient-rsa-key-size.yaml",
+      "id": "insufficient-rsa-key-size",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "9b72b97996a50bfc610dbdf00e8a44cc95229651b64103ae05d37e784670163a",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "ruby"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "rust/lang/security/insecure-hashes.yml",
+      "id": "insecure-hashes",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "5d77d4459a9d29e4b1b2303f2bdbc5282c7e30eda287e288428792659296dd24",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "rust"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "rust/lang/security/reqwest-accept-invalid.yml",
+      "id": "reqwest-accept-invalid",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "dfd5bb583ee0d69342d684b9472b01dd4f39a951df645b4278b44827740a3c6a",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "rust"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "rust/lang/security/rustls-dangerous.yml",
+      "id": "rustls-dangerous",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "dc3187a08d4cbf9200b043c30cd46ad5cd2ce8782d43b372773dd37c4362b8f8",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "rust"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "rust/lang/security/ssl-verify-none.yml",
+      "id": "ssl-verify-none",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "2933371073e51986b8c6a45d1761926c3411f66ee37a2ddf36fd090f2eeb61c8",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "rust"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "scala/jwt-scala/security/jwt-scala-hardcode.yaml",
+      "id": "jwt-scala-hardcode",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "8c53caf90ace08a760e160c35f82daaaf4013f5da2611cfa4b6dcf0ae1660dfc",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "scala"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "scala/lang/security/audit/documentbuilder-dtd-enabled.yaml",
+      "id": "documentbuilder-dtd-enabled",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "1f1f600331f46b7b7f403a19146f8d88b41b8aeeaa35e13a710affedbf46e97c",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "scala"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "scala/lang/security/audit/rsa-padding-set.yaml",
+      "id": "rsa-padding-set",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "dff0201dbec5478d0f3b736dc12e06c7fdef8c54785538e26c803e30265fb6cf",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "scala"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "scala/lang/security/audit/sax-dtd-enabled.yaml",
+      "id": "sax-dtd-enabled",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "16b065486bee3109eaff0f8867d07e7ed7aabcec4d80e8757294bb4efd9268d2",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "scala"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "scala/lang/security/audit/xmlinputfactory-dtd-enabled.yaml",
+      "id": "xmlinputfactory-dtd-enabled",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "cb11a637732f2ee1e8ca3566f1ae0a3be268a9f5fb0382655176a0e719311ef0",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "scala"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "scala/play/security/tainted-slick-sqli.yaml",
+      "id": "tainted-slick-sqli",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "90f459d4914920533c88f0024d5eacc7c3a5e3a617c14219c4468ae83f2d251f",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "scala"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "scala/play/security/tainted-sql-from-http-request.yaml",
+      "id": "tainted-sql-from-http-request",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "25c06662598ef856accf08fcdc2e70a62cfa1c30f4514d1c5b8fcab114793a2b",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "scala"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "scala/scala-jwt/security/jwt-hardcode.yaml",
+      "id": "scala-jwt-hardcoded-secret",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c7c451bb75a90516dc511911e60b41438ee959fbf3b3283ae07c4006c7d1597f",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "scala"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "solidity/security/balancer-readonly-reentrancy-getpooltokens.yaml",
+      "id": "balancer-readonly-reentrancy-getpooltokens",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "3c5e2aee82b99280793d935b1440743851c5001f3abddff01bf579374fe33d03",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "solidity/security/balancer-readonly-reentrancy-getrate.yaml",
+      "id": "balancer-readonly-reentrancy-getrate",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "7816b8ec6ac5c0b220711758fbdcdd2efbee085cb088afc971f7594caaf72dac",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "solidity/security/compound-borrowfresh-reentrancy.yaml",
+      "id": "compound-borrowfresh-reentrancy",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "b6b7a53a8841e85545b63e361e07ea3fd3b7296e215c06066db82530e6882d1b",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "solidity/security/curve-readonly-reentrancy.yaml",
+      "id": "curve-readonly-reentrancy",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "95080235d0a498f007a23f8ce70bdbef060b3871b1b6aae23941b241f77ededc",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "solidity/security/encode-packed-collision.yaml",
+      "id": "encode-packed-collision",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "4821f4c5bf05f20b24bd9c61601d9f069dd45af2846f94ad64e5129c2354273a",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "solidity/security/erc677-reentrancy.yaml",
+      "id": "erc677-reentrancy",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "53267fdc5aa0b317519e01842ba2ef66cb0b57a7088b532d903bfbc7aa66397c",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "solidity/security/erc721-reentrancy.yaml",
+      "id": "erc721-reentrancy",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "018f0f5253adfd63a113521fc8def1cf2489c105e3a1e528041763fda1870a86",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "solidity/security/erc777-reentrancy.yaml",
+      "id": "erc777-reentrancy",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "5eebf1ed8acee1253ec22b3b8fab8b54f40235aeca99ba1e57352f664d26e74f",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "solidity/security/incorrect-use-of-blockhash.yaml",
+      "id": "incorrect-use-of-blockhash",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "7d2ad864864799a161e920eb4ea99e19f559911d06d2ca1e86d4b5224bfca968",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "solidity/security/keeper-network-oracle-manipulation.yaml",
+      "id": "keeper-network-oracle-manipulation",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "6d6fc77a7987fd89580608c11b3cbbdcbb185658aacd162fb939826930062c81",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "solidity/security/missing-self-transfer-check-ercx.yaml",
+      "id": "missing-self-transfer-check-ercx",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "d28b43e36d454f07413b14173ace1e7da1d329e8ca6ae2572b868836d6f57103",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "solidity/security/no-bidi-characters.yaml",
+      "id": "no-bidi-characters",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "6e21fca2c32aed06b76fce4750ecc7ec6ca7342943fd92a41672696b4cb30867",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "solidity/security/proxy-storage-collision.yaml",
+      "id": "proxy-storage-collision",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "40c17f4e5a48f5b3c110d98efd42f57361812fe8b1eaef68ee298cd139185177",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "solidity/security/redacted-cartel-custom-approval-bug.yaml",
+      "id": "redacted-cartel-custom-approval-bug",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "46f6e5e9d7779b1fa14a5b1a73ef614036092c09acb57f1347b43ed899d1f7e6",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "solidity/security/rigoblock-missing-access-control.yaml",
+      "id": "rigoblock-missing-access-control",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "d7428bda4a50fa694b76adb3766bf1c318d1964697442f0c8cf0f889e6bd32f3",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "solidity/security/superfluid-ctx-injection.yaml",
+      "id": "superfluid-ctx-injection",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "57d573d28e7c4b8f6bd0a37b2b2a583d9cb86f0ff2dc35b85747662a9b7f26a5",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "solidity"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "swift/webview/webview-js-window.yaml",
+      "id": "swift-webview-config-allows-js-open-windows",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "e799eb1f98aca2af83039fe0a537e3445c3882f6cb41f55f598ed87564244fbd",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "swift"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "terraform/aws/security/aws-config-aggregator-not-all-regions.yaml",
+      "id": "aws-config-aggregator-not-all-regions",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c6567309ad8dcaccbc376bfe663800832ea0a306e8b562b194e94a0b8850f618",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "hcl"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "terraform/aws/security/aws-elasticsearch-insecure-tls-version.yaml",
+      "id": "aws-elasticsearch-insecure-tls-version",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "7eec0c18daf4e2cbadb9cc7e1a8fa76caa08a1fdda8fb946e8797b8c98cd2938",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "terraform"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "terraform/aws/security/aws-lambda-permission-unrestricted-source-arn.yaml",
+      "id": "aws-lambda-permission-unrestricted-source-arn",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "fbf0448a595648623c85becca1c59df637b7b84cc850bb745937656692891d11",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "hcl"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "terraform/aws/security/aws-provisioner-exec.yaml",
+      "id": "aws-provisioner-exec",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "d1bedc5587149037633cb1fbe9a117043ccb0752f647d3a2fc1d741474cf818a",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "terraform"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "terraform/azure/security/appservice/appservice-use-secure-tls-policy.yaml",
+      "id": "appservice-use-secure-tls-policy",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "734dbc8cb43cc6efba9753b3ba3dc74e68efaa2709951c8560b3b9a6e4b398bb",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "hcl"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "yaml/docker-compose/security/privileged-service.yaml",
+      "id": "privileged-service",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c9bd769f62acf0209ab5a7d83122167adf8e1488587b56d83781c81898c64553",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "yaml"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "yaml/github-actions/security/github-script-injection.yaml",
+      "id": "github-script-injection",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "56bef6376cd413e08b90c2a4f23689ab91cd42b277bbbc94772b3cdde8f98cea",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "yaml"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "yaml/github-actions/security/run-shell-injection.yaml",
+      "id": "run-shell-injection",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "bb0f559ae52c723d291f2011ec784a2d629341a2b5b2805db29c611853de6811",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "yaml"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "yaml/github-actions/security/third-party-action-not-pinned-to-commit-sha.yml",
+      "id": "third-party-action-not-pinned-to-commit-sha",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "0588f986a851cb12409ac9910de1bb0f7583f7154f6933c5085c395dd2e68448",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "yaml"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "yaml/kubernetes/security/legacy-api-clusterrole-excessive-permissions.yaml",
+      "id": "legacy-api-clusterrole-excessive-permissions",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "ae1f82e403f9d55b3e274b7befb4e2828b6e10591db9421f82fce53091e18617",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "yaml"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "yaml/openapi/security/openai-consequential-action-false.yaml",
+      "id": "openai-consequential-action-false",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "a6ad4a22b6b39ad8a042371641b8292d082e05085061c58273cac6e81d6447a9",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "yaml"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "WARNING"
+    },
+    {
+      "path": "yaml/openapi/security/use-of-basic-authentication.yaml",
+      "id": "use-of-basic-authentication",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "c7266e739bbc67ae83670bd6d236eee2ca02a30ef6ccbc081862e9352897059d",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "yaml"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "yaml/semgrep/interfile-true-under-metadata-and-no-options.fixed.test.yaml",
+      "id": "libxml2-xxe-taint",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "b07f1f63e0f3f7fe73853b31546e8c689122cb5c99235e0417b660255092a82d",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "yaml/semgrep/interfile-true-under-metadata-and-no-options.test.yaml",
+      "id": "libxml2-xxe-taint",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "7a414cb51153861fd6e868d4c0880ea349b43f2a00e953f8a9403fb923d2fc8a",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "yaml/semgrep/interfile-true-under-metadata-and-options-already-present.fixed.test.yaml",
+      "id": "libxml2-xxe-taint",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "425a5d9e396f7d3ad90383c8a25fdaa30c0d46771ade54a68e16e9dc31942e32",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    },
+    {
+      "path": "yaml/semgrep/interfile-true-under-metadata-and-options-already-present.test.yaml",
+      "id": "libxml2-xxe-taint",
+      "commit": "f1d2b562b414783763fd02a6ed2736eaed622efa",
+      "sha256": "8d2bb4153cc5a482ca7300c103c1af69f9d69f3fe6dc593d953ea0cdd793fcc4",
+      "license": "LGPL-2.1 + Commons Clause",
+      "languages": [
+        "go"
+      ],
+      "category": "security",
+      "confidence": "HIGH",
+      "severity": "ERROR"
+    }
+  ],
+  "excluded": [
+    {
+      "id": "apex-csrf-static-constructor",
+      "reason": "Pro/validator/extract/join/generic capability excluded"
+    },
+    {
+      "id": "bash_reverse_shell",
+      "reason": "Pro/validator/extract/join/generic capability excluded"
+    },
+    {
+      "id": "insecure-ssl-version",
+      "reason": "Pro/validator/extract/join/generic capability excluded"
+    },
+    {
+      "id": "visualforce-page-api-version",
+      "reason": "Pro/validator/extract/join/generic capability excluded"
+    }
+  ],
+  "languageCounts": {
+    "C#": 1,
+    "apex": 7,
+    "clojure": 3,
+    "csharp": 4,
+    "dockerfile": 2,
+    "go": 17,
+    "hcl": 3,
+    "html": 1,
+    "java": 31,
+    "javascript": 16,
+    "kt": 4,
+    "php": 3,
+    "python": 16,
+    "regex": 1,
+    "ruby": 4,
+    "rust": 4,
+    "scala": 8,
+    "solidity": 16,
+    "swift": 1,
+    "terraform": 2,
+    "typescript": 16,
+    "yaml": 8
+  },
+  "engineValidation": {
+    "requiredAtImageBuild": true,
+    "executedDuringImplementation": false,
+    "reason": "No Linux container runtime is available on implementation workstation; both engines must validate the exact pack before image preparation succeeds."
+  }
+}

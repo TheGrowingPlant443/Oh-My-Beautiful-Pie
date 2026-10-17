@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "sonarqubeCommunity": "docker.io/library/sonarqube:26.9.0.129388-community@sha256:c0f1160bccfa435db4168c2d7df69af3c3ea7bfeb87395613014048fb33a68c1",
+  "postgres": "docker.io/library/postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929",
+  "scannerCli": "docker.io/sonarsource/sonar-scanner-cli:12.2.0.4256_8.1.0@sha256:a3f4215076706c95a17a68c19322ee916e40a3acd081a8c1a1e839e0194afa57",
+  "maven": "docker.io/library/maven:3.9.11-eclipse-temurin-21@sha256:6fdc855a6ed81d288ca7ca37ac6ff5e9308b612485c0801d70b25a858c83d237",
+  "gradle": "docker.io/library/gradle:9.2.1-jdk21@sha256:f1d5be114f4f16e780eee51a942449eaa98808887dddd5da4a5b608971c90aa4",
+  "dotnetSdk": "mcr.microsoft.com/dotnet/sdk:10.0.100@sha256:c7445f141c04f1a6b454181bd098dcfa606c61ba0bd213d0a702489e5bd4cd71",
+  "dotnetSdks": {
+    "6": "mcr.microsoft.com/dotnet/sdk:6.0.425@sha256:844137e067059c74322066a4fbfcb008e56f79a39da705bfc8e99e743e2eacc1",
+    "7": "mcr.microsoft.com/dotnet/sdk:7.0.410@sha256:d32bd65cf5843f413e81f5d917057c82da99737cb1637e905a1a4bc2e7ec6c8d",
+    "8": "mcr.microsoft.com/dotnet/sdk:8.0.414@sha256:ff8311847c54c04d1a14c488362807997d59b61372da5095a95f89cbcda7f9b7",
+    "9": "mcr.microsoft.com/dotnet/sdk:9.0.306@sha256:81f6d622fe21ed9d31375167f62a3538ff4d6835f9d5e6da9c2defa8a84b7687",
+    "10": "mcr.microsoft.com/dotnet/sdk:10.0.100@sha256:c7445f141c04f1a6b454181bd098dcfa606c61ba0bd213d0a702489e5bd4cd71"
+  },
+  "dotnetScannerVersion": "11.0.0",
+  "registryProof": {
+    "method": "Registry HTTP API V2 manifests; Docker-Content-Digest response header; Linux amd64 child config inspected for Sonar and CLI (sonarqube image user sonarqube, writable /opt/sonarqube/{data,logs,extensions,temp}; scanner CLI user 1000:1000). Tags resolved once, never at scan time.",
+    "dockerHub": "https://registry-1.docker.io/v2/",
+    "microsoft": "https://mcr.microsoft.com/v2/dotnet/sdk/",
+    "sonarCliVersion": "Published Docker tag 12.2.0.4256_8.1.0 bundles CLI 8.1.0; 8.1.0 is not assumed to be a Docker tag.",
+    "dotnetCredentialMechanism": "https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/scanners/dotnet/using — /d:sonar.token required on begin and end. Fixed in-container helper expands SONAR_TOKEN only inside container process argv; host argv and stored recipe contain no value. NuGet 11.0.0 runtimeconfig is netcoreapp3.1 with rollForward LatestMajor.",
+    "engineExecutionVerified": false
+  }
+}

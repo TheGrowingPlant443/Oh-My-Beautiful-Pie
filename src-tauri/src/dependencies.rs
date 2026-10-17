@@ -13,6 +13,7 @@ pub type Result<T, E = String> = std::result::Result<T, E>;
 const MAX_NODES: usize = 30_000;
 const MAX_FILE: u64 = 1024 * 1024;
 const MODULE_MAX_DEPTH: usize = 5;
+const MAX_LINKS: usize = 200_000;
 const EXCLUDED: [&str; 9] = ["node_modules", "target", "dist", "build", "out", ".venv", "venv", "env", "__pycache__"];
 const NO_MANIFEST: &str = "(looked for package.json, pom.xml, build.gradle(.kts), pyproject.toml, requirements*.txt, Cargo.toml)";
 
@@ -22,6 +23,8 @@ pub struct DepNode {
     pub id: String,
     pub name: String,
     pub version: Option<String>,
+    pub resolved_versions: Vec<String>,
+    pub declared_versions: Vec<String>,
     pub ecosystem: &'static str,
     pub direct: bool,
     pub dev: bool,
@@ -36,6 +39,29 @@ pub struct DependencyGraph {
     pub edges: Vec<(String, String)>,
     pub notes: Vec<String>,
     pub truncated: bool,
+    #[serde(skip)]
+    pub resolution: Resolution,
+}
+
+/// One installed copy of a package: `version` is `Some` only when it was proven locally from an installed manifest,
+/// `.dist-info` or lock entry (never a declared range or a cache guess).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Occurrence {
+    pub id: String,
+    pub version: Option<String>,
+}
+
+impl Occurrence {
+    fn new(id: &str, version: Option<String>) -> Self {
+        Self { id: id.to_string(), version: version.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) }
+    }
+}
+
+/// Version-aware dependency links; `None` as the source is the project root. Not part of the frontend payload.
+#[derive(Clone, Debug, Default)]
+pub struct Resolution {
+    pub complete: bool,
+    pub links: Vec<(Option<Occurrence>, Occurrence)>,
 }
 
 /// `\\?\C:\x` → `C:\x`.
@@ -57,11 +83,17 @@ pub fn folder_key(folder: &Path) -> String {
 struct Builder {
     nodes: BTreeMap<String, DepNode>,
     edges: BTreeSet<(String, String)>,
+    links: BTreeSet<(Option<Occurrence>, Occurrence)>,
+    max_links: usize,
     notes: Vec<String>,
     truncated: bool,
 }
 
 impl Builder {
+    fn new() -> Self {
+        Self { nodes: BTreeMap::new(), edges: BTreeSet::new(), links: BTreeSet::new(), max_links: MAX_LINKS, notes: Vec::new(), truncated: false }
+    }
+
     fn note(&mut self, text: impl Into<String>) {
         let text = text.into();
         if !self.notes.contains(&text) {
@@ -89,13 +121,49 @@ impl Builder {
             self.note(format!("The graph was cut at {MAX_NODES} packages."));
             return None;
         }
-        let node = DepNode { id: id.clone(), name: name.to_string(), version, ecosystem, direct, dev: direct && dev };
+        let node = DepNode {
+            id: id.clone(), name: name.to_string(), version, resolved_versions: Vec::new(),
+            declared_versions: Vec::new(), ecosystem, direct, dev: direct && dev,
+        };
         self.nodes.insert(id.clone(), node);
         Some(id)
     }
 
+    fn record_resolved(&mut self, id: &str, version: Option<&str>) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            Self::record_version(&mut node.resolved_versions, version);
+        }
+    }
+
+    fn record_declared(&mut self, id: &str, version: Option<&str>) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            Self::record_version(&mut node.declared_versions, version);
+        }
+    }
+
+    fn record_version(versions: &mut Vec<String>, version: Option<&str>) {
+        let Some(version) = version.map(str::trim).filter(|v| !v.is_empty()) else { return };
+        if let Err(index) = versions.binary_search_by(|existing| existing.as_str().cmp(version)) {
+            versions.insert(index, version.to_string());
+        }
+    }
+
     fn edge(&mut self, from: &str, to: &str) {
         self.edges.insert((from.to_string(), to.to_string()));
+    }
+
+    /// A version-aware link; `from == None` is the project root.
+    fn link(&mut self, from: Option<Occurrence>, to: Occurrence) {
+        let link = (from, to);
+        if self.links.len() >= self.max_links {
+            if !self.links.contains(&link) {
+                self.truncated = true;
+                let max = self.max_links;
+                self.note(format!("The version graph was cut at {max} links."));
+            }
+            return;
+        }
+        self.links.insert(link);
     }
 
     /// A dependency declared by the project itself: a node plus an edge from the root.
@@ -144,10 +212,13 @@ pub fn scan(folder: &Path, home: &Path, transitive: bool) -> Result<DependencyGr
         return Err(format!("Not a folder: {}", folder.display()));
     }
     let root = canonical(folder);
-    let mut b = Builder { nodes: BTreeMap::new(), edges: BTreeSet::new(), notes: Vec::new(), truncated: false };
+    let mut b = Builder::new();
     b.nodes.insert(
         "project".into(),
-        DepNode { id: "project".into(), name: file_name(&root), version: None, ecosystem: "project", direct: false, dev: false },
+        DepNode {
+            id: "project".into(), name: file_name(&root), version: None, resolved_versions: Vec::new(),
+            declared_versions: Vec::new(), ecosystem: "project", direct: false, dev: false,
+        },
     );
     let mut modules = vec![root.clone()];
     for dir in subdirs(&root) {
@@ -167,6 +238,12 @@ pub fn scan(folder: &Path, home: &Path, transitive: bool) -> Result<DependencyGr
         return Err(format!("No dependency manifest found in {} {NO_MANIFEST}.", folder.display()));
     }
     let edges = b.edges.iter().filter(|(from, to)| b.nodes.contains_key(from) && b.nodes.contains_key(to)).cloned().collect();
+    let links = b
+        .links
+        .iter()
+        .filter(|(from, to)| b.nodes.contains_key(&to.id) && from.as_ref().is_none_or(|from| b.nodes.contains_key(&from.id)))
+        .cloned()
+        .collect();
     Ok(DependencyGraph {
         folder: root.display().to_string(),
         key: folder_key(&root),
@@ -174,6 +251,7 @@ pub fn scan(folder: &Path, home: &Path, transitive: bool) -> Result<DependencyGr
         edges,
         notes: b.notes,
         truncated: b.truncated,
+        resolution: Resolution { complete: !b.truncated, links },
     })
 }
 
@@ -208,22 +286,25 @@ fn scan_npm(module: &Path, transitive: bool, b: &mut Builder) -> bool {
     }
     let Some(json) = read_json(&manifest) else { return true };
     let modules_dir = module.join("node_modules");
-    let mut queue: VecDeque<(String, PathBuf)> = VecDeque::new();
+    let mut queue: VecDeque<(Occurrence, PathBuf)> = VecDeque::new();
     let mut visited: HashSet<PathBuf> = HashSet::new();
     for (key, dev) in [("dependencies", false), ("optionalDependencies", false), ("devDependencies", true)] {
         for (name, range) in json_keys(&json, key) {
             let installed = resolve_npm(module, module, &name);
-            let version = installed
+            let resolved = installed
                 .as_ref()
                 .and_then(|dir| read_json(&dir.join("package.json")))
-                .and_then(|pkg| pkg["version"].as_str().map(String::from))
-                .or(Some(range));
+                .and_then(|pkg| pkg["version"].as_str().map(String::from));
+            let version = resolved.clone().or_else(|| Some(range.clone()));
             let Some(id) = b.direct("npm", &name, version, dev) else { continue };
+            b.link(None, Occurrence::new(&id, resolved.clone()));
+            b.record_resolved(&id, resolved.as_deref());
+            b.record_declared(&id, Some(&range));
             if transitive {
                 if let Some(dir) = installed {
                     let dir = canonical(&dir);
                     if visited.insert(dir.clone()) {
-                        queue.push_back((id, dir));
+                        queue.push_back((Occurrence::new(&id, resolved.clone()), dir));
                     }
                 }
             }
@@ -240,10 +321,10 @@ fn scan_npm(module: &Path, transitive: bool, b: &mut Builder) -> bool {
         return true;
     }
     let stop = canonical(module);
-    while let Some((from, dir)) = queue.pop_front() {
+    while let Some((parent, dir)) = queue.pop_front() {
         let Some(pkg) = read_json(&dir.join("package.json")) else { continue };
-        let names: Vec<String> = json_keys(&pkg, "dependencies").into_iter().chain(json_keys(&pkg, "optionalDependencies")).map(|(name, _)| name).collect();
-        for name in names {
+        let declarations = json_keys(&pkg, "dependencies").into_iter().chain(json_keys(&pkg, "optionalDependencies"));
+        for (name, range) in declarations {
             let Some(found) = resolve_npm(&dir, &stop, &name) else { continue };
             let dep_dir = canonical(&found);
             let version = read_json(&dep_dir.join("package.json")).and_then(|p| p["version"].as_str().map(String::from));
@@ -251,10 +332,13 @@ fn scan_npm(module: &Path, transitive: bool, b: &mut Builder) -> bool {
             if known.is_some() && version.is_some() && known != version {
                 b.note("Packages installed in several versions are shown once.");
             }
-            let Some(id) = b.node("npm", &name, version, false, false) else { continue };
-            b.edge(&from, &id);
+            let Some(id) = b.node("npm", &name, version.clone(), false, false) else { continue };
+            b.record_resolved(&id, version.as_deref());
+            b.record_declared(&id, Some(&range));
+            b.edge(&parent.id, &id);
+            b.link(Some(parent.clone()), Occurrence::new(&id, version.clone()));
             if visited.insert(dep_dir.clone()) {
-                queue.push_back((id, dep_dir));
+                queue.push_back((Occurrence::new(&id, version.clone()), dep_dir));
             }
         }
     }
@@ -317,6 +401,13 @@ fn find_site_packages(module: &Path, root: &Path) -> Option<PathBuf> {
 struct Installed {
     version: Option<String>,
     requires: Vec<String>,
+    /// A second `.dist-info` for the same name carried a different `Version:`: no version is proven.
+    ambiguous: bool,
+}
+
+/// The installed version of `name`, only when exactly one is installed and the metadata states it.
+fn proven_python_version(installed: &HashMap<String, Installed>, name: &str) -> Option<String> {
+    installed.get(name).filter(|pkg| !pkg.ambiguous).and_then(|pkg| pkg.version.clone())
 }
 
 fn installed_python(site: &Path) -> HashMap<String, Installed> {
@@ -342,45 +433,56 @@ fn installed_python(site: &Path) -> HashMap<String, Installed> {
             }
         }
         if let Some(name) = name {
-            map.insert(name, Installed { version, requires });
+            let ambiguous = map.get(&name).is_some_and(|previous: &Installed| previous.ambiguous || previous.version != version);
+            map.insert(name, Installed { version, requires, ambiguous });
         }
     }
     map
 }
 
-fn pyproject_dependencies(table: &toml::Table, found: &mut BTreeMap<String, bool>) {
-    let mut add = |name: Option<String>, dev: bool| {
-        if let Some(name) = name {
-            found.entry(name).and_modify(|existing| *existing = *existing && dev).or_insert(dev);
+struct PythonDeclaration {
+    dev: bool,
+    versions: Vec<String>,
+}
+
+fn add_python_declaration(found: &mut BTreeMap<String, PythonDeclaration>, name: Option<String>, version: Option<&str>, dev: bool) {
+    let Some(name) = name else { return };
+    let declaration = found.entry(name).or_insert_with(|| PythonDeclaration { dev, versions: Vec::new() });
+    declaration.dev &= dev;
+    Builder::record_version(&mut declaration.versions, version);
+}
+
+fn poetry_dependencies(table: &toml::Table, found: &mut BTreeMap<String, PythonDeclaration>, dev: bool) {
+    for (name, spec) in table {
+        if name == "python" {
+            continue;
         }
-    };
+        let version = spec.as_str().or_else(|| spec.get("version").and_then(|v| v.as_str()));
+        add_python_declaration(found, Some(normalize_python(name)), version, dev);
+    }
+}
+
+fn pyproject_dependencies(table: &toml::Table, found: &mut BTreeMap<String, PythonDeclaration>) {
     if let Some(project) = table.get("project").and_then(|v| v.as_table()) {
         for spec in project.get("dependencies").and_then(|v| v.as_array()).into_iter().flatten() {
-            add(spec.as_str().and_then(requirement_name), false);
+            add_python_declaration(found, spec.as_str().and_then(requirement_name), spec.as_str(), false);
         }
         for group in project.get("optional-dependencies").and_then(|v| v.as_table()).into_iter().flat_map(|t| t.values()) {
             for spec in group.as_array().into_iter().flatten() {
-                add(spec.as_str().and_then(requirement_name), true);
+                add_python_declaration(found, spec.as_str().and_then(requirement_name), spec.as_str(), true);
             }
         }
     }
     if let Some(poetry) = table.get("tool").and_then(|v| v.get("poetry")).and_then(|v| v.as_table()) {
-        let names = |t: &toml::Table| -> Vec<String> { t.keys().filter(|key| key.as_str() != "python").map(|key| normalize_python(key)).collect() };
         if let Some(deps) = poetry.get("dependencies").and_then(|v| v.as_table()) {
-            for name in names(deps) {
-                add(Some(name), false);
-            }
+            poetry_dependencies(deps, found, false);
         }
         if let Some(deps) = poetry.get("dev-dependencies").and_then(|v| v.as_table()) {
-            for name in names(deps) {
-                add(Some(name), true);
-            }
+            poetry_dependencies(deps, found, true);
         }
         for group in poetry.get("group").and_then(|v| v.as_table()).into_iter().flat_map(|t| t.values()) {
             if let Some(deps) = group.get("dependencies").and_then(|v| v.as_table()) {
-                for name in names(deps) {
-                    add(Some(name), true);
-                }
+                poetry_dependencies(deps, found, true);
             }
         }
     }
@@ -388,7 +490,7 @@ fn pyproject_dependencies(table: &toml::Table, found: &mut BTreeMap<String, bool
 
 fn scan_pypi(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> bool {
     let mut found = false;
-    let mut direct: BTreeMap<String, bool> = BTreeMap::new();
+    let mut direct: BTreeMap<String, PythonDeclaration> = BTreeMap::new();
     if let Some(text) = read_text(&module.join("pyproject.toml")) {
         found = true;
         if let Ok(table) = text.parse::<toml::Table>() {
@@ -415,21 +517,26 @@ fn scan_pypi(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> b
             if line.is_empty() || line.starts_with('#') || line.starts_with('-') || line.contains("://") {
                 continue;
             }
-            if let Some(name) = requirement_name(line) {
-                direct.entry(name).and_modify(|existing| *existing = *existing && dev).or_insert(dev);
-            }
+            add_python_declaration(&mut direct, requirement_name(line), Some(line), dev);
         }
     }
     if !found {
         return false;
     }
-    let site = if transitive { find_site_packages(module, root) } else { None };
+    let site = find_site_packages(module, root);
     let installed = site.as_deref().map(installed_python).unwrap_or_default();
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
-    for (name, dev) in &direct {
-        let version = installed.get(name).and_then(|pkg| pkg.version.clone());
-        if b.direct("pypi", name, version, *dev).is_some() && visited.insert(name.clone()) {
+    for (name, declaration) in &direct {
+        let version = installed.get(name).and_then(|pkg| pkg.version.as_deref());
+        let legacy_version = if transitive { version.map(String::from) } else { None };
+        let Some(id) = b.direct("pypi", name, legacy_version, declaration.dev) else { continue };
+        b.link(None, Occurrence::new(&id, proven_python_version(&installed, name)));
+        b.record_resolved(&id, version);
+        for version in &declaration.versions {
+            b.record_declared(&id, Some(version));
+        }
+        if transitive && visited.insert(name.clone()) {
             queue.push_back(name.clone());
         }
     }
@@ -438,11 +545,13 @@ fn scan_pypi(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> b
     }
     while let Some(name) = queue.pop_front() {
         let Some(package) = installed.get(&name) else { continue };
-        let from = format!("pypi:{name}");
+        let from = Occurrence::new(&format!("pypi:{name}"), proven_python_version(&installed, &name));
         for required in &package.requires {
             let version = installed.get(required).and_then(|pkg| pkg.version.clone());
-            let Some(id) = b.node("pypi", required, version, false, false) else { continue };
-            b.edge(&from, &id);
+            let Some(id) = b.node("pypi", required, version.clone(), false, false) else { continue };
+            b.record_resolved(&id, version.as_deref());
+            b.edge(&from.id, &id);
+            b.link(Some(from.clone()), Occurrence::new(&id, proven_python_version(&installed, required)));
             if visited.insert(required.clone()) {
                 queue.push_back(required.clone());
             }
@@ -564,9 +673,47 @@ const GRADLE_CONFIGURATIONS: [&str; 10] = [
     "testCompile",
 ];
 
+/// Read literal properties only; Gradle expressions are never executed or guessed.
+fn gradle_properties(text: &str, quoted: bool, properties: &mut HashMap<String, String>) {
+    for line in text.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else { continue };
+        let key = key.trim().trim_start_matches("val ").trim_start_matches("var ").trim_start_matches("def ").trim_start_matches("ext.");
+        if key.is_empty() || !key.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.') {
+            continue;
+        }
+        let value = value.trim();
+        let value = if quoted {
+            let Some(quote) = value.chars().next().filter(|ch| *ch == '"' || *ch == '\'') else { continue };
+            let Some(end) = value[1..].find(quote) else { continue };
+            &value[1..1 + end]
+        } else {
+            if key.starts_with('#') || key.starts_with('!') { continue; }
+            value
+        };
+        properties.insert(key.to_string(), value.to_string());
+    }
+}
+
+fn gradle_version(value: &str, properties: &HashMap<String, String>) -> Option<String> {
+    let mut expanded = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        expanded.push(ch);
+        if ch == '$' && chars.peek().is_some_and(|ch| ch.is_ascii_alphabetic() || *ch == '_') {
+            expanded.push('{');
+            while chars.peek().is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == '_') {
+                expanded.push(chars.next()?);
+            }
+            expanded.push('}');
+        }
+    }
+    let version = interpolate(&expanded, properties)?;
+    (!version.contains('$')).then_some(version)
+}
+
 /// `(group, artifact, version, dev)` of every string-notation dependency; reports whether a version-catalog
 /// reference (`libs.x`) was seen.
-fn gradle_dependencies(text: &str) -> (Vec<(String, String, Option<String>, bool)>, bool) {
+fn gradle_dependencies(text: &str, properties: &HashMap<String, String>) -> (Vec<(String, String, Option<String>, bool)>, bool) {
     let mut found = Vec::new();
     let mut catalog = false;
     for line in text.lines() {
@@ -587,7 +734,10 @@ fn gradle_dependencies(text: &str) -> (Vec<(String, String, Option<String>, bool
         if group.is_empty() || artifact.is_empty() {
             continue;
         }
-        let version = parts.next().filter(|v| !v.is_empty() && !v.contains('$')).map(String::from);
+        let version = parts.next().and_then(|version| {
+            if quote == '"' { gradle_version(version, properties) }
+            else { (!version.is_empty() && !version.contains('$')).then(|| version.to_string()) }
+        });
         found.push((group.to_string(), artifact.to_string(), version, configuration.starts_with("test")));
     }
     (found, catalog)
@@ -679,7 +829,12 @@ fn scan_java(module: &Path, home: &Path, transitive: bool, b: &mut Builder) -> b
     for name in ["build.gradle", "build.gradle.kts"] {
         if let Some(text) = read_text(&module.join(name)) {
             found = true;
-            let (list, saw_catalog) = gradle_dependencies(&text);
+            let mut properties = HashMap::new();
+            if let Some(text) = read_text(&module.join("gradle.properties")) {
+                gradle_properties(&text, false, &mut properties);
+            }
+            gradle_properties(&text, true, &mut properties);
+            let (list, saw_catalog) = gradle_dependencies(&text, &properties);
             seeds.extend(list);
             catalog |= saw_catalog;
         }
@@ -695,7 +850,9 @@ fn scan_java(module: &Path, home: &Path, transitive: bool, b: &mut Builder) -> b
     let mut visited: HashSet<String> = HashSet::new();
     for (group, artifact, version, dev) in seeds {
         let name = format!("{group}:{artifact}");
-        if b.direct("maven", &name, version.clone(), dev).is_some() && visited.insert(name) {
+        let Some(id) = b.direct("maven", &name, version.clone(), dev) else { continue };
+        b.record_declared(&id, version.as_deref());
+        if visited.insert(name) {
             queue.push_back((group, artifact, version));
         }
     }
@@ -716,6 +873,7 @@ fn scan_java(module: &Path, home: &Path, transitive: bool, b: &mut Builder) -> b
     while let Some((group, artifact, version)) = queue.pop_front() {
         let Some((pom, used)) = find_pom(&roots, &group, &artifact, version.as_deref()) else { continue };
         let from = format!("maven:{group}:{artifact}");
+        // The cached version only feeds the legacy `version`; it is neither resolved nor declared evidence.
         b.node("maven", &format!("{group}:{artifact}"), Some(used), false, false);
         let Some(text) = read_text(&pom) else { continue };
         for dep in pom_dependencies(&text) {
@@ -724,6 +882,7 @@ fn scan_java(module: &Path, home: &Path, transitive: bool, b: &mut Builder) -> b
             }
             let name = format!("{}:{}", dep.group, dep.artifact);
             let Some(id) = b.node("maven", &name, dep.version.clone(), false, false) else { continue };
+            b.record_declared(&id, dep.version.as_deref());
             b.edge(&from, &id);
             if visited.insert(name) {
                 queue.push_back((dep.group, dep.artifact, dep.version));
@@ -742,23 +901,45 @@ fn scan_cargo(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> 
     for (key, dev) in [("dependencies", false), ("build-dependencies", false), ("dev-dependencies", true)] {
         for (name, spec) in manifest.get(key).and_then(|v| v.as_table()).into_iter().flatten() {
             let name = spec.get("package").and_then(|v| v.as_str()).unwrap_or(name).to_string();
-            if b.direct("cargo", &name, None, dev).is_some() {
-                direct.push(name);
-            }
+            let Some(id) = b.direct("cargo", &name, None, dev) else { continue };
+            let version = spec.as_str().or_else(|| spec.get("version").and_then(|v| v.as_str()));
+            b.record_declared(&id, version);
+            direct.push(name);
         }
-    }
-    if !transitive {
-        return true;
     }
     let lock = [module, root].iter().find_map(|dir| read_text(&dir.join("Cargo.lock")));
     let Some(lock) = lock.and_then(|text| text.parse::<toml::Table>().ok()) else {
-        b.note("No Cargo.lock was found: only direct Rust dependencies are shown.");
+        for name in &direct {
+            b.link(None, Occurrence::new(&format!("cargo:{name}"), None));
+        }
+        if transitive {
+            b.note("No Cargo.lock was found: only direct Rust dependencies are shown.");
+        }
         return true;
     };
     let mut packages: HashMap<String, (String, Vec<String>)> = HashMap::new();
+    let mut versions: HashMap<String, Vec<String>> = HashMap::new();
+    // Every lock entry by (name, version): the dependency strings are `name[ version[ (source)]]`.
+    let mut by_version: HashMap<(String, String), BTreeSet<(String, Option<String>)>> = HashMap::new();
     for package in lock.get("package").and_then(|v| v.as_array()).into_iter().flatten() {
         let Some(name) = package.get("name").and_then(|v| v.as_str()) else { continue };
         let version = package.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        Builder::record_version(versions.entry(name.to_string()).or_default(), Some(&version));
+        let pairs: Vec<(String, Option<String>)> = package
+            .get("dependencies")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|dep| dep.as_str())
+            .filter_map(|text| {
+                let mut parts = text.split(' ');
+                let name = parts.next().filter(|name| !name.is_empty())?;
+                Some((name.to_string(), parts.next().filter(|version| !version.starts_with('(')).map(String::from)))
+            })
+            .collect();
+        if !version.is_empty() {
+            by_version.entry((name.to_string(), version.clone())).or_default().extend(pairs);
+        }
         let dependencies = package
             .get("dependencies")
             .and_then(|v| v.as_array())
@@ -768,11 +949,24 @@ fn scan_cargo(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> 
             .collect();
         packages.entry(name.to_string()).or_insert((version, dependencies));
     }
+    let sole_version = |name: &str| versions.get(name).filter(|found| found.len() == 1).map(|found| found[0].clone());
+    let roots: Vec<(String, Option<String>)> = direct.iter().map(|name| (name.clone(), sole_version(name))).collect();
+    for (name, version) in &roots {
+        b.link(None, Occurrence::new(&format!("cargo:{name}"), version.clone()));
+    }
     let mut queue: VecDeque<String> = direct.iter().cloned().collect();
     let mut visited: HashSet<String> = direct.into_iter().collect();
     while let Some(name) = queue.pop_front() {
-        let Some((version, dependencies)) = packages.get(&name) else { continue };
         let from = format!("cargo:{name}");
+        if let Some(found) = versions.get(&name) {
+            for version in found {
+                b.record_resolved(&from, Some(version));
+            }
+        }
+        if !transitive {
+            continue;
+        }
+        let Some((version, dependencies)) = packages.get(&name) else { continue };
         b.node("cargo", &name, Some(version.clone()), false, false);
         for dependency in dependencies {
             let version = packages.get(dependency).map(|(version, _)| version.clone());
@@ -780,6 +974,22 @@ fn scan_cargo(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> 
             b.edge(&from, &id);
             if visited.insert(dependency.clone()) {
                 queue.push_back(dependency.clone());
+            }
+        }
+    }
+    if transitive {
+        let mut occurrences: VecDeque<(String, Option<String>)> = roots.iter().cloned().collect();
+        let mut seen: HashSet<(String, Option<String>)> = roots.into_iter().collect();
+        while let Some((name, version)) = occurrences.pop_front() {
+            let Some(version) = version else { continue };
+            let Some(dependencies) = by_version.get(&(name.clone(), version.clone())) else { continue };
+            let from = Occurrence::new(&format!("cargo:{name}"), Some(version));
+            for (dependency, given) in dependencies {
+                let resolved = given.clone().or_else(|| sole_version(dependency));
+                b.link(Some(from.clone()), Occurrence::new(&format!("cargo:{dependency}"), resolved.clone()));
+                if seen.insert((dependency.clone(), resolved.clone())) {
+                    occurrences.push_back((dependency.clone(), resolved));
+                }
             }
         }
     }
@@ -845,6 +1055,12 @@ mod tests {
         assert!(node(&graph, "npm:app-lib").direct && !node(&graph, "npm:app-lib").dev);
         assert!(!node(&graph, "npm:rxjs").direct);
         assert_eq!(node(&graph, "npm:app-lib").version.as_deref(), Some("1.0.0"));
+        assert_eq!(node(&graph, "npm:app-lib").declared_versions, ["^1"]);
+        assert_eq!(node(&graph, "npm:app-lib").resolved_versions, ["1.0.0"]);
+        assert_eq!(node(&graph, "npm:rxjs").resolved_versions, ["6.0.0", "7.0.0"]);
+        assert_eq!(node(&graph, "npm:rxjs").declared_versions, ["*"]);
+        assert!(node(&graph, "project").resolved_versions.is_empty());
+        assert!(node(&graph, "project").declared_versions.is_empty());
         assert!(graph.notes.iter().any(|note| note == "Packages installed in several versions are shown once."));
         let direct_only = scan(&root, &root, false).unwrap();
         assert_eq!(direct_only.edges, vec![("project".to_string(), "npm:app-lib".to_string()), ("project".to_string(), "npm:tool".to_string())]);
@@ -864,11 +1080,21 @@ mod tests {
         assert!(!ids(&graph).iter().any(|id| id.contains("pysocks")));
         assert!(ids(&graph).contains(&"pypi:flask"));
         assert_eq!(node(&graph, "pypi:requests").version.as_deref(), Some("2.0"));
+        assert_eq!(node(&graph, "pypi:requests").resolved_versions, ["2.0"]);
+        assert_eq!(node(&graph, "pypi:requests").declared_versions, ["requests>=2"]);
+        assert!(node(&graph, "pypi:flask").resolved_versions.is_empty());
+        assert_eq!(node(&graph, "pypi:flask").declared_versions, ["Flask[async]==3"]);
+        assert!(node(&graph, "pypi:urllib3").resolved_versions.is_empty());
+        let direct_only = scan(&root, &root, false).unwrap();
+        assert_eq!(node(&direct_only, "pypi:requests").resolved_versions, ["2.0"]);
+        assert!(!ids(&direct_only).contains(&"pypi:urllib3"));
         assert!(!graph.notes.iter().any(|note| note.contains("virtual environment")));
         let without = temp();
         write(&without.join("requirements-dev.txt"), "# comment\n-r base.txt\npytest==8\n");
         let graph = scan(&without, &without, true).unwrap();
         assert!(node(&graph, "pypi:pytest").dev);
+        assert!(node(&graph, "pypi:pytest").resolved_versions.is_empty());
+        assert_eq!(node(&graph, "pypi:pytest").declared_versions, ["pytest==8"]);
         assert!(graph.notes.iter().any(|note| note.contains("only direct Python dependencies")));
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(without).unwrap();
@@ -898,6 +1124,10 @@ mod tests {
         let graph = scan(&root, &home, true).unwrap();
         assert!(has_edge(&graph, "maven:org.x:lib", "maven:org.y:util"));
         assert_eq!(node(&graph, "maven:org.y:util").version.as_deref(), Some("1.10"));
+        assert!(node(&graph, "maven:org.y:util").resolved_versions.is_empty());
+        assert!(node(&graph, "maven:org.y:util").declared_versions.is_empty());
+        assert_eq!(node(&graph, "maven:org.x:lib").declared_versions, ["1.0"]);
+        assert!(node(&graph, "maven:org.x:lib").resolved_versions.is_empty());
         assert_eq!(node(&graph, "maven:org.x:lib").version.as_deref(), Some("1.0"));
         assert!(!ids(&graph).contains(&"maven:org.z:skip"));
         assert!(node(&graph, "maven:junit:junit").dev);
@@ -914,6 +1144,8 @@ mod tests {
         );
         let graph = scan(&root, &root, false).unwrap();
         assert_eq!(node(&graph, "maven:org.a:one").version.as_deref(), Some("1.2"));
+        assert_eq!(node(&graph, "maven:org.a:one").declared_versions, ["1.2"]);
+        assert!(node(&graph, "maven:org.b:two").declared_versions.is_empty());
         assert!(node(&graph, "maven:org.b:two").dev);
         assert!(graph.notes.iter().any(|note| note.contains("version-catalog")));
         fs::remove_dir_all(root).unwrap();
@@ -931,6 +1163,10 @@ mod tests {
         assert!(has_edge(&graph, "cargo:a", "cargo:b"));
         assert_eq!(node(&graph, "cargo:b").version.as_deref(), Some("2.0.0"));
         assert!(node(&graph, "cargo:t").dev);
+        assert_eq!(node(&graph, "cargo:a").declared_versions, ["1"]);
+        assert_eq!(node(&graph, "cargo:a").resolved_versions, ["1.0.0"]);
+        assert_eq!(node(&graph, "cargo:b").resolved_versions, ["2.0.0"]);
+        assert!(node(&graph, "cargo:t").resolved_versions.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -961,9 +1197,263 @@ mod tests {
     }
 
     #[test]
+    fn evidence_vectors_serialize_camel_case_and_stay_sorted_and_unique() {
+        let mut b = Builder::new();
+        let id = b.node("npm", "x", None, false, false).unwrap();
+        for version in ["2.0.0", "10.0.0", "2.0.0", " ", "1.5.0"] {
+            b.record_resolved(&id, Some(version));
+        }
+        b.record_resolved(&id, None);
+        b.record_declared(&id, Some("^2"));
+        b.record_declared(&id, Some("^1"));
+        b.record_declared(&id, Some("^2"));
+        b.record_resolved("npm:absent", Some("1.0.0"));
+        let node = &b.nodes[&id];
+        assert_eq!(node.resolved_versions, ["1.5.0", "10.0.0", "2.0.0"]);
+        assert_eq!(node.declared_versions, ["^1", "^2"]);
+        let json = serde_json::to_value(node).unwrap();
+        assert_eq!(json["resolvedVersions"], serde_json::json!(["1.5.0", "10.0.0", "2.0.0"]));
+        assert_eq!(json["declaredVersions"], serde_json::json!(["^1", "^2"]));
+        assert!(json.get("resolved_versions").is_none() && json.get("declared_versions").is_none());
+    }
+
+    #[test]
+    fn maven_declarations_from_several_modules_are_all_kept() {
+        let root = temp();
+        write(&root.join("pom.xml"), "<project><modules><module>a</module><module>b</module></modules></project>");
+        for (module, version) in [("a", "1.0"), ("b", "2.0")] {
+            write(
+                &root.join(module).join("pom.xml"),
+                &format!("<project><dependencies><dependency><groupId>org.x</groupId><artifactId>lib</artifactId><version>{version}</version></dependency></dependencies></project>"),
+            );
+        }
+        let graph = scan(&root, &root, false).unwrap();
+        let lib = node(&graph, "maven:org.x:lib");
+        assert_eq!(lib.declared_versions, ["1.0", "2.0"]);
+        assert!(lib.resolved_versions.is_empty());
+        assert_eq!(lib.version.as_deref(), Some("1.0"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn npm_missing_installation_keeps_only_deduplicated_declarations() {
+        let root = temp();
+        write(&root.join("package.json"), r#"{"dependencies":{"missing":"^1"},"optionalDependencies":{"missing":"^1"},"devDependencies":{"missing":"~2"}}"#);
+        for transitive in [false, true] {
+            let graph = scan(&root, &root, transitive).unwrap();
+            let missing = node(&graph, "npm:missing");
+            assert!(missing.resolved_versions.is_empty());
+            assert_eq!(missing.declared_versions, ["^1", "~2"]);
+            assert!(!missing.dev);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn python_poetry_and_requirements_preserve_declarations_and_dev_merging() {
+        let root = temp();
+        write(&root.join("pyproject.toml"), r#"
+[tool.poetry.dependencies]
+python = "^3.11"
+Some_Pkg = "^2"
+table-pkg = { version = "~4", optional = true }
+path-pkg = { path = "../local" }
+[tool.poetry.group.test.dependencies]
+some-pkg = { version = ">=1" }
+only-dev = "*"
+"#);
+        write(&root.join("requirements-dev.txt"), "Some.Pkg[extra]>=2; python_version >= '3.11'\n");
+        write(&root.join(".venv/Lib/site-packages/table_pkg-4.dist-info/METADATA"), "Name: table-pkg\n\nNo version header.\n");
+        let graph = scan(&root, &root, true).unwrap();
+        let merged = node(&graph, "pypi:some-pkg");
+        assert_eq!(merged.declared_versions, [">=1", "Some.Pkg[extra]>=2; python_version >= '3.11'", "^2"]);
+        assert!(merged.resolved_versions.is_empty());
+        assert!(!merged.dev);
+        assert!(node(&graph, "pypi:only-dev").dev);
+        assert_eq!(node(&graph, "pypi:table-pkg").declared_versions, ["~4"]);
+        assert!(node(&graph, "pypi:table-pkg").resolved_versions.is_empty());
+        assert!(node(&graph, "pypi:path-pkg").declared_versions.is_empty());
+        assert!(!ids(&graph).contains(&"pypi:python"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cargo_all_matching_lock_versions_are_evidence_without_changing_collapsed_edges() {
+        let root = temp();
+        write(&root.join("Cargo.toml"), "[dependencies]\nalias = { package = \"a\", version = \">=1\" }\n");
+        write(&root.join("Cargo.lock"), r#"
+[[package]]
+name = "a"
+version = "2.0.0"
+dependencies = ["b 3.0.0"]
+[[package]]
+name = "a"
+version = "1.0.0"
+dependencies = ["other 1.0.0"]
+[[package]]
+name = "a"
+version = "2.0.0"
+[[package]]
+name = "b"
+version = "3.0.0"
+[[package]]
+name = "b"
+version = "2.0.0"
+[[package]]
+name = "unreachable"
+version = "9.0.0"
+"#);
+        let graph = scan(&root, &root, true).unwrap();
+        assert_eq!(node(&graph, "cargo:a").resolved_versions, ["1.0.0", "2.0.0"]);
+        assert_eq!(node(&graph, "cargo:a").declared_versions, [">=1"]);
+        assert_eq!(node(&graph, "cargo:a").version.as_deref(), Some("2.0.0"));
+        assert_eq!(node(&graph, "cargo:b").resolved_versions, ["2.0.0", "3.0.0"]);
+        assert!(has_edge(&graph, "cargo:a", "cargo:b"));
+        assert!(!ids(&graph).contains(&"cargo:other"));
+        assert!(!ids(&graph).contains(&"cargo:unreachable"));
+        let direct_only = scan(&root, &root, false).unwrap();
+        assert_eq!(node(&direct_only, "cargo:a").resolved_versions, ["1.0.0", "2.0.0"]);
+        assert!(!ids(&direct_only).contains(&"cargo:b"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gradle_literal_properties_are_declarations_not_cached_resolution() {
+        let root = temp();
+        let home = temp();
+        write(&root.join("gradle.properties"), "releaseVersion=1.2\n");
+        write(&root.join("build.gradle.kts"), "val otherVersion = \"2.3\"\ndependencies {\n implementation(\"org.a:one:$releaseVersion\")\n api(\"org.a:two:${otherVersion}\")\n runtimeOnly(\"org.a:unknown\")\n}\n");
+        let repository = home.join(".m2/repository");
+        write(&repository.join("org/a/one/9.0/one-9.0.pom"), "<project/>");
+        write(&repository.join("org/a/unknown/9.0/unknown-9.0.pom"), "<project><dependencies><dependency><groupId>org.a</groupId><artifactId>child</artifactId><version>5.0</version></dependency></dependencies></project>");
+        let graph = scan(&root, &home, true).unwrap();
+        assert_eq!(node(&graph, "maven:org.a:one").declared_versions, ["1.2"]);
+        assert_eq!(node(&graph, "maven:org.a:two").declared_versions, ["2.3"]);
+        let unknown = node(&graph, "maven:org.a:unknown");
+        assert_eq!(unknown.version.as_deref(), Some("9.0"));
+        assert!(unknown.declared_versions.is_empty());
+        assert!(graph.nodes.iter().all(|node| node.resolved_versions.is_empty()));
+        assert!(has_edge(&graph, "maven:org.a:unknown", "maven:org.a:child"));
+        assert_eq!(node(&graph, "maven:org.a:child").declared_versions, ["5.0"]);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn versions_compare_numerically_and_numbers_beat_text() {
         assert_eq!(compare_versions("1.10", "1.9"), Ordering::Greater);
         assert_eq!(compare_versions("1.0", "1.0-beta"), Ordering::Less);
         assert_eq!(compare_versions("2", "2"), Ordering::Equal);
+    }
+
+    fn occ(id: &str, version: Option<&str>) -> Occurrence {
+        Occurrence { id: id.to_string(), version: version.map(String::from) }
+    }
+
+    fn has_link(graph: &DependencyGraph, from: Option<Occurrence>, to: Occurrence) -> bool {
+        graph.resolution.links.iter().any(|(a, b)| *a == from && *b == to)
+    }
+
+    #[test]
+    fn npm_nested_copies_of_different_versions_are_distinct_occurrences() {
+        let root = temp();
+        write(&root.join("package.json"), r#"{"dependencies":{"a":"1","b":"1"}}"#);
+        package(&root, "a", "1.0.0", &["shared"]);
+        package(&root, "b", "1.0.0", &["shared"]);
+        package(&root, "shared", "1.0.0", &["leaf"]);
+        package(&root, "leaf", "1.0.0", &[]);
+        write(&root.join("node_modules/a/node_modules/shared/package.json"), r#"{"name":"shared","version":"2.0.0"}"#);
+        let graph = scan(&root, &root, true).unwrap();
+        assert!(graph.resolution.complete);
+        assert!(has_link(&graph, None, occ("npm:a", Some("1.0.0"))));
+        assert!(has_link(&graph, Some(occ("npm:a", Some("1.0.0"))), occ("npm:shared", Some("2.0.0"))));
+        assert!(has_link(&graph, Some(occ("npm:b", Some("1.0.0"))), occ("npm:shared", Some("1.0.0"))));
+        assert!(has_link(&graph, Some(occ("npm:shared", Some("1.0.0"))), occ("npm:leaf", Some("1.0.0"))));
+        assert!(!has_link(&graph, Some(occ("npm:shared", Some("2.0.0"))), occ("npm:leaf", Some("1.0.0"))));
+        let json = serde_json::to_value(&graph).unwrap();
+        assert!(json.get("resolution").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn python_duplicate_dist_info_with_different_versions_is_unproven() {
+        let root = temp();
+        write(&root.join("pyproject.toml"), "[project]\nname = \"x\"\ndependencies = [\"requests\", \"flask\"]\n");
+        let site = root.join(".venv/Lib/site-packages");
+        write(&site.join("requests-2.0.dist-info/METADATA"), "Name: requests\nVersion: 2.0\nRequires-Dist: urllib3\n\n");
+        write(&site.join("requests-2.1.dist-info/METADATA"), "Name: requests\nVersion: 2.1\nRequires-Dist: urllib3\n\n");
+        write(&site.join("flask-3.0.dist-info/METADATA"), "Name: flask\nVersion: 3.0\n\n");
+        write(&site.join("urllib3-1.0.dist-info/METADATA"), "Name: urllib3\nVersion: 1.0\n\n");
+        write(&site.join("urllib3-1.0b.dist-info/METADATA"), "Name: urllib3\nVersion: 1.0\n\n");
+        let graph = scan(&root, &root, true).unwrap();
+        assert!(has_link(&graph, None, occ("pypi:requests", None)));
+        assert!(has_link(&graph, None, occ("pypi:flask", Some("3.0"))));
+        assert!(has_link(&graph, Some(occ("pypi:requests", None)), occ("pypi:urllib3", Some("1.0"))));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cargo_lock_entries_resolve_exact_versions_and_leave_ambiguous_names_unproven() {
+        let root = temp();
+        write(&root.join("Cargo.toml"), "[dependencies]\na = \"1\"\nc = \"1\"\nb = \"*\"\n");
+        write(&root.join("Cargo.lock"), r#"
+[[package]]
+name = "a"
+version = "1.0.0"
+dependencies = ["b 2.0.0 (registry+x)", "d"]
+[[package]]
+name = "b"
+version = "2.0.0"
+[[package]]
+name = "b"
+version = "3.0.0"
+[[package]]
+name = "c"
+version = "1.0.0"
+dependencies = ["b 3.0.0"]
+[[package]]
+name = "d"
+version = "1.0.0"
+dependencies = ["b"]
+"#);
+        let graph = scan(&root, &root, true).unwrap();
+        assert!(has_link(&graph, None, occ("cargo:a", Some("1.0.0"))));
+        assert!(has_link(&graph, None, occ("cargo:b", None)));
+        assert!(has_link(&graph, Some(occ("cargo:a", Some("1.0.0"))), occ("cargo:b", Some("2.0.0"))));
+        assert!(has_link(&graph, Some(occ("cargo:a", Some("1.0.0"))), occ("cargo:d", Some("1.0.0"))));
+        assert!(has_link(&graph, Some(occ("cargo:c", Some("1.0.0"))), occ("cargo:b", Some("3.0.0"))));
+        assert!(has_link(&graph, Some(occ("cargo:d", Some("1.0.0"))), occ("cargo:b", None)));
+        assert!(!has_link(&graph, Some(occ("cargo:d", Some("1.0.0"))), occ("cargo:b", Some("2.0.0"))));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maven_never_proves_versions_and_emits_no_links() {
+        let root = temp();
+        let home = temp();
+        write(
+            &root.join("pom.xml"),
+            "<project><dependencies><dependency><groupId>org.x</groupId><artifactId>lib</artifactId><version>1.0</version></dependency></dependencies></project>",
+        );
+        write(&home.join(".m2/repository/org/x/lib/1.0/lib-1.0.pom"), "<project/>");
+        let graph = scan(&root, &home, true).unwrap();
+        assert!(graph.resolution.links.is_empty());
+        assert!(graph.resolution.complete);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn the_link_cap_truncates_and_marks_the_resolution_incomplete() {
+        let mut b = Builder::new();
+        b.max_links = 2;
+        b.link(None, occ("npm:a", Some("1")));
+        b.link(None, occ("npm:b", Some("1")));
+        b.link(None, occ("npm:a", Some("1")));
+        assert!(!b.truncated);
+        b.link(None, occ("npm:c", Some("1")));
+        assert!(b.truncated);
+        assert_eq!(b.links.len(), 2);
+        assert!(b.notes.iter().any(|note| note == "The version graph was cut at 2 links."));
     }
 }

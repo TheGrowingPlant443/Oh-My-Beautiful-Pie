@@ -51,7 +51,8 @@ test('chosen and latest targets use instance identity and fall back only to Mana
 test('dashboard startup is intentional with or without Manager and preserves saved choices', () => {
   for (const autoStart of [true, false]) {
     const saved = { version: 1, startupTarget: 'dashboard', startupProjectId: 'deleted-project',
-      latestProjectId: 'deleted-latest', autoStart, showPreviousProjects: true, showManagerTile: false, previewSize: 1000, browserHeadless: true, browserEmbedded: false, terminalAutoOpen: true, terminalCreateUser: false, alwaysNewSession: true };
+      latestProjectId: 'deleted-latest', autoStart, showPreviousProjects: true, showManagerTile: false, previewSize: 1000, browserHeadless: true, browserEmbedded: false, terminalAutoOpen: true, terminalCreateUser: false, alwaysNewSession: true,
+      packageLookupGate: true, manifestFilter: true, filterLanguages: ["maven", "npm"], aiFilter: true, filterRoles: ["backend"] };
     const settings = parseAppSettings(JSON.stringify(saved), null);
     assert.deepEqual(settings, saved);
     assert.deepEqual(parseAppSettings(JSON.stringify(settings), null), settings);
@@ -116,4 +117,20 @@ test('a new session is started only for ordinary agents without an explicitly ch
   assert.equal(startsFresh(on, { planTarget: null, helper: { target: 'a', purpose: 'git', repo: 'x' } }, false), false);
   assert.equal(startsFresh(on, { planTarget: 'x', helper: null }, false), false);
   assert.equal(startsFresh(on, undefined, false), false);
+});
+
+test("dependency lookup and filter settings default off and normalise untrusted arrays", () => {
+  const defaults = parseAppSettings(null, null);
+  for (const key of ["packageLookupGate", "manifestFilter", "aiFilter"]) assert.equal(defaults[key], false);
+  assert.deepEqual(defaults.filterLanguages, []);
+  assert.deepEqual(defaults.filterRoles, []);
+  const parsed = parseAppSettings(JSON.stringify({ version: 1, packageLookupGate: "yes", manifestFilter: 1, aiFilter: null, filterLanguages: ["java", "npm", "npm", 7], filterRoles: ["frontend", "frontend", "library", 7] }), null);
+  assert.equal(parsed.packageLookupGate, false);
+  assert.equal(parsed.manifestFilter, false);
+  assert.equal(parsed.aiFilter, false);
+  assert.deepEqual(parsed.filterLanguages, ["npm"]);
+  assert.deepEqual(parsed.filterRoles, ["frontend"]);
+  const invalid = parseAppSettings(JSON.stringify({ version: 1, filterLanguages: "npm", filterRoles: {} }), null);
+  assert.deepEqual(invalid.filterLanguages, []);
+  assert.deepEqual(invalid.filterRoles, []);
 });

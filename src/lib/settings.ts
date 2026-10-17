@@ -1,6 +1,10 @@
 import type { Instance } from "./api";
 
 export type StartupTarget = "manager" | "project" | "latest" | "dashboard";
+export type ProjectLanguage = "maven" | "npm" | "pypi" | "cargo";
+export type ProjectRole = "backend" | "frontend";
+const LANGUAGES: readonly ProjectLanguage[] = ["maven", "npm", "pypi", "cargo"];
+const ROLES: readonly ProjectRole[] = ["backend", "frontend"];
 export interface AppSettings {
   version: 1;
   startupTarget: StartupTarget;
@@ -18,6 +22,11 @@ export interface AppSettings {
   terminalCreateUser: boolean;
   /** Starting an agent begins a new session instead of resuming the previous one. */
   alwaysNewSession: boolean;
+  packageLookupGate: boolean;
+  manifestFilter: boolean;
+  filterLanguages: ProjectLanguage[];
+  aiFilter: boolean;
+  filterRoles: ProjectRole[];
 }
 
 export function parseAppSettings(raw: string | null, legacyShowManager: string | null): AppSettings {
@@ -25,6 +34,7 @@ export function parseAppSettings(raw: string | null, legacyShowManager: string |
     version: 1, startupTarget: "manager", startupProjectId: null, latestProjectId: null,
     showPreviousProjects: false, showManagerTile: legacyShowManager !== "off", previewSize: 640, autoStart: true,
     browserHeadless: false, browserEmbedded: true, terminalAutoOpen: false, terminalCreateUser: true, alwaysNewSession: false,
+    packageLookupGate: false, manifestFilter: false, filterLanguages: [], aiFilter: false, filterRoles: [],
   };
   let data: unknown;
   try { data = raw === null ? null : JSON.parse(raw); }
@@ -46,6 +56,11 @@ export function parseAppSettings(raw: string | null, legacyShowManager: string |
     terminalAutoOpen: typeof value.terminalAutoOpen === "boolean" ? value.terminalAutoOpen : defaults.terminalAutoOpen,
     terminalCreateUser: typeof value.terminalCreateUser === "boolean" ? value.terminalCreateUser : defaults.terminalCreateUser,
     alwaysNewSession: typeof value.alwaysNewSession === "boolean" ? value.alwaysNewSession : defaults.alwaysNewSession,
+    packageLookupGate: typeof value.packageLookupGate === "boolean" ? value.packageLookupGate : defaults.packageLookupGate,
+    manifestFilter: typeof value.manifestFilter === "boolean" ? value.manifestFilter : defaults.manifestFilter,
+    filterLanguages: Array.isArray(value.filterLanguages) ? [...new Set(value.filterLanguages.filter((item): item is ProjectLanguage => LANGUAGES.includes(item)))] : [],
+    aiFilter: typeof value.aiFilter === "boolean" ? value.aiFilter : defaults.aiFilter,
+    filterRoles: Array.isArray(value.filterRoles) ? [...new Set(value.filterRoles.filter((item): item is ProjectRole => ROLES.includes(item)))] : [],
   };
 }
 

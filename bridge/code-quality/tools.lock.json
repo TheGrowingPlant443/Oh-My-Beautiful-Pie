@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "platform": "linux/amd64",
+  "megalinter": {
+    "version": "10.1.0",
+    "image": "ghcr.io/oxsecurity/megalinter:v10.1.0@sha256:b09486c423063200d6f203b63121e0967719eee03c234844f6f1dd658f00a31b",
+    "sourceCommit": "9949bad031045f366be2467e00e8371a7328a2e2",
+    "descriptorNaming": "Explicit name, otherwise descriptor_id + _ + linter_name.upper().replace(-,_), from pinned Linter.py",
+    "linters": [
+      {
+        "linterName": "shellcheck",
+        "name": "BASH_SHELLCHECK",
+        "descriptor": "megalinter/descriptors/bash.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "cppcheck",
+        "name": "C_CPPCHECK",
+        "descriptor": "megalinter/descriptors/c.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "jscpd",
+        "name": "COPYPASTE_JSCPD",
+        "descriptor": "megalinter/descriptors/copypaste.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "cppcheck",
+        "name": "CPP_CPPCHECK",
+        "descriptor": "megalinter/descriptors/cpp.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "hadolint",
+        "name": "DOCKERFILE_HADOLINT",
+        "descriptor": "megalinter/descriptors/dockerfile.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "pmd",
+        "name": "JAVA_PMD",
+        "descriptor": "megalinter/descriptors/java.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "eslint",
+        "name": "JAVASCRIPT_ES",
+        "descriptor": "megalinter/descriptors/javascript.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "eslint",
+        "name": "JSX_ESLINT",
+        "descriptor": "megalinter/descriptors/jsx.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "bandit",
+        "name": "PYTHON_BANDIT",
+        "descriptor": "megalinter/descriptors/python.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "ruff",
+        "name": "PYTHON_RUFF",
+        "descriptor": "megalinter/descriptors/python.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "checkov",
+        "name": "REPOSITORY_CHECKOV",
+        "descriptor": "megalinter/descriptors/repository.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "devskim",
+        "name": "REPOSITORY_DEVSKIM",
+        "descriptor": "megalinter/descriptors/repository.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "betterleaks",
+        "name": "REPOSITORY_BETTERLEAKS",
+        "descriptor": "megalinter/descriptors/repository.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "eslint",
+        "name": "TSX_ESLINT",
+        "descriptor": "megalinter/descriptors/tsx.megalinter-descriptor.yml"
+      },
+      {
+        "linterName": "eslint",
+        "name": "TYPESCRIPT_ES",
+        "descriptor": "megalinter/descriptors/typescript.megalinter-descriptor.yml"
+      }
+    ]
+  },
+  "opengrep": {
+    "version": "1.31.0",
+    "tag": "v1.31.0",
+    "assetUrl": "https://github.com/opengrep/opengrep/releases/download/v1.31.0/opengrep_musllinux_x86",
+    "sha256": "02c9fba481611aa0664bc79ccf7ce59e9e334b76af8921c80b2f738d17fabf9b",
+    "downloadVerified": true,
+    "downloadBytes": 48559944,
+    "taintIntrafile": null,
+    "capabilityPolicy": "Use --taint-intrafile only when scan --help exposes it; saved at image build."
+  },
+  "semgrep": {
+    "version": "1.175.0",
+    "source": "bundled by pinned MegaLinter descriptor"
+  },
+  "workspace": "/workspace",
+  "reports": "/out",
+  "rules": "/opt/omp/rules"
+}

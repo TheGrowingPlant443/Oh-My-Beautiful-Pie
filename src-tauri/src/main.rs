@@ -5,9 +5,17 @@ mod browser;
 #[cfg(windows)]
 mod browser_window;
 mod code_diff;
+mod code_quality;
 mod commands;
 mod config;
 mod dependencies;
+mod dependency_context;
+mod dependency_project_review;
+mod dependency_security;
+mod dependency_updates;
+mod derived_standard;
+mod inhouse;
+mod known_standard;
 mod explain;
 mod git_graph;
 mod helper_agent;
@@ -15,6 +23,7 @@ mod instance;
 mod manager;
 mod pty;
 mod plan;
+mod package_insights;
 mod session;
 mod setup;
 mod terminal;
@@ -33,7 +42,14 @@ pub struct AppState {
     pub helpers: Arc<helper_agent::HelperService>,
     pub browser: Arc<browser::BrowserSupervisor>,
     pub code_diff: Arc<code_diff::DiffService>,
+    pub code_quality: Arc<code_quality::CodeQualityService>,
     pub terminals: Arc<terminal::TerminalService>,
+    pub package_insights: Arc<package_insights::PackageInsightsService>,
+    pub dependency_security: Arc<dependency_security::DependencySecurityService>,
+    pub dependency_context: Arc<dependency_context::DependencyContextService>,
+    pub dependency_project_review: Arc<dependency_project_review::DependencyProjectReviewService>,
+    pub dependency_updates: Arc<dependency_updates::DependencyUpdateService>,
+    pub inhouse: Arc<inhouse::InhouseService>,
     #[cfg(windows)]
     pub browser_host: Arc<browser_window::BrowserHost>,
 }
@@ -95,12 +111,29 @@ fn main() {
             registry.refresh().map_err(std::io::Error::other)?;
             let closing = Arc::new(AtomicBool::new(false));
             commands::tick(app.handle().clone(), registry.clone(), terminals.clone(), closing.clone());
+            let package_insights = Arc::new(
+                package_insights::PackageInsightsService::new(folder.clone())
+                    .map_err(std::io::Error::other)?,
+            );
+            let dependency_security = Arc::new(
+                dependency_security::DependencySecurityService::new(folder.clone()),
+            );
+            let inhouse = Arc::new(inhouse::InhouseService::new(folder.clone()));
+            let code_quality = code_quality::CodeQualityService::new(folder.clone());
+            code_quality.reconcile_on_start();
             app.manage(AppState {
                 registry,
                 closing,
                 browser: browser.clone(),
                 code_diff: Arc::new(code_diff::DiffService::new()),
+                code_quality,
                 terminals,
+                package_insights,
+                dependency_security,
+                dependency_context: Arc::new(dependency_context::DependencyContextService::new(folder.clone())),
+                dependency_project_review: Arc::new(dependency_project_review::DependencyProjectReviewService::new(folder.clone())),
+                dependency_updates: Arc::new(dependency_updates::DependencyUpdateService::new(folder.clone())),
+                inhouse,
                 #[cfg(windows)]
                 browser_host: browser_host.clone(),
                 setup: Arc::new(setup::SetupService::new(folder)),
@@ -116,6 +149,22 @@ fn main() {
             commands::open_session_browser,
             commands::set_browser_view,
             commands::get_code_diff,
+            commands::get_code_quality_state,
+            commands::check_code_quality_prerequisites,
+            commands::configure_code_quality,
+            commands::install_code_quality_runtime,
+            commands::enable_code_quality_windows_features,
+            commands::start_code_quality_service,
+            commands::acknowledge_code_quality_rules,
+            commands::detect_code_quality_project,
+            commands::prepare_code_quality_scan,
+            commands::start_code_quality_scan,
+            commands::read_code_quality_scan,
+            commands::list_code_quality_scans,
+            commands::cancel_code_quality_scan,
+            commands::read_code_quality_report,
+            commands::open_code_quality_dashboard,
+            commands::open_code_quality_sso_login,
             commands::read_code_diff_file,
             commands::save_code_diff_file,
             commands::change_code_diff_file,
@@ -134,6 +183,27 @@ fn main() {
             commands::scan_dependencies,
             commands::get_dependency_classification,
             commands::classify_dependencies,
+            commands::get_package_insights,
+            commands::get_package_insights_status,
+            commands::recheck_github_credential,
+            commands::get_inhouse_status,
+            commands::start_inhouse_sweep,
+            commands::get_project_kind,
+            commands::start_project_kind,
+            commands::get_known_standard,
+            commands::clear_known_standard,
+            commands::get_derived_standard,
+            commands::start_dependency_security_review,
+            commands::read_dependency_security_review,
+            commands::start_dependency_usage_explanation,
+            commands::read_dependency_usage_explanation,
+            commands::show_dependency_result_in_architect,
+            commands::start_project_dependency_security_review,
+            commands::read_project_dependency_security_review,
+            commands::start_dependency_update_plan,
+            commands::read_dependency_update_plan,
+            commands::prepare_dependency_update_handoff,
+            commands::confirm_dependency_update_handoff,
             commands::set_manager_owner,
             commands::return_to_manager,
             commands::start_instance,
@@ -183,8 +253,10 @@ fn main() {
             if !state.closing.swap(true, Ordering::Relaxed) {
                 api.prevent_exit();
                 let registry = state.registry.clone();
+                let quality = state.code_quality.clone();
                 let handle = handle.clone();
                 std::thread::spawn(move || {
+                    quality.shutdown();
                     registry.shutdown();
                     handle.exit(0);
                 });

@@ -1,0 +1,4 @@
+# Built-in checks only; external modules and network secrets checks are not loaded.
+download-external-modules: false
+quiet: true
+compact: true

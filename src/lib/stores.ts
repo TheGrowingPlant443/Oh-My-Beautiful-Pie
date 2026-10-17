@@ -13,6 +13,7 @@ export const instancesById = derived(allInstances, list => new Map(list.map(i =>
 export const managerInstance = derived(instances, list => list.find(instance => instance.kind === "manager"));
 export const architectInstance = derived(instances, list => list.find(instance => instance.kind === "architect"));
 export const globalConfig = writable<GlobalConfigInfo>({ path: null, error: null });
+export const knownStandardVersion = writable(0);
 export const browserStatuses = writable<ReadonlyMap<string, BrowserInfo>>(new Map());
 // Live AI commands, held state and the user shell per agent, as reported by the backend.
 export const terminalOwners = writable<ReadonlyMap<string, TerminalOwner>>(new Map());

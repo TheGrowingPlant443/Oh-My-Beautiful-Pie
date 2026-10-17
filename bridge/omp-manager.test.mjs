@@ -34,6 +34,11 @@ test('app-originated abort and prompt reach any session; manager-originated cont
   assert.equal(controlAllowed({ source: 'manager', action: 'abort', role: 'manager', owner: 'M' }), false);
   assert.equal(controlAllowed({ source: 'manager', action: 'abort', role: 'instance', owner: 'M' }), true);
 });
+test('dependency_result is a human-origin, display-only action never reachable by a Manager or model', () => {
+  assert.equal(controlAllowed({ source: 'human', action: 'dependency_result', role: 'instance', owner: null }), true);
+  assert.equal(controlAllowed({ source: 'manager', action: 'dependency_result', role: 'instance', owner: 'M' }), false);
+  assert.equal(controlAllowed({ source: 'manager', action: 'dependency_result', role: 'manager', owner: 'M' }), false);
+});
 test('plan payloads may be objects or JSON strings but never anything else', () => {
   assert.deepEqual(planPayload({ text: 'a' }), { text: 'a' });
   assert.deepEqual(planPayload('{"text": "# test\\n- [ ] one\\n"}'), { text: '# test\n- [ ] one\n' });

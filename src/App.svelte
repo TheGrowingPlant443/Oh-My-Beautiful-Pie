@@ -17,6 +17,7 @@
   import ProjectPicker from "./lib/components/ProjectPicker.svelte";
   import TerminalsPage from "./lib/components/TerminalsPage.svelte";
   import DependencyTreePage from "./lib/components/DependencyTreePage.svelte";
+  import CodeQualityPage from "./lib/components/CodeQualityPage.svelte";
   import { dashboardInstances, resolveStartupTarget } from "./lib/settings";
   let initializing = $state(true);
   let startupSelected = false;
@@ -46,7 +47,7 @@
   });
   let openedIds = $state<ReadonlySet<string>>(new Set());
   let settingsOpen = $state(false);
-  let view = $state<"dashboard" | "agent_setup" | "code_diff" | "git_graph" | "terminals" | "dependency_tree">("dashboard");
+  let view = $state<"dashboard" | "agent_setup" | "code_diff" | "git_graph" | "terminals" | "dependency_tree" | "code_quality">("dashboard");
   let configOpen = $state(false);
   let configMode = $state<"save" | "import">("save");
   let setupDraft = $state<SetupDraft>({ scope: null, kinds: [], items: [], step: 0, instanceId: null, projectInstanceId: null });
@@ -106,6 +107,11 @@
     void api.setBrowserView(null, null, null).catch(error => reportError("Hide browser", error));
     view = "dependency_tree";
   }
+  function openCodeQuality(): void {
+    planChange = null;
+    void api.setBrowserView(null, null, null).catch(error => reportError("Hide browser", error));
+    view = "code_quality";
+  }
   // A global page, not an agent view: it never starts an agent, and leaving it stops nothing.
   function openTerminals(): void {
     planChange = null;
@@ -142,6 +148,36 @@
     try {
       if (architect.status === "stopped" || architect.status === "error") await startInstance(architect.id);
       focus(architect.id);
+    } finally { openingArchitect = false; }
+  }
+  // Dependency workflows open the existing Architect only: resume it without starting a new session, replay a saved result before focusing, never create a replacement.
+  async function onOpenArchitect(id: string, replayRequestId?: string): Promise<boolean> {
+    const architect = $architectInstance;
+    if (!architect || architect.id !== id) return false;
+    openingArchitect = true;
+    try {
+      if (architect.status === "stopped" || architect.status === "error") {
+        if (!await startInstance(id, true)) return false;
+      }
+      if (replayRequestId) {
+        const deadline = Date.now() + 60_000;
+        while (!$architectInstance?.bridgeReady) {
+          const current = $architectInstance;
+          if (!current || current.id !== id || current.status === "stopped" || current.status === "error" || Date.now() > deadline) {
+            reportError("Show saved result in The Architect", "The Architect did not become ready.");
+            return false;
+          }
+          await new Promise(resolve => setTimeout(resolve, 400));
+          await refreshInstances();
+        }
+        await api.showDependencyResultInArchitect(replayRequestId);
+      }
+      if ($architectInstance?.id !== id) return false;
+      focus(id);
+      return true;
+    } catch (error) {
+      reportError("Open The Architect", error);
+      return false;
     } finally { openingArchitect = false; }
   }
   function focus(id: string | null): void {
@@ -271,7 +307,7 @@
     <button disabled={initializing} class="primary" onclick={newInstance}>New instance</button>
   </header>
   {#if browserSettingsError}<p class="err" role="alert">Configure browser: {browserSettingsError}</p>{/if}
-  <main class:focused={(view === "dashboard" && (!!focused || !!planChange)) || view === "code_diff" || view === "git_graph" || view === "terminals" || view === "dependency_tree"}>
+  <main class:focused={(view === "dashboard" && (!!focused || !!planChange)) || view === "code_diff" || view === "git_graph" || view === "terminals" || view === "dependency_tree" || view === "code_quality"}>
     {#if initializing}
       <p role="status">Loading workspace…</p>
     {:else if view === "agent_setup"}
@@ -279,7 +315,9 @@
     {:else if view === "terminals"}
       <TerminalsPage onBack={() => focus(null)} />
     {:else if view === "dependency_tree"}
-      <DependencyTreePage onBack={() => focus($architectInstance?.id ?? null)} />
+      <DependencyTreePage onBack={() => focus($architectInstance?.id ?? null)} {onOpenArchitect} onOpenManager={openManager} />
+    {:else if view === "code_quality"}
+      <CodeQualityPage onBack={() => focus($architectInstance?.id ?? null)} />
     {:else if view === "git_graph" && diffInstanceId}
       <GitGraphView instanceId={diffInstanceId} name={diffName} onBack={() => view = "code_diff"} />
     {:else if view === "code_diff" && diffInstanceId}
@@ -287,7 +325,7 @@
     {:else if planChange && planTarget && planner}
       <PlanChangeView target={planTarget} {planner} admission={planChange.admission} onBack={() => planChange = null} onRetry={retryPlanContext} />
     {:else if focused}
-      <SessionView instance={focused} instances={$instances} onSwitch={id => void openProject(id)} onClose={() => focus(null)} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} onDependencyTree={() => openDependencyTree()} showBrowser={!focused.helper} browserHidden={browserHidden} />
+      <SessionView instance={focused} instances={$instances} onSwitch={id => void openProject(id)} onClose={() => focus(null)} {onPlan} onPlanChange={openPlanChange} {onSubagents} onCodeDiff={openCodeDiff} onDependencyTree={() => openDependencyTree()} onCodeQuality={openCodeQuality} showBrowser={!focused.helper} browserHidden={browserHidden} />
     {:else if $previewsEnabled}
       <Grid instances={overview} onSelect={focus} onOpen={openProject} {onPlan} onPlanChange={openPlanChange} {onSubagents} tileMin={$appSettings.previewSize} onCreate={newInstance} />
     {:else}

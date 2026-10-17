@@ -15,7 +15,7 @@ pub type Result<T, E = String> = std::result::Result<T, E>;
 
 pub const NOT_RUNNING: &str =
     "The target session is not running; ask the user to start it from the dashboard";
-const HANDOFF_LIMIT: usize = 60_000;
+pub(crate) const HANDOFF_LIMIT: usize = 60_000;
 
 pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
     fs::create_dir_all(path.parent().ok_or("invalid plan path")?).map_err(|e| e.to_string())?;

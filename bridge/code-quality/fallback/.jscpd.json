@@ -1,0 +1,12 @@
+{
+  "minTokens": 100,
+  "minLines": 10,
+  "reporters": [
+    "json",
+    "sarif"
+  ],
+  "ignore": [
+    "**/node_modules/**",
+    "**/coverage/**"
+  ]
+}

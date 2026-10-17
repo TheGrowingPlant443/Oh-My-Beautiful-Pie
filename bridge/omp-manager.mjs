@@ -43,7 +43,7 @@ export async function confirmedPlanHandoff(request, ctx, payload, signal) {
 // including The Manager and unowned workers. Manager-originated control still needs an owned instance.
 // Killing a terminal command also interrupts the agent, so it is never available to a model or a Manager.
 export function controlAllowed({ role, owner, action, source }) {
-  if (action === 'terminal_kill') return source === 'human';
+  if (action === 'terminal_kill' || action === 'dependency_result') return source === 'human';
   if (source === 'human') return action === 'prompt' || action === 'abort';
   return role === 'instance' && !!owner;
 }
@@ -173,7 +173,7 @@ export default function managerBridge(pi) {
   // Set only for a helper agent (Code diff / Git tree): read-only Git access, nothing else.
   if (process.env.OMP_MANAGER_HELPER_REPO) registerRepoInspectTool(pi, process.env.OMP_MANAGER_HELPER_REPO);
   // Set only for The Architect: the one tool that saves its basic/chosen dependency judgements.
-  if (process.env.OMP_MANAGER_ARCHITECT_DIR) registerClassifyTool(pi, process.env.OMP_MANAGER_ARCHITECT_DIR);
+  const architectTools = process.env.OMP_MANAGER_ARCHITECT_DIR ? registerClassifyTool(pi, process.env.OMP_MANAGER_ARCHITECT_DIR) : null;
   function resolveTerminalRequests() {
     for (const item of [...pending.values()]) if (['terminal','custom'].includes(item.request.method) && item.advisory) item.finish('native', undefined);
   }
@@ -254,6 +254,13 @@ export default function managerBridge(pi) {
       return { accepted: true };
     }
     if (frame.action === 'abort') { await context.abort(); return { interrupted: true }; }
+    if (frame.action === 'dependency_result') {
+      // Display-only replay by UUID and kind from the app-owned directory; no path, text or model prompt is accepted.
+      if (!architectTools) throw new Error('not_controlled');
+      if (typeof payload.requestId !== 'string' || !['security', 'usage', 'project', 'updatePlan'].includes(payload.kind)) throw new Error('invalid dependency result request');
+      architectTools.showSaved(context, payload.kind, payload.requestId, payload.replay === true);
+      return { accepted: true };
+    }
     if (frame.action === 'terminal_kill') {
       if (!terminal || typeof payload.executionId !== 'string') throw new Error('terminal integration unavailable');
       return terminal.kill(payload.executionId);

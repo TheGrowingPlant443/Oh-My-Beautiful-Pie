@@ -1,5 +1,8 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
-import type { Classification, DependencyGraph } from "./dependency-graph";
+import type { Classification, DependencyGraph, DerivedStandard, KnownStandard } from "./dependency-graph";
+import type { DependencyJobAdmission, GithubMode, HandoffPrepared, InhouseAdmission, InhouseStatus, PackageInsights, PackageInsightsStatus, ProjectReviewState, SecurityReviewState, UpdatePlanHandoff, UpdatePlanState, UsageExplanationState } from "./package-insights";
+import type { KindAdmission, ProjectKindStatus } from "./project-filter";
+import type { QualityConfig, QualityCredentialUpdate, QualityProject, QualityProjectDetection, QualityReportPreview, QualityRuntime, QualityScan, QualityScanPreparation, QualityState } from "./code-quality";
 
 export type InstanceStatus = "stopped" | "starting" | "running" | "error";
 export interface Subagent {
@@ -119,6 +122,22 @@ export interface HistoryEntry { instanceId: string; instanceName: string; comman
 export interface HistoryPage { entries: HistoryEntry[]; nextCursor: string | null; }
 
 export const api = {
+  getCodeQualityState: () => invoke<QualityState>("get_code_quality_state"),
+  checkCodeQualityPrerequisites: () => invoke<QualityState>("check_code_quality_prerequisites"),
+  configureCodeQuality: (config: QualityConfig, expectedRevision: number, credential: QualityCredentialUpdate | null = null) => invoke<QualityState>("configure_code_quality", { config, expectedRevision, credential }),
+  installCodeQualityRuntime: (runtime: QualityRuntime, expectedRevision: number, consent: boolean) => invoke<QualityState>("install_code_quality_runtime", { runtime, expectedRevision, consent }),
+  enableCodeQualityWindowsFeatures: (expectedRevision: number, consent: boolean) => invoke<QualityState>("enable_code_quality_windows_features", { expectedRevision, consent }),
+  startCodeQualityService: (expectedRevision: number) => invoke<QualityState>("start_code_quality_service", { expectedRevision }),
+  acknowledgeCodeQualityRules: (manifestHash: string, licenseHash: string, expectedRevision: number, consent: boolean) => invoke<QualityState>("acknowledge_code_quality_rules", { manifestHash, licenseHash, expectedRevision, consent }),
+  detectCodeQualityProject: (folder: string) => invoke<QualityProjectDetection>("detect_code_quality_project", { folder }),
+  prepareCodeQualityScan: (project: QualityProject) => invoke<QualityScanPreparation>("prepare_code_quality_scan", { project }),
+  startCodeQualityScan: (project: QualityProject, recipeHash: string, consent: boolean) => invoke<{ scanId: string }>("start_code_quality_scan", { project, recipeHash, consent }),
+  readCodeQualityScan: (scanId: string) => invoke<QualityScan>("read_code_quality_scan", { scanId }),
+  listCodeQualityScans: (folder: string) => invoke<QualityScan[]>("list_code_quality_scans", { folder }),
+  cancelCodeQualityScan: (scanId: string) => invoke<QualityScan>("cancel_code_quality_scan", { scanId }),
+  readCodeQualityReport: (scanId: string, reportName: string) => invoke<QualityReportPreview>("read_code_quality_report", { scanId, reportName }),
+  openCodeQualityDashboard: (scanId: string | null = null) => invoke<void>("open_code_quality_dashboard", { scanId }),
+  openCodeQualitySsoLogin: (url: string) => invoke<void>("open_code_quality_sso_login", { url }),
   listInstances: () => invoke<Instance[]>("list_instances"),
   configureBrowser: (settings: BrowserSettings) => invoke<void>("configure_browser", { settings }),
   listBrowsers: () => invoke<BrowserInfo[]>("list_browsers"),
@@ -141,6 +160,27 @@ export const api = {
   scanDependencies: (folder: string) => invoke<DependencyGraph>("scan_dependencies", { folder }),
   getDependencyClassification: (folder: string) => invoke<Classification>("get_dependency_classification", { folder }),
   classifyDependencies: (folder: string) => invoke<ClassifyAdmission>("classify_dependencies", { folder }),
+  getPackageInsights: (folder: string, packageId: string, github: GithubMode = "skip", refresh = false) => invoke<PackageInsights>("get_package_insights", { folder, packageId, github, refresh }),
+  getPackageInsightsStatus: () => invoke<PackageInsightsStatus>("get_package_insights_status"),
+  recheckGithubCredential: () => invoke<PackageInsightsStatus>("recheck_github_credential"),
+  getInhouseStatus: (folder: string, rescan: boolean, gate: boolean) => invoke<InhouseStatus>("get_inhouse_status", { folder, rescan, gate }),
+  startInhouseSweep: (folder: string) => invoke<InhouseAdmission>("start_inhouse_sweep", { folder }),
+  getProjectKind: (folder: string) => invoke<ProjectKindStatus>("get_project_kind", { folder }),
+  startProjectKind: (folder: string) => invoke<KindAdmission>("start_project_kind", { folder }),
+  getKnownStandard: () => invoke<KnownStandard>("get_known_standard"),
+  clearKnownStandard: (language: string | null) => invoke<number>("clear_known_standard", { language }),
+  startDependencySecurityReview: (folder: string, packageId: string, rerun = false) => invoke<DependencyJobAdmission>("start_dependency_security_review", { folder, packageId, rerun }),
+  readDependencySecurityReview: (requestId: string) => invoke<SecurityReviewState>("read_dependency_security_review", { requestId }),
+  startDependencyUsageExplanation: (folder: string, packageId: string, rerun = false) => invoke<DependencyJobAdmission>("start_dependency_usage_explanation", { folder, packageId, rerun }),
+  readDependencyUsageExplanation: (requestId: string) => invoke<UsageExplanationState>("read_dependency_usage_explanation", { requestId }),
+  showDependencyResultInArchitect: (requestId: string) => invoke<void>("show_dependency_result_in_architect", { requestId }),
+  startProjectDependencySecurityReview: (folder: string, rerun = false) => invoke<DependencyJobAdmission>("start_project_dependency_security_review", { folder, rerun }),
+  readProjectDependencySecurityReview: (requestId: string) => invoke<ProjectReviewState>("read_project_dependency_security_review", { requestId }),
+  startDependencyUpdatePlan: (folder: string, reviewRequestId: string, regenerate = false) => invoke<DependencyJobAdmission>("start_dependency_update_plan", { folder, reviewRequestId, regenerate }),
+  readDependencyUpdatePlan: (requestId: string) => invoke<UpdatePlanState>("read_dependency_update_plan", { requestId }),
+  prepareDependencyUpdateHandoff: (requestId: string, revisionId: string) => invoke<HandoffPrepared>("prepare_dependency_update_handoff", { requestId, revisionId }),
+  confirmDependencyUpdateHandoff: (confirmationToken: string) => invoke<UpdatePlanHandoff>("confirm_dependency_update_handoff", { confirmationToken }),
+  getDerivedStandard: (folder: string) => invoke<DerivedStandard>("get_derived_standard", { folder }),
   setBrowserView: (instanceId: string | null, generation: number | null, rect: BrowserRect | null) => invoke<void>("set_browser_view", { instanceId, generation, rect }),
   createInstance: (config: CreateInstanceInput) => invoke<Instance>("create_instance", { config }),
   createManager: (config: CreateInstanceInput) => invoke<Instance>("create_manager", { config }),

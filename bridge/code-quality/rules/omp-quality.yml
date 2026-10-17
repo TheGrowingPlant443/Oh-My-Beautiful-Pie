@@ -1,0 +1,49 @@
+# Original OMP Manager rules. Matches are risky constructs for human review, not proof of exploitability.
+rules:
+  - id: omp-quality.javascript.eval
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Review dynamic eval; untrusted input can execute arbitrary code. Prefer data parsing.
+    metadata: {category: security, confidence: HIGH, license: MIT}
+    pattern: eval($X)
+  - id: omp-quality.javascript.function-constructor
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Review the Function constructor; strings are compiled as executable code.
+    metadata: {category: security, confidence: HIGH, license: MIT}
+    pattern: new Function(...)
+  - id: omp-quality.python.eval
+    languages: [python]
+    severity: WARNING
+    message: Review eval; untrusted input can execute arbitrary code. Prefer data parsing.
+    metadata: {category: security, confidence: HIGH, license: MIT}
+    pattern: eval($X, ...)
+  - id: omp-quality.python.exec
+    languages: [python]
+    severity: WARNING
+    message: Review exec; untrusted input can execute arbitrary code.
+    metadata: {category: security, confidence: HIGH, license: MIT}
+    pattern: exec($X, ...)
+  - id: omp-quality.python.unsafe-yaml
+    languages: [python]
+    severity: WARNING
+    message: Review yaml.load without SafeLoader; use yaml.safe_load for untrusted data.
+    metadata: {category: security, confidence: HIGH, license: MIT}
+    patterns:
+      - pattern: yaml.load($DATA, ...)
+      - pattern-not: yaml.load($DATA, ..., Loader=yaml.SafeLoader, ...)
+      - pattern-not: yaml.load($DATA, ..., Loader=yaml.CSafeLoader, ...)
+      - pattern-not: yaml.load($DATA, yaml.SafeLoader)
+      - pattern-not: yaml.load($DATA, yaml.CSafeLoader)
+  - id: omp-quality.javascript.tls-verification-disabled
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Review disabled TLS certificate verification; keep rejectUnauthorized enabled in production.
+    metadata: {category: security, confidence: HIGH, license: MIT}
+    pattern: "{..., rejectUnauthorized: false, ...}"
+  - id: omp-quality.python.tls-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: Review disabled TLS certificate verification in requests; use certificate verification.
+    metadata: {category: security, confidence: HIGH, license: MIT}
+    pattern: requests.$METHOD(..., verify=False, ...)

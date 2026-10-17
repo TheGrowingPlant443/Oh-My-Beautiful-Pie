@@ -221,9 +221,23 @@ pub(crate) fn git_timed(dir: &Path, args: &[&str], stdin: Option<&[u8]>, secs: u
     let out = run_timed(git_command(dir, args), stdin, Duration::from_secs(secs), GIT_MISSING)?;
     if out.status.success() { Ok(out.stdout) } else { Err(failure_text(&out)) }
 }
-/// Opens an https URL with the platform handler (no shell).
-fn open_url(url: &str) -> Result<()> {
-    if !url.starts_with("https://") || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+/// Opens a credential-free https URL (or http with a literal loopback host when `allow_loopback_http`)
+/// with the platform handler (no shell).
+pub(crate) fn open_url(url: &str, allow_loopback_http: bool) -> Result<()> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("Refusing to open a link with whitespace or control characters".into());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| "Refusing to open an invalid link".to_string())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Refusing to open a link that contains credentials".into());
+    }
+    let loopback = matches!(parsed.host_str(), Some("127.0.0.1") | Some("[::1]"));
+    let allowed = match parsed.scheme() {
+        "https" => true,
+        "http" => allow_loopback_http && loopback,
+        _ => false,
+    };
+    if !allowed {
         return Err("Refusing to open a non-https link".into());
     }
     #[cfg(windows)]
@@ -871,7 +885,7 @@ impl DiffService {
     }
     pub fn open_pull_request(&self, id: &str) -> Result<()> {
         let url = self.prs.lock().get(id).cloned().ok_or("No pull request was created in this session")?;
-        open_url(&url)
+        open_url(&url, false)
     }
 }
 
