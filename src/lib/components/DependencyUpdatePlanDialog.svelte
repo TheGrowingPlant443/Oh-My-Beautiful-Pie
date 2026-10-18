@@ -10,9 +10,10 @@
   let confirmProgrammatic = 0;
   const proposal = $derived(plan?.state?.proposal ?? null);
   const handoff = $derived(plan?.state?.handoff ?? null);
-  const handoverBlocked = $derived(!proposal || busy || !!plan?.pending || handoff?.status === "accepted" || handoff?.status === "attempting" || handoff?.status === "uncertain");
+  const handoverBlocked = $derived(!proposal || busy || !!plan?.pending || handoff?.status === "pending" || handoff?.status === "accepted" || handoff?.status === "attempting" || handoff?.status === "uncertain");
   const blockedReason = $derived(
     !proposal ? "Available once the plan has been drafted."
+    : handoff?.status === "pending" ? "Pending: waiting for The Manager's working directory to be ready."
     : handoff?.status === "accepted" ? "This plan revision has already been handed over."
     : handoff?.status === "attempting" ? "A handoff of this plan revision is in progress."
     : handoff?.status === "uncertain" ? "A handoff of this plan revision may have been delivered; it will not be resent automatically."
@@ -60,13 +61,14 @@
         {/if}
         {#if handoff}
           <p role="status">{handoff.status === "accepted" ? `Handed over to The Manager (revision ${handoff.revisionId}).`
+            : handoff.status === "pending" ? "Pending: waiting for The Manager's working directory to be ready. This revision will be sent once at a safe step."
             : handoff.status === "attempting" ? `Handoff to The Manager is in progress or was interrupted${handoff.error ? `: ${handoff.error}` : ""}. It will not be resent automatically.`
             : handoff.status === "uncertain" ? `Handoff outcome is uncertain${handoff.error ? `: ${handoff.error}` : ""}. It will not be resent automatically; check The Manager before deciding what to do.`
             : `The last handoff was not sent${handoff.error ? `: ${handoff.error}` : ""}. You can try again.`}</p>
         {/if}
         {#if handoffError}<p class="err" role="alert">{handoffError}</p>{/if}
         <div class="actions">
-          <button onclick={onregenerate} disabled={busy || plan.pending} title="Drafts a new revision; a draft already in progress is joined, not duplicated.">Generate new draft</button>
+          <button onclick={onregenerate} disabled={busy || plan.pending || handoff?.status === "pending" || handoff?.status === "attempting" || handoff?.status === "uncertain"} title="Drafts a new revision; a draft already in progress is joined, not duplicated.">Generate new draft</button>
           <button onclick={onprepare} disabled={handoverBlocked} title={blockedReason}>Hand over to The Manager</button>
         </div>
       {/if}
@@ -79,8 +81,10 @@
     <div class="body">
       {#if prepared}
         <p>Project: {prepared.projectFolder}<br />Plan: {prepared.title}<br />Revision: {prepared.revisionId}<br />Destination: {prepared.managerName}</p>
+        <p>Manager working directory: <span class="mono">{prepared.managerWorkingDirectory}</span></p>
+        <p>Repositories included:</p><ul>{#each prepared.repositoryFolders as repository}<li class="mono">{repository}</li>{/each}</ul>
         <p>{prepared.needsStart ? `${prepared.managerName} is stopped and will be started to receive the plan.` : `${prepared.managerName} is running.`}</p>
-        <p class="warn" role="note">This interrupts any current Manager turn and supplies this approved plan as a new task. It does not stop workers or change native tool-approval settings.</p>
+        <p class="warn" role="note">The approved plan waits for a safe Manager step and the confirmed working directory. It does not interrupt current tools, stop workers or change native tool-approval settings.</p>
         <small class="dim">Confirmation valid until {when(prepared.expiresAt)}. Cancelling does nothing and does not start The Manager.</small>
         {#if handoffError}<p class="err" role="alert">{handoffError}</p>{/if}
         {#if busy}<p role="status">Handing over…</p>{/if}

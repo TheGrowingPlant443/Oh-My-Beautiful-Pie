@@ -25,9 +25,9 @@ pub type Result<T, E = String> = std::result::Result<T, E>;
 pub(crate) const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 pub(crate) const MAX_REPORT_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-const UNKNOWN_ADMISSION: &str = "Prompt admission outcome unknown. Inspect The Architect's conversation before sending anything else; a late report can still arrive.";
+pub(crate) const UNKNOWN_ADMISSION: &str = "Prompt admission outcome unknown. Inspect The Architect's conversation before sending anything else; a late report can still arrive.";
 const BLOCKED_PUBLIC: &str = "Public lookups are blocked until The Architect has identified in-house packages.";
-const PRODUCER_ENDED: &str = "producerEnded";
+pub(crate) const PRODUCER_ENDED: &str = "producerEnded";
 const SCHEMA: u32 = 2;
 
 /// Analysis requirements shared by the single-package and the project-wide prompts.
@@ -62,12 +62,12 @@ pub struct DependencyJobAdmission {
 /// The original three-field admission journal; kept verbatim so files written by earlier builds still load.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StoredAdmission {
-    request_id: String,
+pub(crate) struct StoredAdmission {
+    pub(crate) request_id: String,
     #[serde(deserialize_with = "required_nullable")]
-    prompt_sent: Option<bool>,
+    pub(crate) prompt_sent: Option<bool>,
     #[serde(deserialize_with = "required_nullable")]
-    error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -306,20 +306,20 @@ struct SavedUsage {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum TerminalStatus { Complete, Error }
+pub(crate) enum TerminalStatus { Complete, Error }
 
 /// `terminal.json`: durable completion marker (with the result hash) or an explicit terminal error such as `producerEnded`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Terminal {
-    status: TerminalStatus,
+pub(crate) struct Terminal {
+    pub(crate) status: TerminalStatus,
     #[serde(default)]
-    code: Option<String>,
+    pub(crate) code: Option<String>,
     #[serde(default)]
-    message: Option<String>,
+    pub(crate) message: Option<String>,
     #[serde(default)]
-    result_hash: Option<String>,
-    at: u64,
+    pub(crate) result_hash: Option<String>,
+    pub(crate) at: u64,
 }
 
 enum JobResult { Security(SecurityReviewReport), Usage(PackageUsageReport) }
@@ -363,7 +363,7 @@ pub struct DependencySecurityService {
     test_live: Mutex<Option<bool>>,
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as u64).unwrap_or(1)
 }
 
@@ -819,7 +819,7 @@ pub(crate) fn safe_https(value: &str) -> bool {
     reqwest::Url::parse(value).is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some() && url.username().is_empty() && url.password().is_none())
 }
 
-fn safe_relative_path(path: &str) -> bool {
+pub(crate) fn safe_relative_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     valid_text(path, 1000, true) && !path.chars().any(|ch| ch.is_control()) && !path.starts_with('/') && !path.starts_with('\\') &&
         !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':') &&
@@ -913,7 +913,7 @@ pub(crate) fn validate_usage(report: &PackageUsageReport, folder: &Path) -> Resu
     Ok(())
 }
 
-fn bounded_bytes(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>> {
+pub(crate) fn bounded_bytes(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

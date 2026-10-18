@@ -1,6 +1,7 @@
 //! Helper agents: a read-only OMP session per project and purpose that explains or reviews the Code diff changes
-//! (`diff`) or searches the repository's history (`git`). The helper has no built-in tools (`--no-tools`); its only
-//! tool is `repo_inspect` (bridge/omp-repo.mjs). It is opened like a plan agent: create, start, wait for the bridge,
+//! (`diff`) or searches the repository's history (`git`). The helper has no built-in tools (`--no-tools`); its tools are
+//! `repo_inspect` (bridge/omp-repo.mjs) and the read-only saved-results reader `code_quality_report`
+//! (bridge/omp-code-quality.mjs, registered for every agent role). It is opened like a plan agent: create, start, wait for the bridge,
 //! then send one request prompt.
 use std::collections::HashMap;
 use std::fs;
@@ -63,7 +64,7 @@ pub enum Ask<'a> {
 
 pub fn prompt(root: &str, name: &str, branch: Option<&str>, ask: &Ask) -> String {
     let branch = branch.unwrap_or("detached HEAD");
-    let preamble = format!("You are a read-only Git helper inside OMP Manager for the repository at {root} (project \"{name}\", branch {branch}). You have no shell and cannot change anything. Your only tool is repo_inspect (actions: changes, log, show, diff, blame, file). Never claim to have modified, staged, committed or run anything. Keep answers short and in plain language; the user reads them in a terminal. Quote code only as short fenced diff blocks.");
+    let preamble = format!("You are a read-only Git helper inside OMP Manager for the repository at {root} (project \"{name}\", branch {branch}). You have no shell and cannot change anything. Your tools are repo_inspect (actions: changes, log, show, diff, blame, file) and the read-only code_quality_report (saved code quality results of this repository). Never claim to have modified, staged, committed or run anything. Keep answers short and in plain language; the user reads them in a terminal. Quote code only as short fenced diff blocks.");
     let rest = match ask {
         Ask::Explain(c) => format!("\n\nThe user opened Code diff and pressed Explain. Comparison: {}. {}\n1. Call repo_inspect {} to list the changed files, then read the patches you need (add \"path\" to read one file; untracked files are listed at the end of the result and can be read with action \"file\").\n2. Reply with a SHORT overall explanation of what this change does and why it matters: at most 5 sentences, no per-file detail, no code.\n3. End with this exact line: Type All for a short explanation of every file.\nIf the user later answers All (any case), give one short sentence per changed file instead and nothing else.", c.label, base_line(c.base_commit.as_deref()), call(c.base_commit.as_deref())),
         Ask::Review(c) => format!("\n\nThe user opened Code diff and pressed Review. Comparison: {}. {}\nRead the changes with repo_inspect (start with {}, then the patches; use action \"file\" to read surrounding code when a hunk is not enough). Then review them like a careful reviewer: list concrete problems ordered by severity — correctness bugs, unhandled edge cases, security issues, missing or weak tests, confusing code — each with the file and the line or hunk it concerns and a one-line fix suggestion. Skip praise and do not restate what the change does. If you find nothing serious, say so in one sentence. Finish with a one-line verdict.", c.label, base_line(c.base_commit.as_deref()), call(c.base_commit.as_deref())),
@@ -161,7 +162,7 @@ mod tests {
         for ask in [Ask::Explain(&c), Ask::Review(&c), Ask::Git] {
             let text = prompt("C:/repo", "Alpha", Some("main"), &ask);
             assert!(text.starts_with("You are a read-only Git helper inside OMP Manager for the repository at C:/repo (project \"Alpha\", branch main)."));
-            assert!(text.contains("Your only tool is repo_inspect"));
+            assert!(text.contains("Your tools are repo_inspect") && text.contains("code_quality_report"));
         }
         let explain = prompt("C:/repo", "Alpha", Some("main"), &Ask::Explain(&c));
         assert!(explain.contains("Base commit: abc123.") && explain.contains("{\"action\":\"changes\",\"base\":\"abc123\",\"stat\":true}"));

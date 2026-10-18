@@ -1,16 +1,16 @@
 <script lang="ts">
   import TerminalWorkspace from "./TerminalWorkspace.svelte";
 
-  let { onBack }: { onBack: () => void } = $props();
+  let { onBack, onOpenSession }: { onBack: () => void; onOpenSession: (id: string) => void } = $props();
 </script>
 
 <div class="page">
   <header class="panel topbar">
     <button type="button" onclick={onBack}>Back to Dashboard</button>
     <h3>Terminals</h3>
-    <span class="dim">Every agent's command history, live AI commands and user terminals</span>
+    <span class="dim">Every agent's command history, human decisions, live AI commands and user terminals</span>
   </header>
-  <div class="content"><TerminalWorkspace instanceId={null} /></div>
+  <div class="content"><TerminalWorkspace instanceId={null} {onOpenSession} /></div>
 </div>
 
 <style>

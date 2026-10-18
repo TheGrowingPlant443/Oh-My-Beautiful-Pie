@@ -32,7 +32,7 @@ impl ProcessLock {
     /// `Ok(None)` when another holder owns the mutex.
     #[cfg(windows)]
     pub fn acquire(name: &str) -> Result<Option<ProcessLock>> {
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<Result<bool>>();
@@ -50,8 +50,10 @@ impl ProcessLock {
                     let _ = acquired_tx.send(Ok(true));
                     let _ = release_rx.recv();
                     ReleaseMutex(handle);
-                } else {
+                } else if waited == WAIT_TIMEOUT {
                     let _ = acquired_tx.send(Ok(false));
+                } else {
+                    let _ = acquired_tx.send(Err(format!("Could not inspect the code quality lock: {}", std::io::Error::last_os_error())));
                 }
                 CloseHandle(handle);
             })

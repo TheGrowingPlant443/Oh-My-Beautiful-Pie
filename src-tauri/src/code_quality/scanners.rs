@@ -50,12 +50,12 @@ pub fn default_project_key(folder: &Path) -> String {
     let path = canonical.to_string_lossy().replace('\\', "/").to_lowercase();
     let hash = format!("{:x}", Sha256::digest(path.as_bytes())); format!("omp-{}", &hash[..20])
 }
-fn plain_path(path: &Path) -> Result<()> {
+pub(crate) fn plain_path(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path).map_err(|e| format!("Cannot inspect {}: {e}", path.display()))?;
     if snapshot::is_link(&meta) { return Err(format!("Refusing linked/junction/reparse-point configuration: {}", path.display())); }
     Ok(())
 }
-fn read_config(path: &Path) -> Result<Option<String>> {
+pub(crate) fn read_config(path: &Path) -> Result<Option<String>> {
     match fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("Cannot inspect build configuration {}: {e}", path.display())),
@@ -106,6 +106,12 @@ fn entry_name(path: &str) -> Result<String> {
     if path.contains('\\') || path.contains(':') || path.chars().any(|c| c.is_control()) || path.is_empty() || Path::new(path).components().any(|p| !matches!(p, Component::Normal(_))) { return Err("Select a relative project entry file inside the source folder".into()); }
     Ok(path.to_string())
 }
+/// Folder text without Windows' verbatim `\\?\` prefix, so it equals the folder the rest of the service stores.
+pub(crate) fn display_folder(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") { format!(r"\\{rest}") }
+    else { text.strip_prefix(r"\\?\").unwrap_or(&text).to_string() }
+}
 pub fn detect(folder: &Path, saved: Option<QualityProject>) -> Result<QualityProjectDetection> {
     plain_path(folder)?;
     let folder = fs::canonicalize(folder).map_err(|e| format!("Cannot resolve project folder: {e}"))?;
@@ -126,14 +132,31 @@ pub fn detect(folder: &Path, saved: Option<QualityProject>) -> Result<QualityPro
     if !entry_files.is_empty() || has_dotnet_source { families.push(Scanner::Dotnet); }
     let ambiguous = families.len() > 1 || (families.contains(&Scanner::Dotnet) && entry_files.len() != 1);
     let had_saved = saved.is_some();
-    let mut project = saved.unwrap_or_else(|| QualityProject { folder: folder.to_string_lossy().into_owned(), project_key: key.clone().unwrap_or_else(|| default_project_key(&folder)), scanner: families.first().copied().unwrap_or(Scanner::Cli), entry_file: if entry_files.len() == 1 { Some(entry_files[0].clone()) } else { None }, image: None, build_args: Vec::new(), prepare_npm_dependencies: false, exclusions: Vec::new() });
-    project.folder = folder.to_string_lossy().into_owned();
+    let has = |name: &str| names.iter().any(|n| n == name);
+    let mut project = saved.unwrap_or_else(|| {
+        let mut exclusions = Vec::new();
+        if has("nx.json") { exclusions.push(".nx/**".to_string()); }
+        if has("angular.json") { exclusions.push(".angular/**".to_string()); }
+        QualityProject { folder: display_folder(&folder), project_key: key.clone().unwrap_or_else(|| default_project_key(&folder)), scanner: families.first().copied().unwrap_or(Scanner::Cli), entry_file: if entry_files.len() == 1 { Some(entry_files[0].clone()) } else { None }, image: None, build_args: Vec::new(), prepare_npm_dependencies: false, exclusions }
+    });
+    project.folder = display_folder(&folder);
     let selection_valid = if project.scanner == Scanner::Dotnet { project.entry_file.as_ref().map(|e| entry_files.contains(e)).unwrap_or(false) } else { project.scanner != Scanner::Cli || !families.contains(&Scanner::Dotnet) };
     let needs_selection = (ambiguous && !had_saved) || !selection_valid;
     let mut warnings = Vec::new();
     if needs_selection { warnings.push("Select a scanner/build family and, for .NET, one entry file before preparing analysis.".into()); }
     if has_dotnet_source && entry_files.is_empty() { warnings.push("C#/VB requires a compatible .NET project; the CLI scanner does not analyze C#/VB.".into()); }
-    Ok(QualityProjectDetection { project, families, entry_files, explicit_key: key.is_some(), needs_selection, warnings })
+    let mut labels: Vec<String> = Vec::new();
+    if has("package.json") { labels.push("Node.js / TypeScript (package.json)".into()); }
+    if has("angular.json") { labels.push("Angular (angular.json)".into()); }
+    if has("nx.json") { labels.push("Nx workspace (nx.json)".into()); }
+    if has("pyproject.toml") || has("requirements.txt") { labels.push("Python".into()); }
+    if has("go.mod") { labels.push("Go".into()); }
+    if has("Cargo.toml") { labels.push("Rust".into()); }
+    if has("pom.xml") { labels.push("Maven (pom.xml)".into()); }
+    if has("build.gradle") || has("build.gradle.kts") { labels.push("Gradle".into()); }
+    if !entry_files.is_empty() { labels.push(".NET".into()); }
+    if families.is_empty() { labels.push("No build tool found — analyzed directly".into()); }
+    Ok(QualityProjectDetection { project, families, entry_files, explicit_key: key.is_some(), needs_selection, warnings, labels })
 }
 fn gradle_declares_plugin(folder: &Path) -> Result<bool> {
     for name in ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradle/libs.versions.toml"] {
@@ -267,7 +290,9 @@ fn snapshot_metadata(source: &Snapshot, stage: &Path, project: &QualityProject, 
             return Err("C#/VB requires the .NET scanner, not CLI".into());
         }
         let name = path.to_string_lossy().replace('\\', "/");
-        let needed = matches!(name.as_str(), "global.json" | "gradlew" | "build.gradle" | "build.gradle.kts" | "settings.gradle" | "settings.gradle.kts" | "gradle/libs.versions.toml" | "package-lock.json") || project.entry_file.as_deref() == Some(name.as_str());
+        let needed = matches!(name.as_str(), "global.json" | "gradlew" | "build.gradle" | "build.gradle.kts" | "settings.gradle" | "settings.gradle.kts" | "gradle/libs.versions.toml")
+            || (name == "package-lock.json" && project.prepare_npm_dependencies)
+            || project.entry_file.as_deref() == Some(name.as_str());
         if needed {
             if entry.size() > CONFIG_LIMIT { return Err(format!("Captured scanner metadata exceeds 1 MiB: {name}")); }
             let destination = stage.join(&path);
@@ -365,5 +390,24 @@ mod tests {
         let mut p = detect(&t.0, None).unwrap().project; p.scanner = Scanner::Cli; fs::write(t.0.join("code.cs"), "class X {}").unwrap(); assert!(prepare_scan(&p, &t.0, "https://sonar.example").is_err());
         fs::remove_file(t.0.join("code.cs")).unwrap(); assert!(prepare_scan(&p, &t.0, "https://sonar.example").is_ok());
         p.build_args = vec!["-Dsonar.token=forbidden".into()]; assert!(validate_project(&p, &t.0).is_err());
+    }
+    #[test]
+    fn node_nx_angular_repo_uses_cli_without_consent_and_labels_what_was_found() {
+        let t = Temp::new();
+        for name in ["package.json", "nx.json", "angular.json"] { fs::write(t.0.join(name), "{}").unwrap(); }
+        let detection = detect(&t.0, None).unwrap();
+        assert_eq!(detection.project.scanner, Scanner::Cli);
+        assert!(detection.families.is_empty());
+        assert!(!detection.needs_selection);
+        for label in ["Node.js / TypeScript (package.json)", "Angular (angular.json)", "Nx workspace (nx.json)", "No build tool found — analyzed directly"] {
+            assert!(detection.labels.iter().any(|l| l == label), "missing label {label}: {:?}", detection.labels);
+        }
+        assert!(detection.project.exclusions.contains(&".nx/**".to_string()));
+        assert!(detection.project.exclusions.contains(&".angular/**".to_string()));
+        let prep = prepare_scan(&detection.project, &t.0, "https://sonar.example").unwrap();
+        assert!(!prep.requires_consent);
+        // A saved project keeps its own exclusions; defaults are only for fresh detection.
+        let mut saved = detection.project.clone(); saved.exclusions.clear();
+        assert!(detect(&t.0, Some(saved)).unwrap().project.exclusions.is_empty());
     }
 }

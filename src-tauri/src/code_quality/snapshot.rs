@@ -11,8 +11,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use parking_lot::Mutex;
 
-const MAX_FILES: u64 = 100_000;
-const MAX_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_FILES: u64 = 100_000;
+pub(crate) const MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const EXCLUDED: &[&str] = &[".git", "node_modules", ".venv", "venv", "target", "dist", "build", "coverage", ".coverage", ".scannerwork", ".sonarqube", "megalinter-reports", "mega-linter-reports", "reports", "out", ".next", ".nuxt", "__pycache__", ".pytest_cache", ".mypy_cache"];
 
 pub struct Snapshot {
@@ -39,7 +39,7 @@ pub(crate) fn is_link(meta: &Metadata) -> bool {
     { false }
 }
 /// Rejects a link/reparse point at `path` itself. Callers that own a root check below it with `ensure_plain_below`.
-fn ensure_plain_path(path: &Path) -> Result<()> {
+pub(crate) fn ensure_plain_path(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(m) if is_link(&m) => Err(format!("Refusing linked/reparse-point path: {}", path.display())),
         Ok(_) => Ok(()),
@@ -54,7 +54,7 @@ fn ensure_plain_below(root: &Path, path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn open_plain(path: &Path) -> Result<File> {
+pub(crate) fn open_plain(path: &Path) -> Result<File> {
     ensure_plain_path(path)?;
     let mut options = OpenOptions::new(); options.read(true);
     #[cfg(windows)]
@@ -81,7 +81,7 @@ fn safe_name(path: &Path) -> Result<String> {
     }
     Ok(parts.join("/"))
 }
-fn relative_source_name(path: &Path) -> Result<String> {
+pub(crate) fn relative_source_name(path: &Path) -> Result<String> {
     let text = path.to_str().ok_or("Non-Unicode source path is not supported")?;
     #[cfg(windows)]
     let text = text.replace('\\', "/");
@@ -103,15 +103,17 @@ fn header(size: u64, executable: bool) -> tar::Header {
     let mut h = tar::Header::new_gnu(); h.set_size(size); h.set_uid(1000); h.set_gid(1000); h.set_mtime(0); h.set_mode(if executable { 0o755 } else { 0o644 }); h.set_cksum(); h
 }
 
-pub fn create_snapshot(folder: &Path, extra_exclusions: &[String], job_dir: &Path, ctl: &Ctl) -> Result<Snapshot> {
-    ensure_plain_path(folder)?;
-    let root = fs::canonicalize(folder).map_err(|e| err("Cannot resolve project folder", e))?;
-    if !root.is_dir() { return Err("Project folder is not a directory".into()); }
-    fs::create_dir_all(job_dir).map_err(|e| err("Cannot create job directory", e))?;
-    ensure_plain_path(job_dir)?;
-    let canonical_job = fs::canonicalize(job_dir).map_err(|e| err("Cannot resolve job directory", e))?;
-    if canonical_job.starts_with(&root) { return Err("Job storage must be outside the source folder".into()); }
-    let mut extra = GitignoreBuilder::new(&root);
+/// Ignore-filtered, link-free enumeration of regular files below a canonical `root`, sorted. Shared by
+/// snapshots and read-only repository inspection; it never writes anything. `max_depth` limits how deep
+/// below `root` entries are visited (files directly in `root` have depth 1). `directories` lists every admitted
+/// directory (empty ones included, `root` excluded), sorted; `special` lists sockets/devices that were skipped
+/// when the caller asked to tolerate them (otherwise such an entry fails the listing).
+pub(crate) struct SourceListing { pub paths: Vec<PathBuf>, pub directories: Vec<PathBuf>, pub special: Vec<PathBuf>, pub warnings: Vec<String> }
+pub(crate) fn list_source_files(root: &Path, extra_exclusions: &[String], max_depth: Option<usize>, max_files: u64, ctl: &Ctl) -> Result<SourceListing> {
+    list_source_tree(root, extra_exclusions, max_depth, max_files, false, ctl)
+}
+pub(crate) fn list_source_tree(root: &Path, extra_exclusions: &[String], max_depth: Option<usize>, max_files: u64, tolerate_special: bool, ctl: &Ctl) -> Result<SourceListing> {
+    let mut extra = GitignoreBuilder::new(root);
     for pattern in extra_exclusions {
         if pattern.starts_with('!') || pattern.starts_with('/') || pattern.contains('\\') || pattern.split('/').any(|p| p == "..") { return Err(format!("Exclusions must be relative exclusion globs: {pattern}")); }
         extra.add_line(None, pattern).map_err(|e| err("Invalid project exclusion", e))?;
@@ -119,8 +121,8 @@ pub fn create_snapshot(folder: &Path, extra_exclusions: &[String], job_dir: &Pat
     let extra = extra.build().map_err(|e| err("Invalid project exclusions", e))?;
     let warnings = Arc::new(Mutex::new(Vec::new()));
     let sink = warnings.clone();
-    let mut walk = WalkBuilder::new(&root);
-    walk.hidden(false).follow_links(false).git_ignore(true).git_global(false).git_exclude(true).require_git(false);
+    let mut walk = WalkBuilder::new(root);
+    walk.hidden(false).follow_links(false).git_ignore(true).git_global(false).git_exclude(true).require_git(false).max_depth(max_depth);
     walk.filter_entry(move |entry| {
         if entry.depth() == 0 { return true; }
         match fs::symlink_metadata(entry.path()) {
@@ -133,6 +135,8 @@ pub fn create_snapshot(folder: &Path, extra_exclusions: &[String], job_dir: &Pat
         !EXCLUDED.iter().any(|n| name.eq_ignore_ascii_case(n)) && !extra.matched_path_or_any_parents(entry.path(), entry.file_type().map(|t| t.is_dir()).unwrap_or(false)).is_ignore()
     });
     let mut paths = Vec::new();
+    let mut directories = Vec::new();
+    let mut special = Vec::new();
     for entry in walk.build() {
         if ctl.cancelled() { return Err("Scan cancelled while creating source snapshot".into()); }
         let entry = entry.map_err(|e| err("Cannot enumerate complete project snapshot", e))?;
@@ -141,10 +145,29 @@ pub fn create_snapshot(folder: &Path, extra_exclusions: &[String], job_dir: &Pat
         if is_link(&meta) { continue; }
         if meta.is_file() {
             paths.push(entry.into_path());
-            check_limits(paths.len() as u64, 0, MAX_FILES, MAX_BYTES)?;
-        } else if !meta.is_dir() { return Err("Snapshot contains an unsupported non-regular filesystem entry".into()); }
+            check_limits(paths.len() as u64, 0, max_files, MAX_BYTES)?;
+        } else if meta.is_dir() {
+            directories.push(entry.into_path());
+            if directories.len() as u64 > max_files { return Err(format!("Snapshot exceeds {max_files} directories; narrow the project exclusions.")); }
+        } else if tolerate_special {
+            special.push(entry.into_path());
+        } else { return Err("Snapshot contains an unsupported non-regular filesystem entry".into()); }
     }
     paths.sort();
+    directories.sort();
+    let warnings = warnings.lock().clone();
+    Ok(SourceListing { paths, directories, special, warnings })
+}
+
+pub fn create_snapshot(folder: &Path, extra_exclusions: &[String], job_dir: &Path, ctl: &Ctl) -> Result<Snapshot> {
+    ensure_plain_path(folder)?;
+    let root = fs::canonicalize(folder).map_err(|e| err("Cannot resolve project folder", e))?;
+    if !root.is_dir() { return Err("Project folder is not a directory".into()); }
+    fs::create_dir_all(job_dir).map_err(|e| err("Cannot create job directory", e))?;
+    ensure_plain_path(job_dir)?;
+    let canonical_job = fs::canonicalize(job_dir).map_err(|e| err("Cannot resolve job directory", e))?;
+    if canonical_job.starts_with(&root) { return Err("Job storage must be outside the source folder".into()); }
+    let SourceListing { paths, warnings, .. } = list_source_files(&root, extra_exclusions, None, MAX_FILES, ctl)?;
     let tar_path = job_dir.join("source.tar");
     let manifest_path = job_dir.join("manifest.json");
     let mut tar = tar::Builder::new(File::create(&tar_path).map_err(|e| err("Cannot create source archive", e))?);
@@ -172,7 +195,6 @@ pub fn create_snapshot(folder: &Path, extra_exclusions: &[String], job_dir: &Pat
     let file_count = files.len() as u64;
     crate::dependency_security::atomic_json(&manifest_path, &Manifest { version: 1, hash: hash.clone(), files }, 64 * 1024 * 1024)?;
     let mut applied_exclusions: Vec<String> = EXCLUDED.iter().map(|s| s.to_string()).collect(); applied_exclusions.extend_from_slice(extra_exclusions);
-    let warnings = warnings.lock().clone();
     Ok(Snapshot { tar_path, hash, file_count, total_bytes: total, applied_exclusions, warnings })
 }
 

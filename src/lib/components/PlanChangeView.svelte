@@ -3,8 +3,8 @@
   import Term from "./Term.svelte";
   import PlanPane from "./PlanPane.svelte";
   import { startInstance } from "../stores";
-  let { target, planner, admission, onBack, onRetry }: {
-    target: Instance; planner: Instance; admission: PlanSessionAdmission; onBack: () => void; onRetry: () => void;
+  let { target, planner, admission, onBack, onRetry, onCodeQuality }: {
+    target: Instance; planner: Instance; admission: PlanSessionAdmission; onBack: () => void; onRetry: () => void; onCodeQuality: () => void;
   } = $props();
   const TERMINAL_MIN = 320;
   const PANE_MIN = 360;
@@ -40,6 +40,7 @@
     <strong>Change plan · {target.name}</strong>
     <span class="pill">Plan agent: {planner.status}</span>
     <span class="spacer"></span>
+    <button title="Scan this project's code quality" onclick={onCodeQuality}>Code quality</button>
   </header>
   {#if admission.promptSent === false}
     <p class="warn" role="alert">Context was not sent to the plan agent: {admission.error} <button onclick={onRetry}>Send context</button></p>

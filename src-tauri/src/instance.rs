@@ -90,8 +90,17 @@ pub struct Definition {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HumanRequest {
+    pub id: String,
     pub reason: String,
     pub decision_id: Option<String>,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUiCapabilities {
+    pub agent_hub: bool,
+    pub native_decisions: bool,
+    pub native_decisions_error: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -126,17 +135,56 @@ pub struct Instance {
     pub plan_target: Option<String>,
     pub helper: Option<HelperLink>,
     pub bridge_ready: bool,
+    pub capabilities: NativeUiCapabilities,
     pub pending_decision_count: usize,
     pub human_request: Option<HumanRequest>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorBootstrap {
+    pub manager: Instance,
+    pub architect: Instance,
+    pub temporary_folders: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlLease {
     pub generation: u64,
     pub session_id: Option<String>,
     pub ownership_epoch: u64,
     pub manager_id: Option<String>,
+    pub workspace_epoch: u64,
+}
+
+/// Workspace admission uses only saved metadata, never transcript/task state.
+#[derive(Clone)]
+pub struct WorkspaceMetadata {
+    pub definition: Definition,
+    pub lease: ControlLease,
+    pub running: bool,
+    pub workspace_epoch: u64,
+    pub human_request_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub enum WorkspaceSourceBinding {
+    Path { source_id: String, canonical_path: String },
+    Grant { source_id: String, canonical_path: String, expected: ControlLease },
+    Return { source_id: String, canonical_path: String, expected: ControlLease, human_request_id: String },
+}
+
+#[derive(Clone)]
+pub struct WorkspaceCommit {
+    pub request_id: String,
+    pub coordinator_id: String,
+    pub expected: ControlLease,
+    pub target_folder: String,
+    pub session_id: Option<String>,
+    pub session_file: Option<PathBuf>,
+    pub workspace_epoch: u64,
+    pub source: Option<WorkspaceSourceBinding>,
 }
 
 struct Record {
@@ -148,9 +196,13 @@ struct Record {
     native_session_id: Option<String>,
     materialized: bool,
     bridge_ready: bool,
+    capabilities: NativeUiCapabilities,
     pending_decision_count: usize,
     human_request: Option<HumanRequest>,
     ownership_epoch: u64,
+    workspace_epoch: u64,
+    workspace_request: Option<String>,
+    workspace_committed: Option<String>,
     saved_plan: Option<PathBuf>,
     saved_checked: Option<std::time::Instant>,
     saved_for: Option<PathBuf>,
@@ -186,9 +238,13 @@ impl Record {
             native_session_id,
             materialized,
             bridge_ready: false,
+            capabilities: NativeUiCapabilities::default(),
             pending_decision_count: 0,
             human_request: None,
             ownership_epoch: 0,
+            workspace_epoch: 0,
+            workspace_request: None,
+            workspace_committed: None,
             saved_plan: None,
             saved_checked: None,
             saved_for: None,
@@ -208,6 +264,7 @@ impl Record {
             session_id: self.native_session_id.clone(),
             ownership_epoch: self.ownership_epoch,
             manager_id: self.definition.manager_id.clone(),
+            workspace_epoch: self.workspace_epoch,
         }
     }
     /// What "the plan" of this session is: its live todo list while unfinished, else its native plan file, else
@@ -297,6 +354,7 @@ impl Record {
             plan_target: self.definition.plan_target.clone(),
             helper: self.definition.helper.clone(),
             bridge_ready: self.bridge_ready,
+            capabilities: if self.bridge_ready { self.capabilities.clone() } else { NativeUiCapabilities::default() },
             pending_decision_count: self.pending_decision_count,
             human_request: self.human_request.clone(),
         }
@@ -365,7 +423,306 @@ fn index(records: &[Record], id: &str) -> Result<usize, String> {
         .ok_or_else(|| "unknown instance".into())
 }
 
+/// Component-wise path identity, including Windows drive and UNC-share roots.
+fn folder_components(folder: &str) -> (String, Vec<String>, bool) {
+    let text = folder.replace('\\', "/");
+    let text = text.strip_prefix("//?/UNC/").map(|s| format!("//{s}"))
+        .unwrap_or_else(|| text.strip_prefix("//?/").unwrap_or(&text).to_owned());
+    if let Some(unc) = text.strip_prefix("//") {
+        let mut parts = unc.split('/').filter(|s| !s.is_empty());
+        let root = format!("//{}/{}", parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        return (root, parts.map(String::from).collect(), true);
+    }
+    if text.as_bytes().get(1) == Some(&b':') {
+        return (text[..2].to_owned(), text[2..].split('/').filter(|s| !s.is_empty()).map(String::from).collect(), true);
+    }
+    (if text.starts_with('/') { "/".into() } else { String::new() },
+        text.split('/').filter(|s| !s.is_empty()).map(String::from).collect(), false)
+}
+
+/// An ordinary agent: a project instance that is neither a helper nor a plan session.
+fn is_agent_definition(definition: &Definition) -> bool {
+    definition.kind == InstanceKind::Instance && definition.helper.is_none() && definition.plan_target.is_none()
+}
+
+/// Manager, Architect and ordinary agents may relocate their own working directory; helpers and plan sessions may not.
+pub fn may_change_directory(definition: &Definition) -> bool {
+    matches!(definition.kind, InstanceKind::Manager | InstanceKind::Architect) || is_agent_definition(definition)
+}
+
+pub(crate) fn same_folder(left: &str, right: &str) -> bool {
+    fn identity(path: &str) -> (u8, &str) {
+        if let Some(unc) = path.strip_prefix("\\\\?\\UNC\\").or_else(|| path.strip_prefix("//?/UNC/")) {
+            return (3, unc.trim_end_matches(['/', '\\']));
+        }
+        let path = path.strip_prefix("\\\\?\\").or_else(|| path.strip_prefix("//?/")).unwrap_or(path);
+        if let Some(unc) = path.strip_prefix("\\\\").or_else(|| path.strip_prefix("//")) {
+            (3, unc.trim_end_matches(['/', '\\']))
+        } else if path.as_bytes().get(1) == Some(&b':') {
+            (2, path.trim_end_matches(['/', '\\']))
+        } else {
+            (u8::from(path.starts_with('/')), path.trim_end_matches('/'))
+        }
+    }
+    let (left_root, left) = identity(left);
+    let (right_root, right) = identity(right);
+    if left_root != right_root { return false; }
+    if left_root >= 2 {
+        let normalized = |c: char| if c == '\\' { '/' } else { c }.to_lowercase();
+        left.chars().flat_map(normalized).eq(right.chars().flat_map(normalized))
+    } else {
+        left == right
+    }
+}
+
+pub fn common_ancestor_folder(roots: &[String]) -> Option<String> {
+    let (root, mut common, windows) = folder_components(roots.first()?);
+    if root.is_empty() { return None; }
+    for folder in &roots[1..] {
+        let (other_root, parts, other_windows) = folder_components(folder);
+        if windows != other_windows || !(if windows { root.eq_ignore_ascii_case(&other_root) } else { root == other_root }) {
+            return None;
+        }
+        let length = common.iter().zip(&parts).take_while(|(a,b)| {
+            if windows { a.eq_ignore_ascii_case(b) } else { a == b }
+        }).count();
+        common.truncate(length);
+    }
+    let suffix = common.join("/");
+    Some(if root == "/" { format!("/{suffix}") }
+        else if suffix.is_empty() { format!("{root}/") }
+        else { format!("{root}/{suffix}") })
+}
+
 impl Registry {
+    pub fn coordinator_id(&self, kind: InstanceKind) -> Result<String, String> {
+        if kind == InstanceKind::Instance { return Err("Workspace changes require a coordinator".into()); }
+        let records = self.records.lock().map_err(|e| e.to_string())?;
+        records.iter().find(|r| r.definition.kind == kind).map(|r| r.definition.id.clone())
+            .ok_or_else(|| "Coordinator does not exist".into())
+    }
+
+    pub fn workspace_metadata(&self, id: &str) -> Result<WorkspaceMetadata, String> {
+        let mut records = self.records.lock().map_err(|e| e.to_string())?;
+        let i = index(&records, id)?;
+        let record = &mut records[i];
+        let running = match record.process.as_mut() {
+            Some(process) => matches!(process.poll(), Ok(None)),
+            None => record.bridge_ready,
+        };
+        Ok(WorkspaceMetadata {
+            definition: record.definition.clone(), lease: record.lease(), running,
+            workspace_epoch: record.workspace_epoch,
+            human_request_id: record.human_request.as_ref().map(|r| r.id.clone()),
+        })
+    }
+
+    pub fn coordinator_neutral_folder(&self, kind: InstanceKind) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let role = match kind {
+            InstanceKind::Manager => "manager",
+            InstanceKind::Architect => "architect",
+            _ => return Err("Workspace changes require a coordinator".into()),
+        };
+        fs::create_dir_all(self.config_root()).map_err(|e| e.to_string())?;
+        let root = fs::canonicalize(self.config_root()).map_err(|e| e.to_string())?;
+        let normalized = root.to_string_lossy().replace('\\', "/");
+        #[cfg(windows)]
+        let normalized = normalized.to_lowercase();
+        let folder = std::env::temp_dir().join("omp-manager")
+            .join(format!("{:x}", Sha256::digest(normalized.as_bytes()))).join(role);
+        fs::create_dir_all(&folder).map_err(|e| format!("Coordinator workspace: {e}"))?;
+        crate::setup::canonical(&folder).map(|p| p.to_string_lossy().into_owned()).map_err(|e| e.to_string())
+    }
+
+    pub fn is_real_project_folder(&self, folder: &str) -> bool {
+        let Ok(folder) = crate::setup::canonical(Path::new(folder)) else { return false; };
+        if !folder.is_dir() { return false; }
+        let folder = folder.to_string_lossy();
+        [crate::setup::canonical(self.config_root()).ok(),
+            crate::setup::canonical(&std::env::temp_dir()).ok().map(|p| p.join("omp-manager"))]
+            .into_iter().flatten().all(|excluded| {
+                let excluded = excluded.to_string_lossy().into_owned();
+                common_ancestor_folder(&[folder.to_string(), excluded.clone()])
+                    .is_none_or(|common| !same_folder(&common, &excluded))
+            })
+    }
+
+    fn source_path(&self, definition: &Definition) -> Result<String, String> {
+        if definition.kind != InstanceKind::Instance || definition.helper.is_some() || definition.plan_target.is_some() {
+            return Err("Repository context requires an ordinary project instance".into());
+        }
+        let path = crate::setup::canonical(Path::new(&definition.input.project_path)).map_err(|e| e.to_string())?;
+        let path = path.to_string_lossy().into_owned();
+        if !self.is_real_project_folder(&path) {
+            return Err("Repository context cannot use an app-managed workspace".into());
+        }
+        Ok(path)
+    }
+
+    pub fn workspace_source_binding(&self, id: &str) -> Result<WorkspaceSourceBinding, String> {
+        let definition = {
+            let records = self.records.lock().map_err(|e| e.to_string())?;
+            records[index(&records, id)?].definition.clone()
+        };
+        Ok(WorkspaceSourceBinding::Path {
+            source_id: id.into(), canonical_path: self.source_path(&definition)?,
+        })
+    }
+
+    fn managed_definitions(&self, manager_id: &str) -> Result<Vec<Definition>, String> {
+        let records = self.records.lock().map_err(|e| e.to_string())?;
+        if records[index(&records, manager_id)?].definition.kind != InstanceKind::Manager {
+            return Err("unknown manager".into());
+        }
+        Ok(records.iter().filter(|r| r.definition.manager_id.as_deref() == Some(manager_id)
+            && is_agent_definition(&r.definition)).map(|r| r.definition.clone()).collect())
+    }
+
+    /// One entry per ordinary connected agent definition (never helpers, plan agents or native subagents):
+    /// `(definition id, canonical actual project folder)`. Counted before any Git-root deduplication.
+    pub fn managed_project_folders(&self, manager_id: &str) -> Result<Vec<(String, String)>, String> {
+        let mut folders = Vec::new();
+        for definition in self.managed_definitions(manager_id)? {
+            let path = crate::setup::canonical(Path::new(&definition.input.project_path)).map_err(|e| e.to_string())?;
+            let path = path.to_string_lossy().into_owned();
+            if !self.is_real_project_folder(&path) { continue; }
+            folders.push((definition.id, path));
+        }
+        folders.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(folders)
+    }
+
+    /// Canonical project folders of every ordinary agent definition (owned or not), best effort.
+    pub fn ordinary_project_folders(&self) -> Vec<String> {
+        self.snapshot().into_iter()
+            .filter(|row| row.kind == InstanceKind::Instance && row.plan_target.is_none() && row.helper.is_none())
+            .filter_map(|row| crate::setup::canonical(Path::new(&row.project_path)).ok())
+            .map(|path| path.to_string_lossy().into_owned()).filter(|path| self.is_real_project_folder(path)).collect()
+    }
+
+    pub fn managed_repository_roots(&self, manager_id: &str) -> Result<Vec<String>, String> {
+        let mut roots: Vec<String> = Vec::new();
+        for definition in self.managed_definitions(manager_id)? {
+            let path = crate::setup::canonical(Path::new(&definition.input.project_path)).map_err(|e| e.to_string())?;
+            if !self.is_real_project_folder(&path.to_string_lossy()) { continue; }
+            let root = crate::setup::find_repository_root(&path)?.to_string_lossy().into_owned();
+            if !roots.iter().any(|old| same_folder(old, &root)) { roots.push(root); }
+        }
+        roots.sort_by_key(|p| p.to_lowercase());
+        Ok(roots)
+    }
+
+    pub fn begin_workspace_change(&self, id: &str, request_id: &str, expected: &ControlLease) -> Result<(), String> {
+        let _lifecycle = self.lifecycle.lock();
+        let mut records = self.records.lock().map_err(|e| e.to_string())?;
+        let i = index(&records, id)?;
+        let record = &mut records[i];
+        if record.definition.kind == InstanceKind::Instance && !is_agent_definition(&record.definition) { return Err("Only agent working directories can be changed".into()); }
+        if record.lease() != *expected { return Err("stale_workspace_identity".into()); }
+        if record.workspace_request.as_deref().is_some_and(|active| active != request_id) {
+            return Err("workspace_change_busy".into());
+        }
+        record.workspace_request = Some(request_id.into());
+        Ok(())
+    }
+
+    /// Only the native/offline transaction owner calls this after move/rollback has finished.
+    pub fn finish_workspace_change(&self, id: &str, request_id: &str) {
+        let _lifecycle = self.lifecycle.lock();
+        if let Ok(mut records) = self.records.lock() {
+            if let Some(record) = records.iter_mut().find(|r| r.definition.id == id) {
+                if record.workspace_request.as_deref() == Some(request_id) { record.workspace_request = None; }
+            }
+        }
+    }
+
+    pub fn commit_workspace_change(&self, commit: &WorkspaceCommit) -> Result<ControlLease, String> {
+        let target = crate::setup::canonical(Path::new(&commit.target_folder)).map_err(|e| e.to_string())?;
+        if !target.is_dir() { return Err("project folder is not a directory".into()); }
+        let target = target.to_string_lossy().into_owned();
+        let lifecycle = self.lifecycle.lock();
+        let mut records = self.records.lock().map_err(|e| e.to_string())?;
+        let i = index(&records, &commit.coordinator_id)?;
+        if records[i].workspace_committed.as_deref() == Some(&commit.request_id) {
+            return Ok(records[i].lease());
+        }
+        if records[i].definition.kind == InstanceKind::Instance {
+            // Ordinary agents move their own cwd only: no coordinator source binding, never an app-managed target.
+            if !is_agent_definition(&records[i].definition) { return Err("Only agent working directories can be changed".into()); }
+            if commit.source.is_some() { return Err("invalid_workspace_binding".into()); }
+            if !self.is_real_project_folder(&target) { return Err("An agent working directory cannot be an app-managed workspace".into()); }
+        }
+        if records[i].workspace_request.as_deref() != Some(commit.request_id.as_str())
+            || records[i].lease() != commit.expected || commit.workspace_epoch < records[i].workspace_epoch {
+            return Err("stale_workspace_identity".into());
+        }
+        if commit.expected.session_id.is_some() && commit.session_id != commit.expected.session_id {
+            return Err("stale_workspace_identity".into());
+        }
+        if records[i].definition.session_path.is_some() && commit.session_file.is_none() {
+            return Err("Workspace relocation cannot discard a saved session".into());
+        }
+        let mut source_change = None;
+        if let Some(binding) = &commit.source {
+            let (id, path) = match binding {
+                WorkspaceSourceBinding::Path { source_id, canonical_path }
+                | WorkspaceSourceBinding::Grant { source_id, canonical_path, .. }
+                | WorkspaceSourceBinding::Return { source_id, canonical_path, .. } => (source_id, canonical_path),
+            };
+            let source = index(&records, id)?;
+            if !same_folder(&self.source_path(&records[source].definition)?, path) {
+                return Err("Source repository changed; give repo again.".into());
+            }
+            match binding {
+                WorkspaceSourceBinding::Path { .. } => {
+                    if records[i].definition.kind != InstanceKind::Architect { return Err("invalid_workspace_binding".into()); }
+                }
+                WorkspaceSourceBinding::Grant { expected, .. }
+                | WorkspaceSourceBinding::Return { expected, .. } => {
+                    if records[i].definition.kind != InstanceKind::Manager || records[source].lease() != *expected {
+                        return Err("stale_workspace_source".into());
+                    }
+                    if let WorkspaceSourceBinding::Return { human_request_id, .. } = binding {
+                        if records[source].definition.manager_id.as_deref() != Some(commit.coordinator_id.as_str())
+                            || records[source].human_request.as_ref().map(|h| &h.id) != Some(human_request_id) {
+                            return Err("stale_human_request".into());
+                        }
+                    }
+                    source_change = Some(source);
+                }
+            }
+        }
+        let old_destination = records[i].definition.clone();
+        let old_source = source_change.map(|s| (s, records[s].definition.manager_id.clone()));
+        records[i].definition.input.project_path = target;
+        records[i].definition.session_path = commit.session_file.clone();
+        if let Some(source) = source_change { records[source].definition.manager_id = Some(commit.coordinator_id.clone()); }
+        if let Err(error) = self.save(&records) {
+            records[i].definition = old_destination;
+            if let Some((source, owner)) = old_source { records[source].definition.manager_id = owner; }
+            return Err(error);
+        }
+        if old_destination.session_path != commit.session_file { records[i].reader = session::TailReader::default(); }
+        records[i].native_session_id = commit.session_id.clone();
+        records[i].materialized = commit.session_file.as_ref().is_some_and(|p| p.is_file());
+        records[i].workspace_epoch = commit.workspace_epoch;
+        records[i].workspace_committed = Some(commit.request_id.clone());
+        let notification = source_change.map(|source| {
+            records[source].ownership_epoch += 1;
+            records[source].human_request = None;
+            (records[source].definition.id.clone(), records[source].lease())
+        });
+        let lease = records[i].lease();
+        drop(records);
+        drop(lifecycle);
+        if let (Some(hub), Some((id, lease))) = (self.hub.get(), notification) { hub.ownership_changed(&id, &lease); }
+        Ok(lease)
+    }
+
+    pub fn take_back_control(&self, id: &str) -> Result<(), String> {
+        self.set_manager_owner(id, None)
+    }
     pub fn load(file: PathBuf, home: PathBuf) -> Result<Self, String> {
         let definitions = match fs::read(&file) {
             Ok(bytes) => {
@@ -456,6 +813,61 @@ impl Registry {
     pub fn create_architect(&self, mut input: CreateInput) -> Result<Instance, String> {
         input.name = "The Architect".into();
         self.create_definition(input, InstanceKind::Architect, None, None, None)
+    }
+    /// Definitions only: provisioning never starts a process or replaces saved coordinator state.
+    pub fn ensure_coordinators(&self, preferred_folders: &[String]) -> Result<CoordinatorBootstrap, String> {
+        use sha2::{Digest, Sha256};
+        let root = fs::canonicalize(self.config_root()).or_else(|_| {
+            fs::create_dir_all(self.config_root())?;
+            fs::canonicalize(self.config_root())
+        }).map_err(|e| e.to_string())?;
+        let normalized = root.to_string_lossy().replace('\\', "/");
+        #[cfg(windows)]
+        let normalized = normalized.to_lowercase();
+        let temporary_root = std::env::temp_dir().join("omp-manager")
+            .join(format!("{:x}", Sha256::digest(normalized.as_bytes())));
+        let temporary_paths = [temporary_root.join("manager"), temporary_root.join("architect")];
+        let display = |path: &Path| {
+            let value = path.to_string_lossy();
+            if let Some(unc) = value.strip_prefix("\\\\?\\UNC\\") { format!("\\\\{unc}") }
+            else { value.trim_start_matches("\\\\?\\").to_string() }
+        };
+        let temporary_folders: Vec<String> = temporary_paths.iter().map(|p| display(p)).collect();
+        let candidates = preferred_folders.iter().cloned().chain(self.snapshot().into_iter()
+            .filter(|row| row.kind == InstanceKind::Instance && row.plan_target.is_none() && row.helper.is_none())
+            .map(|row| row.project_path));
+        let excluded_temporary_root = fs::canonicalize(std::env::temp_dir()).map_err(|e| e.to_string())?.join("omp-manager");
+        let real_folder = candidates.filter_map(|folder| fs::canonicalize(folder).ok())
+            .find(|folder| folder.is_dir() && !folder.starts_with(&root)
+                && !folder.starts_with(&excluded_temporary_root));
+        let mut coordinators = Vec::new();
+        for (offset, kind) in [InstanceKind::Manager, InstanceKind::Architect].into_iter().enumerate() {
+            if let Some(existing) = self.snapshot().into_iter().find(|row| row.kind == kind) {
+                // Only app-managed workspaces may be recreated. Missing real project folders remain untouched.
+                if existing.project_path == temporary_folders[offset] {
+                    fs::create_dir_all(&temporary_paths[offset]).map_err(|e| format!("Coordinator workspace: {e}"))?;
+                }
+                coordinators.push(existing);
+                continue;
+            }
+            let folder = if let Some(folder) = &real_folder { folder.clone() } else {
+                fs::create_dir_all(&temporary_paths[offset]).map_err(|e| format!("Coordinator workspace: {e}"))?;
+                temporary_paths[offset].clone()
+            };
+            let input = CreateInput { project_path: display(&folder), ..CreateInput::default() };
+            let created = match kind {
+                InstanceKind::Manager => self.create_manager(input),
+                _ => self.create_architect(input),
+            };
+            // A simultaneous provisioning/manual request may have won singleton creation.
+            coordinators.push(match created {
+                Ok(row) => row,
+                Err(error) => self.snapshot().into_iter().find(|row| row.kind == kind).ok_or(error)?,
+            });
+        }
+        let architect = coordinators.pop().ok_or("Architect provisioning failed")?;
+        let manager = coordinators.pop().ok_or("Manager provisioning failed")?;
+        Ok(CoordinatorBootstrap { manager, architect, temporary_folders })
     }
     pub fn create_owned(&self, manager_id: &str, input: CreateInput) -> Result<Instance, String> {
         self.create_definition(input, InstanceKind::Instance, Some(manager_id.into()), None, None)
@@ -563,14 +975,14 @@ impl Registry {
         plan_target: Option<String>,
         helper: Option<HelperLink>,
     ) -> Result<Instance, String> {
-        let cwd = fs::canonicalize(&input.project_path).map_err(|e| e.to_string())?;
+        let cwd = crate::setup::canonical(Path::new(&input.project_path)).map_err(|e| e.to_string())?;
         if !cwd.is_dir() {
             return Err("project folder is not a directory".into());
         }
         if input.profile.contains(['/', '\\']) || input.profile == "." || input.profile == ".." {
             return Err("invalid profile name".into());
         }
-        input.project_path = cwd.to_string_lossy().trim_start_matches("\\\\?\\").into();
+        input.project_path = cwd.to_string_lossy().into();
         if input.name.trim().is_empty() {
             input.name = cwd.file_name().unwrap_or_default().to_string_lossy().into();
         }
@@ -578,10 +990,8 @@ impl Registry {
             input.profile.clear();
         }
         if let Some(path) = input.agent_file.take() {
-            let verified = crate::setup::verify_agent_file(self, &path)?;
-            input.agent_file = Some(PathBuf::from(
-                verified.to_string_lossy().trim_start_matches("\\\\?\\"),
-            ));
+            let verified = crate::setup::verify_agent_file(self, &path, kind)?;
+            input.agent_file = Some(verified);
         }
         if input.use_global_config.unwrap_or(input.profile.is_empty()) {
             if let Some(path) = self.global_config.current_path()? {
@@ -733,28 +1143,36 @@ impl Registry {
         Ok(())
     }
     pub fn apply_identity(&self, id: &str, generation: u64, payload: &Value) -> Result<(), String> {
+        let _lifecycle = self.lifecycle.lock();
         let mut records = self.records.lock().map_err(|e| e.to_string())?;
         let i = index(&records, id)?;
-        if records[i].generation != generation {
-            return Err("stale_generation".into());
+        if records[i].generation != generation { return Err("stale_generation".into()); }
+        let epoch = payload["workspaceEpoch"].as_u64().unwrap_or(0);
+        if records[i].workspace_request.is_some() || epoch < records[i].workspace_epoch {
+            return Ok(());
         }
+        let old_definition = records[i].definition.clone();
         let path = payload["sessionFile"].as_str().map(PathBuf::from);
-        let dirty = records[i].definition.session_path != path;
-        if dirty {
-            records[i].reader = session::TailReader::default();
-            records[i].definition.session_path = path;
+        let dirty = old_definition.session_path != path;
+        let cwd = payload["cwd"].as_str().filter(|s| Path::new(s).is_dir())
+            .map(|cwd| crate::setup::canonical(Path::new(cwd)))
+            .transpose().map_err(|e| e.to_string())?;
+        records[i].definition.session_path = path;
+        if let Some(cwd) = cwd { records[i].definition.input.project_path = cwd.to_string_lossy().into_owned(); }
+        if dirty || old_definition.input.project_path != records[i].definition.input.project_path {
+            if let Err(error) = self.save(&records) {
+                records[i].definition = old_definition;
+                return Err(error);
+            }
         }
+        if dirty { records[i].reader = session::TailReader::default(); }
         records[i].native_session_id = payload["sessionId"].as_str().map(String::from);
         records[i].materialized = payload["materialized"].as_bool().unwrap_or(false);
         records[i].bridge_ready = payload["supported"].as_bool().unwrap_or(true);
-        let cwd = payload["cwd"].as_str().filter(|s| Path::new(s).is_dir());
-        let cwd_dirty = cwd.is_some_and(|s| s != records[i].definition.input.project_path);
-        if let Some(cwd) = cwd {
-            records[i].definition.input.project_path = cwd.into();
-        }
-        if dirty || cwd_dirty {
-            self.save(&records)?;
-        }
+        records[i].capabilities.agent_hub = payload["capabilities"]["agentHub"].as_bool().unwrap_or(false);
+        records[i].capabilities.native_decisions = payload["capabilities"]["nativeDecisions"].as_bool().unwrap_or(false);
+        records[i].capabilities.native_decisions_error = payload["capabilities"]["nativeDecisionsError"].as_str().map(str::to_owned);
+        records[i].workspace_epoch = epoch;
         Ok(())
     }
     pub fn set_bridge_ready(&self, id: &str, generation: u64, ready: bool) {
@@ -774,12 +1192,14 @@ impl Registry {
             }
         }
     }
-    pub fn set_manager_owner(&self, id: &str, manager_id: Option<&str>) -> Result<(), String> {
+    pub(crate) fn set_manager_owner(&self, id: &str, manager_id: Option<&str>) -> Result<(), String> {
+        let lifecycle = self.lifecycle.lock();
         let lease = {
             let mut records = self.records.lock().map_err(|e| e.to_string())?;
             let i = index(&records, id)?;
-            if records[i].definition.kind == InstanceKind::Manager {
-                return Err("cannot hand over The Manager".into());
+            if records[i].definition.kind != InstanceKind::Instance
+                || records[i].definition.helper.is_some() || records[i].definition.plan_target.is_some() {
+                return Err("Control transfer requires an ordinary project instance".into());
             }
             if let Some(owner) = manager_id {
                 if !records
@@ -799,6 +1219,7 @@ impl Registry {
             records[i].human_request = None;
             records[i].lease()
         };
+        drop(lifecycle);
         if let Some(hub) = self.hub.get() {
             hub.ownership_changed(id, &lease);
         }
@@ -819,16 +1240,11 @@ impl Registry {
         authorize(&records, i, Origin::Manager(manager), false)?;
         if records[i].human_request.is_none() {
             records[i].human_request = Some(HumanRequest {
+                id: uuid::Uuid::new_v4().to_string(),
                 reason,
                 decision_id,
             });
         }
-        Ok(())
-    }
-    pub fn return_to_manager(&self, id: &str) -> Result<(), String> {
-        let mut records = self.records.lock().map_err(|e| e.to_string())?;
-        let i = index(&records, id)?;
-        records[i].human_request = None;
         Ok(())
     }
     pub fn resolve_human_decision(&self, id: &str, decision_id: &str) {
@@ -856,6 +1272,7 @@ impl Registry {
             let i = index(&records, id)?;
             authorize(&records, i, origin, true)?;
             let record = &mut records[i];
+            if record.workspace_request.is_some() { return Err("workspace_change_busy".into()); }
             if record.process.as_mut().is_some_and(|p| matches!(p.poll(), Ok(None))) {
                 return Err("instance already running".into());
             }
@@ -872,8 +1289,11 @@ impl Registry {
             let hub = self.hub.get().ok_or("manager bridge not initialized")?;
             record.process = None;
             record.generation += 1;
+            record.workspace_epoch = 0;
+            record.workspace_committed = None;
             record.error = None;
             record.bridge_ready = false;
+            record.capabilities = NativeUiCapabilities::default();
             record.pending_decision_count = 0;
             let launch = (record.definition.clone(), record.generation, hub);
             if fresh {
@@ -907,6 +1327,7 @@ impl Registry {
             let mut records = self.records.lock().map_err(|e| e.to_string())?;
             let i = index(&records, id)?;
             authorize(&records, i, origin, true)?;
+            if records[i].workspace_request.is_some() { return Err("workspace_change_busy".into()); }
             let result = records[i].process.as_mut().map_or(Ok(()), |process| process.stop());
             records[i].bridge_ready = false;
             (records[i].generation, result)
@@ -937,6 +1358,7 @@ impl Registry {
             let records = self.records.lock().map_err(|e| e.to_string())?;
             let i = index(&records, id)?;
             authorize(&records, i, origin, true)?;
+            if records[i].workspace_request.is_some() { return Err("workspace_change_busy".into()); }
             records
                 .iter()
                 .filter(|r| r.definition.plan_target.as_deref() == Some(id) || r.definition.helper.as_ref().is_some_and(|h| h.target == id))
@@ -1162,6 +1584,280 @@ mod tests {
             ..Default::default()
         }
     }
+    fn workspace_fixture() -> (PathBuf, Registry) {
+        let (folder, _) = fixture();
+        let registry = Registry::load(folder.join("config/instances.json"), folder.join("home")).unwrap();
+        fs::create_dir_all(folder.join("a")).unwrap();
+        fs::create_dir_all(folder.join("b")).unwrap();
+        (folder, registry)
+    }
+
+    fn workspace_commit(registry: &Registry, id: &str, folder: &Path, source: Option<WorkspaceSourceBinding>) -> WorkspaceCommit {
+        let expected = registry.lease(id, Origin::Human, false).unwrap();
+        WorkspaceCommit {
+            request_id: uuid::Uuid::new_v4().to_string(), coordinator_id: id.into(),
+            target_folder: folder.to_string_lossy().into_owned(), workspace_epoch: expected.workspace_epoch + 1,
+            session_id: expected.session_id.clone(), session_file: registry.workspace_metadata(id).unwrap().definition.session_path,
+            expected, source,
+        }
+    }
+
+    #[test]
+    fn common_ancestor_uses_components_and_windows_roots() {
+        let ancestor = |roots: &[&str]| common_ancestor_folder(&roots.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(ancestor(&["C:/work/repo", "c:\\WORK\\repository"]), Some("C:/work".into()));
+        assert_eq!(ancestor(&["C:/work/repo", "c:/WORK/repo/"]), Some("C:/work/repo".into()));
+        assert_eq!(ancestor(&["C:/repo", "D:/repo"]), None);
+        assert_eq!(ancestor(&[r"\\server\share\a", r"\\SERVER\SHARE\b"]), Some("//server/share/".into()));
+        assert_eq!(ancestor(&[r"\\server\share\a", r"\\server\other\b"]), None);
+        assert_eq!(ancestor(&[r"\\?\UNC\server\share\a", r"\\server\share\a"]), Some("//server/share/a".into()));
+        assert_eq!(ancestor(&["/work/repo", "/work/repository"]), Some("/work".into()));
+    }
+
+    #[test]
+    fn workspace_commit_is_atomic_idempotent_and_fences_lifecycle_and_identity() {
+        let (folder, registry) = workspace_fixture();
+        let manager = registry.create_manager(input(&folder.join("a"))).unwrap();
+        let source = registry.create(input(&folder.join("b"))).unwrap();
+        let metadata = registry.workspace_metadata(&source.id).unwrap();
+        let commit = workspace_commit(&registry, &manager.id, &folder.join("b"), Some(WorkspaceSourceBinding::Grant {
+            source_id: source.id.clone(), canonical_path: source.project_path.clone(), expected: metadata.lease,
+        }));
+        registry.begin_workspace_change(&manager.id, &commit.request_id, &commit.expected).unwrap();
+        for error in [
+            registry.start(&manager.id, Origin::Human), registry.stop(&manager.id, Origin::Human),
+            registry.remove(&manager.id, Origin::Human),
+        ] { assert_eq!(error.unwrap_err(), "workspace_change_busy"); }
+        registry.apply_identity(&manager.id, 0, &json!({"cwd":manager.project_path,"sessionId":"stale","workspaceEpoch":0})).unwrap();
+        assert_eq!(registry.lease(&manager.id, Origin::Human, false).unwrap(), commit.expected);
+        let result = registry.commit_workspace_change(&commit).unwrap();
+        let owned = registry.lease(&source.id, Origin::Human, false).unwrap();
+        assert_eq!(owned.manager_id.as_deref(), Some(manager.id.as_str()));
+        assert_eq!(owned.ownership_epoch, 1);
+        assert_eq!(registry.commit_workspace_change(&commit).unwrap(), result);
+        assert_eq!(registry.lease(&source.id, Origin::Human, false).unwrap().ownership_epoch, 1);
+        registry.finish_workspace_change(&manager.id, &commit.request_id);
+        registry.apply_identity(&manager.id, 0, &json!({"cwd":manager.project_path,"sessionId":"stale","workspaceEpoch":0})).unwrap();
+        assert_eq!(registry.lease(&manager.id, Origin::Human, false).unwrap(), result);
+        let saved = Registry::load(registry.file.clone(), folder.join("home")).unwrap();
+        assert!(same_folder(&saved.workspace_metadata(&manager.id).unwrap().definition.input.project_path, &source.project_path));
+        registry.stop(&manager.id, Origin::Human).unwrap();
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn failed_workspace_save_restores_destination_and_source_and_keeps_reservation() {
+        let (folder, registry) = workspace_fixture();
+        let manager = registry.create_manager(input(&folder.join("a"))).unwrap();
+        let source = registry.create(input(&folder.join("b"))).unwrap();
+        let commit = workspace_commit(&registry, &manager.id, &folder.join("b"), Some(WorkspaceSourceBinding::Grant {
+            source_id: source.id.clone(), canonical_path: source.project_path.clone(),
+            expected: registry.lease(&source.id, Origin::Human, false).unwrap(),
+        }));
+        registry.begin_workspace_change(&manager.id, &commit.request_id, &commit.expected).unwrap();
+        fs::create_dir(registry.file.with_extension("json.tmp")).unwrap();
+        assert!(registry.commit_workspace_change(&commit).is_err());
+        assert_eq!(registry.lease(&manager.id, Origin::Human, false).unwrap(), commit.expected);
+        assert_eq!(registry.workspace_metadata(&manager.id).unwrap().definition.input.project_path, manager.project_path);
+        assert!(registry.lease(&source.id, Origin::Human, false).unwrap().manager_id.is_none());
+        assert_eq!(registry.stop(&manager.id, Origin::Human).unwrap_err(), "workspace_change_busy");
+        registry.finish_workspace_change(&manager.id, &commit.request_id);
+        registry.stop(&manager.id, Origin::Human).unwrap();
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn take_back_and_newer_human_request_prevent_queued_source_commit() {
+        let (folder, registry) = workspace_fixture();
+        let manager = registry.create_manager(input(&folder.join("a"))).unwrap();
+        let source = registry.create_owned(&manager.id, input(&folder.join("b"))).unwrap();
+        registry.request_human(&source.id, &manager.id, "old".into(), Some("old-decision".into())).unwrap();
+        let metadata = registry.workspace_metadata(&source.id).unwrap();
+        let commit = workspace_commit(&registry, &manager.id, &folder.join("b"), Some(WorkspaceSourceBinding::Return {
+            source_id: source.id.clone(), canonical_path: source.project_path.clone(), expected: metadata.lease,
+            human_request_id: metadata.human_request_id.unwrap(),
+        }));
+        registry.begin_workspace_change(&manager.id, &commit.request_id, &commit.expected).unwrap();
+        registry.resolve_human_decision(&source.id, "old-decision");
+        registry.request_human(&source.id, &manager.id, "new".into(), None).unwrap();
+        let newer = registry.workspace_metadata(&source.id).unwrap().human_request_id;
+        assert_eq!(registry.commit_workspace_change(&commit).unwrap_err(), "stale_human_request");
+        assert_eq!(registry.workspace_metadata(&source.id).unwrap().human_request_id, newer);
+        registry.take_back_control(&source.id).unwrap();
+        assert_eq!(registry.commit_workspace_change(&commit).unwrap_err(), "stale_workspace_source");
+        registry.finish_workspace_change(&manager.id, &commit.request_id);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn architect_source_binding_is_path_only_and_rejects_changed_repository() {
+        let (folder, registry) = workspace_fixture();
+        let manager = registry.create_manager(input(&folder.join("a"))).unwrap();
+        let architect = registry.create_architect(input(&folder.join("a"))).unwrap();
+        let source = registry.create(input(&folder.join("b"))).unwrap();
+        let binding = registry.workspace_source_binding(&source.id).unwrap();
+        registry.set_manager_owner(&source.id, Some(&manager.id)).unwrap();
+        {
+            let mut records = registry.records.lock().unwrap();
+            let i = index(&records, &source.id).unwrap();
+            records[i].generation += 1;
+            // A broken transcript is irrelevant to this metadata-only action.
+            records[i].definition.session_path = Some(folder.join("missing.jsonl"));
+        }
+        let commit = workspace_commit(&registry, &architect.id, &folder.join("b"), Some(binding.clone()));
+        registry.begin_workspace_change(&architect.id, &commit.request_id, &commit.expected).unwrap();
+        registry.commit_workspace_change(&commit).unwrap();
+        registry.finish_workspace_change(&architect.id, &commit.request_id);
+        let later = workspace_commit(&registry, &architect.id, &folder.join("b"), Some(binding));
+        registry.begin_workspace_change(&architect.id, &later.request_id, &later.expected).unwrap();
+        {
+            let mut records = registry.records.lock().unwrap();
+            let i = index(&records, &source.id).unwrap();
+            records[i].definition.input.project_path = manager.project_path;
+        }
+        assert_eq!(registry.commit_workspace_change(&later).unwrap_err(), "Source repository changed; give repo again.");
+        registry.finish_workspace_change(&architect.id, &later.request_id);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn managed_roots_resolve_git_markers_deduplicate_and_exclude_app_workspaces() {
+        let (folder, registry) = workspace_fixture();
+        fs::create_dir(folder.join("a/.git")).unwrap();
+        fs::create_dir_all(folder.join("a/src/deep")).unwrap();
+        fs::write(folder.join("b/.git"), "gitdir: elsewhere").unwrap();
+        let manager = registry.create_manager(input(&folder.join("a"))).unwrap();
+        let first = registry.create_owned(&manager.id, input(&folder.join("a/src/deep"))).unwrap();
+        registry.create_owned(&manager.id, input(&folder.join("a"))).unwrap();
+        registry.create_owned(&manager.id, input(&folder.join("b"))).unwrap();
+        registry.create_owned(&manager.id, input(registry.config_root())).unwrap();
+        let helper = registry.create_helper(&first.id, HelperPurpose::Diff, first.project_path.clone()).unwrap();
+        let planner = registry.create_planner(&first.id).unwrap();
+        assert!(registry.workspace_source_binding(&helper.id).is_err());
+        assert!(registry.workspace_source_binding(&planner.id).is_err());
+        assert!(registry.workspace_source_binding(&manager.id).is_err());
+        assert!(!registry.is_real_project_folder(&registry.config_root().to_string_lossy()));
+        let roots = registry.managed_repository_roots(&manager.id).unwrap();
+        assert_eq!(roots.len(), 2);
+        for expected in [folder.join("a"), folder.join("b")] {
+            let expected = crate::setup::canonical(&expected).unwrap().to_string_lossy().into_owned();
+            assert!(roots.iter().any(|root| same_folder(root, &expected)));
+        }
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn managed_project_folders_count_definitions_before_root_deduplication() {
+        let (folder, registry) = workspace_fixture();
+        fs::create_dir(folder.join("a/.git")).unwrap();
+        fs::create_dir_all(folder.join("a/src")).unwrap();
+        fs::create_dir_all(folder.join("a/docs")).unwrap();
+        let manager = registry.create_manager(input(&folder.join("b"))).unwrap();
+        let first = registry.create_owned(&manager.id, input(&folder.join("a/src"))).unwrap();
+        registry.create_helper(&first.id, HelperPurpose::Diff, first.project_path.clone()).unwrap();
+        registry.create_planner(&first.id).unwrap();
+        registry.create_owned(&manager.id, input(registry.config_root())).unwrap();
+        registry.create(input(&folder.join("a/docs"))).unwrap();
+        let canonical = |path: PathBuf| crate::setup::canonical(&path).unwrap().to_string_lossy().into_owned();
+        let one = registry.managed_project_folders(&manager.id).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0, first.id);
+        assert!(same_folder(&one[0].1, &canonical(folder.join("a/src"))));
+        let second = registry.create_owned(&manager.id, input(&folder.join("a/docs"))).unwrap();
+        let two = registry.managed_project_folders(&manager.id).unwrap();
+        assert_eq!(two.iter().map(|(id, _)| id.as_str()).collect::<std::collections::BTreeSet<_>>(),
+            [first.id.as_str(), second.id.as_str()].into_iter().collect());
+        assert_eq!(registry.managed_repository_roots(&manager.id).unwrap().len(), 1);
+        assert_eq!(registry.managed_project_folders(&first.id).unwrap_err(), "unknown manager");
+        assert_eq!(registry.ordinary_project_folders().len(), 3);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn ordinary_agents_commit_their_own_workspace_change_while_helpers_and_plans_cannot() {
+        let (folder, registry) = workspace_fixture();
+        let manager = registry.create_manager(input(&folder.join("a"))).unwrap();
+        let worker = registry.create_owned(&manager.id, input(&folder.join("a"))).unwrap();
+        let before = registry.workspace_metadata(&worker.id).unwrap();
+        let commit = workspace_commit(&registry, &worker.id, &folder.join("b"), None);
+        registry.begin_workspace_change(&worker.id, &commit.request_id, &commit.expected).unwrap();
+        let mut bound = commit.clone();
+        bound.source = Some(WorkspaceSourceBinding::Path { source_id: worker.id.clone(), canonical_path: worker.project_path.clone() });
+        assert_eq!(registry.commit_workspace_change(&bound).unwrap_err(), "invalid_workspace_binding");
+        let mut managed = commit.clone();
+        managed.target_folder = registry.config_root().to_string_lossy().into_owned();
+        assert!(registry.commit_workspace_change(&managed).unwrap_err().contains("app-managed"));
+        let lease = registry.commit_workspace_change(&commit).unwrap();
+        registry.finish_workspace_change(&worker.id, &commit.request_id);
+        assert_eq!((lease.generation, lease.session_id.clone(), lease.ownership_epoch, lease.manager_id.clone()),
+            (before.lease.generation, before.lease.session_id.clone(), before.lease.ownership_epoch, before.lease.manager_id.clone()));
+        assert_eq!(lease.manager_id.as_deref(), Some(manager.id.as_str()));
+        assert_eq!(lease.workspace_epoch, before.workspace_epoch + 1);
+        let target = crate::setup::canonical(&folder.join("b")).unwrap().to_string_lossy().into_owned();
+        assert!(same_folder(&registry.workspace_metadata(&worker.id).unwrap().definition.input.project_path, &target));
+        // A late identity report from before the move cannot move the agent back.
+        registry.apply_identity(&worker.id, 0, &json!({"cwd":folder.join("a"),"sessionId":null,"workspaceEpoch":0})).unwrap();
+        assert!(same_folder(&registry.workspace_metadata(&worker.id).unwrap().definition.input.project_path, &target));
+        let helper = registry.create_helper(&worker.id, HelperPurpose::Diff, worker.project_path.clone()).unwrap();
+        let planner = registry.create_planner(&worker.id).unwrap();
+        for id in [&helper.id, &planner.id] {
+            let metadata = registry.workspace_metadata(id).unwrap();
+            assert!(!may_change_directory(&metadata.definition));
+            assert_eq!(registry.begin_workspace_change(id, "request", &metadata.lease).unwrap_err(), "Only agent working directories can be changed");
+        }
+        assert!(may_change_directory(&registry.workspace_metadata(&manager.id).unwrap().definition));
+        assert!(may_change_directory(&registry.workspace_metadata(&worker.id).unwrap().definition));
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_creates_stopped_singletons_and_recreates_only_managed_folders() {
+        let (folder, registry) = fixture();
+        let first = registry.ensure_coordinators(&[]).unwrap();
+        assert_eq!(registry.snapshot().len(), 2);
+        assert_ne!(first.manager.project_path, first.architect.project_path);
+        for row in [&first.manager, &first.architect] {
+            assert_eq!(row.status, "stopped");
+            assert_eq!(row.generation, 0);
+            assert!(Path::new(&row.project_path).is_dir());
+            assert!(row.session_path.is_none());
+        }
+        fs::remove_dir(&first.manager.project_path).unwrap();
+        let second = registry.ensure_coordinators(&[folder.to_string_lossy().into()]).unwrap();
+        assert_eq!(first.manager.id, second.manager.id);
+        assert_eq!(first.architect.id, second.architect.id);
+        assert_eq!(first.manager.project_path, second.manager.project_path);
+        assert!(Path::new(&second.manager.project_path).is_dir());
+        fs::remove_dir(&second.manager.project_path).unwrap();
+        fs::write(&second.manager.project_path, "conflict").unwrap();
+        assert!(registry.ensure_coordinators(&[]).is_err());
+        fs::remove_file(&second.manager.project_path).unwrap();
+        fs::remove_dir(&second.architect.project_path).unwrap();
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_uses_real_candidates_and_preserves_existing_configuration() {
+        let (folder, registry) = fixture();
+        let real = std::env::temp_dir().join(format!("omp-bootstrap-real-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&real).unwrap();
+        let manager = registry.create_manager(CreateInput {
+            profile: "isolated".into(), model: "@preserve".into(), ..input(&real)
+        }).unwrap();
+        let first = registry.ensure_coordinators(&[
+            folder.to_string_lossy().into(), real.to_string_lossy().into(),
+        ]).unwrap();
+        assert_eq!(first.manager.id, manager.id);
+        assert_eq!(first.manager.profile, "isolated");
+        assert_eq!(first.manager.model, "@preserve");
+        assert_eq!(first.architect.project_path, manager.project_path);
+        fs::remove_dir(&real).unwrap();
+        let second = registry.ensure_coordinators(&[]).unwrap();
+        assert_eq!(second.manager.project_path, manager.project_path);
+        assert!(!real.exists());
+        assert_eq!(registry.snapshot().len(), 2);
+        fs::remove_dir_all(folder).unwrap();
+    }
     #[test]
     fn registry_restores_configuration_without_launching() {
         let (folder, registry) = fixture();
@@ -1207,7 +1903,7 @@ mod tests {
             .set_manager_owner(&human.id, Some(&manager.id))
             .unwrap();
         registry
-            .request_human(&owned.id, &manager.id, "Review execution".into(), None)
+            .request_human(&owned.id, &manager.id, "Review execution".into(), Some("review".into()))
             .unwrap();
         assert_eq!(
             registry
@@ -1217,7 +1913,7 @@ mod tests {
             Some("human_intervention_pending")
         );
         assert!(registry.lease(&owned.id, Origin::Human, true).is_ok());
-        registry.return_to_manager(&owned.id).unwrap();
+        registry.resolve_human_decision(&owned.id, "review");
         assert!(registry
             .lease(&owned.id, Origin::Manager(&manager.id), true)
             .is_ok());

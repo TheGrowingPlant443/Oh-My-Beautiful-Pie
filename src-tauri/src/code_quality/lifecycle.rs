@@ -1,7 +1,7 @@
 //! Configuration transitions and the managed Community (SonarQube + PostgreSQL) lifecycle.
 //! Everything here runs under the single operation `Gate`; nothing is queued or speculative.
-use super::runtime::{ContainerSpec, Ctl, Engine, Publish, OWNER_LABEL, ROLE_DB, ROLE_LABEL, ROLE_SONAR};
-use super::secrets::{random_password, sha256_hex};
+use super::runtime::{ContainerSpec, Engine, Publish, OWNER_LABEL, ROLE_DB, ROLE_LABEL, ROLE_SONAR};
+use super::secrets::{random_password, random_sonar_password, sha256_hex};
 use super::sonar::{self, SonarClient, SonarKind};
 use super::store::{self, ResourceRecord, RuntimeRecord};
 use super::types::*;
@@ -105,6 +105,7 @@ impl CodeQualityService {
         let mut inner = self.inner.lock();
         inner.unresolved.retain(|u| !u.starts_with(&prefix));
         inner.unresolved.push(format!("{prefix}{message}"));
+        if &inner.file.config.runtime == runtime { inner.community.running = None; }
     }
 
     fn clear_unresolved(&self, runtime: &QualityRuntime) {
@@ -121,7 +122,7 @@ impl CodeQualityService {
         self.inner.lock().unresolved.iter().any(|u| u.starts_with(&prefix))
     }
 
-    fn set_possibly_running(&self, runtime: &QualityRuntime, fingerprint: Option<&str>, port: u16, running: bool) -> Result<()> {
+    pub(crate) fn set_possibly_running(&self, runtime: &QualityRuntime, fingerprint: Option<&str>, port: u16, running: bool) -> Result<()> {
         let mut resources = store::load_resources(&self.paths)?;
         match resources.runtime_mut(runtime) {
             Some(record) => {
@@ -182,6 +183,7 @@ impl CodeQualityService {
     pub fn start_service(self: &Arc<Self>, expected: u64) -> Result<QualityState> {
         let gate = self.admit(QualityPhase::Starting, None)?;
         self.check_revision(expected)?;
+        self.inner.lock().suspended = false;
         let target = self.inner.lock().file.config.clone();
         if target.mode == QualityMode::Alternate {
             super::alternate::require_acknowledged(&self.config_root)?;
@@ -195,7 +197,7 @@ impl CodeQualityService {
             Err(_) => return Ok(self.state()),
         };
         let runtime = self.inner.lock().file.config.runtime.clone();
-        let (prerequisites, options) = super::install::probe_prerequisites(&self.config_root, &runtime);
+        let (prerequisites, options) = (self.probe)(&self.config_root, &runtime);
         {
             let mut inner = self.inner.lock();
             inner.prerequisites = prerequisites;
@@ -231,18 +233,10 @@ impl CodeQualityService {
             return Ok(self.state());
         }
         // The Elasticsearch prerequisites are part of the explicitly consented setup.
-        if let Ok(engine) = self.engine(&runtime) {
-            if let Ok(probe) = engine.probe(&gate.ctl) {
-                let low = probe.max_map_count.is_some_and(|v| v < MIN_MAP_COUNT) || probe.file_max.is_some_and(|v| v < MIN_FILE_MAX);
-                if low {
-                    gate.say("Raising the container VM limits SonarQube's search engine needs");
-                    if let Err(error) = super::install::raise_vm_limits_at(engine.as_ref(), &self.config_root, &gate.ctl) {
-                        self.refresh_prerequisites(&runtime);
-                        gate.finish(QualityPhase::NeedsSetup, Some(error));
-                        return Ok(self.state());
-                    }
-                }
-            }
+        if let Some(message) = self.ensure_vm_limits(&gate, &runtime) {
+            self.refresh_prerequisites(&runtime);
+            gate.finish(QualityPhase::NeedsSetup, Some(message));
+            return Ok(self.state());
         }
         self.refresh_prerequisites(&runtime);
         gate.finish(QualityPhase::Idle, None);
@@ -283,26 +277,159 @@ impl CodeQualityService {
         Ok(self.state_after(gate))
     }
 
-    /// App-start reconciliation of an already activated selection; never installs anything.
-    pub fn reconcile_on_start(self: &Arc<Self>) {
-        self.recover_interrupted_jobs();
-        let (activated, fatal) = {
-            let inner = self.inner.lock();
-            (inner.file.activated, inner.fatal.is_some())
+    /// Raises the container VM limits SonarQube's search engine needs when they are too low.
+    /// `Some(message)` = it could not be done (or is unsupported on this engine).
+    fn ensure_vm_limits(&self, gate: &Gate, runtime: &QualityRuntime) -> Option<String> {
+        let engine = self.engine(runtime).ok()?;
+        let probe = engine.probe(&gate.ctl).ok()?;
+        let low = probe.max_map_count.is_some_and(|v| v < MIN_MAP_COUNT) || probe.file_max.is_some_and(|v| v < MIN_FILE_MAX);
+        if !low {
+            return None;
+        }
+        gate.say("Raising the container VM limits SonarQube's search engine needs");
+        super::install::raise_vm_limits_at(engine.as_ref(), &self.config_root, &gate.ctl).err()
+    }
+
+    fn write_pending_setup(&self) -> Result<()> {
+        let path = self.pending_setup_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        crate::dependency_security::atomic_json(&path, &serde_json::json!({ "version": 1, "at": now_millis() }), store::MAX_STATE_BYTES)?;
+        self.inner.lock().setup_resume = true;
+        Ok(())
+    }
+
+    fn clear_pending_setup(&self) {
+        let _ = std::fs::remove_file(self.pending_setup_path());
+        self.inner.lock().setup_resume = false;
+    }
+
+    /// One-click "Install and setup": every missing prerequisite in order, then start the analyzer.
+    pub fn setup(self: &Arc<Self>, expected: u64, consent: bool) -> Result<QualityState> {
+        let gate = self.admit(QualityPhase::Installing, None)?;
+        self.check_revision(expected)?;
+        if !consent {
+            return Err("Review and accept the setup details first.".into());
+        }
+        let target = self.inner.lock().file.config.clone();
+        if target.mode == QualityMode::Alternate {
+            super::alternate::require_acknowledged(&self.config_root).map_err(|_| RULES_MESSAGE.to_string())?;
+        }
+        let wsl_runtime = matches!(target.runtime, QualityRuntime::Podman { .. } | QualityRuntime::DockerWsl { .. });
+        if wsl_runtime && super::install::wsl_features_missing(&gate.ctl) {
+            gate.say("Enabling the Windows features WSL needs (administrator approval required)");
+            match super::install::enable_windows_features(&self.config_root, &gate.ctl) {
+                Err(error) => {
+                    gate.finish(QualityPhase::Error, Some(error.clone()));
+                    return Err(error);
+                }
+                Ok(outcome) if outcome.needs_restart => return self.setup_restart(gate, &target.runtime, outcome.message),
+                Ok(outcome) => gate.say(&outcome.message),
+            }
+        }
+        gate.say(&format!("Preparing {}", target.runtime.label()));
+        match super::install::install_runtime(&self.config_root, &target.runtime, &gate.ctl) {
+            Err(error) => {
+                self.refresh_prerequisites(&target.runtime);
+                gate.finish(QualityPhase::Error, Some(error.clone()));
+                return Err(error);
+            }
+            Ok(outcome) if outcome.needs_restart => return self.setup_restart(gate, &target.runtime, outcome.message),
+            Ok(outcome) => {
+                gate.say(&outcome.message);
+                if let Some(connection) = &outcome.podman_connection {
+                    gate.say(&format!("Podman connection: {connection}"));
+                }
+            }
+        }
+        if let Some(message) = self.ensure_vm_limits(&gate, &target.runtime) {
+            self.refresh_prerequisites(&target.runtime);
+            gate.finish(QualityPhase::NeedsSetup, Some(message));
+            return Ok(self.state());
+        }
+        self.refresh_prerequisites(&target.runtime);
+        self.clear_pending_setup();
+        if target.mode == QualityMode::SonarqubeEnterprise {
+            gate.finish(QualityPhase::Idle, None);
+            self.inner.lock().suspended = false;
+            return Ok(self.state());
+        }
+        self.run_transition(gate, target, None)
+    }
+
+    fn setup_restart(self: &Arc<Self>, gate: Gate, runtime: &QualityRuntime, message: String) -> Result<QualityState> {
+        self.refresh_prerequisites(runtime);
+        if let Err(error) = self.write_pending_setup() {
+            gate.finish(QualityPhase::Error, Some(error.clone()));
+            return Err(error);
+        }
+        let text = format!("Windows must restart once to finish enabling WSL. Restart Windows, reopen OMP Manager and press Continue setup. ({message})");
+        gate.finish(QualityPhase::NeedsRestart, Some(text));
+        Ok(self.state())
+    }
+
+    /// The only automatic start path: opening the Code quality view (or launch-start when enabled).
+    pub fn enter(self: &Arc<Self>) -> Result<QualityState> {
+        self.refresh_ownership()?;
+        if self.inner.lock().suspended { return Ok(self.state()); }
+        let gate = match self.admit(QualityPhase::Checking, None) {
+            Ok(gate) => gate,
+            Err(_) => return Ok(self.state()),
         };
-        if !activated || fatal || self.read_only {
+        let (config, activated) = {
+            let inner = self.inner.lock();
+            (inner.file.config.clone(), inner.file.activated)
+        };
+        let (prerequisites, options) = (self.probe)(&self.config_root, &config.runtime);
+        let prerequisite = prerequisites.iter().find(|p| std::mem::discriminant(&p.runtime) == std::mem::discriminant(&config.runtime)).cloned();
+        {
+            let mut inner = self.inner.lock();
+            inner.prerequisites = prerequisites;
+            inner.options = options;
+        }
+        let healthy = activated && self.is_healthy(&config);
+        match enter_decision(activated, prerequisite.as_ref(), healthy) {
+            EnterDecision::Nothing => Ok(self.state_after(gate)),
+            EnterDecision::NeedsSetup(message) => {
+                gate.finish(QualityPhase::NeedsSetup, Some(message));
+                Ok(self.state())
+            }
+            EnterDecision::Start => {
+                if config.mode == QualityMode::Alternate && super::alternate::require_acknowledged(&self.config_root).is_err() {
+                    gate.finish(QualityPhase::NeedsSetup, Some(RULES_MESSAGE.into()));
+                    return Ok(self.state());
+                }
+                gate.phase(QualityPhase::Starting);
+                self.reconcile_orphan_scans(&gate);
+                self.run_transition(gate, config, None)
+            }
+        }
+    }
+
+    pub fn set_start_at_launch(self: &Arc<Self>, enabled: bool) -> Result<QualityState> {
+        let gate = self.admit(QualityPhase::Checking, None)?;
+        let mut file = self.inner.lock().file.clone();
+        file.start_at_launch = enabled;
+        store::save_config(&self.paths, &file)?;
+        self.inner.lock().file = file;
+        Ok(self.state_after(gate))
+    }
+
+    /// App start: only recovers interrupted jobs (files); the analyzer starts here only when the user
+    /// enabled "Start code quality when OMP Manager starts", otherwise when Code quality is opened.
+    pub fn reconcile_on_start(self: &Arc<Self>) {
+        if self.refresh_ownership().is_err() || !self.owns_resources() { return; }
+        let launch = {
+            let inner = self.inner.lock();
+            inner.fatal.is_none() && inner.file.activated && inner.file.start_at_launch
+        };
+        if !launch {
             return;
         }
         let svc = self.clone();
-        let _ = self.spawn_worker("code-quality-reconcile", move || {
-            let Ok(gate) = svc.admit(QualityPhase::Starting, None) else { return };
-            let target = svc.inner.lock().file.config.clone();
-            if target.mode == QualityMode::Alternate && super::alternate::require_acknowledged(&svc.config_root).is_err() {
-                gate.finish(QualityPhase::NeedsSetup, Some(RULES_MESSAGE.into()));
-                return;
-            }
-            svc.reconcile_orphan_scans(&gate);
-            let _ = svc.run_transition(gate, target, None);
+        let _ = self.spawn_worker("code-quality-launch", move || {
+            let _ = svc.enter();
         });
     }
 
@@ -337,6 +464,7 @@ impl CodeQualityService {
         }
         match self.apply(&gate, &target, credential.as_ref()) {
             Ok(Outcome::Ready) => {
+                self.inner.lock().suspended = false;
                 gate.finish(QualityPhase::Idle, None);
                 Ok(self.state())
             }
@@ -400,6 +528,13 @@ impl CodeQualityService {
 
     fn commit(&self, target: &QualityConfig) -> Result<()> {
         let mut file = self.inner.lock().file.clone();
+        if file.config == *target && file.activated {
+            self.inner.lock().suspended = false;
+            // Re-confirming the committed selection (opening the view, Start / retry) is not a change.
+            self.inner.lock().effective = Some(target.mode);
+            self.refresh_credentials();
+            return Ok(());
+        }
         file.config = target.clone();
         file.revision += 1;
         file.activated = true;
@@ -408,6 +543,7 @@ impl CodeQualityService {
             let mut inner = self.inner.lock();
             inner.file = file;
             inner.effective = Some(target.mode);
+            inner.suspended = false;
         }
         self.refresh_credentials();
         Ok(())
@@ -521,6 +657,7 @@ impl CodeQualityService {
             return Err(message);
         }
         let owner = self.installation_id();
+        if owner.is_empty() { return Err("The managed installation identity is missing; no containers were stopped.".into()); }
         let owned = engine.list_owned(&owner, &gate.ctl).map_err(|e| {
             let message = format!("Could not list managed containers on {}: {e}", runtime.label());
             self.mark_unresolved(runtime, message.clone());
@@ -528,6 +665,17 @@ impl CodeQualityService {
         })?;
         for role in [super::runtime::ROLE_SCAN, ROLE_SONAR, ROLE_DB] {
             for container in owned.iter().filter(|c| c.running && c.labels.get(ROLE_LABEL).map(String::as_str) == Some(role)) {
+                let Some(current) = engine.inspect(&container.id, &gate.ctl).map_err(|error| {
+                    let message = format!("{} could not be inspected before stopping: {error}", container.name);
+                    self.mark_unresolved(runtime, message.clone());
+                    message
+                })? else { continue };
+                if current.labels.get(OWNER_LABEL).map(String::as_str) != Some(owner.as_str())
+                    || current.labels.get(ROLE_LABEL).map(String::as_str) != Some(role) {
+                    let message = format!("{} no longer has the expected managed ownership labels; it was left running.", container.name);
+                    self.mark_unresolved(runtime, message.clone());
+                    return Err(message);
+                }
                 gate.say(&format!("Stopping {}", container.name));
                 let stopped = engine.stop(&container.id, 30, &gate.ctl).and_then(|_| match engine.inspect(&container.id, &gate.ctl)? {
                     Some(info) if info.running => Err(format!("{} is still running", container.name)),
@@ -540,46 +688,64 @@ impl CodeQualityService {
                 }
             }
         }
+        let remaining = engine.list_owned(&owner, &gate.ctl).map_err(|error| {
+            let message = format!("Managed containers could not be verified stopped: {error}");
+            self.mark_unresolved(runtime, message.clone());
+            message
+        })?;
+        if let Some(container) = remaining.iter().find(|container| container.running) {
+            let message = format!("{} is still running with a managed ownership label; shutdown was not confirmed.", container.name);
+            self.mark_unresolved(runtime, message.clone());
+            return Err(message);
+        }
         let port = store::load_resources(&self.paths)?.runtime(runtime).map(|r| r.port).unwrap_or(0);
         self.set_possibly_running(runtime, None, port, false)?;
         self.clear_unresolved(runtime);
         let mut inner = self.inner.lock();
-        inner.community.running = Some(false);
+        if &inner.file.config.runtime == runtime { inner.community.running = Some(false); }
         Ok(())
+    }
+
+    /// Stop all recorded active runtimes without starting any daemon to reach them.
+    pub(crate) fn stop_recorded_servers(&self, gate: &Gate) -> Result<()> {
+        let resources = store::load_resources(&self.paths)?;
+        let mut errors = Vec::new();
+        for record in resources.runtimes.iter().filter(|r| r.possibly_running || self.is_unresolved(&r.runtime)) {
+            if let Err(error) = self.stop_runtime(gate, &record.runtime) { errors.push(error); }
+        }
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
+    }
+
+    pub fn stop_server(self: &Arc<Self>) -> Result<QualityState> {
+        let gate = self.admit(QualityPhase::Stopping, None)?;
+        let runtime = {
+            let mut inner = self.inner.lock();
+            inner.suspended = true;
+            inner.effective = None;
+            inner.file.config.runtime.clone()
+        };
+        let outcome = self.verify_pending_tasks_stopped().and_then(|_| self.stop_recorded_servers(&gate)).and_then(|_| {
+            super::install::stop_owned_podman_machine(&self.config_root, &runtime, &self.installation_id(), &gate.ctl)
+        });
+        {
+            let mut inner = self.inner.lock();
+            for prerequisite in &mut inner.prerequisites {
+                if prerequisite.runtime == runtime { prerequisite.ready = false; }
+            }
+            if outcome.is_ok() { inner.community.running = Some(false); }
+        }
+        match outcome {
+            Ok(()) => { gate.finish(QualityPhase::Idle, None); Ok(self.state()) }
+            Err(error) => { gate.finish(QualityPhase::Error, Some(error.clone())); Err(error) }
+        }
     }
 
     /// Exit path: best-effort stop of every owned server; unconfirmed stops stay recorded.
     pub(crate) fn stop_all_on_exit(self: &Arc<Self>) {
-        let Ok(resources) = store::load_resources(&self.paths) else { return };
-        let Ok(gate_phase) = self.admit_for_exit() else { return };
-        for record in resources.runtimes.iter().filter(|r| r.possibly_running) {
-            let _ = self.stop_runtime(&gate_phase, &record.runtime);
-        }
+        let Ok(gate_phase) = self.admit_internal(QualityPhase::Stopping, None, false, true) else { return };
+        let _ = self.stop_recorded_servers(&gate_phase);
     }
 
-    fn admit_for_exit(self: &Arc<Self>) -> Result<Gate> {
-        // `closing` blocks normal admission, so exit builds its own gate directly.
-        let mut inner = self.inner.lock();
-        if inner.busy {
-            // A worker that ignored cancellation still owns the gate; do not run concurrent engine work.
-            return Err(BUSY_MESSAGE.into());
-        }
-        inner.busy = true;
-        inner.phase = QualityPhase::Stopping;
-        drop(inner);
-        let weak = Arc::downgrade(self);
-        let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |line| {
-            if let Some(svc) = weak.upgrade() {
-                svc.push_diagnostic(line);
-            }
-        });
-        Ok(Gate {
-            svc: self.clone(),
-            ctl: Ctl { cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)), log },
-            previous: (QualityPhase::Idle, None),
-            finished: false,
-        })
-    }
 
     // ---- alternate backend -----------------------------------------------------------------
 
@@ -595,6 +761,7 @@ impl CodeQualityService {
         if let Err(message) = engine.probe(&gate.ctl) {
             return Ok(Outcome::Setup(message));
         }
+        self.record_ready_runtime(&target.runtime);
         gate.phase(QualityPhase::Pulling);
         super::alternate::prepare_alternate(engine.as_ref(), &self.config_root, &gate.ctl)?;
         Ok(Outcome::Ready)
@@ -616,6 +783,7 @@ impl CodeQualityService {
             Ok(probe) => probe,
             Err(message) => return Ok(Outcome::Setup(message)),
         };
+        self.record_ready_runtime(runtime);
         if let Some(value) = probe.max_map_count.filter(|v| *v < MIN_MAP_COUNT) {
             return Ok(Outcome::Setup(format!(
                 "SonarQube's search engine needs vm.max_map_count >= {MIN_MAP_COUNT} but {} has {value}. Use Install runtime to raise it (Podman/WSL), or follow Docker's Desktop instructions.",
@@ -663,12 +831,73 @@ impl CodeQualityService {
                     self.secrets.write(&name, &token)?;
                 }
             }
+        } else {
+            self.bootstrap_sonar_token(gate, runtime, &url, &set);
         }
         {
             let mut inner = self.inner.lock();
             inner.community = CommunityState { running: Some(true), url: Some(url), runtime_id: Some(set) };
         }
         Ok(Outcome::Ready)
+    }
+
+    /// Fresh app-owned server only: change the default admin password to a random one and create a scan
+    /// token, both kept in Windows Credential Manager. Never fails the start; problems become log lines.
+    fn bootstrap_sonar_token(&self, gate: &Gate, runtime: &QualityRuntime, url: &str, set: &str) {
+        let Some(token_target) = self.community_token_target(runtime) else { return };
+        if matches!(self.secrets.read(&token_target), Ok(Some(_))) {
+            return;
+        }
+        let admin_target = super::secrets::target_name(&self.config_root, &format!("community:{set}"), "adminpassword");
+        let password = match self.secrets.read(&admin_target) {
+            Ok(Some(password)) => password,
+            Ok(None) => {
+                let Ok(default_login) = SonarClient::with_login(url, "admin", "admin") else { return };
+                if !default_login.login_valid() {
+                    gate.say("SonarQube's admin account was already changed outside OMP Manager; create a token manually (Open SonarQube setup).");
+                    return;
+                }
+                let new = random_sonar_password();
+                // Persist first: a crash between the change and the save must not lose the only password.
+                if let Err(error) = self.secrets.write(&admin_target, &new) {
+                    gate.say(&format!("Could not save the SonarQube admin password, so it was left unchanged: {error}"));
+                    return;
+                }
+                if let Err(error) = default_login.change_password("admin", "admin", &new) {
+                    let _ = self.secrets.delete(&admin_target);
+                    gate.say(&format!("Could not change the SonarQube admin password: {error}"));
+                    return;
+                }
+                new
+            }
+            Err(error) => {
+                gate.say(&format!("Could not read the saved SonarQube admin password: {error}"));
+                return;
+            }
+        };
+        let created: Result<String> = (|| {
+            let admin = SonarClient::with_login(url, "admin", &password)?;
+            let name = format!("omp-manager-{}", &set[..set.len().min(8)]);
+            let token = match admin.generate_user_token(&name) {
+                Ok(token) => token,
+                Err(_) => {
+                    let _ = admin.revoke_user_token(&name);
+                    admin.generate_user_token(&name).map_err(String::from)?
+                }
+            };
+            SonarClient::new(SonarKind::Community, url, Some(&token))?.validate_token().map_err(String::from)?;
+            Ok(token)
+        })();
+        match created {
+            Ok(token) => match self.secrets.write(&token_target, &token) {
+                Ok(()) => {
+                    self.refresh_credentials();
+                    gate.say("Created the SonarQube scan token and saved it in Windows Credential Manager.");
+                }
+                Err(error) => gate.say(&format!("Could not save the SonarQube scan token: {error}")),
+            },
+            Err(error) => gate.say(&format!("Automatic SonarQube token setup failed: {error}. Create a token manually (Open SonarQube setup).")),
+        }
     }
 
     /// Remember the daemon's identity; a replaced daemon invalidates its old container records.
@@ -885,12 +1114,50 @@ impl CodeQualityService {
         }
     }
 
+    /// Reuse the successful engine probe rather than leaving shutdown's cached "not ready"
+    /// status in place or probing every unrelated runtime again.
+    fn record_ready_runtime(&self, runtime: &QualityRuntime) {
+        let mut inner = self.inner.lock();
+        if let Some(prerequisite) = inner.prerequisites.iter_mut().find(|item| &item.runtime == runtime) {
+            prerequisite.installed = true;
+            prerequisite.ready = true;
+            prerequisite.needs_restart = false;
+            prerequisite.message = None;
+        } else {
+            inner.prerequisites.push(Prerequisite {
+                runtime: runtime.clone(), installed: true, ready: true,
+                needs_restart: false, message: None,
+            });
+        }
+    }
+
     fn refresh_prerequisites(&self, runtime: &QualityRuntime) {
-        let (prerequisites, options) = super::install::probe_prerequisites(&self.config_root, runtime);
+        let (prerequisites, options) = (self.probe)(&self.config_root, runtime);
         let mut inner = self.inner.lock();
         inner.prerequisites = prerequisites;
         inner.options = options;
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EnterDecision {
+    Nothing,
+    NeedsSetup(String),
+    Start,
+}
+
+/// What opening the Code quality view must do (pure so it can be tested without engines).
+pub(crate) fn enter_decision(activated: bool, prerequisite: Option<&Prerequisite>, healthy: bool) -> EnterDecision {
+    if !activated {
+        return EnterDecision::Nothing;
+    }
+    if let Some(p) = prerequisite.filter(|p| !p.installed) {
+        return EnterDecision::NeedsSetup(p.message.clone().unwrap_or_else(|| "The container runtime is not installed.".into()));
+    }
+    if healthy {
+        return EnterDecision::Nothing;
+    }
+    EnterDecision::Start
 }
 
 pub(crate) struct PreparedCredential {

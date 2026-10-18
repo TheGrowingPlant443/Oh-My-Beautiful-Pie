@@ -75,7 +75,7 @@
     <div class="body">
       <label>Open on startup
         <select value={$appSettings.startupTarget} onchange={e => update("startupTarget", e.currentTarget.value as AppSettings["startupTarget"])}>
-          <option value="manager">The Manager</option><option value="project">Chosen project</option><option value="latest">Latest project</option>
+          <option value="manager">The Manager</option><option value="architect">The Architect</option><option value="project">Chosen project</option><option value="latest">Latest project</option>
           <option value="dashboard">Dashboard</option>
         </select>
       </label>

@@ -6,9 +6,11 @@
   import CommandHistory from "./CommandHistory.svelte";
   import CommandOutput from "./CommandOutput.svelte";
   import UserTerminal from "./UserTerminal.svelte";
+  import HumanDecisionInbox from "./HumanDecisionInbox.svelte";
+  import { humanDecisions } from "../human-decisions";
 
   // instanceId: one agent's pane next to its terminal. null: every agent (the Dashboard's Terminals page).
-  let { instanceId }: { instanceId: string | null } = $props();
+  let { instanceId, onOpenSession }: { instanceId: string | null; onOpenSession?: (id: string) => void } = $props();
   const uiKey = $derived(instanceId ?? GLOBAL_UI_KEY);
   const ui = $derived($terminalUi.get(uiKey) ?? defaultTerminalUi());
   const owners = $derived(instanceId === null
@@ -39,7 +41,7 @@
     {#each tabs as tab (tab.key)}
       {@const shell = tab.kind === "shell" ? ownerOf(tab.instanceId)?.userShell : null}
       <span class="tab" class:active={tab.key === selected.key}>
-        <button type="button" role="tab" aria-selected={tab.key === selected.key} title={tab.title} onclick={() => updateTerminalUi(uiKey, { tab: tab.key })}>{tab.label}</button>
+        <button type="button" role="tab" aria-selected={tab.key === selected.key} title={tab.title} onclick={() => updateTerminalUi(uiKey, { tab: tab.key })}>{tab.label}{#if tab.kind === "decisions"} <span class="pill">{$humanDecisions.items.length}</span>{/if}</button>
         {#if shell && tab.instanceId}<button type="button" class="close ghost" aria-label="Close terminal" title="Close this terminal and end its shell" onclick={() => closeShell(tab.instanceId!, shell.shellId)}>×</button>{/if}
       </span>
     {/each}
@@ -53,6 +55,8 @@
     {#key selected.key}
       {#if selected.kind === "history"}
         <CommandHistory {instanceId} />
+      {:else if selected.kind === "decisions"}
+        <HumanDecisionInbox {onOpenSession} />
       {:else if selected.kind === "shell"}
         {@const owner = ownerOf(selected.instanceId)}
         {#if owner?.userShell}<UserTerminal instanceId={owner.instanceId} shell={owner.userShell} />{/if}

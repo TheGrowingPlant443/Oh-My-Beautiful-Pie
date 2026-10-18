@@ -3,7 +3,9 @@
   import { startInstance, stopInstance } from "../stores";
   import { basename } from "../ui";
   import OwnershipControls from "./OwnershipControls.svelte";
-  let { list, onSelect, onSubagent, onPlan, onPlanChange }: { list: Instance[]; onSelect: (id: string) => void; onSubagent: (id: string, child: string) => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void } = $props();
+  import AgentDirectory from "./AgentDirectory.svelte";
+  import { nativeHubDisabled } from "../native-agent-hub";
+  let { list, onSelect, onSubagents, onSubagent, onPlan, onPlanChange }: { list: Instance[]; onSelect: (id: string) => void; onSubagents: (id: string) => void; onSubagent: (id: string, child: string) => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void } = $props();
   const groups = $derived.by(() => {
     const folders = new Map<string, Instance[]>();
     for (const instance of list) {
@@ -26,14 +28,16 @@
             <span class="pill">{instance.status === "running" ? instance.activity : instance.status}</span>
             <span class="dim">{instance.profile || "Default profile"}</span>
             <span class="spacer"></span>
+            <button disabled={nativeHubDisabled(instance)} title={instance.bridgeReady && !instance.capabilities?.agentHub ? "Reopen this session with a compatible OMP version." : "Open this session's native Agent Hub"} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>
             {#if instance.planKind}<button onclick={() => onPlanChange(instance.id)}>Plan</button>{/if}
             {#if instance.planPath}<button onclick={() => onPlan(instance.id)}>View Plan</button>{/if}
             <button onclick={() => instance.status === "running" || instance.status === "starting" ? stopInstance(instance.id) : startInstance(instance.id)}>{instance.status === "running" || instance.status === "starting" ? "Stop" : "Start / reopen"}</button>
           </div>
+          {#if !instance.helper && !instance.planTarget}<AgentDirectory {instance} compact />{/if}
           <OwnershipControls {instance} onOpen={() => onSelect(instance.id)} />
           {#if instance.task}<p>{instance.task}</p>{/if}
           <ul class="subagents">{#each instance.subagents as child (child.id)}
-            <li><button onclick={() => onSubagent(instance.id, child.id)}>{child.name}</button><span class="dim">{child.agent || "Subagent"} · {child.status}</span></li>
+            <li><button disabled={nativeHubDisabled(instance)} onclick={() => onSubagent(instance.id, child.id)}>{child.name}</button><span class="dim">{child.agent || "Subagent"} · {child.status}</span></li>
           {/each}</ul>
         </li>
       {/each}</ul>

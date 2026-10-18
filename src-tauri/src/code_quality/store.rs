@@ -16,11 +16,14 @@ pub struct ConfigFile {
     pub config: QualityConfig,
     pub revision: u64,
     pub activated: bool,
+    /// Start the managed analyzer when OMP Manager starts (default off: it starts when Code quality is opened).
+    #[serde(default)]
+    pub start_at_launch: bool,
 }
 
 impl Default for ConfigFile {
     fn default() -> Self {
-        ConfigFile { version: 1, config: QualityConfig::default(), revision: 0, activated: false }
+        ConfigFile { version: 1, config: QualityConfig::default(), revision: 0, activated: false, start_at_launch: false }
     }
 }
 
@@ -192,13 +195,21 @@ pub fn save_resources(paths: &Paths, file: &ResourceFile) -> Result<()> {
     atomic_json(&paths.resources(), file, MAX_STATE_BYTES)
 }
 
-/// Stable random installation id; owner label value for every container the app creates.
-pub fn load_installation(paths: &Paths) -> Result<String> {
+/// Read-only installation identity lookup. A waiting process must never create this file.
+pub fn read_installation(paths: &Paths) -> Result<Option<String>> {
     if let Some(file) = read_versioned::<InstallationFile>(&paths.installation(), MAX_STATE_BYTES, "installation")? {
         if file.version == 1 && uuid::Uuid::parse_str(&file.id).is_ok() {
-            return Ok(file.id);
+            return Ok(Some(file.id));
         }
         return Err("The code quality installation file is invalid. Remove it manually only if no managed containers exist.".into());
+    }
+    Ok(None)
+}
+
+/// Owner-only load-or-create of the label identity used for every managed container.
+pub fn load_installation(paths: &Paths) -> Result<String> {
+    if let Some(id) = read_installation(paths)? {
+        return Ok(id);
     }
     std::fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -208,6 +219,30 @@ pub fn load_installation(paths: &Paths) -> Result<String> {
 
 pub fn load_project(paths: &Paths, folder: &str) -> Result<ProjectFile> {
     Ok(read_versioned::<ProjectFile>(&paths.project(folder), MAX_STATE_BYTES, "project")?.unwrap_or(ProjectFile { version: 1, project: None, recent: Vec::new() }))
+}
+
+pub fn list_project_folders(paths: &Paths) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(paths.root.join("projects")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("json") { files.push(path); }
+    }
+    files.sort();
+    let mut folders = Vec::new();
+    for path in files {
+        if let Some(file) = read_versioned::<ProjectFile>(&path, MAX_STATE_BYTES, "project")? {
+            if file.version != 1 { return Err(format!("The code quality project file {} has an unsupported version {}", path.display(), file.version)); }
+            if let Some(project) = file.project { folders.push(project.folder); }
+        }
+    }
+    folders.sort();
+    folders.dedup();
+    Ok(folders)
 }
 
 pub fn save_project(paths: &Paths, folder: &str, file: &ProjectFile) -> Result<()> {
@@ -259,6 +294,25 @@ mod tests {
     }
 
     #[test]
+    fn project_listing_is_read_only_and_rejects_invalid_metadata() {
+        let (paths, dir) = temp_paths();
+        assert!(list_project_folders(&paths).unwrap().is_empty());
+        assert!(!paths.root.join("projects").exists());
+        let path = paths.project("test");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = br#"{"version":1,"project":null,"recent":[]}"#;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(list_project_folders(&paths).unwrap().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::write(&path, br#"{"version":2,"project":null,"recent":[]}"#).unwrap();
+        assert!(list_project_folders(&paths).unwrap_err().contains("unsupported version"));
+        std::fs::write(&path, b"invalid").unwrap();
+        assert!(list_project_folders(&paths).unwrap_err().contains("unreadable"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn missing_config_is_default_and_roundtrips() {
         let (paths, dir) = temp_paths();
         assert_eq!(load_config(&paths).unwrap(), ConfigFile::default());
@@ -285,8 +339,11 @@ mod tests {
     #[test]
     fn installation_id_is_stable() {
         let (paths, dir) = temp_paths();
+        assert_eq!(read_installation(&paths).unwrap(), None);
+        assert!(!paths.installation().exists());
         let first = load_installation(&paths).unwrap();
         assert_eq!(load_installation(&paths).unwrap(), first);
+        assert_eq!(read_installation(&paths).unwrap(), Some(first));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

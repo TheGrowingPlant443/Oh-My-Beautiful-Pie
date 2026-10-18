@@ -40,6 +40,19 @@ pub fn random_password() -> String {
     out
 }
 
+/// Random SonarQube admin password: always 42 characters with upper case, lower case, digit and
+/// special character so Sonar's password policy accepts it. Kept at or below 50 characters, which
+/// stays under every length cap SonarQube applies (and bcrypt's 72-byte input limit); the two
+/// 16-hex-digit random groups carry 128 bits of entropy.
+pub fn random_sonar_password() -> String {
+    let group = || {
+        let mut text = uuid::Uuid::new_v4().simple().to_string();
+        text.truncate(16);
+        text
+    };
+    format!("Omp-{}-{}-Aa1!", group(), group())
+}
+
 #[cfg(any(test, not(windows)))]
 #[derive(Default)]
 pub struct MemorySecrets {
@@ -178,5 +191,19 @@ mod tests {
     fn passwords_are_long_and_unique() {
         let (a, b) = (random_password(), random_password());
         assert!(a.len() >= 32 && a != b);
+    }
+
+    #[test]
+    fn sonar_passwords_satisfy_the_policy_and_are_unique() {
+        let (a, b) = (random_sonar_password(), random_sonar_password());
+        assert_ne!(a, b);
+        for password in [&a, &b] {
+            assert!((12..=50).contains(&password.len()), "{}", password.len());
+            assert!(password.chars().any(|c| c.is_ascii_uppercase()));
+            assert!(password.chars().any(|c| c.is_ascii_lowercase()));
+            assert!(password.chars().any(|c| c.is_ascii_digit()));
+            assert!(password.chars().any(|c| !c.is_ascii_alphanumeric()));
+            assert!(password.chars().all(|c| c.is_ascii_graphic()));
+        }
     }
 }

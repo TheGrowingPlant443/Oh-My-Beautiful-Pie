@@ -16,6 +16,7 @@ pub type Result<T, E = String> = std::result::Result<T, E>;
 pub enum SetupScope {
     Global,
     Manager,
+    Architect,
     Repository,
 }
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Debug)]
@@ -57,6 +58,7 @@ pub struct SetupPaths {
     pub global_omp_folder: PathBuf,
     pub global_agent_folder: PathBuf,
     pub manager_folder: PathBuf,
+    pub architect_folder: PathBuf,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,12 +157,14 @@ impl SetupRequest {
 }
 
 pub fn materialize(root: &Path) -> Result<()> {
-    let folder = root.join("manager-setup");
-    fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
-    let file = folder.join("index.ts");
-    let source = include_str!("../../bridge/manager-setup.ts");
-    if fs::read_to_string(&file).ok().as_deref() != Some(source) {
-        fs::write(file, source).map_err(|e| e.to_string())?;
+    let source = include_str!("../../bridge/coordinator-setup.ts");
+    for role in ["manager", "architect"] {
+        let folder = root.join(format!("{role}-setup"));
+        fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+        let file = folder.join("index.ts");
+        if fs::read_to_string(&file).ok().as_deref() != Some(source) {
+            fs::write(file, source).map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -189,6 +193,7 @@ pub fn paths(registry: &Registry) -> Result<SetupPaths> {
         global_omp_folder,
         global_agent_folder,
         manager_folder: registry.config_root().join("manager-setup"),
+        architect_folder: registry.config_root().join("architect-setup"),
     })
 }
 
@@ -225,32 +230,41 @@ fn scan_roots(roots: &[(SetupScope, &Path)]) -> Vec<AgentFile> {
     found.sort_by_key(|f| (f.name.clone(), f.scope != SetupScope::Global));
     found
 }
-pub fn scan_agent_files(paths: &SetupPaths) -> Vec<AgentFile> {
-    scan_roots(&[
-        (SetupScope::Global, &paths.global_agent_folder),
-        (SetupScope::Manager, &paths.manager_folder),
-    ])
+pub fn scan_agent_files(paths: &SetupPaths, kind: InstanceKind) -> Vec<AgentFile> {
+    let mut roots = vec![
+        (SetupScope::Global, paths.global_agent_folder.as_path()),
+        (SetupScope::Manager, paths.manager_folder.as_path()),
+    ];
+    if kind == InstanceKind::Architect {
+        roots.push((SetupScope::Architect, paths.architect_folder.as_path()));
+    }
+    scan_roots(&roots)
 }
-pub fn agent_files(registry: &Registry) -> AgentFiles {
+pub fn agent_files(registry: &Registry, kind: InstanceKind) -> AgentFiles {
     match paths(registry) {
         Ok(paths) => AgentFiles {
-            files: scan_agent_files(&paths),
+            files: scan_agent_files(&paths, kind),
             error: None,
         },
-        Err(error) => AgentFiles {
-            files: scan_roots(&[(
-                SetupScope::Manager,
-                &registry.config_root().join("manager-setup"),
-            )]),
-            error: Some(error),
-        },
+        Err(error) => {
+            let manager = registry.config_root().join("manager-setup");
+            let architect = registry.config_root().join("architect-setup");
+            let mut roots = vec![(SetupScope::Manager, manager.as_path())];
+            if kind == InstanceKind::Architect {
+                roots.push((SetupScope::Architect, architect.as_path()));
+            }
+            AgentFiles { files: scan_roots(&roots), error: Some(error) }
+        }
     }
 }
 pub(crate) fn canonical(path: &Path) -> std::io::Result<PathBuf> {
     let path = fs::canonicalize(path)?;
-    Ok(PathBuf::from(
-        path.to_string_lossy().trim_start_matches("\\\\?\\"),
-    ))
+    let text = path.to_string_lossy();
+    Ok(PathBuf::from(if let Some(unc) = text.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{unc}")
+    } else {
+        text.strip_prefix("\\\\?\\").unwrap_or(&text).to_owned()
+    }))
 }
 pub fn verify_agent_file_in(files: &[AgentFile], path: &Path) -> Result<PathBuf> {
     let wanted = canonical(path)
@@ -264,8 +278,8 @@ pub fn verify_agent_file_in(files: &[AgentFile], path: &Path) -> Result<PathBuf>
         Err("Agent instructions file must be one created by Agent setup".into())
     }
 }
-pub fn verify_agent_file(registry: &Registry, path: &Path) -> Result<PathBuf> {
-    let found = agent_files(registry);
+pub fn verify_agent_file(registry: &Registry, path: &Path, kind: InstanceKind) -> Result<PathBuf> {
+    let found = agent_files(registry, kind);
     let warning = found.error;
     verify_agent_file_in(&found.files, path).map_err(|e| match warning {
         Some(w) => format!("{e} ({w})"),
@@ -284,16 +298,20 @@ fn discoverable_module(package: &Path, module: &Path) -> bool {
             && is_script(module))
 }
 
-/// Plugin packages under `<root>/extensions` that The Manager loads (and only The Manager) through
-/// `--extension`. Never executes anything: malformed packages are reported instead of skipped.
-pub fn manager_plugin_paths(root: &Path) -> Result<Vec<PathBuf>> {
+/// Validated role-private packages loaded through native directory discovery.
+pub fn private_plugin_paths(root: &Path, role: InstanceKind) -> Result<Vec<PathBuf>> {
+    let role = match role {
+        InstanceKind::Manager => "Manager",
+        InstanceKind::Architect => "Architect",
+        _ => return Err("Private plugins require a coordinator role".into()),
+    };
     let folder = root.join("extensions");
     let entries = match fs::read_dir(&folder) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("Manager plugins folder is unreadable: {e}")),
+        Err(e) => return Err(format!("{role} plugins folder is unreadable: {e}")),
     };
-    let base = canonical(&folder).map_err(|e| format!("Manager plugins folder is unreadable: {e}"))?;
+    let base = canonical(&folder).map_err(|e| format!("{role} plugins folder is unreadable: {e}"))?;
     let mut names = Vec::new();
     for entry in entries {
         let name = entry.map_err(|e| e.to_string())?.file_name().to_string_lossy().into_owned();
@@ -304,16 +322,16 @@ pub fn manager_plugin_paths(root: &Path) -> Result<Vec<PathBuf>> {
     names.sort();
     let mut packages = Vec::new();
     for name in names {
-        let package = canonical(&folder.join(&name)).map_err(|e| format!("Manager plugin {name} is unreadable: {e}"))?;
+        let package = canonical(&folder.join(&name)).map_err(|e| format!("{role} plugin {name} is unreadable: {e}"))?;
         if !package.starts_with(&base) {
-            return Err(format!("Manager plugin {name} resolves outside the extensions folder"));
+            return Err(format!("{role} plugin {name} resolves outside the extensions folder"));
         }
         let manifest = package.join("package.json");
         if !package.is_dir() || !manifest.is_file() {
             continue;
         }
-        let text = fs::read_to_string(&manifest).map_err(|e| format!("Manager plugin {name}: package.json is unreadable: {e}"))?;
-        let json: Value = serde_json::from_str(&text).map_err(|e| format!("Manager plugin {name}: package.json is invalid: {e}"))?;
+        let text = fs::read_to_string(&manifest).map_err(|e| format!("{role} plugin {name}: package.json is unreadable: {e}"))?;
+        let json: Value = serde_json::from_str(&text).map_err(|e| format!("{role} plugin {name}: package.json is invalid: {e}"))?;
         let declared = ["omp", "pi"]
             .iter()
             .find_map(|key| json.get(*key).filter(|v| v.is_object()))
@@ -321,22 +339,22 @@ pub fn manager_plugin_paths(root: &Path) -> Result<Vec<PathBuf>> {
             .and_then(Value::as_array);
         for entry in declared.into_iter().flatten().filter_map(Value::as_str) {
             let resolved = canonical(&package.join(entry))
-                .map_err(|_| format!("Manager plugin {name} declares a missing extension module: {entry}"))?;
+                .map_err(|_| format!("{role} plugin {name} declares a missing extension module: {entry}"))?;
             if !resolved.starts_with(&package) {
-                return Err(format!("Manager plugin {name} declares a module outside its package: {entry}"));
+                return Err(format!("{role} plugin {name} declares a module outside its package: {entry}"));
             }
             let module = if resolved.is_dir() {
                 ["index.ts", "index.js"]
                     .iter()
                     .map(|file| resolved.join(file))
                     .find(|file| file.is_file())
-                    .ok_or_else(|| format!("Manager plugin {name} declares {entry} without an index module"))?
+                    .ok_or_else(|| format!("{role} plugin {name} declares {entry} without an index module"))?
             } else {
                 resolved
             };
             if !discoverable_module(&package, &module) {
                 return Err(format!(
-                    "Manager plugin {name} declares {entry}, which The Manager cannot load; use index.ts at the package root"
+                    "{role} plugin {name} declares {entry}, which The {role} cannot load; use index.ts at the package root"
                 ));
             }
         }
@@ -411,7 +429,7 @@ pub fn omp_profiles(registry: &Registry) -> OmpProfiles {
     }
 }
 
-fn find_repository_root(cwd: &Path) -> Result<PathBuf> {
+pub(crate) fn find_repository_root(cwd: &Path) -> Result<PathBuf> {
     let cwd = canonical(cwd)
         .map_err(|_| format!("Project working directory not found: {}", cwd.display()))?;
     if !cwd.is_dir() {
@@ -466,6 +484,7 @@ pub fn open_folder(registry: &Registry, scope: SetupScope, project_instance_id: 
     let folder = match scope {
         SetupScope::Global => paths(registry)?.global_omp_folder,
         SetupScope::Manager => registry.config_root().join("manager-setup"),
+        SetupScope::Architect => registry.config_root().join("architect-setup"),
         SetupScope::Repository => repository_root(registry, project_instance_id.ok_or("Repository setup requires a project")?)?,
     };
     open_editor_folder(&folder)
@@ -531,6 +550,7 @@ fn prompt(request: &SetupRequest, paths: &SetupPaths, repository_root: Option<&P
     let target = match request.scope {
         SetupScope::Global => &paths.global_agent_folder,
         SetupScope::Manager => &paths.manager_folder,
+        SetupScope::Architect => &paths.architect_folder,
         SetupScope::Repository => {
             repository_target = repository_folder(repository_root.ok_or("Repository setup requires a project")?)?;
             &repository_target
@@ -581,12 +601,12 @@ fn prompt(request: &SetupRequest, paths: &SetupPaths, repository_root: Option<&P
         match item.kind {
             SetupKind::Agents if item.name.is_empty() => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
             SetupKind::Rules => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
-            SetupKind::Agents if request.scope == SetupScope::Repository => text.push_str("Create a standalone named instruction file, not merged into AGENTS.md. It is not automatically loaded and is not in this GUI's Global/Manager Persona list. Use it through an explicit --append-system-prompt file argument. No frontmatter is required.\n"),
+            SetupKind::Agents if request.scope == SetupScope::Repository => text.push_str("Create a standalone named instruction file, not merged into AGENTS.md. It is not automatically loaded and is not in this GUI's Persona catalog. Use it through an explicit --append-system-prompt file argument. No frontmatter is required.\n"),
             SetupKind::Agents => text.push_str("Create a standalone, named instruction file with plain Markdown instructions for an agent. Do not merge it into the scope's AGENTS.md. OMP does not load it automatically: the user selects it per dashboard instance, and OMP appends it to that session's system prompt. No frontmatter is required.\n"),
             SetupKind::Profile => text.push_str(&format!("Create the native OMP profile `{name}` at {root}/profiles/{name}/agent/. This overrides the general rule against modifying config.yml: write that profile's config.yml with native OMP settings that implement the description (for example plan.enabled: true and plan.defaultOnStartup: true start sessions in plan mode; modelRoles select models). Validate that it loads with native Settings.loadReadOnly using that agent directory. Add AGENTS.md, rules, skills or tools inside that profile only if the description asks. Never create or copy credentials or agent.db and never modify the default profile; tell the human the profile has its own login (run /login inside it). If the profile already exists read it first and make only surgical changes.\n", name = item.name, root = paths.global_omp_folder.display())),
             SetupKind::Skill => text.push_str("Create native SKILL.md with YAML name/description and concrete reusable steps. Update SKILLS.md as a readable catalog pointing to the real skill, preserving other entries. The catalog itself is not a native skill.\n"),
             SetupKind::Workflow => text.push_str("Use native rule frontmatter description, alwaysApply: true, agents: [main]. Describe semantic trigger, native delegation/reviewer steps, required evidence, completion/decision handling, and stop conditions. Use installed native agents; if a required reviewer is unavailable, request human guidance. No scheduler or automatic hooks.\n"),
-            SetupKind::Plugin => text.push_str(&format!("Create the native OMP plugin package `{name}` in the `extensions/{name}/` folder of the target above. package.json must be {{\"name\":\"{name}\",\"version\":\"0.1.0\",\"private\":true,\"type\":\"module\",\"description\":<one line from the request>,\"omp\":{{\"extensions\":[\"index.ts\"]}}}}; index.ts must export a default factory that receives the injected native ExtensionAPI and registers real behavior for the description (api.registerTool, api.registerCommand, api.on hooks as needed). Read the installed OMP's examples/extensions and its ExtensionAPI types first, and use native tool registration (injected zod, execute signature) exactly as the installed version defines it. This overrides the general rule against editing bridge/index.ts entrypoints only for this plugin's own package.json and index.ts; never touch the Manager setup root index.ts. Add package-local skills/ tools/ or rules/ folders only when the description needs them. No import-time side effects, no placeholder or no-op tools, no dependency installation or publishing, no `omp plugin link`/install, and do not edit the installed OMP. If the package already exists read it first and change only the requested behavior; never overwrite a different package. After approval validate that the package loads natively and exercise one harmless behavior with a fixture, then tell the human that running sessions need a native reload or an explicit reopen to load it.\n", name = item.name)),
+            SetupKind::Plugin => text.push_str(&format!("Create the native OMP plugin package `{name}` in the `extensions/{name}/` folder of the target above. package.json must be {{\"name\":\"{name}\",\"version\":\"0.1.0\",\"private\":true,\"type\":\"module\",\"description\":<one line from the request>,\"omp\":{{\"extensions\":[\"index.ts\"]}}}}; index.ts must export a default factory that receives the injected native ExtensionAPI and registers real behavior for the description (api.registerTool, api.registerCommand, api.on hooks as needed). Read the installed OMP's examples/extensions and its ExtensionAPI types first. ExtensionAPI registered tools use execute(toolCallId, params, signal, onUpdate, ctx), unlike tools/ native CustomTool factories. This overrides the general rule against editing bridge/index.ts entrypoints only for this plugin's own package.json and index.ts; never touch either coordinator setup root index.ts. Add package-local skills/ tools/ or rules/ folders only when the description needs them. No import-time side effects, no placeholder or no-op tools, no dependency installation or publishing, no `omp plugin link`/install, and do not edit the installed OMP. If the package already exists read it first and change only the requested behavior; never overwrite a different package. After approval validate that the package loads natively and exercise one harmless behavior with a fixture, then tell the human that running sessions need a native reload or an explicit reopen to load it.\n", name = item.name)),
             SetupKind::Tool => {
                 text.push_str(&format!("Language: {:?}. Native default factory in index.ts uses injected api.zod, approval: 'exec', execute(toolCallId, params, onUpdate, ctx, signal). Validate arguments; return native content/details with true stdout/stderr/error/abort state. No import-time execution. Python/Bash code lives beside it as run.py/run.sh, invoked via api.exec(interpreter, argumentArray, {{cwd:ctx.sessionManager.getCwd(),signal}}). Missing interpreter must fail clearly, never install it. On Windows use installed Git Bash rather than System32/WindowsApps WSL launchers. TypeScript logic stays in the native tool module. Inspect local interpreter locations before selecting one. Validate using a harmless fixture operation after approval.\n", item.language));
             }
@@ -594,9 +614,18 @@ fn prompt(request: &SetupRequest, paths: &SetupPaths, repository_root: Option<&P
         text.push('\n');
     }
     if request.scope == SetupScope::Repository {
-        text.push_str("After native plan approval, write only the requested assets under this repository's .omp folder. Read existing files first and preserve unrelated content. Validate native discovery with cwd equal to the repository root. Never modify Global/Manager setup or copy credentials. Existing project processes are not reloaded or restarted automatically. A nested cwd or nearer .omp can change discovery; use or reopen OMP from the repository root for root-scoped rules/tools. This session is human-controlled: wait for human plan review.");
+        text.push_str("After native plan approval, write only the requested assets under this repository's .omp folder. Read existing files first and preserve unrelated content. Validate native discovery with cwd equal to the repository root. Never modify Global/Manager/Architect setup or copy credentials. Existing project processes are not reloaded or restarted automatically. A nested cwd or nearer .omp can change discovery; use or reopen OMP from the repository root for root-scoped rules/tools. This session is human-controlled: wait for human plan review.");
     } else {
-        text.push_str("Global native assets apply to the default OMP profile. Manager-only assets are loaded by a private directory extension, not by worker project .omp folders. Instruction text reloads next Manager turn; skill/tool/rule catalogs need native reload or an explicit user reopen. Do not restart The Manager automatically. This session is human-controlled: wait for human plan review.");
+        let role = match request.scope {
+            SetupScope::Manager => Some("Manager"),
+            SetupScope::Architect => Some("Architect"),
+            _ => None,
+        };
+        if let Some(role) = role {
+            text.push_str(&format!("{role}-only assets are loaded by that coordinator's private directory extension, never by other coordinators or workers. Root instructions reload next {role} turn; skill/tool/rule catalogs need native reload or an explicit user reopen. Do not restart The {role} automatically. Never modify Global, other coordinator, repository, or analysis-result assets. This session is human-controlled: wait for human plan review."));
+        } else {
+            text.push_str("Global native assets apply to the default OMP profile. Existing sessions need native reload or an explicit user reopen for skill/tool/rule catalogs. Do not restart coordinators automatically. This session is human-controlled: wait for human plan review.");
+        }
     }
     Ok(text)
 }
@@ -615,13 +644,15 @@ impl SetupService {
         request: SetupRequest,
     ) -> Result<SetupAdmission> {
         let request = request.normalize()?;
-        if request.scope == SetupScope::Manager
-            && !registry
-                .snapshot()
-                .iter()
-                .any(|row| row.kind == InstanceKind::Manager)
-        {
-            return Err("Set up The Manager before creating Manager-only assets".into());
+        let coordinator = match request.scope {
+            SetupScope::Manager => Some((InstanceKind::Manager, "Manager")),
+            SetupScope::Architect => Some((InstanceKind::Architect, "Architect")),
+            _ => None,
+        };
+        if let Some((kind, name)) = coordinator {
+            if !registry.snapshot().iter().any(|row| row.kind == kind) {
+                return Err(format!("Set up The {name} before creating {name}-only assets"));
+            }
         }
         let repository_root = if request.scope == SetupScope::Repository {
             Some(repository_root(registry, request.project_instance_id.as_deref().ok_or("Repository setup requires a project")?)?)
@@ -640,6 +671,7 @@ impl SetupService {
         let name = match request.scope {
             SetupScope::Global => "Agent setup — Global".into(),
             SetupScope::Manager => "Agent setup — The Manager".into(),
+            SetupScope::Architect => "Agent setup — The Architect".into(),
             SetupScope::Repository => {
                 let root = repository_root.as_ref().ok_or("Repository setup requires a project")?;
                 let basename = root.file_name().map(|name| name.to_string_lossy()).unwrap_or_else(|| root.to_string_lossy());
@@ -830,6 +862,7 @@ mod tests {
             global_omp_folder: root.join("global"),
             global_agent_folder: root.join("global/agent"),
             manager_folder: root.join("manager-setup"),
+            architect_folder: root.join("architect-setup"),
         };
         touch(&paths.global_agent_folder.join("agent-instructions/beta/AGENTS.md"));
         touch(&paths.global_agent_folder.join("agent-instructions/alpha/AGENTS.md"));
@@ -838,7 +871,7 @@ mod tests {
         touch(&paths.global_agent_folder.join("agent-instructions/stray.md"));
         let outside = root.join("elsewhere/AGENTS.md");
         touch(&outside);
-        let files = scan_agent_files(&paths);
+        let files = scan_agent_files(&paths, InstanceKind::Instance);
         let listed: Vec<_> = files.iter().map(|f| (f.name.as_str(), f.scope)).collect();
         assert_eq!(
             listed,
@@ -848,6 +881,16 @@ mod tests {
                 ("beta", SetupScope::Global)
             ]
         );
+        let architect_file = paths.architect_folder.join("agent-instructions/designer/AGENTS.md");
+        touch(&architect_file);
+        for kind in [InstanceKind::Instance, InstanceKind::Manager] {
+            let files = scan_agent_files(&paths, kind);
+            assert!(!files.iter().any(|file| file.scope == SetupScope::Architect));
+            assert!(verify_agent_file_in(&files, &architect_file).is_err());
+        }
+        let architect_files = scan_agent_files(&paths, InstanceKind::Architect);
+        assert!(architect_files.iter().any(|file| file.scope == SetupScope::Architect));
+        assert_eq!(verify_agent_file_in(&architect_files, &architect_file).unwrap(), canonical(&architect_file).unwrap());
         let verified = verify_agent_file_in(&files, &files[2].path).unwrap();
         assert!(verified.is_file());
         assert!(verify_agent_file_in(&files, &outside).is_err());
@@ -940,7 +983,7 @@ mod tests {
         assert!(request.clone().normalize().is_err());
         request.project_instance_id = Some("project-a".into());
         assert_eq!(request.clone().normalize().unwrap().project_instance_id.as_deref(), Some("project-a"));
-        for scope in [SetupScope::Global, SetupScope::Manager] {
+        for scope in [SetupScope::Global, SetupScope::Manager, SetupScope::Architect] {
             let mut ordinary = request.clone();
             ordinary.scope = scope;
             assert_eq!(ordinary.normalize().unwrap().project_instance_id, None);
@@ -952,7 +995,7 @@ mod tests {
     fn repository_prompt_targets_every_asset_inside_the_bound_repo() {
         let root = std::env::temp_dir().join(format!("omp-repo-prompt-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let paths = SetupPaths { global_omp_folder: root.join("global"), global_agent_folder: root.join("global/agent"), manager_folder: root.join("manager") };
+        let paths = SetupPaths { global_omp_folder: root.join("global"), global_agent_folder: root.join("global/agent"), manager_folder: root.join("manager"), architect_folder: root.join("architect-setup") };
         let mut request = requests(SetupScope::Repository, vec![
             item(SetupKind::Agents, ""), item(SetupKind::Agents, "reviewer"),
             item(SetupKind::Rules, ""), item(SetupKind::Skill, "review"),
@@ -978,6 +1021,7 @@ mod tests {
             global_omp_folder: PathBuf::from("/g/.omp"),
             global_agent_folder: PathBuf::from("/g/.omp/agent"),
             manager_folder: PathBuf::from("/m/manager-setup"),
+            architect_folder: PathBuf::from("/m/architect-setup"),
         };
         let text = prompt(
             &requests(
@@ -1008,6 +1052,7 @@ mod tests {
             global_omp_folder: root.join("global"),
             global_agent_folder: root.join("global/agent"),
             manager_folder: root.join("manager-setup"),
+            architect_folder: root.join("architect-setup"),
         };
         let mut manager_request = request(SetupKind::Rules, "");
         manager_request.scope = SetupScope::Manager;
@@ -1019,6 +1064,12 @@ mod tests {
             Some("Set up The Manager before creating Manager-only assets")
         );
         assert!(registry.snapshot().is_empty());
+        let mut architect_request = request(SetupKind::Rules, "");
+        architect_request.scope = SetupScope::Architect;
+        assert_eq!(
+            service.start(&registry, &paths, architect_request).err().as_deref(),
+            Some("Set up The Architect before creating Architect-only assets")
+        );
         let row = registry
             .create(CreateInput {
                 project_path: root.join("agent-setup/jobs/job").to_string_lossy().into(),
@@ -1081,7 +1132,7 @@ mod tests {
         bound.scope = SetupScope::Repository;
         bound.project_instance_id = Some(source_a.id.clone());
         service.jobs.lock().map_err(|error| error.to_string())?.insert(row.id.clone(), Job {
-            request: bound.clone(), paths: SetupPaths { global_omp_folder: root.join("global"), global_agent_folder: root.join("global/agent"), manager_folder: root.join("manager-setup") },
+            request: bound.clone(), paths: SetupPaths { global_omp_folder: root.join("global"), global_agent_folder: root.join("global/agent"), manager_folder: root.join("manager-setup"), architect_folder: root.join("architect-setup") },
             repository_root: Some(canonical(&repo_a).unwrap()), admission: Some(false), sending: false,
         });
         let mut changed = bound.clone();
@@ -1109,7 +1160,7 @@ mod tests {
     fn plugins_are_available_in_every_scope_while_profiles_stay_global() {
         let parsed: SetupRequest = serde_json::from_str(r#"{"scope":"manager","items":[{"kind":"plugin","name":"Release Notes","description":"Summarise changes"}]}"#).unwrap();
         assert_eq!(parsed.normalize().unwrap().items[0].name, "release-notes");
-        for scope in [SetupScope::Global, SetupScope::Manager, SetupScope::Repository] {
+        for scope in [SetupScope::Global, SetupScope::Manager, SetupScope::Architect, SetupScope::Repository] {
             let mut plugin = requests(scope, vec![item(SetupKind::Plugin, "release-notes"), item(SetupKind::Skill, "release-notes")]);
             plugin.project_instance_id = Some("project".into());
             plugin.items[0].language = Some(ScriptLanguage::Python);
@@ -1127,8 +1178,8 @@ mod tests {
     }
     #[test]
     fn plugin_prompts_target_the_scope_extensions_folder() {
-        let paths = SetupPaths { global_omp_folder: "G".into(), global_agent_folder: PathBuf::from("G").join("agent"), manager_folder: PathBuf::from("M") };
-        for (scope, target) in [(SetupScope::Global, PathBuf::from("G").join("agent")), (SetupScope::Manager, PathBuf::from("M"))] {
+        let paths = SetupPaths { global_omp_folder: "G".into(), global_agent_folder: PathBuf::from("G").join("agent"), manager_folder: PathBuf::from("M"), architect_folder: PathBuf::from("A") };
+        for (scope, target) in [(SetupScope::Global, PathBuf::from("G").join("agent")), (SetupScope::Manager, PathBuf::from("M")), (SetupScope::Architect, PathBuf::from("A"))] {
             let text = prompt(&requests(scope, vec![item(SetupKind::Plugin, "release-notes")]), &paths, None).unwrap();
             assert!(text.contains(&target.display().to_string()));
             assert!(text.contains("extensions/release-notes/package.json and extensions/release-notes/index.ts"));
@@ -1138,7 +1189,7 @@ mod tests {
     #[test]
     fn manager_plugins_are_validated_and_ordered_without_executing_them() {
         let root = std::env::temp_dir().join(format!("omp-manager-plugins-{}", uuid::Uuid::new_v4()));
-        assert!(manager_plugin_paths(&root).unwrap().is_empty());
+        assert!(private_plugin_paths(&root, InstanceKind::Manager).unwrap().is_empty());
         let extensions = root.join("extensions");
         let write = |relative: &str, text: &str| {
             let file = extensions.join(relative);
@@ -1154,7 +1205,9 @@ mod tests {
         write("loose/index.ts", "");
         write("note.txt", "");
         let names = |paths: Vec<PathBuf>| paths.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
-        assert_eq!(names(manager_plugin_paths(&root).unwrap()), ["alpha", "zeta"]);
+        assert_eq!(names(private_plugin_paths(&root, InstanceKind::Manager).unwrap()), ["alpha", "zeta"]);
+        assert_eq!(names(private_plugin_paths(&root, InstanceKind::Architect).unwrap()), ["alpha", "zeta"]);
+        assert!(private_plugin_paths(&root, InstanceKind::Instance).is_err());
         for (text, expected) in [
             ("{", "package.json is invalid"),
             (r#"{"omp":{"extensions":["missing.ts"]}}"#, "declares a missing extension module"),
@@ -1163,9 +1216,26 @@ mod tests {
         ] {
             write("bad/package.json", text);
             write("bad/src/main.ts", "");
-            let error = manager_plugin_paths(&root).unwrap_err();
+            let error = private_plugin_paths(&root, InstanceKind::Manager).unwrap_err();
             assert!(error.starts_with("Manager plugin bad") && error.contains(expected), "{error}");
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn architect_setup_materializes_separately_and_preserves_assets() {
+        let root = std::env::temp_dir().join(format!("omp-private-setup-{}", uuid::Uuid::new_v4()));
+        touch(&root.join("architect-setup/AGENTS.md"));
+        touch(&root.join("architect/results.json"));
+        materialize(&root).unwrap();
+        let loader = include_str!("../../bridge/coordinator-setup.ts");
+        for role in ["manager", "architect"] {
+            assert_eq!(fs::read_to_string(root.join(format!("{role}-setup/index.ts"))).unwrap(), loader);
+        }
+        materialize(&root).unwrap();
+        assert_eq!(fs::read_to_string(root.join("architect-setup/AGENTS.md")).unwrap(), "x");
+        assert_eq!(fs::read_to_string(root.join("architect/results.json")).unwrap(), "x");
+        let request = requests(SetupScope::Architect, vec![item(SetupKind::Profile, "private")]);
+        assert_eq!(request.normalize().unwrap_err(), "OMP profiles are global; choose the Global scope");
         fs::remove_dir_all(root).unwrap();
     }
 }

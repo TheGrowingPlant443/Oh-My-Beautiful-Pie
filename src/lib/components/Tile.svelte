@@ -4,6 +4,8 @@
   import OwnershipControls from "./OwnershipControls.svelte";
   import { removeInstance, restartInstance, startInstance, stopInstance } from "../stores";
   import { basename, confirmDanger, statusClass } from "../ui";
+  import AgentDirectory from "./AgentDirectory.svelte";
+  import { nativeHubDisabled } from "../native-agent-hub";
   let { instance, onSelect, onOpen, onPlan, onPlanChange, onSubagents }: { instance: Instance; onSelect: (id: string) => void; onOpen: (id: string) => Promise<void>; onPlan: (id: string) => void; onPlanChange: (id: string) => void; onSubagents: (id: string) => void } = $props();
   let busy = $state(false);
   const live = $derived(instance.status === "running" || instance.status === "starting");
@@ -21,14 +23,14 @@
     <span class="spacer"></span><span class="pill {statusClass(instance.status)}">{live ? instance.activity : instance.status}{instance.exitCode !== null ? ` (${instance.exitCode})` : ""}</span>
   </header>
   <div class="metadata">
-    <strong title={instance.projectPath}>{basename(instance.projectPath)}</strong>
+    {#if !instance.helper && !instance.planTarget}<AgentDirectory {instance} compact />{:else}<strong title={instance.projectPath}>{basename(instance.projectPath)}</strong>{/if}
     <span>{instance.profile || "Default profile"} · {instance.model || "OMP model setup"}</span>
     {#if instance.configs.length}<span title={instance.configs.join("\n")}>{instance.configs.length} config overlay(s)</span>{/if}
     <p>{instance.task || "No active todo task"}{instance.todoTotal ? ` · ${instance.todoDone}/${instance.todoTotal}` : ""}</p>
     <OwnershipControls {instance} onOpen={() => onSelect(instance.id)} />
   </div>
   <div class="row links">
-    <button disabled={!instance.subagents.length} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>
+    <button disabled={busy || nativeHubDisabled(instance)} title={instance.bridgeReady && !instance.capabilities?.agentHub ? "Reopen this session with a compatible OMP version." : "Open this session's native Agent Hub"} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>
     {#if instance.planKind}<button onclick={() => onPlanChange(instance.id)}>Plan</button>{/if}
     {#if instance.planPath}<button onclick={() => onPlan(instance.id)}>View Plan</button>{/if}
   </div>

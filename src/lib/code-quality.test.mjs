@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultQualityConfig, modeSelectors, selectorMode, QualityClient, qualityLocked, QUALITY_BUSY, QualityGeneration, filterQualityFindings, findingTools, mergeFindingAttribution, qualityPage, scanPresentation, parseQualityPreferences } from "./code-quality.ts";
+import { defaultQualityConfig, modeSelectors, selectorMode, QualityClient, qualityLocked, QUALITY_BUSY, QualityGeneration, QualityViewEntry, QualityRevealLifetime, setupAction, filterQualityFindings, findingTools, mergeFindingAttribution, qualityPage, scanPresentation, parseQualityPreferences, pageScreen, scanAction, installVisible, featuresVisible, countBySeverity, STARTING_TEXT } from "./code-quality.ts";
 
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 function state(extra = {}) {
   return { revision: 0, config: defaultQualityConfig(), effectiveMode: null, phase: "idle", busy: false, operationId: null, requestedConfig: null, error: null,
-    activated: false, community: { running: false, url: null, runtimeId: null }, credentials: { community: false, enterprise: false }, rules: { manifestHash: "pack", licenseHash: "license", acknowledged: false, licenseText: "terms" }, prerequisites: [], options: { wslDistros: [], podmanConnections: [], wingetAvailable: false, podmanAppConnection: null }, diagnostics: [], unresolved: [], activeScanId: null, ...extra };
+    activated: false, community: { running: false, url: null, runtimeId: null }, credentials: { community: false, enterprise: false }, rules: { manifestHash: "pack", licenseHash: "license", acknowledged: false, licenseText: "terms" }, prerequisites: [], options: { wslDistros: [], podmanConnections: [], wingetAvailable: false, podmanAppConnection: null, wslFeaturesMissing: false }, diagnostics: [], unresolved: [], activeScanId: null,
+    ownership: { status: "owned", ownerPid: 42 }, suspended: false, setup: { needed: false, installRequired: false, resume: false, steps: [] }, startAtLaunch: false, ...extra };
 }
 function harness(read = async () => state()) {
   let next = 0; const timers = new Map();
@@ -108,4 +109,150 @@ test("folder generations reject stale results after navigation, revisits and unm
 test("only nonsecret folder and filter preferences are restored", () => {
   assert.deepEqual(parseQualityPreferences('{"folder":"C:/repo","tool":"Semgrep CE","token":"secret","config":{"mode":"alternate"}}'), { folder: "C:/repo", tool: "Semgrep CE", severity: "", text: "" });
   assert.deepEqual(parseQualityPreferences("invalid"), { folder: "", tool: "", severity: "", text: "" });
+});
+
+const ready = (extra = {}) => state({ activated: true, effectiveMode: "sonarqubeCommunity", ...extra });
+const step = (id, value) => ({ id, label: id, state: value });
+
+test("page screen follows the evaluation order from loading to scan", () => {
+  assert.equal(pageScreen(null, true), "loading");
+  assert.equal(pageScreen(ready(), false), "loading");
+  assert.equal(pageScreen(ready({ busy: true, phase: "waitingForReady" }), false), "starting", "progress shows while the open-view start is still running");
+  assert.equal(pageScreen(state(), true), "setup", "fresh install shows the setup button");
+  assert.equal(pageScreen(ready({ busy: true, phase: "installing" }), true), "setup");
+  assert.equal(pageScreen(ready({ busy: true, phase: "waitingForReady" }), true), "starting");
+  assert.equal(pageScreen(ready({ busy: true, phase: "scanning" }), true), "scan");
+  assert.equal(pageScreen(ready({ busy: true, phase: "cancelling" }), true), "scan");
+  assert.equal(pageScreen(ready({ setup: { needed: true, installRequired: true, resume: false, steps: [step("runtime", "pending")] } }), true), "setup");
+  assert.equal(pageScreen(ready({ setup: { needed: true, installRequired: true, resume: true, steps: [step("windowsFeatures", "blocked")] } }), true), "setup");
+  assert.equal(pageScreen(ready({ phase: "needsRestart" }), true), "setup");
+  assert.equal(pageScreen(ready({ phase: "needsSetup" }), true), "setup");
+  assert.equal(pageScreen(ready({ setup: { needed: true, installRequired: false, resume: false, steps: [step("token", "pending"), step("server", "pending")] } }), true), "setup", "missing token/server offers Start and scan, not installation");
+  assert.equal(pageScreen(ready({ phase: "error", error: "boom", effectiveMode: null }), true), "failed");
+  assert.equal(pageScreen(ready(), true), "scan");
+  assert.equal(pageScreen(ready({ effectiveMode: null }), true), "setup", "idle without an effective analyzer offers explicit start");
+});
+
+test("scan action blocks until the recipe is ready and labels approval", () => {
+  const base = { quality: state(), preparationReady: true, selectionNeeded: false, entryNeeded: false, requiresConsent: false, activeScanId: null, locked: false };
+  assert.deepEqual(scanAction(base), { label: "Scan project", kind: "scan", reason: null });
+  assert.deepEqual(scanAction({ ...base, requiresConsent: true }), { label: "Approve recipe and scan", kind: "scan", reason: null });
+  assert.equal(scanAction({ ...base, preparationReady: false }).reason, "Preparing…");
+  assert.equal(scanAction({ ...base, preparationReady: false }).kind, "blocked");
+  assert.equal(scanAction({ ...base, selectionNeeded: true }).kind, "blocked");
+  assert.match(scanAction({ ...base, entryNeeded: true }).reason, /build family/);
+  assert.deepEqual(scanAction({ ...base, activeScanId: "scan-1" }), { label: "Cancel scan", kind: "cancel", reason: null });
+  assert.equal(scanAction({ ...base, locked: true }).kind, "blocked");
+  assert.equal(scanAction({ ...base, quality: null }).kind, "blocked");
+});
+
+test("install and Windows feature controls appear only after a probe proves them necessary", () => {
+  const podman = { kind: "podman", connection: "" };
+  const entry = (runtime, installed) => ({ runtime, installed, ready: installed, needsRestart: false, message: null });
+  assert.equal(installVisible(state()), false, "not probed");
+  assert.equal(installVisible(state({ prerequisites: [entry(podman, false)] })), true);
+  assert.equal(installVisible(state({ prerequisites: [entry(podman, true)] })), false);
+  assert.equal(installVisible(state({ prerequisites: [entry({ kind: "dockerDesktop" }, false)] })), false, "another runtime's entry never counts");
+  const missing = { wslDistros: [], podmanConnections: [], wingetAvailable: true, podmanAppConnection: null, wslFeaturesMissing: true };
+  assert.equal(featuresVisible(state({ options: missing })), false, "not probed");
+  assert.equal(featuresVisible(state({ options: missing, prerequisites: [entry(podman, false)] })), true);
+  assert.equal(featuresVisible(state({ options: { ...missing, wslFeaturesMissing: false }, prerequisites: [entry(podman, false)] })), false);
+  const desktop = { ...defaultQualityConfig(), runtime: { kind: "dockerDesktop" } };
+  assert.equal(featuresVisible(state({ config: desktop, options: missing, prerequisites: [entry({ kind: "dockerDesktop" }, false)] })), false);
+});
+
+test("severity counts and starting phase text", () => {
+  assert.deepEqual(countBySeverity([]), { critical: 0, high: 0, medium: 0, low: 0, info: 0 });
+  const counts = countBySeverity([finding("1", ["a"], { severity: "critical" }), finding("2", ["a"]), finding("3", ["b"]), finding("4", ["b"], { severity: "info" })]);
+  assert.deepEqual(counts, { critical: 1, high: 2, medium: 0, low: 0, info: 1 });
+  assert.equal(STARTING_TEXT.waitingForReady, "Waiting for SonarQube to finish starting (1–3 minutes)");
+  assert.equal(STARTING_TEXT.idle, undefined);
+});
+
+test("setup action distinguishes installed prerequisites from analyzer/token work and unknown probes", () => {
+  assert.equal(setupAction(null).ready, false);
+  assert.equal(setupAction(state()).ready, false);
+  const installed = ready({ prerequisites: [{ runtime: defaultQualityConfig().runtime, installed: true, ready: false }],
+    setup: { needed: true, installRequired: false, resume: false, steps: ["windowsFeatures", "runtime", "machine"].map(id => step(id, "done")).concat([step("server", "pending"), step("token", "pending")]) } });
+  assert.deepEqual(setupAction(installed), { ready: true, install: false, label: "Start and scan" });
+  assert.deepEqual(setupAction({ ...installed, suspended: true }), setupAction(installed));
+  for (const id of ["windowsFeatures", "runtime", "machine"]) {
+    for (const status of ["pending", "blocked"]) {
+      const setup = { ...installed.setup, installRequired: true, steps: installed.setup.steps.map(item => item.id === id ? step(id, status) : item) };
+      assert.equal(setupAction({ ...installed, setup }).label, "Install and setup");
+      assert.equal(setupAction({ ...installed, setup: { ...setup, resume: true } }).label, "Continue setup");
+    }
+  }
+  assert.equal(pageScreen({ ...installed, suspended: true }, true), "scan", "stopped reports stay accessible");
+});
+
+test("ownership blocks every ordinary mutation while one explicit takeover is serialized", async () => {
+  let current = state({ ownership: { status: "otherProcess", ownerPid: 77 } });
+  const h = harness(async () => current); const stop = h.client.subscribe(() => {}); await flush();
+  assert.equal(pageScreen(current, true), "ownership"); assert.equal(qualityLocked(h.client.snapshot), true);
+  await assert.rejects(h.client.mutate(async () => assert.fail("must not admit")), /Code quality is busy/);
+  await assert.rejects(h.client.mutate(async () => assert.fail("cancel must not bypass ownership"), true), /Code quality is busy/);
+  const transfer = deferred(); let requests = 0;
+  const first = h.client.mutate(async () => { requests++; await transfer.promise; current = state(); }, false, true);
+  const rest = await Promise.allSettled(Array.from({ length: 20 }, () => h.client.mutate(async () => { requests++; }, false, true)));
+  assert.ok(rest.every(value => value.status === "rejected")); assert.equal(requests, 1);
+  transfer.resolve(); await first; assert.equal(qualityLocked(h.client.snapshot), false); stop();
+});
+
+test("handoff and suspension survive read-only polling without any engine admission", async () => {
+  let mutations = 0;
+  const current = state({ suspended: true, ownership: { status: "handedOff", ownerPid: null } });
+  const h = harness(async () => current); const stop = h.client.subscribe(() => {}); await flush();
+  await h.tick(); await h.tick();
+  assert.equal(pageScreen(h.client.snapshot.state, true), "ownership");
+  await assert.rejects(h.client.mutate(async () => { mutations++; }), /Code quality is busy/);
+  assert.equal(mutations, 0); stop();
+});
+
+test("reveal lifetime clears fake secrets and rejects late responses after close, blur or unmount", () => {
+  let secret = null, masks = false, next = 0; const timers = new Map();
+  const lifetime = new QualityRevealLifetime(() => { secret = null; masks = false; }, (fn, ms) => { assert.equal(ms, 60_000); timers.set(++next, fn); return next; }, id => timers.delete(id));
+  for (const dismissal of ["close", "escape", "backdrop", "blur", "navigation", "unmount"]) {
+    const generation = lifetime.begin(); secret = { token: "fake-token", password: "fake-password" }; masks = true;
+    lifetime.opened(generation); lifetime.close();
+    assert.equal(secret, null, dismissal); assert.equal(masks, false); assert.equal(timers.size, 0);
+    assert.equal(lifetime.accepts(generation), false, "late fetch cannot resurrect dismissed details");
+  }
+  const generation = lifetime.begin(); secret = { token: "fake-token" }; lifetime.opened(generation);
+  const expire = [...timers.values()][0]; expire();
+  assert.equal(secret, null); assert.equal(lifetime.accepts(generation), false); assert.equal(timers.size, 0);
+});
+
+test("reveal event bindings clear on actual blur/pagehide and detach on unmount", () => {
+  const target = new EventTarget(); let secret = null, clears = 0;
+  const lifetime = new QualityRevealLifetime(() => { secret = null; clears++; }, () => 1, () => {});
+  const detach = lifetime.attach(target);
+  for (const event of ["blur", "pagehide"]) {
+    const generation = lifetime.begin(); secret = { token: "fake-token" }; lifetime.opened(generation);
+    target.dispatchEvent(new Event(event));
+    assert.equal(secret, null); assert.equal(lifetime.accepts(generation), false);
+  }
+  secret = { token: "fake-token" }; detach(); assert.equal(secret, null);
+  const afterDetach = clears; target.dispatchEvent(new Event("blur")); assert.equal(clears, afterDetach);
+});
+
+test("mounted view admits initial entry and recovered ownership exactly once without restarting suspended work", () => {
+  const entry = new QualityViewEntry();
+  const other = status => state({ ownership: { status, ownerPid: null } });
+  assert.equal(entry.shouldEnter(null, true), false);
+  assert.equal(entry.shouldEnter(other("otherProcess"), true), false);
+  assert.equal(entry.shouldEnter(state(), true), false, "wait for the authoritative mutation gate");
+  assert.equal(entry.shouldEnter(state(), false), true, "owner exits and this window acquires");
+  for (let poll = 0; poll < 20; poll++) assert.equal(entry.shouldEnter(state(), false), false, "polling never restarts");
+  assert.equal(entry.shouldEnter(other("transferring"), true), false);
+  assert.equal(entry.shouldEnter(state(), false), false, "failed outgoing transfer does not restart");
+  assert.equal(entry.shouldEnter(other("handedOff"), true), false);
+  assert.equal(entry.shouldEnter(other("handedOff"), true), false);
+  assert.equal(entry.shouldEnter(state(), false), true, "explicit reacquisition gets one entry");
+  assert.equal(entry.shouldEnter(state({ suspended: true }), false), false);
+  assert.equal(entry.shouldEnter(state(), false), false, "explicit resume already starts itself");
+  const suspendedMount = new QualityViewEntry();
+  assert.equal(suspendedMount.shouldEnter(state({ suspended: true }), false), false);
+  assert.equal(suspendedMount.shouldEnter(state(), false), false);
+  assert.equal(new QualityViewEntry().shouldEnter(state(), false), true, "fresh mounted owner enters once");
 });

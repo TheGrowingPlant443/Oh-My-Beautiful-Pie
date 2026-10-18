@@ -42,7 +42,7 @@
       agentFiles = { files: [], error: null };
       dialog.showModal();
       void api.listOmpProfiles().then(found => { profiles = found; }).catch(e => { profiles = { profiles: [], error: errorText(e) }; });
-      void api.listAgentFiles().then(found => { agentFiles = found; }).catch(e => { agentFiles = { files: [], error: errorText(e) }; });
+      void api.listAgentFiles(purpose).then(found => { agentFiles = found; }).catch(e => { agentFiles = { files: [], error: errorText(e) }; });
       void refreshGlobalConfig().then(() => { useGlobalConfig = !!$globalConfig.path || !!$globalConfig.error; advanced = !!$globalConfig.error; });
       dialog.querySelector<HTMLInputElement>("input")?.focus();
     } else if (!open && dialog.open) {
@@ -127,7 +127,7 @@
           <label>Persona
             <select bind:value={persona}>
               <option value="">No persona</option>
-              {#each agentFiles.files as file (file.path)}<option value={file.path}>{file.name} · {file.scope === "global" ? "Global" : "The Manager"}</option>{/each}
+              {#each agentFiles.files as file (file.path)}<option value={file.path}>{file.name} · {file.scope === "global" ? "Global" : file.scope === "architect" ? "The Architect" : "The Manager"}</option>{/each}
             </select>
           </label>
           {#if agentFiles.error}<small class="dim">{agentFiles.error}</small>{/if}

@@ -144,7 +144,7 @@ export function registerRepoInspectTool(pi, repo) {
     name: 'repo_inspect',
     label: 'Repo Inspect',
     loadMode: 'essential',
-    description: 'Read-only access to this Git repository (the only thing you can do). Actions: changes (current working-tree diff against base, default HEAD; stat:true for the file list), log (search history by message query, code added/removed, regex, author, dates, path, merges; limit 1-100), show (one commit: message and diff), diff (between two commits), blame (path, optional line range), file (working-tree file, or at a ref). Commits are given as hashes, branch names or tags.',
+    description: 'Read-only access to this Git repository (besides the read-only code_quality_report, the only thing you can do). Actions: changes (current working-tree diff against base, default HEAD; stat:true for the file list), log (search history by message query, code added/removed, regex, author, dates, path, merges; limit 1-100), show (one commit: message and diff), diff (between two commits), blame (path, optional line range), file (working-tree file, or at a ref). Commits are given as hashes, branch names or tags.',
     parameters: pi.zod.object({
       action: pi.zod.enum(['changes', 'log', 'show', 'diff', 'blame', 'file']),
       base: text, target: text, commit: text, ref: text, path: text, query: text, code: text, regex: text, author: text, since: text, until: text,

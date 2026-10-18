@@ -73,6 +73,12 @@ fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).map(|p| plain(&p)).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The canonical, verbatim-prefix-free path of an existing folder, spelled the way scan reports it.
+pub(crate) fn canonical_folder(folder: &Path) -> Result<PathBuf> {
+    if !folder.is_dir() { return Err(format!("Not a folder: {}", folder.display())); }
+    Ok(canonical(folder))
+}
+
 /// The first 16 hex characters of the SHA-256 of the canonical folder path (forward slashes, lower case).
 pub fn folder_key(folder: &Path) -> String {
     let text = canonical(folder).to_string_lossy().replace('\\', "/").to_lowercase();
@@ -206,10 +212,34 @@ fn file_name(path: &Path) -> String {
     path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// Whether a folder holds any manifest this scanner understands. `Missing` only for the no-manifest condition;
+/// every other failure (unreadable or not a folder) propagates and never offers manifest assistance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ManifestStatus { Present, Missing }
+
+enum ScanFailure { NoManifest(String), Other(String) }
+
+impl ScanFailure {
+    fn message(self) -> String { match self { Self::NoManifest(message) | Self::Other(message) => message } }
+}
+
+pub fn manifest_status(folder: &Path, home: &Path) -> Result<ManifestStatus> {
+    match scan_checked(folder, home, false) {
+        Ok(_) => Ok(ManifestStatus::Present),
+        Err(ScanFailure::NoManifest(_)) => Ok(ManifestStatus::Missing),
+        Err(ScanFailure::Other(message)) => Err(message),
+    }
+}
+
 /// Scan `folder` and its immediate sub-folders. `transitive == false` stops at the declared dependencies.
 pub fn scan(folder: &Path, home: &Path, transitive: bool) -> Result<DependencyGraph> {
+    scan_checked(folder, home, transitive).map_err(ScanFailure::message)
+}
+
+fn scan_checked(folder: &Path, home: &Path, transitive: bool) -> std::result::Result<DependencyGraph, ScanFailure> {
     if !folder.is_dir() {
-        return Err(format!("Not a folder: {}", folder.display()));
+        return Err(ScanFailure::Other(format!("Not a folder: {}", folder.display())));
     }
     let root = canonical(folder);
     let mut b = Builder::new();
@@ -235,7 +265,7 @@ pub fn scan(folder: &Path, home: &Path, transitive: bool) -> Result<DependencyGr
         found |= scan_cargo(module, &root, transitive, &mut b);
     }
     if !found {
-        return Err(format!("No dependency manifest found in {} {NO_MANIFEST}.", folder.display()));
+        return Err(ScanFailure::NoManifest(format!("No dependency manifest found in {} {NO_MANIFEST}.", folder.display())));
     }
     let edges = b.edges.iter().filter(|(from, to)| b.nodes.contains_key(from) && b.nodes.contains_key(to)).cloned().collect();
     let links = b
@@ -1182,6 +1212,19 @@ mod tests {
         let error = scan(&empty, &empty, true).unwrap_err();
         assert_eq!(error, format!("No dependency manifest found in {} {NO_MANIFEST}.", empty.display()));
         fs::remove_dir_all(empty).unwrap();
+    }
+
+    #[test]
+    fn manifest_status_is_missing_only_for_the_no_manifest_condition() {
+        let root = temp();
+        assert_eq!(manifest_status(&root, &root).unwrap(), ManifestStatus::Missing);
+        write(&root.join("web/package.json"), r#"{"dependencies":{"left-pad":"1"}}"#);
+        assert_eq!(manifest_status(&root, &root).unwrap(), ManifestStatus::Present);
+        // A path that cannot be scanned is an ordinary error, never "missing".
+        let file = root.join("web/package.json");
+        assert!(manifest_status(&file, &root).unwrap_err().starts_with("Not a folder"));
+        assert!(manifest_status(&root.join("absent"), &root).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

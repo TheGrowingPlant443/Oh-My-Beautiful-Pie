@@ -365,6 +365,49 @@ fn run_process(mut cmd: Command, stdin_file: Option<&Path>, stdout_file: Option<
     Ok(RunOutput { status, stdout, stderr, timed_out, cancelled })
 }
 
+/// Runs a Podman machine command (`init`, `start`). `podman machine start` leaves the VM's keep-alive
+/// processes running: they must neither be killed with a job object nor hold our output pipes open, so
+/// output goes to temp files and only the direct child is waited on (and killed on timeout/cancel).
+pub(crate) fn run_machine(mut cmd: Command, timeout: Duration, ctl: &Ctl) -> Result<RunOutput> {
+    if ctl.cancelled() { return Err("Code quality operation cancelled.".into()); }
+    let secrets = sanitize_environment(&mut cmd);
+    crate::code_diff::no_console(&mut cmd);
+    let base = std::env::temp_dir().join(format!("omp-machine-{}", uuid::Uuid::new_v4()));
+    let (out_path, err_path) = (base.with_extension("out"), base.with_extension("err"));
+    let result = (|| {
+        let out = File::create(&out_path).map_err(|e| format!("Create machine output file: {e}"))?;
+        let err = File::create(&err_path).map_err(|e| format!("Create machine output file: {e}"))?;
+        cmd.stdin(Stdio::null()).stdout(Stdio::from(out)).stderr(Stdio::from(err));
+        let mut child = cmd.spawn().map_err(|e| format!("Start Podman machine command: {e}"))?;
+        let started = Instant::now();
+        let (mut timed_out, mut cancelled) = (false, false);
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| format!("Wait for Podman machine command: {e}"))? {
+                break status;
+            }
+            if started.elapsed() >= timeout || ctl.cancelled() {
+                timed_out = started.elapsed() >= timeout;
+                cancelled = ctl.cancelled();
+                let _ = child.kill();
+                break child.wait().map_err(|e| format!("Reap Podman machine command: {e}"))?;
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        let tail = |path: &Path| {
+            let mut bytes = fs::read(path).unwrap_or_default();
+            if bytes.len() > TAIL_BYTES { bytes.drain(..bytes.len() - TAIL_BYTES); }
+            bytes
+        };
+        let (mut stdout, mut stderr) = (tail(&out_path), tail(&err_path));
+        private_tail(&mut stdout, &secrets);
+        private_tail(&mut stderr, &secrets);
+        Ok(RunOutput { status, stdout, stderr, timed_out, cancelled })
+    })();
+    let _ = fs::remove_file(&out_path);
+    let _ = fs::remove_file(&err_path);
+    result
+}
+
 pub(crate) fn discover_program(name: &str, standard: &[PathBuf]) -> Option<PathBuf> {
     std::env::var_os("PATH").into_iter().flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .map(|p| p.join(name)).chain(standard.iter().cloned()).find(|p| p.is_file())
@@ -548,7 +591,7 @@ impl CliEngine {
         if !out.status.success() {
             if out.cancelled || out.timed_out { out.require_success("Inspect container resource")?; }
             let text = out.diagnostic().to_lowercase();
-            if text.contains("no such") || text.contains("not found") || text.contains("does not exist") { return Ok(None); }
+            if text.contains("no such") || text.contains("not found") || text.contains("does not exist") || text.contains("not known") || text.contains("failed to find") { return Ok(None); }
             return Err(format!("Inspect container resource: {}", out.diagnostic()));
         }
         let json: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| "Invalid or oversized container inspect response.")?;
@@ -564,7 +607,8 @@ fn validate_env_name(key: &str) -> Result<()> {
 }
 
 fn verify_resource_labels(kind: &str, name: &str, value: &serde_json::Value, labels: &[(String, String)]) -> Result<()> {
-    let actual = value.get("Labels").and_then(|v| v.as_object());
+    // Docker and `podman volume inspect` say "Labels"; `podman network inspect` says "labels".
+    let actual = value.get("Labels").or_else(|| value.get("labels")).and_then(|v| v.as_object());
     if labels.iter().all(|(key, expected)| actual.and_then(|v| v.get(key)).and_then(|v| v.as_str()) == Some(expected.as_str())) {
         Ok(())
     } else {
@@ -695,8 +739,8 @@ impl Engine for CliEngine {
                 let machine = super::install::podman_machine_for_connection(&self.config_root, &self.runtime, ctl)
                     .ok_or("Selected Podman connection is unreachable. Start its remote machine, or select an installed local Podman machine connection.")?;
                 let mut cmd = Command::new(&self.program);
-                cmd.args(["machine", "start", "--update-connection=false", &machine]);
-                run_bounded(cmd, None, Duration::from_secs(180), ctl)?.require_success("Start selected Podman machine")?;
+                cmd.args(["machine", "start", &machine]);
+                run_machine(cmd, Duration::from_secs(180), ctl)?.require_success("Start selected Podman machine")?;
             }
         }
         let deadline = Instant::now() + Duration::from_secs(180);
@@ -744,6 +788,11 @@ impl Engine for CliEngine {
         run_bounded(self.command(&args), None, PROBE_TIMEOUT, ctl)?.require_success("Create persistent owned volume")
     }
     fn create(&self, spec: &ContainerSpec, ctl: &Ctl) -> Result<String> {
+        // Creating from an image that is not local would pull inside the short create timeout.
+        if !self.image_exists(&spec.image, ctl)? {
+            ctl.say(&format!("Downloading {} (first use only)", spec.image));
+            self.pull(&spec.image, ctl)?;
+        }
         let result = run_bounded(self.create_command(spec)?, None, PROBE_TIMEOUT, ctl).and_then(|out| {
             out.require_success(&format!("Create analysis container '{}'", spec.name))?;
             let id = out.text();
@@ -812,6 +861,22 @@ impl Engine for CliEngine {
         run_bounded(cmd, Some(tar_file), PREPARE_TIMEOUT, ctl)?.require_success("Copy source archive into container")
     }
     fn copy_out(&self, id: &str, src: &str, tar_file: &Path, ctl: &Ctl) -> Result<()> {
+        if matches!(self.runtime, QualityRuntime::Podman { .. }) {
+            // `podman cp <container>:<path> -` cannot stream to stdout through the Windows remote client
+            // ("/dev/stdout could not be found on the host"): copy into a private temp directory instead.
+            let staging = std::env::temp_dir().join(format!("omp-cpout-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&staging).map_err(|e| format!("Create report staging folder: {e}"))?;
+            let result = (|| {
+                let mut args: Vec<String> = vec!["cp".into(), format!("{id}:{src}")];
+                args.push(staging.to_string_lossy().into_owned());
+                run_bounded(self.command(&args), None, PREPARE_TIMEOUT, ctl)?.require_success("Copy report archive out of container")?;
+                super::snapshot::pack_dir_tar(&staging, tar_file)?;
+                super::snapshot::validate_tar(tar_file, 4 * 1024 * 1024 * 1024).map(|_| ())
+            })();
+            let _ = fs::remove_dir_all(&staging);
+            if result.is_err() { let _ = fs::remove_file(tar_file); }
+            return result;
+        }
         let cmd = self.transfer_command(id, src, false);
         let result = run_process(cmd, None, Some(tar_file), PREPARE_TIMEOUT, ctl, false)
             .and_then(|out| out.require_success("Copy report archive out of container"))

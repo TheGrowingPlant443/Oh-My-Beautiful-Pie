@@ -22,10 +22,11 @@
   import forceAtlas2 from "graphology-layout-forceatlas2";
   import Sigma from "sigma";
   import { api } from "../api";
-  import { errorText, instances, appSettings, knownStandardVersion, architectInstance, reportError } from "../stores";
+  import { errorText, instances, appSettings, knownStandardVersion, architectInstance, reportError, projectHistory, visibleProjectHistory, computedFolders, rememberProjectFolder } from "../stores";
   import { pickFolder } from "../ui";
   import { projectFolders, repoKey } from "../repo-agents";
-  import { ROOT, nodeColor, nodeSize, pendingDirect, visibleGraph, pathToNode, focusCamera, packageTotals, buildPackageSearchIndex, searchPackages, exactNameMatch, parseDependencyPrefs, type KnownStandard, type Classification, type DepNode, type DependencyGraph, type DependencyMode, type HideSets, type VisibleGraph, type DerivedStandard } from "../dependency-graph";
+  import { folderOptions as historyOptions } from "../project-history";
+  import { ROOT, nodeColor, nodeSize, pendingDirect, visibleGraph, pathToNode, focusCamera, packageTotals, buildPackageSearchIndex, searchPackages, exactNameMatch, parseDependencyPrefs, filterGraphByEcosystem, validEcosystemChoice, type EcosystemChoice, type PackageEcosystem, type KnownStandard, type Classification, type DepNode, type DependencyGraph, type DependencyMode, type HideSets, type VisibleGraph, type DerivedStandard } from "../dependency-graph";
   import { DependencyReviewSession, DependencyJobSession, PackageInsightsQueue, PAGE_SIZE, formatCount, githubProblemText, githubStatusText, newestText, ownerText, packageMajorLag, projectVersionText, rankPackages, rankingIncomplete, type DependencyJobAdmission, type HandoffPrepared, type InhouseStatus, type PackageInsightsStatus, type ProjectReviewState, type UpdatePlanState, type UsageExplanationState } from "../package-insights";
   import { isCommonlyUsed, knownOwnerOf } from "../known-packages";
   import { InhouseSweep, type SweepSnapshot } from "../inhouse-sweep";
@@ -35,15 +36,21 @@
   import DependencyUsageDialog from "./DependencyUsageDialog.svelte";
   import DependencyProjectDialog from "./DependencyProjectDialog.svelte";
   import DependencyUpdatePlanDialog from "./DependencyUpdatePlanDialog.svelte";
-  let { onBack, onOpenArchitect, onOpenManager }: {
+  import DependencyDiscoveryDialog from "./DependencyDiscoveryDialog.svelte";
+  import { insightTransport, type InsightJobState } from "../project-insight";
+  import type { ProjectInsightStatus } from "../api";
+  import ProjectRequirementsDialog from "./ProjectRequirementsDialog.svelte";
+  let { onBack, onOpenArchitect, onOpenManager, onOpenCodeQuality, initialFolder }: {
     onBack: () => void;
     onOpenArchitect: (id: string, replayRequestId?: string) => Promise<boolean>;
     onOpenManager: () => Promise<void>;
+    onOpenCodeQuality?: (folder: string) => void;
+    initialFolder?: string;
   } = $props();
 
   const SEARCH_PAGE = 30;
   const saved = parseDependencyPrefs(localStorage.getItem(PREFS_KEY));
-  let folder = $state(saved.folder);
+  let folder = $state(untrack(() => initialFolder || saved.folder || $visibleProjectHistory[0] || projectFolders($instances)[0] || ""));
   let mode = $state<DependencyMode>(saved.mode);
   let showAll = $state(saved.showAll);
   let hideStandard = $state(saved.hideStandard);
@@ -73,6 +80,7 @@
   }, snapshot => { usage = snapshot; });
   let usage = $state.raw(usageSession.snapshot);
   let projectOpen = $state(false);
+  let requirementsOpen = $state(false);
   const projectSession = new DependencyJobSession<ProjectReviewState>({
     start: (target, _subject, rerun) => api.startProjectDependencySecurityReview(target, rerun), read: api.readProjectDependencySecurityReview,
   }, snapshot => { project = snapshot; });
@@ -83,10 +91,42 @@
     start: (target, reviewRequestId, regenerate) => api.startDependencyUpdatePlan(target, reviewRequestId ?? "", regenerate), read: api.readDependencyUpdatePlan,
   }, snapshot => { plan = snapshot; });
   let plan = $state.raw(planSession.snapshot);
+  let discoveryOpen = $state(false);
+  const discoverySession = new DependencyJobSession<InsightJobState>(insightTransport(api, "dependencyDiscovery"), snapshot => { discovery = snapshot; });
+  let discovery = $state.raw(discoverySession.snapshot);
+  // Set only when the scan failed with the no-manifest condition (never for other errors); the Architect is asked only by a click.
+  let manifestMissing = $state(false);
+  let savedDiscovery = $state.raw<ProjectInsightStatus | null>(null);
+  let languageSelection = $state<EcosystemChoice>("all");
   let prepared = $state.raw<HandoffPrepared | null>(null);
   let handoffError = $state<string | null>(null);
   let handoffBusy = $state(false);
-  let reviewAction = 0, usageAction = 0, projectAction = 0, planAction = 0;
+  $effect(() => {
+    const requestId = plan.requestId;
+    const status = plan.state?.handoff?.status;
+    if (!planOpen || !requestId || (status !== "pending" && status !== "attempting")) return;
+    const target = folder;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    async function refreshHandoff(): Promise<void> {
+      try {
+        const state = await api.readDependencyUpdatePlan(requestId!);
+        if (cancelled || target !== folder || plan.requestId !== requestId) return;
+        plan = { ...plan, state };
+        if (state.handoff?.status === "accepted") {
+          closePlan();
+          await onOpenManager();
+        } else if (state.handoff?.status === "pending" || state.handoff?.status === "attempting") {
+          timer = setTimeout(refreshHandoff, 1000);
+        }
+      } catch (error) {
+        if (!cancelled) { handoffError = errorText(error); timer = setTimeout(refreshHandoff, 1000); }
+      }
+    }
+    timer = setTimeout(refreshHandoff, 1000);
+    return () => { cancelled = true; clearTimeout(timer); };
+  });
+  let reviewAction = 0, usageAction = 0, projectAction = 0, planAction = 0, discoveryAction = 0;
   // Only an index of which jobs exist: the backend decides whether to reuse, so a remount or restart still finds saved work.
   type JobKind = "security" | "usage" | "project";
   const JOBS_KEY = "omp-manager.dependency-jobs";
@@ -167,34 +207,39 @@
   const differentIds = $derived(new Set(differentById.keys()));
   const hideSet = $derived(hideStandard ? new Set([...knownIds, ...derivedHide].filter(id => !differentIds.has(id))) : null);
   const hidePinkSet = $derived(hidePink ? differentIds : null);
-  const knownInGraph = $derived(graph?.nodes.filter(node => node.id !== ROOT && (knownIds.has(node.id) || derivedHide.has(node.id))).length ?? 0);
-  const derivedInGraph = $derived(graph?.nodes.filter(node => node.id !== ROOT && derivedHide.has(node.id)).length ?? 0);
-  const pinkInGraph = $derived(graph?.nodes.filter(node => differentIds.has(node.id)).length ?? 0);
-  const commonIds = $derived(new Set((graph?.nodes ?? []).filter(isCommonlyUsed).map(node => node.id)));
+  const ecosystems = $derived(graph ? projectEcosystems(graph.nodes) : new Set<string>());
+  const languageChoices = $derived([...ecosystems].filter((name): name is PackageEcosystem => name !== ROOT).sort());
+  const activeLanguage = $derived(validEcosystemChoice(languageSelection, ecosystems));
+  // One language scope for the displayed graph: graph, list, search index, view counts and metadata demand all derive from it.
+  const scoped = $derived(graph && activeLanguage !== "all" ? filterGraphByEcosystem(graph, activeLanguage) : graph);
+  $effect(() => { if (graph && languageSelection !== activeLanguage) languageSelection = activeLanguage; });
+  const knownInGraph = $derived(scoped?.nodes.filter(node => node.id !== ROOT && (knownIds.has(node.id) || derivedHide.has(node.id))).length ?? 0);
+  const derivedInGraph = $derived(scoped?.nodes.filter(node => node.id !== ROOT && derivedHide.has(node.id)).length ?? 0);
+  const pinkInGraph = $derived(scoped?.nodes.filter(node => differentIds.has(node.id)).length ?? 0);
+  const commonIds = $derived(new Set((scoped?.nodes ?? []).filter(isCommonlyUsed).map(node => node.id)));
   function ownerOf(node: DepNode) {
     const info = metadata.insights.get(node.id);
     return knownOwnerOf(node, info?.repositoryUrl, info?.repository?.ownerLogin);
   }
   // Keyed by content so metadata batches that find no new owner never re-layout the graph.
-  const ownerKey = $derived((graph?.nodes ?? []).filter(node => node.id !== ROOT && ownerOf(node)).map(node => node.id).sort().join("\u0000"));
+  const ownerKey = $derived((scoped?.nodes ?? []).filter(node => node.id !== ROOT && ownerOf(node)).map(node => node.id).sort().join("\u0000"));
   const ownerIds = $derived(new Set(ownerKey ? ownerKey.split("\u0000") : []));
   const commonInGraph = $derived(commonIds.size);
   const ownersInGraph = $derived(ownerIds.size);
-  const unprovenInGraph = $derived(graph?.nodes.filter(node => unprovenById.has(node.id)).length ?? 0);
-  const ecosystems = $derived(graph ? projectEcosystems(graph.nodes) : new Set<string>());
+  const unprovenInGraph = $derived(scoped?.nodes.filter(node => unprovenById.has(node.id)).length ?? 0);
   const verdict = $derived.by(() => { overrideTick; return projectFilterVerdict($appSettings, ecosystems, projectKind, filterOverrides.has(repoKey(folder))); });
   const gated = $derived($appSettings.packageLookupGate && !(inhouse?.gate === true && inhouse.complete));
   const held = $derived(verdict.kind !== "ok" || gated);
   const inhouseSet = $derived(gated || !$appSettings.packageLookupGate || !inhouse ? new Set<string>() : new Set(Object.keys(inhouse.inhouse)));
 
   const folders = $derived(projectFolders($instances));
-  const folderOptions = $derived(folder && !folders.some(known => repoKey(known) === repoKey(folder)) ? [folder, ...folders] : folders);
+  const folderOptions = $derived(historyOptions($projectHistory, folders, folder, $computedFolders));
   const empty: VisibleGraph = { nodes: [], edges: [], hidden: 0, depthHidden: 0, maxDepth: 0, standardHidden: 0, differentHidden: 0, commonHidden: 0, ownersHidden: 0 };
   const hideSets = $derived<HideSets>({ known: hideSet, different: hidePinkSet, common: hideCommon ? commonIds : null, owners: hideOwners ? ownerIds : null });
-  const transitive = $derived(graph ? visibleGraph(graph, classification, "transitive", showAll, null, hideSets) : empty);
-  const visible = $derived(graph ? mode === "transitive" && layers === null ? transitive : visibleGraph(graph, classification, mode, showAll, layers, hideSets) : empty);
+  const transitive = $derived(scoped ? visibleGraph(scoped, classification, "transitive", showAll, null, hideSets) : empty);
+  const visible = $derived(scoped ? mode === "transitive" && layers === null ? transitive : visibleGraph(scoped, classification, mode, showAll, layers, hideSets) : empty);
   // A search result hidden by the view filters is shown against a temporary unfiltered base; saved filters are never touched.
-  const rawBase = $derived(graph && searchRevealed ? visibleGraph(graph, classification, "transitive", true, null) : null);
+  const rawBase = $derived(scoped && searchRevealed ? visibleGraph(scoped, classification, "transitive", true, null) : null);
   const pathBase = $derived(rawBase ?? visible);
   // The package's own transitive packages come with its path, down to the selected layer (All = every one; Direct view = none).
   const foundPath = $derived(pathTarget ? pathToNode(pathBase, pathTarget, mode === "transitive" ? layers : undefined) : null);
@@ -231,7 +276,7 @@
   const shownCount = $derived(displayed.nodes.filter(node => node.id !== ROOT).length);
   const totals = $derived(graph ? packageTotals(graph, classification, knownIds, derivedHide) : { total: 0, nonBuiltIn: 0, unclassified: 0 });
   const forceLabels = $derived(mode === "direct" || pathTarget !== null || (mode === "transitive" && layers !== null && layers <= 2));
-  const searchIndex = $derived(graph ? buildPackageSearchIndex(graph.nodes) : []);
+  const searchIndex = $derived(scoped ? buildPackageSearchIndex(scoped.nodes) : []);
   const matches = $derived(searchPackages(searchIndex, query));
   const shownMatches = $derived(matches.slice(0, searchLimit));
   const allNames = $derived(new Map((graph?.nodes ?? []).map(node => [node.id, node.name])));
@@ -255,7 +300,6 @@
     return list;
   }
 
-  $effect(() => { if (!folder && folders.length) folder = folders[0]; });
   $effect(() => { localStorage.setItem(PREFS_KEY, JSON.stringify({ folder, mode, showAll, hideStandard, hidePink, hideCommon, hideOwners, presentation, layers })); });
   $effect(() => { if (page >= pageCount) page = pageCount - 1; });
   $effect(() => { if (pathTarget && graph && !pathView) setPath(null); });
@@ -434,11 +478,28 @@
   function closeUsage(): void { usageNode = null; usageSession.close(); }
   function closeProject(): void { projectOpen = false; projectSession.close(); }
   function closePlan(): void { planOpen = false; planSession.close(); prepared = null; handoffError = null; handoffBusy = false; }
+  function closeDiscovery(): void { discoveryOpen = false; discoverySession.close(); }
   function resetJobs(): void {
-    reviewAction++; usageAction++; projectAction++; planAction++;
-    closeReview(); closeUsage(); closeProject(); closePlan();
-    reviewSession.reset(); usageSession.reset(); projectSession.reset(); planSession.reset();
+    reviewAction++; usageAction++; projectAction++; planAction++; discoveryAction++;
+    closeReview(); closeUsage(); closeProject(); closePlan(); closeDiscovery();
+    reviewSession.reset(); usageSession.reset(); projectSession.reset(); planSession.reset(); discoverySession.reset();
   }
+  async function refreshSavedDiscovery(target: string): Promise<void> {
+    try {
+      const value = await api.getProjectInsight(target, "dependencyDiscovery");
+      if (target === folder) savedDiscovery = value;
+    } catch { if (target === folder) savedDiscovery = null; }
+  }
+  /** Starts, joins or reopens the Architect's dependency discovery. Only ever called by a click, never on mount or by polling. */
+  async function openDiscovery(rerun = false): Promise<void> {
+    if (!folder || loading) return;
+    const target = folder;
+    const sequence = ++discoveryAction;
+    discoveryOpen = true;
+    await discoverySession.open(target, null, rerun);
+    if (sequence === discoveryAction && target === folder) void refreshSavedDiscovery(target);
+  }
+  function rescanAfterManifest(): void { closeDiscovery(); void load(folder); }
   const blockedFromAi = (node: DepNode): boolean => node.id === ROOT || held || inhouseSet.has(node.id);
   /**
    * Opens the existing Architect for an authoritatively admitted job. Returns false when the saved popup must show the outcome instead:
@@ -497,7 +558,7 @@
     void openReview(node, "popup");
   }
   async function openUpdatePlan(reviewRequestId: string | null, regenerate = false): Promise<void> {
-    if (!reviewRequestId) return;
+    if (!reviewRequestId || (regenerate && ["pending", "attempting", "uncertain"].includes(plan.state?.handoff?.status ?? ""))) return;
     const target = folder;
     const sequence = ++planAction;
     planSource = reviewRequestId;
@@ -520,7 +581,7 @@
   async function prepareHandoff(): Promise<void> {
     const requestId = plan.requestId;
     const proposal = plan.state?.proposal;
-    if (!requestId || !proposal || handoffBusy) return;
+    if (!requestId || !proposal || handoffBusy || ["pending", "attempting", "accepted", "uncertain"].includes(plan.state?.handoff?.status ?? "")) return;
     const target = folder;
     handoffBusy = true;
     handoffError = null;
@@ -538,10 +599,11 @@
     try {
       const result = await api.confirmDependencyUpdateHandoff(token);
       prepared = null;
+      if (plan.state) plan = { ...plan, state: { ...plan.state, handoff: result } };
       if (result.status === "accepted") {
         closePlan();
         await onOpenManager();
-      } else {
+      } else if (result.status !== "pending") {
         handoffError = result.error ?? (result.status === "uncertain"
           ? "Delivery to The Manager is uncertain; the plan was not sent again."
           : "The plan was not delivered to The Manager.");
@@ -577,6 +639,8 @@
     resetJobs();
     insightQueue.reset();
     graph = null;
+    manifestMissing = false;
+    savedDiscovery = null;
     hovered = null;
     selected = null;
     page = 0;
@@ -584,8 +648,19 @@
     error = null;
     classifyError = null;
     try {
-      const [scanned, judged] = await Promise.all([api.scanDependencies(target), api.getDependencyClassification(target)]);
+      const [scan, judgement] = await Promise.allSettled([api.scanDependencies(target), api.getDependencyClassification(target)]);
       if (sequence !== loadSequence) return;
+      if (scan.status === "rejected") {
+        // Only the no-manifest condition offers Architect assistance; every other failure keeps its plain text.
+        try {
+          if (await api.dependencyManifestStatus(target) === "missing" && sequence === loadSequence) { manifestMissing = true; void refreshSavedDiscovery(target); }
+        } catch { /* the scan error below is the answer */ }
+        if (sequence !== loadSequence) return;
+        throw scan.reason;
+      }
+      if (judgement.status === "rejected") throw judgement.reason;
+      const scanned = scan.value, judged = judgement.value;
+      rememberProjectFolder(target, true);
       graph = scanned;
       classification = judged;
       await refreshKnown();
@@ -767,11 +842,20 @@
       {#each folderOptions as option (option)}<option value={option}>{option}</option>{/each}
     </select>
     <button onclick={browse}>Browse…</button>
+    <button disabled={!folder} title="What this project needs to build and run, and whether this computer has it. Nothing is installed or started." onclick={() => { requirementsOpen = true; }}>Project requirements</button>
     {#if !held}
     <select aria-label="Dependency view" value={mode} onchange={e => { mode = e.currentTarget.value as DependencyMode; }}>
       <option value="direct">Direct dependencies</option>
       <option value="transitive">Transitive dependencies</option>
     </select>
+    {#if languageChoices.length > 1}
+      <label class="layers">Language
+        <select aria-label="Package language" value={activeLanguage} onchange={e => { languageSelection = e.currentTarget.value as EcosystemChoice; page = 0; }}>
+          <option value="all">All package languages</option>
+          {#each languageChoices as name (name)}<option value={name}>{languageLabel(name)}</option>{/each}
+        </select>
+      </label>
+    {/if}
     {#if mode === "transitive"}
       <label class="layers">Layers
         <select aria-label="Transitive layers" value={layers === null ? "all" : String(layers)} onchange={e => { layers = e.currentTarget.value === "all" ? null : Number(e.currentTarget.value); page = 0; }}>
@@ -848,6 +932,7 @@
           {#if sweepState.warning}<p class="dim">{sweepState.warning}</p>{/if}
         {/if}
         {#if error}<p role="alert">{error}</p>{/if}
+        {@render manifestAssist()}
       </div>
     </div>
   {:else}
@@ -857,7 +942,7 @@
   <p class="meta">Hover for package statistics and versions. Ctrl+click a package to open The Architect with its security review.</p>
   <p class="meta">Public metadata lookup sends package names to official registries and GitHub; it does not upload project files.</p>
   {#if loading}<p role="status">Scanning dependencies…</p>{/if}
-  {#if error}<p class="alert err" role="alert">{error}</p>{/if}
+  {#if error}<div class="alert err alert-line" role="alert"><span>{error}</span>{@render manifestAssist()}</div>{:else}{@render manifestAssist()}{/if}
   {#if classifyError}<p class="alert err" role="alert">{classifyError}</p>{/if}
   {#if graph}
     <p class="meta" role="status">
@@ -941,6 +1026,16 @@
 <DependencyUsageDialog node={usageNode} {usage} onclose={closeUsage} onrun={() => { if (usageNode) void openUsage(usageNode, "popup", true); }} onopenarchitect={() => void openArchitectFor(usage)} />
 <DependencyProjectDialog open={projectOpen} {project} names={allNames} onclose={closeProject} onrun={() => void openProjectReview(true)} onupdateplan={updatePlanFromProject} onopenarchitect={() => void openArchitectFor(project)} onopenpackage={openProjectPackage} />
 <DependencyUpdatePlanDialog plan={planOpen ? plan : null} {prepared} {handoffError} busy={handoffBusy} onclose={closePlan} onregenerate={() => void openUpdatePlan(planSource, true)} onprepare={() => void prepareHandoff()} onconfirm={() => void confirmHandoff()} oncancelprepare={cancelHandoff} />
+{#snippet manifestAssist()}
+  {#if manifestMissing && !graph && !loading}
+    <div class="assist">
+      <button title="Find the dependencies from this repository's files" onclick={() => void openDiscovery()}>Ask Architect</button>
+      {#if savedDiscovery?.state === "completed"}<button title="Reopen the list The Architect already produced" onclick={() => void openDiscovery()}>Open saved Architect list</button>{/if}
+    </div>
+  {/if}
+{/snippet}
+<DependencyDiscoveryDialog open={discoveryOpen} {discovery} {folder} onclose={closeDiscovery} onrun={() => void openDiscovery(true)} onopenarchitect={() => void openArchitectFor(discovery)} onrescan={rescanAfterManifest} />
+<ProjectRequirementsDialog open={requirementsOpen} {folder} onclose={() => { requirementsOpen = false; }} {onOpenCodeQuality} />
 <style>
   .page { height: 100%; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
   .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
@@ -949,6 +1044,7 @@
   .meta { margin: 0; color: var(--text-dim); font-size: 12px; }
   .notes { margin: 0; padding-left: 18px; font-size: 12px; }
   .alert { margin: 0; padding: 10px; border: 1px solid var(--err); border-radius: 8px; white-space: pre-wrap; }
+  .alert-line { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
   .legend { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; }
   .legend li { display: inline-flex; align-items: center; gap: 6px; }
   .swatch { width: 12px; height: 12px; border-radius: 50%; flex: none; }
@@ -983,4 +1079,5 @@
   .badge { padding: 0 6px; font-size: 11px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-dim); }
   .banner { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .pagination { display: flex; align-items: center; gap: 12px; }
+  .assist { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 </style>

@@ -11,7 +11,8 @@ import { createResultConsole, escapeTerminal, REPLAY_HEADER, RESULT_TYPE } from 
 function harness(sessionId = 'session-fixture') {
   const state = { idle: true, pending: false, session: sessionId, now: 0, timers: [], branch: [], sent: [], forbidden: [], handlers: {} };
   state.pi = {
-    on: (name, handler) => { state.handlers[name] = handler; },
+    // The native runner calls every registered handler for an event, in registration order.
+    on: (name, handler) => { const previous = state.handlers[name]; state.handlers[name] = previous ? (...args) => { previous(...args); return handler(...args); } : handler; },
     sendMessage: (message, options) => {
       state.sent.push({ message, options });
       state.branch.push({ type: 'custom_message', customType: message.customType, details: message.details });

@@ -4,15 +4,21 @@
   import Term from "./Term.svelte";
   import BrowserPane from "./BrowserPane.svelte";
   import OwnershipControls from "./OwnershipControls.svelte";
+  import AgentDirectory from "./AgentDirectory.svelte";
+  import { workspaceChanges } from "../stores";
+  import { workspacePending } from "../workspace";
   import { restartInstance, startInstance, browserStatuses, errorText, reportError, appSettings, terminalOwners, terminalUi, updateTerminalUi, openUserTerminal, allInstances } from "../stores";
   import { defaultTerminalUi } from "../terminal";
   import { sameRepoAgents } from "../repo-agents";
   import TerminalWorkspace from "./TerminalWorkspace.svelte";
-  let { instance, instances, onSwitch, onClose, onPlan, onPlanChange, onSubagents, onCodeDiff, onDependencyTree, onCodeQuality, showBrowser = false, browserHidden = false }: {
+  import { nativeHubDisabled } from "../native-agent-hub";
+  let { instance, instances, onSwitch, onClose, onPlan, onPlanChange, onSubagents, onCodeDiff, onDependencyTree, onSystemOverview, onCodeQuality, showBrowser = false, browserHidden = false, focusRequest = 0, onTerminalReady }: {
     instance: Instance; instances: Instance[]; onSwitch: (id: string) => void;
     onClose: () => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void; onSubagents: (id: string) => void;
-    onCodeDiff: (id: string) => void; onDependencyTree?: (id: string) => void; onCodeQuality?: () => void; showBrowser?: boolean; browserHidden?: boolean;
+    onCodeDiff: (id: string) => void; onDependencyTree?: (id: string) => void; onSystemOverview?: (id: string) => void; onCodeQuality?: (id: string) => void; showBrowser?: boolean; browserHidden?: boolean;
+    focusRequest?: number; onTerminalReady?: (id: string, generation: number, ready: boolean) => void;
   } = $props();
+  const contextPending = $derived($workspaceChanges.some(change => change.coordinatorId === instance.id && workspacePending(change)));
   const TERMINAL_MIN = 160;
   const BROWSER_MIN = 520;
   const TERMINAL_PANE_MIN = 360;
@@ -116,24 +122,25 @@
     {#if currentBrowser && !paneBrowser}
       <span class="pill">{currentBrowser.state === "error" ? "Browser error" : currentBrowser.state === "opening" ? "Opening browser…" : currentBrowser.headless ? "Browser: headless" : "Browser: external"}</span>
     {/if}
-    <button disabled={!instance.subagents.length} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>
+    <button disabled={busy || nativeHubDisabled(instance)} title={instance.bridgeReady && !instance.capabilities?.agentHub ? "Reopen this session with a compatible OMP version." : "Open this session's native Agent Hub"} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>
     {#if showBrowser}<button disabled={busy || !live} title={live ? "Show this session's browser next to the terminal" : "Start this session first"} onclick={openBrowser}>Browser</button>{/if}
     {#if showBrowser}<button class:active={terminalOpen} aria-pressed={terminalOpen} title="Your own shell, the AI's command history and its live commands next to the terminal" onclick={toggleTerminal}>Terminal</button>{/if}
-    {#if instance.kind === "architect" && onDependencyTree}<button title="Diagram of this project's dependencies" onclick={() => onDependencyTree(instance.id)}>Dependency tree</button>{/if}
-    {#if instance.kind === "architect" && onCodeQuality}<button title="Scan this project's code quality" onclick={onCodeQuality}>Code quality</button>{/if}
+    {#if instance.kind === "architect" && onDependencyTree}<button disabled={contextPending} title="Diagram of this project's dependencies" onclick={() => onDependencyTree(instance.id)}>Dependency tree</button>{/if}
+    {#if instance.kind === "architect" && onSystemOverview}<button disabled={contextPending} title="Function, file and system diagrams of this project, and its repository structure" onclick={() => onSystemOverview(instance.id)}>System overview</button>{/if}
+    {#if onCodeQuality}<button disabled={contextPending} title="Scan this project's code quality" onclick={() => onCodeQuality(instance.id)}>Code quality</button>{/if}
     {#if showBrowser}<button title="Review and edit this project's changes" onclick={() => onCodeDiff(instance.id)}>Code diff</button>{/if}
     {#if instance.planKind}<button onclick={() => onPlanChange(instance.id)}>Plan</button>{/if}
     {#if instance.planPath}<button onclick={() => onPlan(instance.id)}>View Plan</button>{/if}
     {#if !live}<button disabled={busy} onclick={() => run(() => startInstance(instance.id))}>Start / reopen</button>{/if}
     <button disabled={busy} onclick={() => run(() => restartInstance(instance.id))}>Restart</button>
   </header>
-  <p class="identity mono">{instance.projectPath}{instance.task ? ` · ${instance.task}` : ""}</p>
+  <div class="identity mono">{#if !instance.helper && !instance.planTarget}<AgentDirectory {instance} />{:else}{instance.projectPath}{/if}{#if instance.task}<span> · {instance.task}</span>{/if}</div>
   {#if !instance.helper}<OwnershipControls {instance} onOpen={() => onSwitch(instance.id)} />{/if}
   {#if instance.lastError}<p class="err" role="alert">{instance.lastError}</p>{/if}
   {#if currentBrowser?.error && !paneBrowser}<p class="browser-error err" role="alert">{currentBrowser.error}</p>{/if}
   <div class="workspace" bind:this={workspace}>
     <div class="screen" style={rightPane ? `flex: 0 0 ${ratio * 100}%` : undefined}>
-      {#if instance.generation > 0}<Term instanceId={instance.id} interactive cols={instance.cols} rows={instance.rows} generation={instance.generation} scrollback={8000} />
+      {#if instance.generation > 0}<Term instanceId={instance.id} interactive cols={instance.cols} rows={instance.rows} generation={instance.generation} scrollback={8000} {focusRequest} onReady={onTerminalReady} />
       {:else}<p class="empty">Start this instance to open its native OMP terminal.</p>{/if}
     </div>
     {#if rightPane}

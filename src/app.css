@@ -169,20 +169,21 @@ a:hover { color: #a5d6ff; }
 
 /* Code quality is shared by the Architect page and the global settings dialog. */
 .quality-page { height: 100%; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
-.quality-page > header { padding: 10px; flex-direction: row; }
+.quality-page > header { padding: 10px; flex: 0 0 auto; flex-direction: row; flex-wrap: wrap; min-width: 0; overflow-wrap: anywhere; }
 .quality-page h2 { margin: 0; font-size: 16px; }
-.quality-content { min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 12px; padding-bottom: 12px; }
-.quality-section { padding: 14px; flex: 0 0 auto; gap: 12px; overflow: visible; }
+.quality-content { flex: 1 1 auto; min-height: 0; min-width: 0; overflow: auto; display: flex; flex-direction: column; gap: 12px; padding-bottom: 12px; }
+.quality-section { padding: 14px; flex: 0 0 auto; min-width: 0; gap: 12px; overflow: visible; }
 .quality-section > summary { cursor: pointer; font-weight: 600; }
 .quality-settings { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 8px 0; }
 .quality-settings h3 { margin: 0; }
 .quality-settings p, .quality-section p { margin: 0; overflow-wrap: anywhere; }
 .quality-settings fieldset, .quality-section fieldset { border: 1px solid var(--line); border-radius: 7px; min-width: 0; display: flex; flex-direction: column; gap: 12px; padding: 12px; margin: 0; }
-.quality-settings label, .quality-section label { display: flex; flex-direction: column; gap: 6px; }
+.quality-settings label, .quality-section label { display: flex; flex-direction: column; min-width: 0; gap: 6px; overflow-wrap: anywhere; }
 .quality-settings label.quality-check, .quality-section label.quality-check { display: flex; flex-direction: row; align-items: flex-start; gap: 8px; }
 .quality-check input { width: auto; margin-top: 3px; flex-shrink: 0; }
 .quality-actions { display: flex; flex-direction: row; flex-wrap: wrap; gap: 8px; align-items: center; }
-.quality-grow { flex: 1; min-width: 240px; }
+.quality-grow { flex: 1; min-width: min(240px, 100%); }
+.quality-settings select, .quality-section select { min-width: 0; max-width: 100%; }
 .quality-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 12px; }
 .quality-log { font-family: var(--mono); font-size: 12px; background: var(--bg); border: 1px solid var(--line-soft); border-radius: 7px; padding: 10px; max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; }
 .quality-provenance { font-size: 12px; overflow-wrap: anywhere; }
@@ -193,3 +194,13 @@ a:hover { color: #a5d6ff; }
 .quality-table th { position: sticky; top: 0; background: var(--panel-2); z-index: 1; }
 .quality-table .quality-message { white-space: pre-wrap; text-align: left; width: 100%; }
 .quality-page summary:focus-visible, .quality-settings summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.quality-center { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 60vh; text-align: center; gap: 1rem; }
+.quality-center h3 { margin: 0; }
+.quality-center label.quality-check { text-align: left; }
+.quality-wide { width: 100%; max-width: 720px; }
+.quality-steps { list-style: none; margin: 0; padding: 0; text-align: left; display: flex; flex-direction: column; gap: 4px; }
+.quality-report { display: flex; flex-direction: column; gap: 12px; }
+.quality-counts { display: flex; flex-wrap: wrap; gap: 8px; }
+.quality-count { display: flex; flex-direction: column; align-items: center; min-width: 84px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 7px; }
+.quality-count strong { font-size: 20px; }
+.quality-count span { font-size: 12px; text-transform: capitalize; }

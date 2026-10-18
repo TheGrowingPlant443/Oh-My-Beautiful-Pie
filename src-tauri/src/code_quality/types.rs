@@ -155,6 +155,51 @@ pub struct QualityOptions {
     pub winget_available: bool,
     /// The app-provisioned Podman machine connection once its setup receipt exists.
     pub podman_app_connection: Option<String>,
+    /// `wsl.exe --status` reports that WSL's Windows optional components are missing.
+    pub wsl_features_missing: bool,
+}
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SetupStepState {
+    Done,
+    Pending,
+    Blocked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupStep {
+    pub id: String,
+    pub label: String,
+    pub state: SetupStepState,
+}
+
+/// What the one-click "Install and setup" still has to do, derived from cached probes and state.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupState {
+    pub needed: bool,
+    pub install_required: bool,
+    pub resume: bool,
+    pub steps: Vec<SetupStep>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OwnershipStatus {
+    Owned,
+    OtherProcess,
+    Transferring,
+    HandedOff,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityOwnership {
+    pub status: OwnershipStatus,
+    pub owner_pid: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +208,8 @@ pub struct QualityState {
     pub revision: u64,
     pub config: QualityConfig,
     pub activated: bool,
+    pub ownership: QualityOwnership,
+    pub suspended: bool,
     pub effective_mode: Option<QualityMode>,
     pub phase: QualityPhase,
     pub busy: bool,
@@ -179,6 +226,9 @@ pub struct QualityState {
     pub diagnostics: Vec<String>,
     /// Resources whose stop could not be confirmed; non-empty blocks new Community starts and scans.
     pub unresolved: Vec<String>,
+    pub setup: SetupState,
+    /// Whether the managed analyzer is started when OMP Manager starts (default false).
+    pub start_at_launch: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +376,44 @@ pub struct ReportPreview {
     pub truncated: bool,
 }
 
+/// One slice of a saved report artifact. `next_offset` is `None` at the end of the file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportSlice {
+    pub text: String,
+    pub next_offset: Option<u64>,
+    pub total: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentReportSection {
+    Scans,
+    Summary,
+    Findings,
+    Artifact,
+}
+
+/// Arguments of the agents' read-only `code_quality_report` tool. There is deliberately no folder, instance,
+/// path or export field: the repository is derived from the authenticated agent, never from the request.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentReportRequest {
+    pub section: AgentReportSection,
+    #[serde(default)]
+    pub scan_id: Option<String>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub severity: Option<Severity>,
+    #[serde(default)]
+    pub report_name: Option<String>,
+}
+
 pub const BUSY_MESSAGE: &str = "Code quality is busy; wait for the current operation to finish.";
 pub const STALE_MESSAGE: &str = "Code quality settings changed; reload and try again.";
 pub const RULES_MESSAGE: &str = "Review and acknowledge the code quality rules license first.";
@@ -389,4 +477,6 @@ pub struct QualityProjectDetection {
     /// True when mixed families or several .NET entry points require the user to choose.
     pub needs_selection: bool,
     pub warnings: Vec<String>,
+    /// Human-readable list of what was detected at the root (e.g. "Node.js / TypeScript (package.json)").
+    pub labels: Vec<String>,
 }

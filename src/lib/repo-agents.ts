@@ -1,6 +1,6 @@
 import type { Instance } from "./api";
 
-export const repoKey = (path: string): string => path.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+export const repoKey = (path: string): string => path.trim().replace(/\\/g, "/").replace(/^\/\/\?\/UNC\//i, "//").replace(/^\/\/\?\//, "").replace(/\/+$/, "").toLowerCase();
 
 /** Project folders of the saved sessions, one per folder (slash style, case and a trailing slash are ignored). */
 export function projectFolders(rows: readonly { kind: string; projectPath: string }[]): string[] {

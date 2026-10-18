@@ -1,9 +1,11 @@
 import { writable, derived, get } from "svelte/store";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { api, type Instance, type PtyChunk, type GlobalConfigInfo, type BrowserInfo, type TerminalOwner } from "./api";
+import { api, type Instance, type WorkspaceChange, type PtyChunk, type GlobalConfigInfo, type BrowserInfo, type TerminalOwner } from "./api";
 import { parseAppSettings, startsFresh, type AppSettings } from "./settings";
 import { defaultTerminalUi, shellKey, type TerminalUi } from "./terminal";
+import { PROJECT_HISTORY_KEY, parseProjectHistory, folderOptions, persistProjectHistory, isHiddenComputed, isRememberable, coordinatorMoveFolders } from "./project-history";
+import { projectFolders } from "./repo-agents";
 
 // Every row the backend reports, including plan agents (looked up by id for the plan view).
 export const allInstances = writable<Instance[]>([]);
@@ -12,6 +14,8 @@ export const instances = derived(allInstances, list => list.filter(row => row.pl
 export const instancesById = derived(allInstances, list => new Map(list.map(i => [i.id, i])));
 export const managerInstance = derived(instances, list => list.find(instance => instance.kind === "manager"));
 export const architectInstance = derived(instances, list => list.find(instance => instance.kind === "architect"));
+export const workspaceChanges = writable<WorkspaceChange[]>([]);
+export const coordinatorTemporaryFolders = writable<string[]>([]);
 export const globalConfig = writable<GlobalConfigInfo>({ path: null, error: null });
 export const knownStandardVersion = writable(0);
 export const browserStatuses = writable<ReadonlyMap<string, BrowserInfo>>(new Map());
@@ -48,6 +52,73 @@ export function reportError(context: string, error: unknown): void {
   setTimeout(() => dismissToast(id), 8000);
 }
 export function dismissToast(id: number): void { toasts.update(list => list.filter(t => t.id !== id)); }
+
+export const projectHistory = writable<string[]>([]);
+export const projectHistoryError = writable<string | null>(null);
+let historyDiagnostic = "";
+function historyFailure(error: unknown): void {
+  const message = errorText(error);
+  projectHistoryError.set(message);
+  if (message !== historyDiagnostic) { historyDiagnostic = message; reportError("Project folder history", message); }
+}
+// Folders the app computed for shared ownership; they are never project choices unless they are live projects or explicitly selected.
+export const computedFolders = writable<string[]>([]);
+// History without computed shared folders: use for defaults and for folders handed to the backend.
+export const visibleProjectHistory = derived([projectHistory, computedFolders, instances], ([history, computed, rows]) => {
+  const live = projectFolders(rows);
+  return history.filter(folder => !isHiddenComputed(folder, computed, live));
+});
+let computedVersion = 0;
+function setComputedFolders(folders: string[]): void {
+  computedVersion++;
+  computedFolders.set(Array.isArray(folders) ? folders.filter(folder => typeof folder === "string") : []);
+}
+// A listing is applied only if no newer event arrived while it was requested.
+export async function refreshComputedFolders(): Promise<void> {
+  const version = computedVersion;
+  try {
+    const folders = await api.listComputedWorkspaceFolders();
+    if (version === computedVersion) setComputedFolders(folders);
+  } catch (error) { reportError("Computed workspace folders", error); }
+}
+function mergeProjectHistory(seeds: readonly string[], selected = ""): void {
+  const result = persistProjectHistory(localStorage, get(projectHistory), seeds, selected, get(computedFolders), projectFolders(get(instances)));
+  projectHistory.set(result.folders);
+  projectHistoryError.set(result.error);
+  if (result.error) historyFailure(result.error);
+}
+/** Computed shared folders are recorded only when they are a live project or `explicit` (a folder the user chose). */
+export function rememberProjectFolder(path: string, explicit = false): void {
+  if (!isRememberable(path, get(computedFolders), projectFolders(get(instances)), explicit)) return;
+  mergeProjectHistory([], path);
+}
+async function rememberCoordinatorMove(previous: string, next: string): Promise<void> {
+  await refreshComputedFolders();
+  for (const folder of coordinatorMoveFolders(previous, next, get(coordinatorTemporaryFolders), get(computedFolders), projectFolders(get(instances)))) rememberProjectFolder(folder);
+}
+let historyInitialization: Promise<void> | null = null;
+export function initializeProjectHistory(): Promise<void> {
+  if (historyInitialization) return historyInitialization;
+  historyInitialization = (async () => {
+    await refreshComputedFolders();
+    const seeds = projectFolders(get(instances));
+    for (const key of ["omp-manager.code-quality", "omp-manager.dependency-tree"]) {
+      try { const value = JSON.parse(localStorage.getItem(key) ?? "null"); if (typeof value?.folder === "string") seeds.push(value.folder); }
+      catch (error) { historyFailure(error); }
+    }
+    mergeProjectHistory(seeds);
+    try { mergeProjectHistory(await api.listCodeQualityProjectFolders()); }
+    catch (error) { historyFailure(error); }
+  })();
+  return historyInitialization;
+}
+instances.subscribe(rows => { const folders = projectFolders(rows); if (folders.length) mergeProjectHistory(folders); });
+if (typeof window !== "undefined") window.addEventListener("storage", event => {
+  if (event.key !== PROJECT_HISTORY_KEY) return;
+  const stored = parseProjectHistory(event.newValue);
+  projectHistory.update(history => folderOptions(history, stored.folders, ""));
+  if (stored.error) historyFailure(stored.error);
+});
 
 const LIMIT = 256 * 1024;
 type Listener = (bytes: Uint8Array | null) => void;
@@ -117,6 +188,7 @@ function applySnapshot(list: Instance[]): void {
   const previous = get(allInstances);
   for (const row of list) {
     const old = previous.find(i => i.id === row.id);
+    if (old && old.projectPath !== row.projectPath && row.kind !== "instance") void rememberCoordinatorMove(old.projectPath, row.projectPath);
     if (old && row.generation !== old.generation) ptyBus.reset(row.id);
     if (row.generation > 0 && streams.get(row.id)?.listeners.size) {
       void ptyBus.ensureAttached(row.id).catch(error => reportError("Terminal attachment", error));
@@ -135,12 +207,21 @@ export async function refreshInstances(): Promise<void> {
 export async function connectInstances(): Promise<() => void> {
   let disposed = false;
   let browserEventSeen = false;
+  let workspaceEventSeen = false;
+  let unlistenWorkspace: (() => void) | undefined;
+  let unlistenComputed: (() => void) | undefined;
   const terminalEventsSeen = new Set<string>();
   const unlisten = await listen<Instance[]>("instances", event => { if (!disposed) applySnapshot(event.payload); });
   let unlistenBrowsers: (() => void) | undefined;
   let unlistenTerminals: (() => void) | undefined;
-  function cleanup(): void { disposed = true; unlisten(); unlistenBrowsers?.(); unlistenTerminals?.(); }
+  function cleanup(): void { disposed = true; unlisten(); unlistenBrowsers?.(); unlistenTerminals?.(); unlistenWorkspace?.(); unlistenComputed?.(); }
   try {
+    unlistenWorkspace = await listen<WorkspaceChange[]>("workspace_changes", event => {
+      workspaceEventSeen = true;
+      if (!disposed) workspaceChanges.set(event.payload);
+    });
+    unlistenComputed = await listen<string[]>("computed_workspace_folders", event => { if (!disposed) setComputedFolders(event.payload); });
+    await refreshComputedFolders();
     unlistenBrowsers = await listen<BrowserInfo[]>("browser_state", event => {
       browserEventSeen = true;
       if (!disposed) browserStatuses.set(new Map(event.payload.map(info => [info.instanceId, info])));
@@ -150,9 +231,10 @@ export async function connectInstances(): Promise<() => void> {
       terminalEventsSeen.add(event.payload.instanceId);
       if (!disposed) terminalOwners.update(map => new Map(map).set(event.payload.instanceId, event.payload));
     });
-    const [list, browsers, terminals] = await Promise.all([api.listInstances(), api.listBrowsers(), api.listAllTerminals()]);
+    const [list, browsers, terminals, changes] = await Promise.all([api.listInstances(), api.listBrowsers(), api.listAllTerminals(), api.listWorkspaceChanges()]);
     if (!disposed) {
       applySnapshot(list);
+      if (!workspaceEventSeen) workspaceChanges.set(changes);
       if (!browserEventSeen) browserStatuses.set(new Map(browsers.map(info => [info.instanceId, info])));
       terminalOwners.update(map => {
         const next = new Map(map);
@@ -179,10 +261,18 @@ export function startInstance(id: string, keepSession = false): Promise<boolean>
 export const stopInstance = (id: string) => action(id, api.stopInstance);
 export const restartInstance = (id: string) => action(id, api.restartInstance);
 export const removeInstance = (id: string) => action(id, api.removeInstance);
-export function setManagerOwner(id: string, managerId: string | null): Promise<boolean> {
-  return action(id, id => api.setManagerOwner(id, managerId));
+async function workspaceAction(command: () => Promise<WorkspaceChange>): Promise<WorkspaceChange | null> {
+  try {
+    const change = await command();
+    workspaceChanges.update(rows => rows.some(row => row.requestId === change.requestId) ? rows : [...rows, change]);
+    return change;
+  } catch (error) { reportError("Workspace action", error); return null; }
 }
-export const returnToManager = (id: string) => action(id, api.returnToManager);
+export const changeAgentDirectory = (id: string, folder: string, generation: number) => workspaceAction(() => api.changeAgentDirectory(id, folder, generation));
+export const handOverToManager = (id: string) => workspaceAction(() => api.handOverToManager(id));
+export const giveRepoToArchitect = (id: string) => workspaceAction(() => api.giveRepoToArchitect(id));
+export const takeBackControl = (id: string) => action(id, api.takeBackControl);
+export const returnToManager = (id: string, humanRequestId: string) => workspaceAction(() => api.returnToManager(id, humanRequestId));
 
 export const previewsEnabled = writable(localStorage.getItem("omp-manager.previews") !== "off");
 previewsEnabled.subscribe(on => localStorage.setItem("omp-manager.previews", on ? "on" : "off"));

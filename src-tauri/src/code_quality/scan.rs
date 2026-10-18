@@ -21,6 +21,10 @@ const MAX_FINDINGS: usize = 50_000;
 const KEEP_RECENT: usize = 20;
 const REPORT_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
 const SONAR_ISSUE_CAP: usize = 10_000;
+const REPORT_SLICE_BYTES: usize = 64 * 1024;
+/// Same ceiling as the Architect's `inspect_dependency_context` tool.
+const AGENT_OUTPUT_CAP: usize = 256 * 1024;
+const NOT_THIS_REPOSITORY: &str = "That scan does not belong to this repository";
 
 /// Canonical existing directory; Windows verbatim prefixes removed so paths compare and hash stably.
 pub(crate) fn canonical_folder(folder: &str) -> Result<PathBuf> {
@@ -84,8 +88,61 @@ fn project_name(folder: &Path) -> String {
     folder.file_name().map(|n| n.to_string_lossy().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| "project".into())
 }
 
+/// A report destination must be an absolute `.html` file path in an existing directory; an existing target
+/// must be a regular, non-linked file so the save can never be redirected elsewhere.
+fn validate_report_path(path: &str) -> Result<PathBuf> {
+    let target = PathBuf::from(path);
+    if path.trim().is_empty() || !clean(path) || !target.is_absolute() {
+        return Err("Choose an absolute file path for the report.".into());
+    }
+    if !target.extension().map(|e| e.to_string_lossy().eq_ignore_ascii_case("html")).unwrap_or(false) {
+        return Err("The report file must have the .html extension.".into());
+    }
+    let parent = target.parent().ok_or("The report folder is missing.")?;
+    if !parent.is_dir() {
+        return Err("The report folder does not exist.".into());
+    }
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if !meta.is_file() || snapshot::is_link(&meta) => return Err("The report target is not a regular file.".into()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("Cannot inspect the report target: {e}")),
+    }
+    Ok(target)
+}
+
+fn clip(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// Agent-facing summary of a scan. It names only results, never the configuration, server URL, project settings or
+/// log, and never a path outside the repository.
+fn scan_summary(scan: &QualityScan) -> serde_json::Value {
+    serde_json::json!({
+        "id": scan.id, "status": scan.status, "phase": clip(&scan.phase, 200), "startedAt": scan.started_at,
+        "finishedAt": scan.finished_at, "qualityGate": scan.quality_gate, "mode": scan.config.mode,
+        "snapshotHash": scan.snapshot_hash, "rulesHash": scan.rules_hash, "findingCount": scan.findings.len(),
+        "tools": scan.tools, "warnings": scan.warnings.iter().take(20).map(|w| clip(w, 500)).collect::<Vec<_>>(),
+        "error": scan.error.as_deref().map(|e| clip(e, 2000)),
+    })
+}
+
+/// `offset` (default 0) and `limit` (1..=100, default 50) of a findings page.
+fn page(req: &AgentReportRequest) -> Result<(usize, usize)> {
+    let offset = usize::try_from(req.offset.unwrap_or(0)).map_err(|_| "offset is too large".to_string())?;
+    let limit = req.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err("limit must be an integer from 1 to 100".into());
+    }
+    Ok((offset, limit as usize))
+}
+
 impl CodeQualityService {
     // ---- read-only helpers ---------------------------------------------------------------
+
+    pub fn list_project_folders(&self) -> Result<Vec<String>> {
+        store::list_project_folders(&self.paths)
+    }
 
     pub fn detect_project(&self, folder: &str) -> Result<QualityProjectDetection> {
         let canonical = canonical_folder(folder)?;
@@ -112,11 +169,6 @@ impl CodeQualityService {
         if consents.approved.contains(&store::consent_key(&project.folder, &preparation.recipe_hash)) {
             preparation.requires_consent = false;
         }
-        // Remember the user's per-folder choices (not credentials).
-        let mut file = store::load_project(&self.paths, &project.folder)?;
-        file.version = 1;
-        file.project = Some(project);
-        store::save_project(&self.paths, &file.project.as_ref().expect("set").folder.clone(), &file)?;
         Ok(preparation)
     }
 
@@ -125,6 +177,13 @@ impl CodeQualityService {
             return Ok(active.scan.clone());
         }
         store::load_scan(&self.paths, id)?.ok_or_else(|| "That scan no longer exists.".to_string())
+    }
+
+    /// Writes the self-contained HTML report of a stored (or active) scan to `path`.
+    pub fn save_report(&self, id: &str, path: &str) -> Result<()> {
+        let target = validate_report_path(path)?;
+        let scan = self.read_scan(id)?;
+        std::fs::write(&target, super::report_html::render_html(&scan)).map_err(|e| format!("Cannot write the report: {e}"))
     }
 
     pub fn list_scans(&self, folder: &str) -> Result<Vec<QualityScan>> {
@@ -141,7 +200,9 @@ impl CodeQualityService {
         Ok(scans)
     }
 
-    pub fn read_report(&self, id: &str, name: &str) -> Result<ReportPreview> {
+    /// The one validation of an artifact request: the name must be declared by this scan's tool outcomes, must not
+    /// be a path, and must be a regular (non-linked) file inside the scan's own report folder.
+    fn report_file(&self, id: &str, name: &str) -> Result<PathBuf> {
         let scan = self.read_scan(id)?;
         let allowed = scan.tools.iter().any(|t| t.report_names.iter().any(|n| n == name));
         if !allowed || name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." || name.contains("..") {
@@ -152,6 +213,11 @@ impl CodeQualityService {
         if !meta.is_file() {
             return Err("The report is not available.".into());
         }
+        Ok(path)
+    }
+
+    pub fn read_report(&self, id: &str, name: &str) -> Result<ReportPreview> {
+        let path = self.report_file(id, name)?;
         let mut bytes = Vec::new();
         std::fs::File::open(&path)
             .map_err(|e| e.to_string())?
@@ -159,6 +225,151 @@ impl CodeQualityService {
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
         Ok(super::reports::preview_text(&String::from_utf8_lossy(&bytes), REPORT_PREVIEW_BYTES))
+    }
+
+    /// A continuation-friendly read of one declared report: at most `len` (<= 64 KiB) bytes from byte `offset`, ending on
+    /// a UTF-8 character boundary so `next_offset` always starts a character.
+    pub fn read_report_slice(&self, id: &str, name: &str, offset: u64, len: usize) -> Result<ReportSlice> {
+        use std::io::{Seek, SeekFrom};
+        let len = len.clamp(1, REPORT_SLICE_BYTES);
+        let path = self.report_file(id, name)?;
+        let mut file = std::fs::File::open(&path).map_err(|e| format!("The report is not available: {e}"))?;
+        let total = file.metadata().map_err(|e| e.to_string())?.len();
+        if offset > total {
+            return Err("The offset is beyond the end of the report.".into());
+        }
+        file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        // One extra byte shows whether the cut falls inside a multi-byte character.
+        file.take(len as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if offset > 0 && bytes.first().is_some_and(|b| b & 0xC0 == 0x80) {
+            return Err("The offset is not on a UTF-8 character boundary; continue from nextOffset.".into());
+        }
+        let mut end = bytes.len().min(len);
+        if bytes.len() > len {
+            while end > 0 && bytes[end] & 0xC0 == 0x80 {
+                end -= 1;
+            }
+            if end == 0 {
+                end = len;
+            }
+        }
+        let next = offset + end as u64;
+        Ok(ReportSlice { text: String::from_utf8_lossy(&bytes[..end]).into_owned(), next_offset: (next < total).then_some(next), total })
+    }
+
+    /// Passive, read-only view of the saved results for `folder` (the caller's own repository, chosen by the hub from the
+    /// authenticated agent, never by the agent). It never admits an operation, starts, probes or contacts an engine.
+    pub fn agent_report(&self, folder: &str, req: &AgentReportRequest) -> Result<serde_json::Value> {
+        use serde_json::json;
+        let canonical = folder_string(&canonical_folder(folder)?);
+        let scans: Vec<QualityScan> = self.list_scans(&canonical)?
+            .into_iter()
+            .filter(|scan| crate::instance::same_folder(&scan.folder, &canonical))
+            .collect();
+        let mut given: Vec<&str> = Vec::new();
+        for (name, present) in [
+            ("scanId", req.scan_id.is_some()), ("offset", req.offset.is_some()), ("limit", req.limit.is_some()),
+            ("tool", req.tool.is_some()), ("severity", req.severity.is_some()), ("reportName", req.report_name.is_some()),
+        ] {
+            if present {
+                given.push(name);
+            }
+        }
+        let section: &str = match req.section {
+            AgentReportSection::Scans => "scans",
+            AgentReportSection::Summary => "summary",
+            AgentReportSection::Findings => "findings",
+            AgentReportSection::Artifact => "artifact",
+        };
+        let allowed: &[&str] = match req.section {
+            AgentReportSection::Scans => &[],
+            AgentReportSection::Summary => &["scanId"],
+            AgentReportSection::Findings => &["scanId", "offset", "limit", "tool", "severity"],
+            AgentReportSection::Artifact => &["scanId", "reportName", "offset"],
+        };
+        if let Some(extra) = given.iter().find(|name| !allowed.contains(name)) {
+            return Err(format!("section {section} does not accept {extra}"));
+        }
+        let result = if req.section == AgentReportSection::Scans {
+            json!({ "section": section, "total": scans.len(), "scans": scans.iter().map(scan_summary).collect::<Vec<_>>() })
+        } else {
+            let id = req.scan_id.as_deref().ok_or_else(|| format!("section {section} requires scanId"))?;
+            let id = uuid::Uuid::parse_str(id).map_err(|_| "scanId must be a scan id returned by section scans".to_string())?.to_string();
+            let scan = scans.iter().find(|scan| scan.id == id).ok_or(NOT_THIS_REPOSITORY)?;
+            match req.section {
+                AgentReportSection::Summary => {
+                    let mut by_severity = serde_json::Map::new();
+                    let mut by_tool = std::collections::BTreeMap::<&str, u64>::new();
+                    for severity in [Severity::Critical, Severity::High, Severity::Medium, Severity::Low, Severity::Info] {
+                        let key = serde_json::to_value(severity).map_err(|e| e.to_string())?;
+                        by_severity.insert(key.as_str().unwrap_or_default().to_string(), scan.findings.iter().filter(|f| f.severity == severity).count().into());
+                    }
+                    for finding in &scan.findings {
+                        for tool in &finding.tools {
+                            *by_tool.entry(tool.as_str()).or_default() += 1;
+                        }
+                    }
+                    json!({
+                        "section": section, "scan": scan_summary(scan), "findingsBySeverity": by_severity,
+                        "findingsByTool": by_tool, "hotspots": scan.findings.iter().filter(|f| f.hotspot).count(),
+                    })
+                }
+                AgentReportSection::Findings => {
+                    let (offset, limit) = page(req)?;
+                    if req.tool.as_ref().is_some_and(|tool| tool.is_empty() || tool.len() > 200 || !clean(tool)) {
+                        return Err("tool must be 1..200 characters".into());
+                    }
+                    let selected: Vec<&QualityFinding> = scan.findings.iter()
+                        .filter(|f| req.tool.as_ref().is_none_or(|tool| f.tools.iter().any(|t| t == tool)))
+                        .filter(|f| req.severity.is_none_or(|severity| f.severity == severity))
+                        .collect();
+                    let mut items = Vec::new();
+                    let mut size = 0usize;
+                    for (index, finding) in selected.iter().enumerate().skip(offset) {
+                        if items.len() >= limit {
+                            break;
+                        }
+                        let item = serde_json::to_value(finding).map_err(|e| e.to_string())?;
+                        let bytes = item.to_string().len();
+                        if bytes > AGENT_OUTPUT_CAP - 4096 {
+                            return Err(format!("finding {index} is {bytes} bytes, larger than the {AGENT_OUTPUT_CAP}-byte output cap; it cannot be returned whole (continue with offset {})", index + 1));
+                        }
+                        if !items.is_empty() && size + bytes > AGENT_OUTPUT_CAP - 4096 {
+                            break;
+                        }
+                        size += bytes;
+                        items.push(item);
+                    }
+                    let next = offset + items.len();
+                    json!({
+                        "section": section, "scanId": scan.id, "total": selected.len(), "offset": offset, "count": items.len(),
+                        "nextOffset": (next < selected.len()).then_some(next), "items": items,
+                    })
+                }
+                _ => {
+                    let name = req.report_name.as_deref().ok_or("section artifact requires reportName")?;
+                    let offset = req.offset.unwrap_or(0);
+                    let mut len = REPORT_SLICE_BYTES;
+                    loop {
+                        let slice = self.read_report_slice(&scan.id, name, offset, len)?;
+                        let value = json!({
+                            "section": section, "scanId": scan.id, "reportName": name, "offset": offset,
+                            "text": slice.text, "nextOffset": slice.next_offset, "totalBytes": slice.total,
+                        });
+                        // Escaped control characters can expand a slice; shrink it until the reply fits whole.
+                        if value.to_string().len() <= AGENT_OUTPUT_CAP - 4096 || len <= 1024 {
+                            break value;
+                        }
+                        len /= 2;
+                    }
+                }
+            }
+        };
+        if result.to_string().len() > AGENT_OUTPUT_CAP {
+            return Err(format!("The result is larger than the {AGENT_OUTPUT_CAP}-byte output cap; request a smaller limit."));
+        }
+        Ok(result)
     }
 
     pub fn open_dashboard(&self, scan_id: Option<String>) -> Result<()> {
@@ -420,7 +631,10 @@ impl CodeQualityService {
         } };
         self.scan_phase(id, "Checking the container engine");
         engine.ensure_started(&ctl)?;
-        engine.probe(&ctl)?;
+        let probe = engine.probe(&ctl)?;
+        // Alternate and Enterprise also run owned scanner containers. Persist the runtime before
+        // creating one so shutdown/handover can verify cleanup even after a failed scan or crash.
+        self.set_possibly_running(&job.config.runtime, Some(&probe.fingerprint), job.config.community_port, true)?;
         self.scan_phase(id, "Snapshotting the project");
         let snapshot = snapshot::create_snapshot(&job.folder, &job.project.exclusions, &job.job_dir, &ctl)?;
         self.scan_log(
@@ -606,7 +820,7 @@ impl CodeQualityService {
             labels: vec![(OWNER_LABEL.into(), owner.to_string()), (ROLE_LABEL.into(), ROLE_SCAN.into())],
             network: network.map(str::to_string),
             entrypoint: Some(vec!["sh".into(), "-c".into()]),
-            command: vec![format!("wget -q -T 15 -O /dev/null '{}/api/system/status'", url.trim_end_matches('/'))],
+            command: vec![format!("curl -sS -f --max-time 15 -o /dev/null '{}/api/system/status'", url.trim_end_matches('/'))],
             cpus: Some(1.0),
             memory: Some("256m".into()),
             ..Default::default()
@@ -771,5 +985,24 @@ mod tests {
         let canonical = canonical_folder(&dir.to_string_lossy()).unwrap();
         assert!(!canonical.to_string_lossy().starts_with(r"\\?\"));
         assert!(canonical_folder("C:/definitely/missing/folder-for-omp").is_err());
+    }
+
+    #[test]
+    fn report_path_must_be_an_absolute_html_file_in_an_existing_folder() {
+        let dir = std::env::temp_dir().join(format!("omp report ø {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(validate_report_path("report.html").is_err());
+        assert!(validate_report_path("").is_err());
+        assert!(validate_report_path(&dir.join("report.txt").to_string_lossy()).is_err());
+        assert!(validate_report_path(&dir.join("report").to_string_lossy()).is_err());
+        assert!(validate_report_path(&dir.join("missing").join("report.html").to_string_lossy()).is_err());
+        let as_dir = dir.join("folder.html");
+        std::fs::create_dir_all(&as_dir).unwrap();
+        assert!(validate_report_path(&as_dir.to_string_lossy()).is_err());
+        let ok = dir.join("Report.HTML");
+        assert_eq!(validate_report_path(&ok.to_string_lossy()).unwrap(), ok);
+        std::fs::write(&ok, "old").unwrap();
+        assert!(validate_report_path(&ok.to_string_lossy()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

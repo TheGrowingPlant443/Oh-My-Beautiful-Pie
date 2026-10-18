@@ -118,19 +118,27 @@ impl Pty {
             cmd.arg("--append-system-prompt");
             cmd.arg(path);
         }
-        // A helper agent (Code diff / Git tree) has no built-in tools at all; its only tool is repo_inspect.
+        // A helper agent (Code diff / Git tree) has no built-in tools at all; its tools are the bridge's repo_inspect and code_quality_report.
         let helper = definition.helper.as_ref();
         if helper.is_some() {
             cmd.arg("--no-tools");
         }
         cmd.arg("--extension");
         cmd.arg(&bridge.extension_path);
-        if definition.kind == crate::instance::InstanceKind::Manager {
+        cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_DIR");
+        cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_ROLE");
+        let private_setup = match definition.kind {
+            InstanceKind::Manager => Some((&bridge.manager_setup_dir, "manager")),
+            InstanceKind::Architect => Some((&bridge.architect_setup_dir, "architect")),
+            _ => None,
+        };
+        if let Some((root, role)) = private_setup {
             cmd.arg("--extension");
-            cmd.arg(&bridge.manager_setup_dir);
-            cmd.env("OMP_MANAGER_SETUP_DIR", &bridge.manager_setup_dir);
-            // Private plugin packages are loaded only here, never into workers or the global OMP registry.
-            for package in crate::setup::manager_plugin_paths(&bridge.manager_setup_dir)? {
+            cmd.arg(root);
+            cmd.env("OMP_MANAGER_PRIVATE_SETUP_DIR", root);
+            cmd.env("OMP_MANAGER_PRIVATE_SETUP_ROLE", role);
+            // Private packages remain confined to their coordinator's directory.
+            for package in crate::setup::private_plugin_paths(root, definition.kind)? {
                 cmd.arg("--extension");
                 cmd.arg(package);
             }

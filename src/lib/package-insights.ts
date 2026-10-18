@@ -71,7 +71,7 @@ export interface ProjectReviewState {
   coverage: ProjectCoverage[]; summary: string | null; limitations: string[]; completedAt: number | null; error: string | null;
 }
 export interface UpdatePlanProposal { revisionId: string; hash: string; title: string; summary: string; markdown: string; sourceReviewIds: string[]; completedAt: number }
-export interface UpdatePlanHandoff { status: "attempting" | "accepted" | "knownUnsent" | "uncertain"; managerId: string; revisionId: string; error: string | null }
+export interface UpdatePlanHandoff { status: "pending" | "attempting" | "accepted" | "knownUnsent" | "uncertain"; managerId: string; revisionId: string; error: string | null }
 /** Which saved review a draft plans from, and which current-scan snapshot it used; `historicalContextNote` is non-null for legacy reviews and shown verbatim. */
 export interface UpdatePlanSource {
   kind: "security" | "project"; reviewId: string; contextId: string | null; completedAt: number;
@@ -83,7 +83,7 @@ export interface UpdatePlanState {
 }
 export interface HandoffPrepared {
   confirmationToken: string; expiresAt: number; revisionId: string; managerId: string; managerName: string;
-  needsStart: boolean; projectFolder: string; title: string;
+  needsStart: boolean; projectFolder: string; title: string; managerWorkingDirectory: string; repositoryFolders: string[];
 }
 
 /** One-line GitHub budget/credential summary shown beside the metadata controls. */

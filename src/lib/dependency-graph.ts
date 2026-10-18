@@ -11,6 +11,28 @@ export interface DerivedStandard { complete: boolean; hide: string[]; different:
 
 export const ROOT = "project";
 
+export type PackageEcosystem = Exclude<DepNode["ecosystem"], "project">;
+export type EcosystemChoice = "all" | PackageEcosystem;
+
+/**
+ * The package-language selection that is valid for the ecosystems actually present. A selector exists only when more than one
+ * package ecosystem is present, so a lone ecosystem (or a language the scan no longer contains) means "all".
+ */
+export function validEcosystemChoice(choice: EcosystemChoice, ecosystems: ReadonlySet<string>): EcosystemChoice {
+  return choice !== "all" && ecosystems.size > 1 && ecosystems.has(choice) ? choice : "all";
+}
+
+/**
+ * Keeps the synthetic root, the packages of one ecosystem and only the edges whose two endpoints survive. Edges are never
+ * invented (a package whose parents were in another ecosystem stays an orphan, which only Show all displays). "all" is the scan itself.
+ */
+export function filterGraphByEcosystem(graph: DependencyGraph, choice: EcosystemChoice): DependencyGraph {
+  if (choice === "all") return graph;
+  const nodes = graph.nodes.filter(node => node.id === ROOT || node.ecosystem === choice);
+  const kept = new Set(nodes.map(node => node.id));
+  return { ...graph, nodes, edges: graph.edges.filter(([from, to]) => kept.has(from) && kept.has(to)) };
+}
+
 /**
  * Basic direct packages and packages only reachable through them are removed first. A layer cap then
  * uses the shortest surviving path from the project (root 0, direct 1), independently of that count.

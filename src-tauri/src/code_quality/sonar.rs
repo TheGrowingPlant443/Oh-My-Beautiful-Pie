@@ -93,16 +93,28 @@ pub fn identity_of(base_url: &str) -> String {
         .unwrap_or_else(|_| base_url.to_string())
 }
 
+enum Auth {
+    Anonymous,
+    Token(String),
+    Basic { login: String, password: String },
+}
+impl Auth {
+    /// The secret value that must never appear in diagnostics or API messages.
+    fn secret(&self) -> Option<&str> {
+        match self { Self::Anonymous => None, Self::Token(token) => Some(token), Self::Basic { password, .. } => Some(password) }
+    }
+}
+
 pub struct SonarClient {
     kind: SonarKind,
     base: Url,
     http: Client,
-    token: Option<String>,
+    auth: Auth,
 }
 impl fmt::Debug for SonarClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SonarClient").field("kind", &self.kind)
-            .field("base", &self.base).field("token", &self.token.as_ref().map(|_| "<redacted>")).finish()
+            .field("base", &self.base).field("auth", &self.auth.secret().map(|_| "<redacted>")).finish()
     }
 }
 
@@ -125,6 +137,23 @@ pub struct ReportTask { pub task_id: String, pub project_key: String, pub dashbo
 
 impl SonarClient {
     pub fn new(kind: SonarKind, base_url: &str, token: Option<&str>) -> Result<Self> {
+        if token.is_some_and(|t| t.is_empty() || t.chars().any(char::is_control)) {
+            return Err("Enter a nonempty SonarQube user token without control characters.".into());
+        }
+        Self::build(kind, base_url, token.map_or(Auth::Anonymous, |t| Auth::Token(t.to_owned())))
+    }
+
+    /// Login/password client for the app-owned Community server's one-time admin bootstrap. The
+    /// credentials are only ever sent to the literal-loopback URL that `new` also enforces.
+    pub fn with_login(base_url: &str, login: &str, password: &str) -> Result<Self> {
+        if login.is_empty() || login.chars().any(|c| c.is_control() || c == ':')
+            || password.is_empty() || password.chars().any(char::is_control) {
+            return Err("Enter a nonempty SonarQube login and password without control characters.".into());
+        }
+        Self::build(SonarKind::Community, base_url, Auth::Basic { login: login.to_owned(), password: password.to_owned() })
+    }
+
+    fn build(kind: SonarKind, base_url: &str, auth: Auth) -> Result<Self> {
         let base = normalized_url(base_url, kind == SonarKind::Community)?;
         if kind == SonarKind::Community {
             let loopback = literal_loopback(&base);
@@ -132,17 +161,14 @@ impl SonarClient {
                 return Err("Managed Community must use the app-derived literal-loopback HTTP URL without a context path.".into());
             }
         }
-        if token.is_some_and(|t| t.is_empty() || t.chars().any(char::is_control)) {
-            return Err("Enter a nonempty SonarQube user token without control characters.".into());
-        }
         let http = Client::builder().redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(15))
             .build().map_err(|_| "Could not initialize the SonarQube HTTPS client.".to_string())?;
-        Ok(Self { kind, base, http, token: token.map(str::to_owned) })
+        Ok(Self { kind, base, http, auth })
     }
 
     fn sanitize(&self, value: &str) -> String {
-        match &self.token { Some(token) => value.replace(token, "[redacted]"), None => value.to_string() }
+        match self.auth.secret() { Some(secret) => value.replace(secret, "[redacted]"), None => value.to_string() }
     }
 
     fn endpoint(&self, path: &str) -> SonarResult<Url> {
@@ -171,7 +197,11 @@ impl SonarClient {
                 .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded").body(body)
         } else { self.http.request(method, url) };
         request = request.header(reqwest::header::ACCEPT, "application/json");
-        if let Some(token) = &self.token { request = request.basic_auth(token, Some("")); }
+        request = match &self.auth {
+            Auth::Anonymous => request,
+            Auth::Token(token) => request.basic_auth(token, Some("")),
+            Auth::Basic { login, password } => request.basic_auth(login, Some(password)),
+        };
         let response = request.send().map_err(transport_error)?;
         let status = response.status();
         if status.is_redirection() {
@@ -184,6 +214,7 @@ impl SonarClient {
                 "api/projects/create" => "Grant this user Create Projects, Browse and Execute Analysis permissions for the local project.",
                 "api/ce/cancel" => "Task cancellation requires project Administer or Administer System; in-progress tasks cannot be cancelled. Keep waiting for this exact task to finish.",
                 "api/ce/task" => "Grant the user Execute Analysis on this project (or project/global administration).",
+                "api/users/change_password" | "api/user_tokens/generate" | "api/user_tokens/revoke" => "The SonarQube account is not allowed to manage this user's password or tokens.",
                 _ => "Grant the user Browse and Execute Analysis on the selected project; use a user token, not an analysis-only token.",
             };
             return Err(SonarError::Forbidden(permission.into()));
@@ -205,7 +236,7 @@ impl SonarClient {
         if empty_ok && bytes.is_empty() { return Ok(Value::Null); }
         let mut data: Value = serde_json::from_slice(&bytes)
             .map_err(|_| malformed("Expected JSON, not a login page or truncated response."))?;
-        if let Some(token) = &self.token { redact_api_messages(&mut data, token); }
+        if let Some(secret) = self.auth.secret() { redact_api_messages(&mut data, secret); }
         Ok(data)
     }
 
@@ -214,10 +245,32 @@ impl SonarClient {
         Ok(required_str(&data, "status")?.to_string())
     }
     pub fn validate_token(&self) -> SonarResult<()> {
-        if self.token.is_none() { return Err(SonarError::Unauthorized); }
+        if !matches!(self.auth, Auth::Token(_)) { return Err(SonarError::Unauthorized); }
         match self.request(Method::GET, "api/authentication/validate", &[], false)?.get("valid").and_then(Value::as_bool) {
             Some(true) => Ok(()), Some(false) => Err(SonarError::Unauthorized), None => Err(malformed("authentication/validate has no boolean valid field.")),
         }
+    }
+    /// True only when the server answers `valid: true` for this client's credentials; every
+    /// failure (unreachable, 401, redirect, malformed) counts as not valid.
+    pub fn login_valid(&self) -> bool {
+        self.request(Method::GET, "api/authentication/validate", &[], false).ok()
+            .and_then(|data| data.get("valid").and_then(Value::as_bool)) == Some(true)
+    }
+    /// `POST api/users/change_password` (login, previousPassword, password); answers 204.
+    pub fn change_password(&self, login: &str, previous: &str, new: &str) -> SonarResult<()> {
+        self.request(Method::POST, "api/users/change_password",
+            &[("login", login), ("previousPassword", previous), ("password", new)], true)?;
+        Ok(())
+    }
+    /// `POST api/user_tokens/generate` (name, type=USER_TOKEN); the token is only returned once.
+    pub fn generate_user_token(&self, name: &str) -> SonarResult<String> {
+        let data = self.request(Method::POST, "api/user_tokens/generate", &[("name", name), ("type", "USER_TOKEN")], false)?;
+        Ok(required_str(&data, "token")?.to_string())
+    }
+    /// `POST api/user_tokens/revoke` (name); answers 204.
+    pub fn revoke_user_token(&self, name: &str) -> SonarResult<()> {
+        self.request(Method::POST, "api/user_tokens/revoke", &[("name", name)], true)?;
+        Ok(())
     }
     pub fn ensure_project(&self, key: &str, name: &str, create_if_missing: bool) -> SonarResult<()> {
         validate_identifier(key)?;
@@ -667,7 +720,7 @@ mod tests {
         assert!(matches!(error, SonarError::Forbidden(_)));
         assert!(error.to_string().contains("Browse and Execute Analysis"));
         let mut absent = fake.client();
-        absent.token = None;
+        absent.auth = Auth::Anonymous;
         assert_eq!(absent.validate_token().unwrap_err(), SonarError::Unauthorized);
         assert_eq!(fake.finish().len(), 3);
     }
@@ -895,5 +948,107 @@ mod tests {
         assert!(classic_severity("NEW").is_err());
         for path in ["../private","/etc/passwd","C:/secrets","dir/../../secret","\\\\server\\share"] { assert!(safe_path(path).is_none()); }
         assert_eq!(safe_path("src/main.rs").as_deref(),Some("src/main.rs"));
+    }
+
+    const ADMIN_PASSWORD: &str = "Omp-pw&1";
+    // base64("admin:Omp-pw&1") and base64("admin:admin")
+    const ADMIN_BASIC: &str = "YWRtaW46T21wLXB3JjE=";
+    const DEFAULT_ADMIN_BASIC: &str = "YWRtaW46YWRtaW4=";
+
+    impl Fake {
+        fn login_client(&self, login: &str, password: &str) -> SonarClient {
+            let mut client = SonarClient::with_login(&self.url, login, password).unwrap();
+            client.http = Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(2)).timeout(Duration::from_secs(3)).build().unwrap();
+            client
+        }
+    }
+
+    #[test]
+    fn login_client_sends_basic_login_credentials_and_validity_is_strictly_true() {
+        let fake = Fake::new(vec![Reply::json(json!({"valid":true})), Reply::json(json!({"valid":false})),
+            Reply::status(401), Reply::json(json!({"status":"UP"}))]);
+        let client = fake.login_client("admin", ADMIN_PASSWORD);
+        assert!(client.login_valid());
+        assert!(!client.login_valid(), "valid:false is not a valid login");
+        assert!(!client.login_valid(), "401 is not a valid login");
+        assert!(!client.login_valid(), "a body without a boolean valid field is not a valid login");
+        assert_eq!(client.validate_token().unwrap_err(), SonarError::Unauthorized, "a login client is not a token");
+        let requests = fake.finish();
+        assert_eq!(requests.len(), 4);
+        for request in &requests {
+            assert!(request.starts_with("GET /api/authentication/validate "));
+            assert!(request.to_ascii_lowercase().contains(&format!("authorization: basic {}", ADMIN_BASIC.to_ascii_lowercase())));
+            assert!(request.contains(ADMIN_BASIC));
+        }
+        let default = Fake::new(vec![Reply::json(json!({"valid":true}))]);
+        assert!(default.login_client("admin", "admin").login_valid());
+        assert!(default.finish()[0].contains(DEFAULT_ADMIN_BASIC));
+    }
+
+    #[test]
+    fn login_valid_is_false_when_the_server_is_unreachable_or_redirects() {
+        let fake = Fake::new(vec![Reply { status: 302, headers: vec![("Location", "https://other.example/login".into())], body: String::new() }]);
+        assert!(!fake.login_client("admin", "admin").login_valid());
+        assert_eq!(fake.finish().len(), 1, "the redirect must not be followed");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        assert!(!SonarClient::with_login(&url, "admin", "admin").unwrap().login_valid());
+    }
+
+    #[test]
+    fn change_password_posts_form_fields_not_url_parameters() {
+        let fake = Fake::new(vec![Reply::status(204), Reply::status(400), Reply { status: 302,
+            headers: vec![("Location", "https://other.example/login".into())], body: String::new() }]);
+        let client = fake.login_client("admin", "admin");
+        client.change_password("admin", "admin", ADMIN_PASSWORD).unwrap();
+        let rejected = client.change_password("admin", "admin", "weak").unwrap_err();
+        assert!(rejected.to_string().contains("HTTP 400"), "{rejected}");
+        assert!(matches!(client.change_password("admin", "admin", "x").unwrap_err(), SonarError::Redirect { .. }));
+        let requests = fake.finish();
+        assert_eq!(requests.len(), 3, "the redirect must not be followed");
+        let first = &requests[0];
+        assert!(first.starts_with("POST /api/users/change_password HTTP/1.1"), "{first}");
+        assert!(first.to_ascii_lowercase().contains("content-type: application/x-www-form-urlencoded"));
+        assert!(first.ends_with("login=admin&previousPassword=admin&password=Omp-pw%261"), "{first}");
+        assert!(first.contains(DEFAULT_ADMIN_BASIC));
+    }
+
+    #[test]
+    fn user_token_generate_parses_the_token_and_revoke_posts_the_name() {
+        let fake = Fake::new(vec![
+            Reply::json(json!({"login":"admin","name":"omp-manager-abcdef12","token":"squ_boot","type":"USER_TOKEN","createdAt":"2026-01-01T00:00:00+0000"})),
+            Reply::json(json!({"login":"admin","name":"omp-manager-abcdef12"})),
+            Reply::status(204),
+            Reply::status(404),
+            Reply::status(403)]);
+        let client = fake.login_client("admin", ADMIN_PASSWORD);
+        assert_eq!(client.generate_user_token("omp-manager-abcdef12").unwrap(), "squ_boot");
+        assert!(matches!(client.generate_user_token("omp-manager-abcdef12").unwrap_err(), SonarError::BadResponse(_)));
+        client.revoke_user_token("omp-manager-abcdef12").unwrap();
+        assert!(matches!(client.revoke_user_token("missing").unwrap_err(), SonarError::NotFound(_)));
+        let forbidden = client.generate_user_token("n").unwrap_err();
+        assert!(forbidden.to_string().contains("password or tokens"), "{forbidden}");
+        let requests = fake.finish();
+        assert!(requests[0].starts_with("POST /api/user_tokens/generate HTTP/1.1"));
+        assert!(requests[0].ends_with("name=omp-manager-abcdef12&type=USER_TOKEN"), "{}", requests[0]);
+        assert!(requests[0].contains(ADMIN_BASIC));
+        assert!(requests[2].starts_with("POST /api/user_tokens/revoke HTTP/1.1"));
+        assert!(requests[2].ends_with("name=omp-manager-abcdef12"));
+    }
+
+    #[test]
+    fn login_client_is_loopback_community_only_and_never_prints_the_password() {
+        for url in ["https://sonar.example", "http://sonar.example", "http://127.0.0.1:9000/sonar", "http://localhost:9000"] {
+            assert!(SonarClient::with_login(url, "admin", "admin").is_err(), "{url}");
+        }
+        assert!(SonarClient::with_login("http://127.0.0.1:9000", "", "admin").is_err());
+        assert!(SonarClient::with_login("http://127.0.0.1:9000", "admin", "").is_err());
+        assert!(SonarClient::with_login("http://127.0.0.1:9000", "admin", "a\nb").is_err());
+        assert!(SonarClient::with_login("http://127.0.0.1:9000", "ad:min", "x").is_err());
+        let client = SonarClient::with_login("http://127.0.0.1:9000", "admin", ADMIN_PASSWORD).unwrap();
+        assert!(!format!("{client:?}").contains(ADMIN_PASSWORD));
+        assert_eq!(client.sanitize(&format!("bad {ADMIN_PASSWORD}")), "bad [redacted]");
     }
 }

@@ -1,5 +1,7 @@
 //! Explicit, consent-gated setup actions. Probes never install, pull, start a VM, or mutate
 //! defaults. Scripts are fixed include_str assets, materialized and digest-recorded before use.
+//! Explicit shutdown requires a ready receipt and matching live machine identity;
+//! both rootless/rootful stores must be empty. No workload, volume, or machine is deleted.
 use super::runtime::*;
 use super::types::*;
 use serde::{Deserialize, Serialize};
@@ -107,6 +109,128 @@ pub(crate) fn podman_machine_identity(machine: &str, ctl: &Ctl) -> Option<String
     inspect_machine(machine, ctl).ok()?["Created"].as_str().map(str::to_owned)
 }
 
+
+const EXTERNAL_MACHINE_STOP: &str = "Code quality containers stopped; this Podman machine is not owned by OMP Manager and was left running.";
+
+fn verified_stop_identity<'a>(receipt: &'a PodmanReceipt, machine: &serde_json::Value) -> Result<&'a str> {
+    let created = receipt.created.as_deref().filter(|value| !value.trim().is_empty())
+        .ok_or("The Podman setup receipt has no creation identity. The machine was left running; repair its setup record before retrying shutdown.")?;
+    if receipt.stage != "ready" || receipt.version != 1 || receipt.machine != MACHINE || receipt.provider != "wsl" {
+        return Err(EXTERNAL_MACHINE_STOP.into());
+    }
+    if machine["Name"].as_str() != Some(receipt.machine.as_str())
+        || machine["Created"].as_str() != Some(created) {
+        return Err("The app-owned Podman machine was replaced or its identity cannot be verified. It was left running; restore the matching setup receipt before retrying shutdown.".into());
+    }
+    Ok(created)
+}
+
+// Connection names are not authority: match the loopback SSH endpoint and identity
+// recorded by the live machine inspection, then distinguish both container stores.
+fn machine_store(connection: &serde_json::Value, machine: &serde_json::Value) -> Option<bool> {
+    let uri = reqwest::Url::parse(connection["URI"].as_str()?).ok()?;
+    let port = machine.pointer("/SSHConfig/Port")?.as_u64()?;
+    let identity = machine.pointer("/SSHConfig/IdentityPath")?.as_str()?;
+    if identity.is_empty() || uri.scheme() != "ssh"
+        || !matches!(uri.host_str(), Some("127.0.0.1" | "localhost" | "[::1]" | "::1"))
+        || uri.port().map(u64::from) != Some(port)
+        || connection["Identity"].as_str() != Some(identity) {
+        return None;
+    }
+    if uri.username() == "root" && uri.path() == "/run/podman/podman.sock" {
+        Some(true)
+    } else if !uri.username().is_empty() && uri.username() != "root" {
+        let uid = uri.path().strip_prefix("/run/user/")?.strip_suffix("/podman/podman.sock")?;
+        if !uid.is_empty() && uid.bytes().all(|value| value.is_ascii_digit()) && uid != "0" { Some(false) } else { None }
+    } else { None }
+}
+
+fn shutdown_store_connections<'a>(entries: &'a [serde_json::Value], machine: &serde_json::Value, selected: &str) -> Result<[&'a str; 2]> {
+    if !entries.iter().any(|entry| entry["Name"].as_str() == Some(selected) && machine_store(entry, machine).is_some()) {
+        return Err(EXTERNAL_MACHINE_STOP.into());
+    }
+    let find = |rootful| entries.iter().find_map(|entry| {
+        if machine_store(entry, machine) == Some(rootful) {
+            entry["Name"].as_str().filter(|name| !name.is_empty())
+        } else { None }
+    });
+    let rootless = find(false).ok_or("Cannot check the Podman machine's rootless container store. Repair its rootless SSH connection and retry shutdown; the VM was left running.")?;
+    let rootful = find(true).ok_or("Cannot check the Podman machine's rootful container store. Repair its root SSH connection and retry shutdown; the VM was left running.")?;
+    validate_selector(rootless, "Podman rootless connection")?;
+    validate_selector(rootful, "Podman rootful connection")?;
+    Ok([rootless, rootful])
+}
+
+fn remaining_workload_names(containers: &[ContainerInfo]) -> Result<()> {
+    let mut names: Vec<&str> = containers.iter().filter(|info| info.running).map(|info| info.name.as_str()).collect();
+    if names.is_empty() { return Ok(()); }
+    names.sort_unstable();
+    names.dedup();
+    Err(format!("Code quality containers stopped; the Podman machine was left running because containers are still running: {}. Stop these workloads explicitly, then retry shutdown.", names.join(", ")))
+}
+
+/// Stop only the receipt-proven app VM, after checking *both* stores for remaining
+/// workloads. This never starts a daemon, changes defaults, or removes containers/data.
+pub fn stop_owned_podman_machine(config_root: &Path, runtime: &QualityRuntime, owner: &str, ctl: &Ctl) -> Result<()> {
+    let QualityRuntime::Podman { connection } = runtime else { return Ok(()); };
+    validate_selector(owner, "installation owner")?;
+    if ctl.cancelled() { return Err("Podman server shutdown was cancelled; the machine was left unchanged.".into()); }
+    let receipt = read_receipt(config_root)?.ok_or(EXTERNAL_MACHINE_STOP)?;
+    if receipt.stage != "ready" { return Err(EXTERNAL_MACHINE_STOP.into()); }
+    let selected = if connection.is_empty() {
+        receipt.connection.as_deref().filter(|name| !name.is_empty()).ok_or(EXTERNAL_MACHINE_STOP)?
+    } else { connection.as_str() };
+    validate_selector(selected, "Podman connection")?;
+    let machine = inspect_machine(&receipt.machine, ctl)?;
+    verified_stop_identity(&receipt, &machine)?;
+    let entries = podman_connections(ctl)?;
+    // A stopped machine needs no store probes (which would require starting it),
+    // but the selected connection must still prove that it addresses this VM.
+    if !entries.iter().any(|entry| entry["Name"].as_str() == Some(selected) && machine_store(entry, &machine).is_some()) {
+        return Err(EXTERNAL_MACHINE_STOP.into());
+    }
+    match machine["State"].as_str() {
+        Some("stopped") => return Ok(()),
+        Some("running") => {}
+        _ => return Err("The Podman machine is in an unknown or transitional state. It was left unchanged; wait for its current operation to finish and retry shutdown.".into()),
+    }
+    let connections = shutdown_store_connections(&entries, &machine, selected)?;
+    let mut remaining = Vec::new();
+    for (index, connection) in connections.into_iter().enumerate() {
+        let store = if index == 0 { "rootless" } else { "rootful" };
+        let check = || -> Result<Vec<ContainerInfo>> {
+            let mut cmd = Command::new(podman_program().ok_or("Podman is not installed.")?);
+            cmd.args(["--connection", connection, "ps", "--no-trunc", "--format", "{{.ID}}"]);
+            let out = run_bounded(cmd, None, PROBE_TIMEOUT, ctl)?;
+            out.require_success("Check remaining Podman workloads")?;
+            let engine = CliEngine::new(QualityRuntime::Podman { connection: connection.into() }, config_root)?;
+            let mut containers = Vec::new();
+            for id in out.text().lines().map(str::trim).filter(|id| !id.is_empty()) {
+                // Disappeared containers are safe; an inspection failure is not.
+                if let Some(info) = engine.inspect(id, ctl)? { containers.push(info); }
+            }
+            Ok(containers)
+        };
+        remaining.extend(check().map_err(|_| format!("Cannot verify the Podman machine's {store} container store. Check that connection's engine is reachable and retry shutdown; the VM was left running."))?);
+    }
+    // Every remaining container blocks shutdown, including unexpected owned roles.
+    remaining_workload_names(&remaining)?;
+    verified_stop_identity(&receipt, &inspect_machine(&receipt.machine, ctl)?)?;
+    if ctl.cancelled() { return Err("Podman server shutdown was cancelled; the machine was left running.".into()); }
+    let mut cmd = Command::new(podman_program().ok_or("Podman is not installed.")?);
+    cmd.args(["machine", "stop", &receipt.machine]);
+    run_machine(cmd, Duration::from_secs(180), ctl)?.require_success("Stop app-owned Podman machine")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let current = inspect_machine(&receipt.machine, ctl)?;
+        verified_stop_identity(&receipt, &current)?;
+        if current["State"].as_str() == Some("stopped") { return Ok(()); }
+        if ctl.cancelled() || std::time::Instant::now() >= deadline {
+            return Err("Podman machine stop could not be verified. The server remains suspended; Recheck and retry shutdown before starting it again.".into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
 fn winget_program() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_default();
     discover_program("winget.exe", &[local.join("Microsoft/WindowsApps/winget.exe")])
@@ -162,6 +286,30 @@ fn windows_feature_exit(code: Option<i32>) -> Result<bool> {
     }
 }
 
+/// Decides from `wsl.exe --status` text whether WSL cannot run for lack of Windows features.
+/// The "Windows Subsystem for Linux" component only counts when the text is not merely the WSL1
+/// note ("…optional component to use WSL1"), which also appears when WSL2 works.
+fn features_missing_from(status_text: &str, exit_code: Option<i32>) -> bool {
+    let lower = status_text.to_lowercase();
+    let component = lower.contains("optional component");
+    (component && lower.contains("virtual machine platform"))
+        || (component && lower.contains("windows subsystem for linux") && !lower.contains("wsl1"))
+        || (exit_code.is_some_and(|code| code != 0) && status_text.to_uppercase().contains("HCS_E_SERVICE_NOT_AVAILABLE"))
+}
+
+/// True when `wsl.exe --status` reports a missing Windows feature. Absent `wsl.exe`, a timeout or
+/// any launch failure is not evidence of missing features, so those answer false.
+pub fn wsl_features_missing(ctl: &Ctl) -> bool {
+    let Some(program) = wsl_program() else { return false; };
+    let mut cmd = Command::new(program);
+    cmd.arg("--status");
+    let Ok(out) = run_bounded(cmd, None, PROBE_TIMEOUT, ctl) else { return false; };
+    if out.timed_out || out.cancelled { return false; }
+    // wsl.exe writes UTF-16LE; decode_wsl_list shares the NUL/BOM-aware decoder and falls back to UTF-8.
+    let text = [decode_wsl_list(&out.stdout), decode_wsl_list(&out.stderr)].concat().join("\n");
+    features_missing_from(&text, out.status.code())
+}
+
 pub fn probe_prerequisites(config_root: &Path, selected: &QualityRuntime) -> (Vec<Prerequisite>, QualityOptions) {
     let ctl = Ctl::silent();
     let distro_result = wsl_distros(&ctl);
@@ -174,7 +322,7 @@ pub fn probe_prerequisites(config_root: &Path, selected: &QualityRuntime) -> (Ve
         let mut cmd = Command::new(program); cmd.arg("--version");
         run_bounded(cmd, None, PROBE_TIMEOUT, &ctl).ok()
     }).map(|o| o.status.success()).unwrap_or(false);
-    let options = QualityOptions { wsl_distros: distros.clone(), podman_connections: connections,
+    let options = QualityOptions { wsl_features_missing: wsl_features_missing(&ctl), wsl_distros: distros.clone(), podman_connections: connections,
         winget_available, podman_app_connection: podman_app_connection(config_root) };
     let podman = match selected {
         QualityRuntime::Podman { connection } => QualityRuntime::Podman { connection: connection.clone() },
@@ -241,18 +389,52 @@ fn materialize(root: &Path, name: &str, content: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+const PODMAN_PACKAGE: &str = "RedHat.Podman";
+
+/// winget arguments and the progress line shown before it runs. Podman installs silently (Windows
+/// still raises its own administrator prompt); Docker Desktop stays interactive because its license
+/// must be accepted by the user, never automatically.
+fn winget_command(package: &str) -> (Vec<&str>, &'static str) {
+    if package == PODMAN_PACKAGE {
+        (vec!["install", "--exact", "--id", package, "--source", "winget", "--silent",
+            "--accept-package-agreements", "--accept-source-agreements"],
+            "Installing Podman (Windows will ask for administrator approval).")
+    } else {
+        (vec!["install", "--exact", "--id", package, "--source", "winget", "--interactive"],
+            "Awaiting the interactive runtime installer. Review its license/elevation prompts; no license is automatically accepted.")
+    }
+}
+
+/// Fixed PowerShell that runs winget elevated (a hidden app process cannot raise winget's own UAC
+/// prompt; `Start-Process -Verb RunAs` does) and exits with winget's exit code. Only constants and the
+/// discovered winget path are interpolated, never frontend input.
+fn elevated_winget_script(program: &Path, args: &[&str], hidden: bool) -> String {
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    let list = args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(",");
+    format!(
+        "try {{ $p = Start-Process -FilePath {} -ArgumentList @({list}) -Verb RunAs -Wait -PassThru{}; exit $p.ExitCode }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 5 }}",
+        quote(&program.to_string_lossy()),
+        if hidden { " -WindowStyle Hidden" } else { "" }
+    )
+}
+
 fn run_winget(package: &str, ctl: &Ctl) -> Result<bool> {
     let program = winget_program().ok_or_else(|| {
         let link = if package == "Docker.DockerDesktop" { "https://www.docker.com/products/docker-desktop/" } else { "https://podman.io/docs/installation" };
         format!("winget is unavailable. Use the official installer at {link}, then Recheck. No unverified mirror will be used.")
     })?;
-    let mut cmd = Command::new(program);
-    cmd.args(["install", "--exact", "--id", package, "--source", "winget", "--interactive"]);
-    ctl.say("Awaiting the interactive runtime installer. Review its license/elevation prompts; no license is automatically accepted.");
+    let (args, progress) = winget_command(package);
+    let mut cmd = Command::new(powershell());
+    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]).arg(elevated_winget_script(&program, &args, package == PODMAN_PACKAGE));
+    ctl.say(progress);
     let out = run_installer(cmd, None, ctl)?;
     if out.cancelled { return Err("Runtime installation was cancelled; the actual installer has now exited. Recheck installed runtime state before retrying.".into()); }
-    if out.status.code() == Some(3010) { return Ok(true); }
-    out.require_success("Runtime installation (elevation cancellation is an error)")?;
+    match out.status.code().map(|c| c as u32) {
+        Some(3010) => return Ok(true),
+        Some(5) => return Err("Administrator approval was declined or never shown, so nothing was installed. Press Continue setup and approve the Windows administrator prompt.".into()),
+        _ => {}
+    }
+    out.require_success("Runtime installation")?;
     Ok(false)
 }
 
@@ -272,8 +454,10 @@ fn setup_podman(root: &Path, ctl: &Ctl) -> Result<String> {
     let mut receipt = receipt.ok_or("Missing Podman setup receipt.")?;
     if !existing {
         let mut cmd = Command::new(podman_program().ok_or("Podman was not found after installation. Recheck or repair the official installation.")?);
-        cmd.args(["machine", "init", "--provider", "wsl", "--rootful=false", "--update-connection=false", MACHINE]);
-        run_installer(cmd, None, ctl)?.require_success("Initialize app-owned WSL Podman machine")?;
+        // Podman 5.8 has no --provider/--update-connection flags: the provider is chosen by this variable.
+        cmd.env("CONTAINERS_MACHINE_PROVIDER", "wsl");
+        cmd.args(["machine", "init", "--rootful=false", MACHINE]);
+        crate::code_quality::runtime::run_machine(cmd, Duration::from_secs(30 * 60), ctl)?.require_success("Initialize app-owned WSL Podman machine")?;
     }
     if !machines(ctl)?.iter().any(|v| v["Name"].as_str() == Some(MACHINE) && v["VMType"].as_str() == Some("wsl")) {
         return Err("The app-owned Podman machine is not verified as WSL-backed. It will not be adopted or reconfigured; choose an existing connection explicitly.".into());
@@ -289,8 +473,8 @@ fn setup_podman(root: &Path, ctl: &Ctl) -> Result<String> {
     save_receipt(root, &receipt)?;
     if inspected["State"].as_str() != Some("running") {
         let mut cmd = Command::new(podman_program().ok_or("Podman is not installed.")?);
-        cmd.args(["machine", "start", "--update-connection=false", MACHINE]);
-        run_installer(cmd, None, ctl)?.require_success("Start app-owned Podman machine")?;
+        cmd.args(["machine", "start", MACHINE]);
+        crate::code_quality::runtime::run_machine(cmd, Duration::from_secs(10 * 60), ctl)?.require_success("Start app-owned Podman machine")?;
     }
     let inspected = inspect_machine(MACHINE, ctl)?;
     let port = inspected.pointer("/SSHConfig/Port").and_then(|v| v.as_u64()).ok_or("Podman machine omitted its SSH port.")?;
@@ -406,6 +590,98 @@ pub fn raise_vm_limits_at(engine: &dyn Engine, config_root: &Path, ctl: &Ctl) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stop_receipt() -> PodmanReceipt {
+        PodmanReceipt { version: 1, machine: MACHINE.into(), provider: "wsl".into(),
+            stage: "ready".into(), connection: Some("quality-user".into()), created: Some("2026-10-17T12:00:00Z".into()) }
+    }
+
+    fn stop_machine() -> serde_json::Value {
+        serde_json::json!({ "Name": MACHINE, "Created": "2026-10-17T12:00:00Z", "State": "running",
+            "SSHConfig": { "Port": 54321, "IdentityPath": "C:/quality/identity" } })
+    }
+
+    fn stop_connections() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({ "Name": "quality-user", "URI": "ssh://user@127.0.0.1:54321/run/user/1000/podman/podman.sock", "Identity": "C:/quality/identity" }),
+            serde_json::json!({ "Name": "quality-root", "URI": "ssh://root@127.0.0.1:54321/run/podman/podman.sock", "Identity": "C:/quality/identity" }),
+        ]
+    }
+
+    #[test]
+    fn machine_stop_requires_ready_receipt_and_exact_creation_identity() {
+        let mut receipt = stop_receipt();
+        let machine = stop_machine();
+        assert!(verified_stop_identity(&receipt, &machine).is_ok());
+        receipt.stage = "creating".into();
+        assert_eq!(verified_stop_identity(&receipt, &machine).unwrap_err(), EXTERNAL_MACHINE_STOP);
+        receipt.stage = "ready".into();
+        for identity in [None, Some("".into()), Some("   ".into()), Some("replacement".into())] {
+            receipt.created = identity;
+            assert!(verified_stop_identity(&receipt, &machine).is_err());
+        }
+        receipt = stop_receipt();
+        let mut replaced = machine;
+        replaced["Name"] = "different-machine".into();
+        assert!(verified_stop_identity(&receipt, &replaced).is_err());
+    }
+
+    #[test]
+    fn machine_shutdown_checks_both_stores_and_selected_connection() {
+        let machine = stop_machine();
+        let mut entries = stop_connections();
+        assert_eq!(shutdown_store_connections(&entries, &machine, "quality-user").unwrap(), ["quality-user", "quality-root"]);
+        assert_eq!(shutdown_store_connections(&entries, &machine, "quality-root").unwrap(), ["quality-user", "quality-root"]);
+        assert_eq!(shutdown_store_connections(&entries, &machine, "external").unwrap_err(), EXTERNAL_MACHINE_STOP);
+        entries.pop();
+        assert!(shutdown_store_connections(&entries, &machine, "quality-user").unwrap_err().contains("rootful"));
+        let entries = vec![stop_connections().pop().unwrap()];
+        assert!(shutdown_store_connections(&entries, &machine, "quality-root").unwrap_err().contains("rootless"));
+    }
+
+    #[test]
+    fn machine_shutdown_rejects_unproven_connection_endpoints() {
+        let machine = stop_machine();
+        let original = stop_connections().remove(0);
+        for uri in [
+            "ssh://user@remote.example:54321/run/user/1000/podman/podman.sock",
+            "ssh://user@127.0.0.1:12345/run/user/1000/podman/podman.sock",
+            "http://127.0.0.1:54321/run/user/1000/podman/podman.sock",
+            "ssh://root@127.0.0.1:54321/run/user/1000/podman/podman.sock",
+            "ssh://user@127.0.0.1:54321/run/user/0/podman/podman.sock",
+            "ssh://user@127.0.0.1:54321/run/user/invalid/podman/podman.sock",
+        ] {
+            let mut entry = original.clone();
+            entry["URI"] = uri.into();
+            assert_eq!(machine_store(&entry, &machine), None);
+        }
+        let mut entry = original;
+        entry["Identity"] = "another-key".into();
+        assert_eq!(machine_store(&entry, &machine), None);
+    }
+
+    #[test]
+    fn any_remaining_workload_blocks_vm_shutdown_without_exposing_metadata() {
+        let mut foreign = ContainerInfo { name: "foreign-sentinel".into(), running: true, ..Default::default() };
+        foreign.labels.insert("secret".into(), "never-include-this".into());
+        let owned = ContainerInfo { name: "unexpected-quality-role".into(), running: true,
+            labels: std::collections::HashMap::from([(OWNER_LABEL.into(), "quality-owner".into())]), ..Default::default() };
+        let error = remaining_workload_names(&[foreign.clone(), owned]).unwrap_err();
+        assert!(error.contains("foreign-sentinel") && error.contains("unexpected-quality-role"));
+        assert!(!error.contains("never-include-this") && !error.contains("quality-owner"));
+        foreign.running = false;
+        assert!(remaining_workload_names(&[foreign]).is_ok());
+        assert!(remaining_workload_names(&[]).is_ok());
+    }
+
+    #[test]
+    fn shutdown_without_receipt_never_discovers_or_adopts_a_machine() {
+        let root = std::env::temp_dir().join(format!("omp-quality-stop-{}", uuid::Uuid::new_v4()));
+        let runtime = QualityRuntime::Podman { connection: "external".into() };
+        assert_eq!(stop_owned_podman_machine(&root, &runtime, "quality-owner", &Ctl::silent()).unwrap_err(), EXTERNAL_MACHINE_STOP);
+        assert!(!root.exists(), "shutdown must not create a receipt or config directory");
+        assert!(stop_owned_podman_machine(&root, &QualityRuntime::DockerDesktop, "quality-owner", &Ctl::silent()).is_ok());
+    }
     #[test]
     fn bundled_helpers_have_fixed_safe_policies() {
         assert!(WSL_INSTALL.contains("docker-ce docker-ce-cli containerd.io"));
@@ -452,5 +728,44 @@ mod tests {
         assert!(windows_feature_exit(Some(5)).unwrap_err().contains("cancelled or denied"));
         assert!(windows_feature_exit(Some(6)).unwrap_err().contains("firmware"));
         assert!(windows_feature_exit(Some(7)).unwrap_err().contains("servicing error"));
+    }
+    // Captured from `wsl.exe --status` (exit code 0) on a machine lacking Virtual Machine Platform.
+    const WSL_STATUS_FEATURES_MISSING: &str = "Default Distribution: Ubuntu\r\nDefault Version: 2\r\nWSL1 is not supported with your current machine configuration.\r\nPlease enable the \"Windows Subsystem for Linux\" optional component to use WSL1.\r\nWSL2 is not supported with your current machine configuration.\r\nPlease enable the \"Virtual Machine Platform\" optional component and ensure virtualization is enabled in the BIOS.\r\nEnable \"Virtual Machine Platform\" by running: wsl.exe --install --no-distribution\r\nFor information please visit https://aka.ms/enablevirtualization\r\n";
+    #[test]
+    fn wsl_status_decides_missing_windows_features() {
+        assert!(features_missing_from(WSL_STATUS_FEATURES_MISSING, Some(0)));
+        assert!(features_missing_from(WSL_STATUS_FEATURES_MISSING, None));
+        let utf16: Vec<u8> = std::iter::once(0xfeffu16).chain(WSL_STATUS_FEATURES_MISSING.encode_utf16())
+            .flat_map(u16::to_le_bytes).collect();
+        assert!(features_missing_from(&decode_wsl_list(&utf16).join("\n"), Some(0)), "UTF-16LE output decodes before matching");
+        // Healthy WSL, and healthy WSL2 that only prints the WSL1 note.
+        assert!(!features_missing_from("Default Distribution: Ubuntu\r\nDefault Version: 2", Some(0)));
+        assert!(!features_missing_from("Default Distribution: Ubuntu\r\nDefault Version: 2\r\nWSL1 is not supported with your current machine configuration.\r\nPlease enable the \"Windows Subsystem for Linux\" optional component to use WSL1.", Some(0)));
+        // Older inbox wsl.exe wording for a disabled WSL component.
+        assert!(features_missing_from("The Windows Subsystem for Linux optional component is not enabled. Please enable it and try again.", Some(1)));
+        // Service failure counts only with a failing exit code.
+        assert!(features_missing_from("Wsl/Service/CreateInstance/CreateVm/HCS/HCS_E_SERVICE_NOT_AVAILABLE", Some(-1)));
+        assert!(!features_missing_from("Wsl/Service/CreateInstance/CreateVm/HCS/HCS_E_SERVICE_NOT_AVAILABLE", Some(0)));
+        assert!(!features_missing_from("", Some(1)));
+    }
+    #[test]
+    fn winget_runs_elevated_with_quoted_constants_and_returns_its_exit_code() {
+        let script = elevated_winget_script(Path::new("C:/Users/o'brien/winget.exe"), &["install", "--id", "RedHat.Podman"], true);
+        assert!(script.contains("-Verb RunAs -Wait -PassThru -WindowStyle Hidden"));
+        assert!(script.contains("'C:/Users/o''brien/winget.exe'") && script.contains("@('install','--id','RedHat.Podman')"));
+        assert!(script.contains("exit $p.ExitCode") && script.contains("exit 5"));
+        assert!(!elevated_winget_script(Path::new("w.exe"), &["x"], false).contains("Hidden"));
+    }
+
+    #[test]
+    fn podman_installs_silently_and_docker_desktop_stays_interactive() {
+        let (podman, progress) = winget_command("RedHat.Podman");
+        assert_eq!(podman, ["install", "--exact", "--id", "RedHat.Podman", "--source", "winget", "--silent",
+            "--accept-package-agreements", "--accept-source-agreements"]);
+        assert_eq!(progress, "Installing Podman (Windows will ask for administrator approval).");
+        let (docker, progress) = winget_command("Docker.DockerDesktop");
+        assert_eq!(docker, ["install", "--exact", "--id", "Docker.DockerDesktop", "--source", "winget", "--interactive"]);
+        assert!(!docker.contains(&"--silent") && !docker.contains(&"--accept-package-agreements"));
+        assert!(progress.contains("no license is automatically accepted"));
     }
 }

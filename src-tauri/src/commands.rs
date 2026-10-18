@@ -21,6 +21,16 @@ pub fn list_instances(state: State<'_, AppState>) -> Vec<Instance> {
     state.registry.snapshot()
 }
 #[tauri::command]
+pub async fn ensure_coordinators(app: AppHandle, window: tauri::WebviewWindow, state: State<'_, AppState>, preferred_folders: Vec<String>) -> Result<crate::instance::CoordinatorBootstrap> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || {
+        let result = registry.ensure_coordinators(&preferred_folders);
+        publish(&app, &registry);
+        result
+    }).await
+}
+#[tauri::command]
 pub async fn configure_browser(window: tauri::WebviewWindow, state: State<'_, AppState>, settings: crate::browser::BrowserSettings) -> Result<()> {
     if window.label() != "main" { return Err("unauthorized window".into()); }
     let browser = state.browser.clone();
@@ -133,6 +143,13 @@ pub async fn scan_dependencies(window: tauri::WebviewWindow, state: State<'_, Ap
         }
         Ok(graph)
     }).await
+}
+#[tauri::command]
+pub async fn get_project_requirements(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String) -> Result<crate::project_requirements::ProjectRequirements> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    // Passive: tool versions plus the Code quality service's read-only probe seam; nothing is started or installed.
+    let service = state.code_quality.clone();
+    blocking(move || crate::project_requirements::analyze(Path::new(&folder), &crate::project_requirements::SystemHost::new(service))).await
 }
 #[tauri::command]
 pub async fn get_dependency_classification(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String) -> Result<crate::architect::Classification> {
@@ -294,10 +311,152 @@ pub async fn show_dependency_result_in_architect(
     let registry = state.registry.clone();
     let security = state.dependency_security.clone();
     let project = state.dependency_project_review.clone();
+    let insight = state.project_insight.clone();
     blocking(move || {
         if project.owns(&request_id) { project.show_in_architect(&registry, &security, &request_id) }
+        else if insight.owns(&request_id) { insight.show_in_architect(&registry, &request_id) }
         else { security.show_in_architect(&registry, &request_id) }
     }).await
+}
+#[tauri::command]
+pub async fn dependency_manifest_status(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String) -> Result<crate::dependencies::ManifestStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::dependencies::manifest_status(Path::new(&folder), &registry.home)).await
+}
+#[tauri::command]
+pub async fn request_project_insight(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    folder: String,
+    kind: crate::project_insight::InsightKind,
+    rerun: Option<bool>,
+) -> Result<crate::project_insight::ProjectInsightStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    let insight = state.project_insight.clone();
+    blocking(move || {
+        let result = insight.request(&registry, Path::new(&folder), kind, rerun.unwrap_or(false));
+        publish(&app, &registry);
+        result
+    }).await
+}
+#[tauri::command]
+pub async fn get_project_insight(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    folder: String,
+    kind: crate::project_insight::InsightKind,
+) -> Result<Option<crate::project_insight::ProjectInsightStatus>> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    let insight = state.project_insight.clone();
+    blocking(move || insight.get(&registry, Path::new(&folder), kind)).await
+}
+#[tauri::command]
+pub async fn request_system_visualization(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    folder: String,
+    kind: crate::project_insight::InsightKind,
+    snapshot_id: String,
+    source_id: Option<String>,
+    base_request_id: Option<String>,
+    supersedes_request_id: Option<String>,
+) -> Result<crate::project_insight::ProjectInsightStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    let insight = state.project_insight.clone();
+    blocking(move || {
+        let result = insight.request_visualization(
+            &registry, Path::new(&folder), kind, &snapshot_id, source_id.as_deref(), base_request_id.as_deref(), supersedes_request_id.as_deref(),
+        );
+        publish(&app, &registry);
+        result
+    }).await
+}
+#[tauri::command]
+pub async fn read_project_insight(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<crate::project_insight::ProjectInsightStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    let insight = state.project_insight.clone();
+    blocking(move || insight.status(&registry, &request_id)).await
+}
+#[tauri::command]
+pub async fn approve_structure_preview(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request_id: String,
+    expected_result_hash: String,
+    expected_source_hash: String,
+) -> Result<crate::project_insight::ProjectInsightStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    let insight = state.project_insight.clone();
+    blocking(move || insight.approve_structure_preview(&registry, &request_id, &expected_result_hash, &expected_source_hash)).await
+}
+#[tauri::command]
+pub async fn list_structure_sources(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    architect_id: String,
+    expected_generation: u64,
+) -> Result<crate::system_overview::StructureSourceList> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::system_overview::list_structure_sources(&registry, &architect_id, expected_generation)).await
+}
+#[tauri::command]
+pub async fn read_structure_source(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    architect_id: String,
+    expected_generation: u64,
+    source_id: String,
+    offset: u64,
+) -> Result<crate::system_overview::StructureSourcePage> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::system_overview::read_structure_source(&registry, &architect_id, expected_generation, &source_id, offset)).await
+}
+#[tauri::command]
+pub async fn select_last_structure_source(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    architect_id: String,
+    expected_generation: u64,
+) -> Result<crate::system_overview::StructureSourceRow> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    blocking(move || crate::system_overview::select_last_structure_source(&registry, &architect_id, expected_generation)).await
+}
+#[tauri::command]
+pub async fn prepare_manifest_creation(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    request_id: String,
+    ecosystem: String,
+) -> Result<crate::project_insight::ManifestPreparation> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let registry = state.registry.clone();
+    let insight = state.project_insight.clone();
+    blocking(move || insight.prepare_manifest(&registry, &request_id, &ecosystem)).await
+}
+#[tauri::command]
+pub async fn confirm_manifest_creation(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    confirmation_token: String,
+) -> Result<crate::project_insight::ManifestCreated> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let insight = state.project_insight.clone();
+    blocking(move || insight.confirm_manifest(&confirmation_token)).await
 }
 #[tauri::command]
 pub async fn start_project_dependency_security_review(
@@ -404,23 +563,39 @@ pub async fn confirm_dependency_update_handoff(
     }).await
 }
 #[tauri::command]
-pub fn set_manager_owner(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-    manager_id: Option<String>,
-) -> Result<()> {
-    state
-        .registry
-        .set_manager_owner(&id, manager_id.as_deref())?;
-    publish(&app, &state.registry);
-    Ok(())
+pub fn change_agent_directory(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, folder: String, expected_generation: u64) -> Result<crate::workspace::WorkspaceChange> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.workspace.change_directory(id, folder, expected_generation)
 }
 #[tauri::command]
-pub fn return_to_manager(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<()> {
-    state.registry.return_to_manager(&id)?;
-    publish(&app, &state.registry);
-    Ok(())
+pub fn list_computed_workspace_folders(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<Vec<String>> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.workspace.computed_folders()
+}
+#[tauri::command]
+pub fn hand_over_to_manager(window: tauri::WebviewWindow, state: State<'_, AppState>, source_id: String) -> Result<crate::workspace::WorkspaceChange> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.workspace.hand_over_to_manager(source_id)
+}
+#[tauri::command]
+pub fn take_back_control(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.workspace.take_back_control(&id)
+}
+#[tauri::command]
+pub fn return_to_manager(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, human_request_id: String) -> Result<crate::workspace::WorkspaceChange> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.workspace.return_to_manager(id, human_request_id)
+}
+#[tauri::command]
+pub fn give_repo_to_architect(window: tauri::WebviewWindow, state: State<'_, AppState>, source_id: String) -> Result<crate::workspace::WorkspaceChange> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.workspace.give_repo_to_architect(source_id)
+}
+#[tauri::command]
+pub fn list_workspace_changes(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<Vec<crate::workspace::WorkspaceChange>> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    Ok(state.workspace.list())
 }
 #[tauri::command]
 pub fn start_instance(app: AppHandle, state: State<'_, AppState>, id: String, fresh: Option<bool>) -> Result<()> {
@@ -479,6 +654,54 @@ pub fn write_pty(state: State<'_, AppState>, id: String, data: String) -> Result
 #[tauri::command]
 pub fn resize_pty(state: State<'_, AppState>, id: String, cols: u16, rows: u16) -> Result<()> {
     state.registry.resize(&id, cols, rows, Origin::Human)
+}
+#[tauri::command]
+pub async fn get_source_index(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String) -> Result<crate::source_index::SourceIndexSelection> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.source_index.clone();
+    blocking(move || service.get(&folder)).await
+}
+#[tauri::command]
+pub async fn start_source_index(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String) -> Result<crate::source_index::SourceIndexStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.source_index.clone();
+    blocking(move || service.start(&folder)).await
+}
+#[tauri::command]
+pub async fn read_source_index_job(window: tauri::WebviewWindow, state: State<'_, AppState>, job_id: String) -> Result<crate::source_index::SourceIndexStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.source_index.clone();
+    blocking(move || service.read_job(&job_id)).await
+}
+#[tauri::command]
+pub async fn cancel_source_index(window: tauri::WebviewWindow, state: State<'_, AppState>, job_id: String) -> Result<crate::source_index::SourceIndexStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.source_index.clone();
+    blocking(move || service.cancel(&job_id)).await
+}
+#[tauri::command]
+pub async fn query_source_index(window: tauri::WebviewWindow, state: State<'_, AppState>, snapshot_id: String, query: crate::source_index::SourceIndexQuery) -> Result<crate::source_index::SourceIndexPage> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.source_index.clone();
+    blocking(move || service.query(&snapshot_id, query)).await
+}
+#[tauri::command]
+pub async fn open_native_agent_hub(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, expected_generation: u64) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let hub = state.registry.manager_hub().ok_or("manager bridge not initialized")?.clone();
+    blocking(move || hub.open_agent_hub(&id, expected_generation)).await
+}
+#[tauri::command]
+pub async fn list_human_decisions(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<crate::manager::HumanDecisionSnapshot> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let hub = state.registry.manager_hub().ok_or("manager bridge not initialized")?.clone();
+    blocking(move || hub.human_decisions()).await
+}
+#[tauri::command]
+pub async fn respond_human_decision(window: tauri::WebviewWindow, state: State<'_, AppState>, target: crate::manager::HumanDecisionTarget, response: serde_json::Value) -> Result<serde_json::Value> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let hub = state.registry.manager_hub().ok_or("manager bridge not initialized")?.clone();
+    blocking(move || hub.respond_human_decision(&target, response)).await
 }
 #[tauri::command]
 pub async fn list_all_terminals(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<Vec<crate::terminal::TerminalOwner>> {
@@ -674,9 +897,9 @@ pub async fn get_repository_setup_root(
     blocking(move || crate::setup::repository_root(&registry, &project_instance_id)).await
 }
 #[tauri::command]
-pub async fn list_agent_files(state: State<'_, AppState>) -> Result<crate::setup::AgentFiles> {
+pub async fn list_agent_files(state: State<'_, AppState>, kind: crate::instance::InstanceKind) -> Result<crate::setup::AgentFiles> {
     let registry = state.registry.clone();
-    blocking(move || Ok(crate::setup::agent_files(&registry))).await
+    blocking(move || Ok(crate::setup::agent_files(&registry, kind))).await
 }
 #[tauri::command]
 pub async fn list_omp_profiles(state: State<'_, AppState>) -> Result<crate::setup::OmpProfiles> {
@@ -866,9 +1089,13 @@ use crate::code_quality::types::{
     QualityState, ReportPreview, ScanAdmission,
 };
 #[tauri::command]
-pub fn get_code_quality_state(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<QualityState> {
+pub async fn get_code_quality_state(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<QualityState> {
     if window.label() != "main" { return Err("unauthorized window".into()); }
-    Ok(state.code_quality.state())
+    let service = state.code_quality.clone();
+    blocking(move || {
+        service.refresh_ownership()?;
+        Ok(service.state())
+    }).await
 }
 #[tauri::command]
 pub async fn check_code_quality_prerequisites(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<QualityState> {
@@ -903,6 +1130,50 @@ pub async fn start_code_quality_service(window: tauri::WebviewWindow, state: Sta
     if window.label() != "main" { return Err("unauthorized window".into()); }
     let service = state.code_quality.clone();
     blocking(move || service.start_service(expectedRevision)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn setup_code_quality(window: tauri::WebviewWindow, state: State<'_, AppState>, expectedRevision: u64, consent: bool) -> Result<QualityState> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.code_quality.clone();
+    blocking(move || service.setup(expectedRevision, consent)).await
+}
+#[tauri::command]
+pub async fn enter_code_quality(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<QualityState> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.code_quality.clone();
+    blocking(move || service.enter()).await
+}
+#[tauri::command]
+pub async fn take_over_code_quality(window: tauri::WebviewWindow, state: State<'_, AppState>, consent: bool) -> Result<QualityState> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.code_quality.clone();
+    blocking(move || service.take_over(consent)).await
+}
+#[tauri::command]
+pub async fn shutdown_code_quality_server(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<QualityState> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.code_quality.clone();
+    blocking(move || service.stop_server()).await
+}
+#[tauri::command]
+pub async fn reveal_code_quality_credentials(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<crate::code_quality::credentials::QualityLoginDetails> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.code_quality.clone();
+    blocking(move || service.reveal_credentials()).await
+}
+#[tauri::command]
+pub async fn set_code_quality_start_at_launch(window: tauri::WebviewWindow, state: State<'_, AppState>, enabled: bool) -> Result<QualityState> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.code_quality.clone();
+    blocking(move || service.set_start_at_launch(enabled)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn save_code_quality_report(window: tauri::WebviewWindow, state: State<'_, AppState>, scanId: String, path: String) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.code_quality.clone();
+    blocking(move || service.save_report(&scanId, &path)).await
 }
 #[tauri::command]
 #[allow(non_snake_case)]
@@ -944,6 +1215,12 @@ pub async fn list_code_quality_scans(window: tauri::WebviewWindow, state: State<
     blocking(move || service.list_scans(&folder)).await
 }
 #[tauri::command]
+pub async fn list_code_quality_project_folders(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<Vec<String>> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let service = state.code_quality.clone();
+    blocking(move || service.list_project_folders()).await
+}
+#[tauri::command]
 #[allow(non_snake_case)]
 pub async fn cancel_code_quality_scan(window: tauri::WebviewWindow, state: State<'_, AppState>, scanId: String) -> Result<QualityScan> {
     if window.label() != "main" { return Err("unauthorized window".into()); }
@@ -972,7 +1249,15 @@ pub async fn open_code_quality_sso_login(window: tauri::WebviewWindow, state: St
 }
 pub fn tick(app: AppHandle, registry: Arc<Registry>, terminals: Arc<crate::terminal::TerminalService>, closing: Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {
-        while !closing.load(std::sync::atomic::Ordering::Relaxed) {
+        loop {
+            if closing.load(std::sync::atomic::Ordering::Relaxed) {
+                use tauri::Manager as _;
+                if !app.try_state::<AppState>().is_some_and(|state| state.workspace.has_active_work()) { break; }
+                // Retain the existing process-exit monitor until entered workspace work settles.
+                if let Some(hub)=registry.manager_hub() {hub.observe_processes(&registry.snapshot());}
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
             if let Err(e) = registry.refresh() {
                 eprintln!("session refresh: {e}");
             }

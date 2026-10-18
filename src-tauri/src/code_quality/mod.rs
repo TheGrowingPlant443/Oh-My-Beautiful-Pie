@@ -6,9 +6,12 @@
 pub mod alternate;
 pub mod install;
 pub mod job;
+pub mod credentials;
 mod lifecycle;
 mod process_lock;
+mod ownership;
 pub mod reports;
+mod report_html;
 pub mod runtime;
 mod scan;
 pub mod scanners;
@@ -36,6 +39,8 @@ pub(crate) struct ActiveScan {
     pub cancel: Arc<AtomicBool>,
     pub scan: QualityScan,
 }
+pub(crate) type ProbeFn = Arc<dyn Fn(&std::path::Path, &QualityRuntime) -> (Vec<Prerequisite>, QualityOptions) + Send + Sync>;
+
 
 pub(crate) struct Inner {
     pub file: ConfigFile,
@@ -57,6 +62,9 @@ pub(crate) struct Inner {
     pub diagnostics: VecDeque<String>,
     pub unresolved: Vec<String>,
     pub op_cancel: Option<Arc<AtomicBool>>,
+    /// A setup run stopped for a Windows restart; the next run is labelled "Continue setup".
+    pub setup_resume: bool,
+    pub suspended: bool,
 }
 
 pub struct CodeQualityService {
@@ -65,9 +73,9 @@ pub struct CodeQualityService {
     pub(crate) factory: Arc<dyn EngineFactory>,
     pub(crate) secrets: Arc<dyn SecretStore>,
     pub(crate) inner: Mutex<Inner>,
-    /// True when another OMP Manager process owns the managed resources: this process only reads.
-    pub(crate) read_only: bool,
-    process_lock: Mutex<Option<process_lock::ProcessLock>>,
+    pub(crate) ownership: Mutex<ownership::Ownership>,
+    /// Read-only prerequisite probe; a seam so tests never touch the real machine.
+    pub(crate) probe: ProbeFn,
     pub(crate) closing: AtomicBool,
     pub(crate) workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
@@ -119,6 +127,44 @@ impl Drop for Gate {
     }
 }
 
+/// What "Install and setup" still has to do, derived only from cached probes and state (never probes).
+pub(crate) fn setup_state(inner: &Inner) -> SetupState {
+    let config = &inner.file.config;
+    let probed = !inner.prerequisites.is_empty();
+    let prerequisite = inner
+        .prerequisites
+        .iter()
+        .find(|p| std::mem::discriminant(&p.runtime) == std::mem::discriminant(&config.runtime));
+    let mut steps = Vec::new();
+    let mut push = |id: &str, label: String, done: bool, blocked: bool| {
+        let state = if done {
+            SetupStepState::Done
+        } else if blocked {
+            SetupStepState::Blocked
+        } else {
+            SetupStepState::Pending
+        };
+        steps.push(SetupStep { id: id.to_string(), label, state });
+    };
+    let wsl_runtime = matches!(config.runtime, QualityRuntime::Podman { .. } | QualityRuntime::DockerWsl { .. });
+    if wsl_runtime {
+        let restart = prerequisite.is_some_and(|p| p.needs_restart);
+        push("windowsFeatures", "Enable Windows features for WSL (needs one restart)".into(), probed && !restart && !inner.options.wsl_features_missing, restart);
+    }
+    let installed = prerequisite.is_some_and(|p| p.installed);
+    push("runtime", format!("Install {}", config.runtime.label()), installed, false);
+    if let QualityRuntime::Podman { connection } = &config.runtime {
+        push("machine", "Create the app's Podman machine".into(), probed && prerequisite.is_some_and(|p| p.installed) && (inner.options.podman_app_connection.is_some() || !connection.is_empty()), false);
+    }
+    push("server", "Start the analyzer".into(), inner.effective == Some(config.mode), false);
+    if config.mode == QualityMode::SonarqubeCommunity {
+        push("token", "Create the scan token".into(), inner.credentials.community, false);
+    }
+    let needed = steps.iter().any(|s| s.state != SetupStepState::Done);
+    let install_required = steps.iter().any(|s| matches!(s.id.as_str(), "windowsFeatures" | "runtime" | "machine") && s.state != SetupStepState::Done);
+    SetupState { needed, install_required, resume: inner.setup_resume, steps }
+}
+
 pub(crate) fn redact_line(line: &str) -> String {
     let mut text: String = line.chars().filter(|c| !c.is_control() || *c == '\t').collect();
     if text.len() > 600 {
@@ -132,6 +178,16 @@ pub(crate) fn redact_line(line: &str) -> String {
     text
 }
 
+/// The agents' `code_quality_report` tool lives in this module next to the bridge extension, which imports it.
+pub fn materialize_bridge(folder: &std::path::Path) -> Result<()> {
+    let file = folder.join("omp-code-quality.mjs");
+    let source = include_str!("../../../bridge/omp-code-quality.mjs");
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(source) {
+        std::fs::write(file, source).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 impl CodeQualityService {
     /// Production constructor: real engines, Windows Credential Manager, cross-process lock.
     pub fn new(config_root: PathBuf) -> Arc<Self> {
@@ -143,7 +199,7 @@ impl CodeQualityService {
         let root = config_root.join("code-quality");
         let name = process_lock::name_for(&root);
         let lock = process_lock::ProcessLock::acquire(&name);
-        Self::with_parts(config_root, factory, secrets, lock)
+        Self::with_parts(config_root, factory, secrets, lock, Arc::new(install::probe_prerequisites))
     }
 
     pub(crate) fn with_parts(
@@ -151,25 +207,26 @@ impl CodeQualityService {
         factory: Arc<dyn EngineFactory>,
         secrets: Arc<dyn SecretStore>,
         lock: Result<Option<process_lock::ProcessLock>>,
+        probe: ProbeFn,
     ) -> Arc<Self> {
         let paths = Paths::new(config_root.join("code-quality"));
+        let (held, lock_error) = match lock {
+            Ok(held) => (held, None),
+            Err(error) => (None, Some(error)),
+        };
         let mut fatal = None;
         let file = store::load_config(&paths).unwrap_or_else(|e| {
             fatal = Some(e);
             ConfigFile::default()
         });
-        let installation = store::load_installation(&paths).unwrap_or_else(|e| {
+        let installation = (if held.is_some() { store::load_installation(&paths) } else { store::read_installation(&paths).map(|id| id.unwrap_or_default()) }).unwrap_or_else(|e| {
             fatal.get_or_insert(e);
             String::new()
         });
         if let Err(e) = store::load_resources(&paths) {
             fatal.get_or_insert(e);
         }
-        let (read_only, held, lock_error) = match lock {
-            Ok(Some(lock)) => (false, Some(lock), None),
-            Ok(None) => (true, None, None),
-            Err(e) => (true, None, Some(e)),
-        };
+        let setup_resume = config_root.join("setup").join("pending-setup.json").is_file();
         let svc = Arc::new(CodeQualityService {
             config_root: config_root.clone(),
             paths,
@@ -194,36 +251,61 @@ impl CodeQualityService {
                 diagnostics: VecDeque::new(),
                 unresolved: Vec::new(),
                 op_cancel: None,
+                setup_resume,
+                suspended: false,
             }),
-            read_only,
-            process_lock: Mutex::new(held),
+            ownership: Mutex::new(ownership::Ownership::new(held)),
+            probe,
             closing: AtomicBool::new(false),
             workers: Mutex::new(Vec::new()),
         });
         svc.refresh_rules();
         svc.refresh_credentials();
+        if svc.owns_resources() && svc.inner.lock().fatal.is_none() {
+            svc.recover_interrupted_jobs();
+            if let Err(error) = svc.publish_owner() {
+                svc.inner.lock().fatal = Some(error.clone());
+                svc.inner.lock().error = Some(error);
+            }
+        }
         svc
     }
 
+    /// A read-only service (no process ownership, no credentials, a factory that must never be asked for an engine) so other
+    /// modules can test saved-result reads without touching a container runtime.
+    #[cfg(test)]
+    pub(crate) fn passive_for_tests(config_root: PathBuf) -> Arc<Self> {
+        struct NoEngine;
+        impl EngineFactory for NoEngine {
+            fn engine(&self, _: &QualityRuntime) -> Result<Arc<dyn runtime::Engine>> {
+                panic!("a saved-result read must not reach a container engine")
+            }
+        }
+        Self::with_parts(config_root, Arc::new(NoEngine), Arc::new(secrets::MemorySecrets::default()), Ok(None),
+            Arc::new(|_, _| (Vec::new(), QualityOptions::default())))
+    }
+
+    pub(crate) fn pending_setup_path(&self) -> PathBuf {
+        self.config_root.join("setup").join("pending-setup.json")
+    }
+
     pub fn state(&self) -> QualityState {
+        let ownership = self.ownership.lock();
+        let ownership_state = ownership.snapshot(&self.paths);
         let inner = self.inner.lock();
         let config = inner.file.config.clone();
         QualityState {
             revision: inner.file.revision,
             config,
             activated: inner.file.activated,
+            ownership: ownership_state,
+            suspended: inner.suspended,
             effective_mode: inner.effective,
             phase: inner.phase,
             busy: inner.busy,
             operation_id: inner.operation_id.clone(),
             requested_config: inner.requested.clone(),
-            error: inner.error.clone().or_else(|| {
-                if self.read_only {
-                    Some("Another OMP Manager process manages code quality; this one can only read saved results.".into())
-                } else {
-                    None
-                }
-            }),
+            error: inner.error.clone(),
             community: inner.community.clone(),
             credentials: inner.credentials.clone(),
             rules: inner.rules.clone(),
@@ -232,6 +314,8 @@ impl CodeQualityService {
             active_scan_id: inner.active_scan.as_ref().map(|s| s.id.clone()),
             diagnostics: inner.diagnostics.iter().cloned().collect(),
             unresolved: inner.unresolved.clone(),
+            setup: setup_state(&inner),
+            start_at_launch: inner.file.start_at_launch,
         }
     }
 
@@ -250,14 +334,21 @@ impl CodeQualityService {
 
     /// Single atomic admission. A second request is rejected immediately, never queued.
     pub(crate) fn admit(self: &Arc<Self>, phase: QualityPhase, requested: Option<QualityConfig>) -> Result<Gate> {
+        self.refresh_ownership()?;
+        self.admit_internal(phase, requested, false, false)
+    }
+
+    pub(crate) fn admit_internal(self: &Arc<Self>, phase: QualityPhase, requested: Option<QualityConfig>, transfer: bool, exit: bool) -> Result<Gate> {
+        let ownership = self.ownership.lock();
         let mut inner = self.inner.lock();
         if let Some(fatal) = &inner.fatal {
             return Err(fatal.clone());
         }
-        if self.read_only {
+        if ownership.transferring && !transfer { return Err(BUSY_MESSAGE.into()); }
+        if ownership.lock.is_none() || ownership.handed_off {
             return Err("Another OMP Manager process manages code quality; close it to change settings.".into());
         }
-        if self.closing.load(Ordering::Relaxed) {
+        if self.closing.load(Ordering::Relaxed) && !exit {
             return Err("OMP Manager is closing.".into());
         }
         if inner.busy {
@@ -349,24 +440,29 @@ impl CodeQualityService {
         Ok(())
     }
 
-    /// Exit path: cancel work, join workers, stop only app-owned Community containers, release the lock.
+    /// Keep OS authority until every admitted operation and worker has actually stopped.
     pub fn shutdown(self: &Arc<Self>) {
-        self.closing.store(true, Ordering::Relaxed);
-        self.request_cancel_all();
-        let handles: Vec<_> = std::mem::take(&mut *self.workers.lock());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        for handle in handles {
-            while !handle.is_finished() && std::time::Instant::now() < deadline {
+        if self.closing.swap(true, Ordering::AcqRel) {
+            // Concurrent close requests must not release the mutex underneath the first cleanup.
+            while self.owns_resources() {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            if handle.is_finished() {
-                let _ = handle.join();
-            }
+            return;
         }
-        if !self.read_only {
+        self.request_cancel_all();
+        for handle in std::mem::take(&mut *self.workers.lock()) {
+            let _ = handle.join();
+        }
+        while self.ownership.lock().transferring {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        while self.inner.lock().busy {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if self.owns_resources() {
             self.stop_all_on_exit();
+            self.release_owner(false);
         }
-        self.process_lock.lock().take();
     }
 
 }

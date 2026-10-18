@@ -1,4 +1,4 @@
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type { InstanceStatus } from "./api";
 
 export function basename(path: string): string {
@@ -15,9 +15,12 @@ export function statusClass(status: InstanceStatus): string {
   if (status === "error") return "err";
   return "";
 }
-export async function pickFolder(): Promise<string | null> {
-  const result = await open({ directory: true, multiple: false, title: "Choose project folder" });
+export async function pickFolder(defaultPath?: string): Promise<string | null> {
+  const result = await open({ directory: true, multiple: false, title: "Choose project folder", defaultPath });
   return typeof result === "string" ? result : null;
+}
+export async function pickReportPath(defaultName: string): Promise<string | null> {
+  return await save({ title: "Save code quality report", defaultPath: defaultName, filters: [{ name: "HTML report", extensions: ["html"] }] });
 }
 export async function confirmDanger(message: string): Promise<boolean> {
   return window.confirm(message);

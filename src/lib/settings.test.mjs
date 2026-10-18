@@ -48,6 +48,17 @@ test('chosen and latest targets use instance identity and fall back only to Mana
   assert.deepEqual(resolveStartupTarget(base, rows.slice(1)), { instanceId: null, missingProject: false });
 });
 
+test('Architect startup survives persistence and resolves only Architect', () => {
+  for (const autoStart of [true, false]) {
+    const saved = { ...parseAppSettings(null, null), startupTarget: 'architect', autoStart };
+    const settings = parseAppSettings(JSON.stringify(saved), null);
+    assert.deepEqual(settings, saved);
+    assert.deepEqual(resolveStartupTarget(settings, [...rows, { id: 'ARCH', kind: 'architect', status: 'stopped' }]),
+      { instanceId: 'ARCH', missingProject: false });
+    assert.deepEqual(resolveStartupTarget(settings, rows), { instanceId: null, missingProject: false });
+  }
+});
+
 test('dashboard startup is intentional with or without Manager and preserves saved choices', () => {
   for (const autoStart of [true, false]) {
     const saved = { version: 1, startupTarget: 'dashboard', startupProjectId: 'deleted-project',

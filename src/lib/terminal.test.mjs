@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { terminalTabs, nextSelection, outputWrite, stripAnsi, shellKey, commandKey, HISTORY_KEY } from './terminal.ts';
+import { terminalTabs, nextSelection, outputWrite, stripAnsi, shellKey, commandKey, HISTORY_KEY, DECISIONS_KEY } from './terminal.ts';
 
 function command(id, tab, startedAt, description = null) {
   return { executionId: id, sessionId: 's', sourceSessionId: 's', toolCallId: id, agentId: 'main', kind: 'bash', description, preview: `run ${id}`, cwd: '.', startedAt, endedAt: null, status: 'running', exitCode: null, tab, historical: false, hasOutput: false };
@@ -17,7 +17,17 @@ test('a session pane lists the user shell, history, then live commands by slot',
 
 test('the aggregate page labels every tab with its owner and never invents a shell', () => {
   const tabs = terminalTabs(null, [owner('a', 'Alpha', [command('c1', 2, 20)]), owner('b', 'Beta', [command('c2', 2, 10)], true)]);
-  assert.deepEqual(tabs.map(tab => tab.label), ['History', 'Beta · Tab 2 · run c2', 'Alpha · Tab 2 · run c1', 'Beta · User terminal']);
+  assert.deepEqual(tabs.map(tab => tab.label), ['History', 'Decisions', 'Beta · Tab 2 · run c2', 'Alpha · Tab 2 · run c1', 'Beta · User terminal']);
+});
+
+test('global decisions is permanent, never appears per-agent, and cannot steal Follow selection', () => {
+  const tabs = terminalTabs(null, []);
+  assert.deepEqual(tabs.map(tab => tab.key), [HISTORY_KEY, DECISIONS_KEY]);
+  assert.equal(nextSelection(tabs, new Set([HISTORY_KEY]), HISTORY_KEY, true), HISTORY_KEY);
+  assert.equal(nextSelection(tabs, new Set(), DECISIONS_KEY, true), DECISIONS_KEY);
+  assert.equal(terminalTabs('a', []).some(tab => tab.kind === 'decisions'), false);
+  const commands = terminalTabs(null, [owner('a', 'Alpha', [command('c', 2, 20)])]);
+  assert.equal(nextSelection(commands, new Set(tabs.map(tab => tab.key)), DECISIONS_KEY, true), commandKey('a', 'c'));
 });
 
 test('follow selects only newly started commands; without it the selection stays and falls back to history', () => {

@@ -14,8 +14,10 @@
     generation?: number;
     fontSize?: number;
     scrollback?: number;
+    focusRequest?: number;
+    onReady?: (id: string, generation: number, ready: boolean) => void;
   }
-  let { instanceId, interactive = false, cols = 120, rows = 32, generation = 0, fontSize = 13, scrollback = 4000 }: Props = $props();
+  let { instanceId, interactive = false, cols = 120, rows = 32, generation = 0, fontSize = 13, scrollback = 4000, focusRequest = 0, onReady }: Props = $props();
   let host = $state<HTMLDivElement>();
   let terminal: Terminal | undefined;
   let relayout: (() => void) | undefined;
@@ -28,6 +30,7 @@
     const element = host;
     const run = processGeneration;
     const mode = terminalMode;
+    const ready = untrack(() => onReady);
     if (!element) return;
     // Snapshot metadata must not dispose and recreate the terminal.
     const term = untrack(() => new Terminal({
@@ -59,7 +62,9 @@
     });
     const unsubscribe = ptyBus.subscribe(id, sink, mode);
     term.write("", () => { replaying = false; });
-    if (run > 0) void ptyBus.ensureAttached(id).catch(error => reportError("Attach terminal", error));
+    if (run > 0) void ptyBus.ensureAttached(id).then(() => {
+      term.write("", () => { if (!disposed && mode) ready?.(id, run, true); });
+    }).catch(error => reportError("Attach terminal", error));
     let frame = 0;
     // 0 forces the first layout after mount to report the fitted size: the snapshot's cols/rows can be stale, and the
     // backend ignores resizes to the size the PTY already has.
@@ -96,6 +101,7 @@
     frame = requestAnimationFrame(layout);
     return () => {
       disposed = true;
+      if (mode) ready?.(id, run, false);
       cancelAnimationFrame(frame);
       observer.disconnect();
       unsubscribe();
@@ -103,6 +109,11 @@
       term.dispose();
       if (terminal === term) { terminal = undefined; relayout = undefined; }
     };
+  });
+
+  $effect(() => {
+    focusRequest;
+    if (interactive) terminal?.focus();
   });
 
   $effect(() => {

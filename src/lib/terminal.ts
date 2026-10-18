@@ -8,7 +8,7 @@ export const defaultTerminalUi = (): TerminalUi => ({ pane: null, tab: "", follo
 
 export interface TabDescriptor {
   key: string;
-  kind: "shell" | "history" | "command";
+  kind: "shell" | "history" | "decisions" | "command";
   label: string;
   title: string;
   instanceId: string | null;
@@ -16,6 +16,7 @@ export interface TabDescriptor {
 }
 
 export const HISTORY_KEY = "history";
+export const DECISIONS_KEY = "decisions";
 export const shellKey = (instanceId: string): string => `shell:${instanceId}`;
 export const commandKey = (instanceId: string, executionId: string): string => `command:${instanceId}:${executionId}`;
 
@@ -23,7 +24,7 @@ export function commandLabel(command: CommandSummary): string {
   return command.description ?? command.preview;
 }
 
-// Session pane: 0 user shell, 1 history, 2.. live commands by slot. Aggregate: history, commands, then shells.
+// Session pane: 0 user shell, 1 history, 2.. live commands by slot. Aggregate: history, decisions, commands, then shells.
 export function terminalTabs(instanceId: string | null, owners: readonly TerminalOwner[]): TabDescriptor[] {
   const history: TabDescriptor = {
     key: HISTORY_KEY, kind: "history", label: instanceId === null ? "History" : "1 · History",
@@ -43,7 +44,9 @@ export function terminalTabs(instanceId: string | null, owners: readonly Termina
     key: shellKey(owner.instanceId), kind: "shell", instanceId: owner.instanceId,
     label: instanceId === null ? `${owner.name} · User terminal` : "0 · Terminal", title: "Your own shell",
   }));
-  if (instanceId === null) return [history, ...commands, ...shells];
+  if (instanceId === null) return [history, {
+    key: DECISIONS_KEY, kind: "decisions", label: "Decisions", title: "Human answers across all agents", instanceId: null,
+  }, ...commands, ...shells];
   return [...shells, history, ...commands];
 }
 

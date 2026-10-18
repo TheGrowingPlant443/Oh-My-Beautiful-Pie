@@ -24,9 +24,15 @@ mod manager;
 mod pty;
 mod plan;
 mod package_insights;
+mod project_insight;
+mod project_requirements;
 mod session;
 mod setup;
+mod source_index;
+mod system_overview;
 mod terminal;
+mod workspace;
+mod workspace_native;
 #[cfg(windows)]
 mod process_tree;
 
@@ -36,6 +42,7 @@ use tauri::Manager;
 
 pub struct AppState {
     pub registry: Arc<instance::Registry>,
+    pub workspace: Arc<workspace::WorkspaceService>,
     pub closing: Arc<AtomicBool>,
     pub setup: Arc<setup::SetupService>,
     pub plan: Arc<plan::PlanService>,
@@ -49,6 +56,8 @@ pub struct AppState {
     pub dependency_context: Arc<dependency_context::DependencyContextService>,
     pub dependency_project_review: Arc<dependency_project_review::DependencyProjectReviewService>,
     pub dependency_updates: Arc<dependency_updates::DependencyUpdateService>,
+    pub project_insight: Arc<project_insight::ProjectInsightService>,
+    pub source_index: Arc<source_index::SourceIndexService>,
     pub inhouse: Arc<inhouse::InhouseService>,
     #[cfg(windows)]
     pub browser_host: Arc<browser_window::BrowserHost>,
@@ -96,9 +105,12 @@ fn main() {
             let terminals = terminal::TerminalService::new(&folder);
             terminal::TerminalService::materialize(&folder).map_err(std::io::Error::other)?;
             helper_agent::materialize(&folder).map_err(std::io::Error::other)?;
+            code_quality::materialize_bridge(&folder).map_err(std::io::Error::other)?;
             architect::materialize(&folder).map_err(std::io::Error::other)?;
+            workspace_native::materialize(&folder).map_err(std::io::Error::other)?;
             terminals.bind_app(app.handle().clone()).map_err(std::io::Error::other)?;
             let hub = manager::ManagerHub::bind(extension).map_err(std::io::Error::other)?;
+            hub.bind_app(app.handle().clone()).map_err(std::io::Error::other)?;
             hub.bind_registry(Arc::downgrade(&registry))
                 .map_err(std::io::Error::other)?;
             terminals.bind_registry(Arc::downgrade(&registry)).map_err(std::io::Error::other)?;
@@ -106,9 +118,16 @@ fn main() {
             hub.install_terminal_service(terminals.clone()).map_err(std::io::Error::other)?;
             registry.install_terminal_service(terminals.clone()).map_err(std::io::Error::other)?;
             registry
-                .install_manager_hub(hub)
+                .install_manager_hub(hub.clone())
                 .map_err(std::io::Error::other)?;
+            let workspace = workspace::WorkspaceService::new(registry.clone(), hub.clone(), folder.clone());
+            workspace.bind_app(app.handle().clone()).map_err(std::io::Error::other)?;
+            hub.install_workspace_service(Arc::downgrade(&workspace)).map_err(std::io::Error::other)?;
+            let dependency_updates = Arc::new(dependency_updates::DependencyUpdateService::new(folder.clone()));
+            dependency_updates.bind_workspace(workspace.clone()).map_err(std::io::Error::other)?;
+            workspace.bind_dependency_updates(Arc::downgrade(&dependency_updates)).map_err(std::io::Error::other)?;
             registry.refresh().map_err(std::io::Error::other)?;
+            if let Err(error) = workspace.reconcile_computed_folders() { eprintln!("Reconciling computed workspace folders: {error}"); }
             let closing = Arc::new(AtomicBool::new(false));
             commands::tick(app.handle().clone(), registry.clone(), terminals.clone(), closing.clone());
             let package_insights = Arc::new(
@@ -121,8 +140,13 @@ fn main() {
             let inhouse = Arc::new(inhouse::InhouseService::new(folder.clone()));
             let code_quality = code_quality::CodeQualityService::new(folder.clone());
             code_quality.reconcile_on_start();
+            hub.install_code_quality_service(Arc::downgrade(&code_quality)).map_err(std::io::Error::other)?;
+            let source_index = source_index::SourceIndexService::new(folder.clone());
+            let project_insight = Arc::new(project_insight::ProjectInsightService::new(folder.clone()));
+            project_insight.bind_source_facts(source_index.clone());
             app.manage(AppState {
                 registry,
+                workspace,
                 closing,
                 browser: browser.clone(),
                 code_diff: Arc::new(code_diff::DiffService::new()),
@@ -132,7 +156,9 @@ fn main() {
                 dependency_security,
                 dependency_context: Arc::new(dependency_context::DependencyContextService::new(folder.clone())),
                 dependency_project_review: Arc::new(dependency_project_review::DependencyProjectReviewService::new(folder.clone())),
-                dependency_updates: Arc::new(dependency_updates::DependencyUpdateService::new(folder.clone())),
+                dependency_updates,
+                project_insight,
+                source_index,
                 inhouse,
                 #[cfg(windows)]
                 browser_host: browser_host.clone(),
@@ -155,12 +181,20 @@ fn main() {
             commands::install_code_quality_runtime,
             commands::enable_code_quality_windows_features,
             commands::start_code_quality_service,
+            commands::setup_code_quality,
+            commands::enter_code_quality,
+            commands::take_over_code_quality,
+            commands::shutdown_code_quality_server,
+            commands::reveal_code_quality_credentials,
+            commands::set_code_quality_start_at_launch,
+            commands::save_code_quality_report,
             commands::acknowledge_code_quality_rules,
             commands::detect_code_quality_project,
             commands::prepare_code_quality_scan,
             commands::start_code_quality_scan,
             commands::read_code_quality_scan,
             commands::list_code_quality_scans,
+            commands::list_code_quality_project_folders,
             commands::cancel_code_quality_scan,
             commands::read_code_quality_report,
             commands::open_code_quality_dashboard,
@@ -178,9 +212,11 @@ fn main() {
             commands::reset_last_commit,
             commands::create_branch_at,
             commands::create_instance,
+            commands::ensure_coordinators,
             commands::create_manager,
             commands::create_architect,
             commands::scan_dependencies,
+            commands::get_project_requirements,
             commands::get_dependency_classification,
             commands::classify_dependencies,
             commands::get_package_insights,
@@ -198,13 +234,34 @@ fn main() {
             commands::start_dependency_usage_explanation,
             commands::read_dependency_usage_explanation,
             commands::show_dependency_result_in_architect,
+            commands::dependency_manifest_status,
+            commands::request_project_insight,
+            commands::get_project_insight,
+            commands::request_system_visualization,
+            commands::read_project_insight,
+            commands::approve_structure_preview,
+            commands::list_structure_sources,
+            commands::read_structure_source,
+            commands::select_last_structure_source,
+            commands::get_source_index,
+            commands::start_source_index,
+            commands::read_source_index_job,
+            commands::cancel_source_index,
+            commands::query_source_index,
+            commands::prepare_manifest_creation,
+            commands::confirm_manifest_creation,
             commands::start_project_dependency_security_review,
             commands::read_project_dependency_security_review,
             commands::start_dependency_update_plan,
             commands::read_dependency_update_plan,
             commands::prepare_dependency_update_handoff,
             commands::confirm_dependency_update_handoff,
-            commands::set_manager_owner,
+            commands::change_agent_directory,
+            commands::list_computed_workspace_folders,
+            commands::hand_over_to_manager,
+            commands::take_back_control,
+            commands::give_repo_to_architect,
+            commands::list_workspace_changes,
             commands::return_to_manager,
             commands::start_instance,
             commands::stop_instance,
@@ -238,6 +295,9 @@ fn main() {
             commands::open_helper,
             commands::read_terminal_output,
             commands::attach_command_output,
+            commands::open_native_agent_hub,
+            commands::list_human_decisions,
+            commands::respond_human_decision,
             commands::kill_terminal_command,
             commands::open_user_terminal,
             commands::attach_user_terminal,
@@ -248,18 +308,24 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("could not initialize OMP Manager");
     app.run(|handle, event| {
-        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+        if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
             let state = handle.state::<AppState>();
             if !state.closing.swap(true, Ordering::Relaxed) {
                 api.prevent_exit();
                 let registry = state.registry.clone();
                 let quality = state.code_quality.clone();
+                let workspace = state.workspace.clone();
                 let handle = handle.clone();
                 std::thread::spawn(move || {
+                    workspace.shutdown();
                     quality.shutdown();
                     registry.shutdown();
                     handle.exit(0);
                 });
+            } else if code.is_none() {
+                // Repeated window closes must not bypass the in-flight cleanup.
+                // The cleanup worker's explicit exit(0) is the terminal request.
+                api.prevent_exit();
             }
         }
     });

@@ -1,10 +1,13 @@
 //! Dependency-update proposals: the existing Architect drafts a plan from a saved security/project review, the human
 //! reads it, and only an explicit, separately confirmed handoff sends it to The Manager. Drafting never touches The
 //! Manager, a worker, a project file or a live plan; handoff idempotency is scoped to the proposal revision.
+//! A confirmed revision is durably Pending while the workspace queue reaches a safe native boundary. Only its
+//! post-commit callback may persist Attempting and admit the approved input. Restarted Pending is known-unsent;
+//! restarted Attempting is uncertain and must never be automatically replayed.
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -17,9 +20,10 @@ use crate::dependency_security::{
     atomic_json, bounded_json, required_nullable, valid_text, validate_id, DependencyJobAdmission, JobDisposition,
     MAX_REPORT_BYTES, MAX_REQUEST_BYTES, MAX_SAFE_INTEGER,
 };
-use crate::instance::{Instance, InstanceKind, Origin, Registry};
+use crate::instance::{ControlLease, Instance, InstanceKind, Origin, Registry};
 use crate::manager::{DependencyProducer, UpdatePlanSendError};
 use crate::plan;
+use crate::workspace::WorkspaceService;
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
 
@@ -34,6 +38,8 @@ const UNKNOWN_ADMISSION: &str = "Prompt admission outcome unknown. Inspect The A
 const PRODUCER_ENDED: &str = "The Architect session that was asked to draft this plan ended before it saved a proposal. Regenerate the plan to try again.";
 const NO_MANAGER: &str = "Create The Manager first using its toolbar button.";
 const RESTART_UNCERTAIN: &str = "The app closed while this handoff was in progress. Inspect The Manager's conversation before sending anything else.";
+const RESTART_PENDING: &str = "The app closed before this queued workspace handoff admitted a prompt. Review the current Manager repository context and confirm the handoff again.";
+const CONTEXT_CHANGED: &str = "The Manager's repository set or working directory target changed. Review a fresh handoff confirmation before sending the plan.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -73,7 +79,7 @@ pub enum UpdatePlanStatus { Pending, Complete, Error }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum HandoffStatus { Attempting, Accepted, KnownUnsent, Uncertain }
+pub enum HandoffStatus { Pending, Attempting, Accepted, KnownUnsent, Uncertain }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,6 +140,8 @@ pub struct HandoffPrepared {
     pub manager_name: String,
     pub needs_start: bool,
     pub project_folder: String,
+    pub manager_working_directory: String,
+    pub repository_folders: Vec<String>,
     pub title: String,
 }
 
@@ -206,6 +214,9 @@ struct HandoffRecord {
     #[serde(deserialize_with = "required_nullable")]
     error: Option<String>,
     updated_at: u64,
+    /// Identifies this claim, not merely its revision; late callbacks cannot affect a later explicit retry.
+    #[serde(default)]
+    handoff_id: Option<String>,
 }
 
 impl HandoffRecord {
@@ -233,10 +244,16 @@ struct Prepared {
     revision_id: String,
     hash: String,
     manager_id: String,
-    manager_generation: u64,
-    manager_session_id: Option<String>,
+    manager_lease: ControlLease,
+    manager_working_directory: String,
+    repository_folders: Vec<String>,
     needs_start: bool,
     expires_at: u64,
+}
+
+struct PendingHandoff {
+    prepared: Arc<Prepared>,
+    registry: Weak<Registry>,
 }
 
 enum Claim { Granted, Blocked(HandoffRecord) }
@@ -247,6 +264,9 @@ pub struct DependencyUpdateService {
     root: PathBuf,
     index: Mutex<Index>,
     prepared: Mutex<HashMap<String, Prepared>>,
+    workspace: OnceLock<Arc<WorkspaceService>>,
+    /// Removing an entry claims its one completion; no mutex spans native prompt admission.
+    pending: Mutex<HashMap<String, PendingHandoff>>,
     /// Serialises handoff claims inside this process; the `create_new` lock file protects against another process.
     handoff_gate: Mutex<()>,
     starter: Starter,
@@ -302,6 +322,8 @@ impl DependencyUpdateService {
             root: config_root.join("architect").join("dependency-update-plans"),
             index: Mutex::new(Index::default()),
             prepared: Mutex::new(HashMap::new()),
+            workspace: OnceLock::new(),
+            pending: Mutex::new(HashMap::new()),
             handoff_gate: Mutex::new(()),
             starter: Box::new(|registry, id| registry.start(id, Origin::Human)),
         };
@@ -328,11 +350,14 @@ impl DependencyUpdateService {
         service
     }
 
-    #[cfg(test)]
-    fn with_starter(mut self, starter: Starter) -> Self {
-        self.starter = starter;
-        self
+    pub fn bind_workspace(&self, workspace: Arc<WorkspaceService>) -> Result<()> {
+        self.workspace.set(workspace).map_err(|_| "dependency workspace service already initialized".into())
     }
+
+    fn workspace(&self) -> Result<&Arc<WorkspaceService>> {
+        self.workspace.get().ok_or_else(|| "dependency workspace service not initialized".into())
+    }
+
 
     /// Start, join or reuse the draft for `(project, source review)`. `planning` publishes the snapshot of the current
     /// authoritative scan and runs only when a fresh draft is created, so reuse performs no scan or model prompt.
@@ -348,6 +373,9 @@ impl DependencyUpdateService {
         if let Some(id) = existing {
             // A pending draft is always joined, even when regenerating; a finished one is reused unless regenerating.
             let state = self.read(registry, &id)?;
+            if state.handoff.as_ref().is_some_and(|handoff| matches!(handoff.status, HandoffStatus::Pending | HandoffStatus::Attempting)) {
+                return Err("A handoff of this plan is pending; wait for its delivery result before regenerating.".into());
+            }
             if state.status == UpdatePlanStatus::Pending || !regenerate {
                 return self.job_admission(registry, &id, false);
             }
@@ -454,6 +482,7 @@ impl DependencyUpdateService {
         if let Some(record) = self.read_handoff(request_id, revision_id)? {
             match record.status {
                 HandoffStatus::Accepted => return Err("This plan revision was already handed over to The Manager.".into()),
+                HandoffStatus::Pending => return Err("This plan revision is waiting for The Manager's safe workspace transition.".into()),
                 HandoffStatus::Attempting | HandoffStatus::Uncertain => return Err(
                     "A handoff of this plan revision may already have reached The Manager. Inspect The Manager's conversation before sending anything else.".into()),
                 HandoffStatus::KnownUnsent => (),
@@ -462,6 +491,8 @@ impl DependencyUpdateService {
         let manager = find_manager(registry).ok_or(NO_MANAGER)?;
         let lease = registry.lease(&manager.id, Origin::Human, false)?;
         let needs_start = !is_running(&manager);
+        let context = self.workspace()?.dependency_plan_context(&entry.request.folder)?;
+        if context.manager_id != manager.id { return Err("The Manager was replaced; confirm the handoff again.".into()); }
         let token = uuid::Uuid::new_v4().to_string();
         let expires_at = now_ms() + TOKEN_TTL_MS;
         {
@@ -470,17 +501,18 @@ impl DependencyUpdateService {
             prepared.retain(|_, item| item.expires_at > now);
             prepared.insert(token.clone(), Prepared {
                 request_id: request_id.into(), revision_id: proposal.revision_id.clone(), hash: proposal.hash.clone(),
-                manager_id: manager.id.clone(), manager_generation: lease.generation, manager_session_id: lease.session_id, needs_start, expires_at,
+                manager_id: manager.id.clone(), manager_lease: lease, needs_start, expires_at,
+                manager_working_directory: context.manager_working_directory.clone(), repository_folders: context.repository_folders.clone(),
             });
         }
         Ok(HandoffPrepared {
             confirmation_token: token, expires_at, revision_id: proposal.revision_id, manager_id: manager.id, manager_name: manager.name,
             needs_start, project_folder: entry.request.folder.clone(), title: proposal.title,
+            manager_working_directory: context.manager_working_directory, repository_folders: context.repository_folders,
         })
     }
 
-    /// Consumes the token once. Every failure before the revision claim has no Manager side effect; after the claim the
-    /// returned handoff status says what happened and its `error` explains it.
+    /// Consumes the token once. The durable Pending claim precedes queue admission, process start and native moves.
     pub fn confirm_handoff(&self, registry: &Arc<Registry>, token: &str) -> Result<UpdatePlanHandoff> {
         let prepared = self.prepared.lock().remove(token).ok_or("This confirmation is no longer valid; confirm the handoff again.")?;
         if now_ms() > prepared.expires_at { return Err("The confirmation expired; confirm the handoff again.".into()); }
@@ -492,63 +524,135 @@ impl DependencyUpdateService {
         let manager = find_manager(registry).ok_or(NO_MANAGER)?;
         if manager.id != prepared.manager_id { return Err("The Manager was replaced; confirm the handoff again.".into()); }
         if is_running(&manager) == prepared.needs_start { return Err("The Manager was started or stopped since you confirmed; confirm the handoff again.".into()); }
-        if !prepared.needs_start {
-            let lease = registry.lease(&manager.id, Origin::Human, false)?;
-            if lease.generation != prepared.manager_generation || (prepared.manager_session_id.is_some() && lease.session_id != prepared.manager_session_id) {
-                return Err("The Manager's session changed since you confirmed; confirm the handoff again.".into());
-            }
+        let lease = registry.lease(&manager.id, Origin::Human, false)?;
+        if lease != prepared.manager_lease {
+            return Err("The Manager's session or workspace changed since you confirmed; confirm the handoff again.".into());
         }
-        // Revision-scoped durable claim BEFORE any start, abort or prompt.
-        if let Claim::Blocked(record) = self.claim_handoff(&prepared.request_id, &prepared.revision_id, &prepared.manager_id)? {
+        self.validate_workspace_context(&entry.request.folder, &prepared)?;
+        let handoff_id = uuid::Uuid::new_v4().to_string();
+        if let Claim::Blocked(record) = self.claim_handoff(&prepared.request_id, &prepared.revision_id, &prepared.manager_id, &handoff_id)? {
             let mut view = record.view();
             if view.error.is_none() {
                 view.error = Some(match record.status {
                     HandoffStatus::Accepted => "This plan revision was already handed over to The Manager.".into(),
-                    _ => "A handoff of this plan revision may already have reached The Manager. Inspect its conversation before sending anything else.".to_string(),
+                    HandoffStatus::Pending => "This plan revision is waiting for The Manager's safe workspace transition.".into(),
+                    _ => "A handoff of this plan revision may already have reached The Manager. Inspect its conversation before sending anything else.".into(),
                 });
             }
             return Ok(view);
         }
-        let outcome = self.dispatch(registry, &entry.request, &proposal, &prepared);
-        let (status, error) = match outcome {
-            Ok(()) => (HandoffStatus::Accepted, None),
-            Err(UpdatePlanSendError::NotSent(error)) => (HandoffStatus::KnownUnsent, Some(error)),
-            Err(UpdatePlanSendError::Uncertain(error)) => (HandoffStatus::Uncertain,
-                Some(format!("The plan may or may not have reached The Manager: {error}. Inspect The Manager's conversation before sending anything else."))),
+        let request_id = prepared.request_id.clone();
+        let revision_id = prepared.revision_id.clone();
+        let manager_id = prepared.manager_id.clone();
+        let target = prepared.manager_working_directory.clone();
+        let repositories = prepared.repository_folders.clone();
+        self.pending.lock().insert(handoff_id.clone(), PendingHandoff { prepared: Arc::new(prepared), registry: Arc::downgrade(registry) });
+        if let Err(error) = self.workspace()?.enqueue_dependency_plan(handoff_id.clone(), manager_id, lease, target, repositories) {
+            self.fail_workspace_handoff(&handoff_id, &error)?;
+        }
+        self.read_handoff(&request_id, &revision_id)?.map(|record| record.view()).ok_or_else(|| "The claimed handoff record is missing".into())
+    }
+
+    fn validate_workspace_context(&self, project_folder: &str, prepared: &Prepared) -> Result<()> {
+        let context = self.workspace()?.dependency_plan_context(project_folder)?;
+        if context.manager_id != prepared.manager_id ||
+            !crate::instance::same_folder(&context.manager_working_directory, &prepared.manager_working_directory) ||
+            context.repository_folders.len() != prepared.repository_folders.len() ||
+            !context.repository_folders.iter().zip(&prepared.repository_folders).all(|(current, approved)| crate::instance::same_folder(current, approved)) {
+            return Err(CONTEXT_CHANGED.into());
+        }
+        Ok(())
+    }
+
+    /// Revalidate the approved set and original lease when the FIFO head is about to enter its first move. A later
+    /// authorized offline-move/start continuation uses the post-commit lease instead, through completion below.
+    pub(crate) fn validate_workspace_handoff(&self, handoff_id: &str) -> Result<()> {
+        let (prepared, registry) = {
+            let pending = self.pending.lock();
+            let item = pending.get(handoff_id).ok_or("The queued dependency handoff was cancelled")?;
+            (item.prepared.clone(), item.registry.upgrade().ok_or("The application is closing")?)
         };
-        let record = HandoffRecord { status, manager_id: prepared.manager_id, revision_id: prepared.revision_id, error, updated_at: now_ms() };
-        self.write_handoff(&prepared.request_id, &record)?;
-        Ok(record.view())
+        let record = self.read_handoff(&prepared.request_id, &prepared.revision_id)?.ok_or("The claimed handoff record is missing")?;
+        if record.status != HandoffStatus::Pending || record.handoff_id.as_deref() != Some(handoff_id) {
+            return Err("The dependency handoff claim changed; confirm the handoff again.".into());
+        }
+        let entry = self.entry(&prepared.request_id)?;
+        self.validate_workspace_context(&entry.request.folder, &prepared)?;
+        if registry.lease(&prepared.manager_id, Origin::Human, false)? != prepared.manager_lease {
+            return Err("The Manager's session or workspace changed while the handoff was queued; confirm again.".into());
+        }
+        Ok(())
     }
 
-    fn dispatch(&self, registry: &Arc<Registry>, request: &UpdateRequest, proposal: &SavedProposal, prepared: &Prepared) -> std::result::Result<(), UpdatePlanSendError> {
-        use UpdatePlanSendError::NotSent;
-        let hub = registry.manager_hub().ok_or_else(|| NotSent("manager bridge not initialized".into()))?;
-        if prepared.needs_start {
-            // Start/resume only this saved Manager; the lease below must then be the one the dispatch keeps.
-            (self.starter)(registry, &prepared.manager_id).map_err(|error| NotSent(format!("The Manager could not be started: {error}")))?;
+    /// The authenticated dependencyPlan queue head calls this after its workspace commit. The new lease belongs to
+    /// this authorized transition; comparing it verbatim to the old pre-move identity would reject a valid relocation.
+    pub(crate) fn complete_workspace_handoff(&self, handoff_id: &str, request_id: &str, postmove: &ControlLease) -> Result<(), UpdatePlanSendError> {
+        use UpdatePlanSendError::{NotSent, Uncertain};
+        let Some(pending) = self.pending.lock().remove(handoff_id) else { return Ok(()); };
+        let prepared = &pending.prepared;
+        let mut attempting = false;
+        let outcome = (|| {
+            let registry = pending.registry.upgrade().ok_or_else(|| NotSent("The application is closing.".into()))?;
+            let entry = self.entry(&prepared.request_id).map_err(NotSent)?;
+            let proposal = self.load_proposal(&entry.request).map_err(NotSent)?.ok_or_else(|| NotSent("The approved update plan is no longer available.".into()))?;
+            if proposal.revision_id != prepared.revision_id || proposal.hash != prepared.hash {
+                return Err(NotSent("The approved plan changed; review a fresh confirmation.".into()));
+            }
+            self.validate_workspace_context(&entry.request.folder, prepared).map_err(NotSent)?;
+            let manager = registry.inspect(&prepared.manager_id, Origin::Human).map_err(NotSent)?;
+            let current = registry.lease(&prepared.manager_id, Origin::Human, true).map_err(NotSent)?;
+            if manager.kind != InstanceKind::Manager || &current != postmove || current.session_id.is_none() ||
+                !crate::instance::same_folder(&manager.project_path, &prepared.manager_working_directory) {
+                return Err(NotSent("The Manager's post-move session or workspace changed before delivery. Confirm the handoff again.".into()));
+            }
+            let path = self.request_dir(&prepared.request_id).join("plan.md");
+            plan::write_atomic(&path, &proposal.markdown).map_err(NotSent)?;
+            let hub = registry.manager_hub().ok_or_else(|| NotSent("manager bridge not initialized".into()))?;
+            // No native input can be admitted until Attempting is durable. A failed Accepted save leaves this marker.
+            self.transition_handoff(prepared, handoff_id, HandoffStatus::Pending, HandoffStatus::Attempting, None).map_err(NotSent)?;
+            attempting = true;
+            hub.send_workspace_plan_prompt(&prepared.manager_id, postmove, request_id, &handoff_message(&entry.request, &proposal, &path))
+        })();
+        let (status, error) = match &outcome {
+            Ok(()) => (HandoffStatus::Accepted, None),
+            Err(NotSent(error)) => (HandoffStatus::KnownUnsent, Some(error.clone())),
+            Err(Uncertain(error)) => (HandoffStatus::Uncertain, Some(format!("The plan may or may not have reached The Manager: {error}. Inspect The Manager's conversation before sending anything else."))),
+        };
+        let expected = if attempting { HandoffStatus::Attempting } else { HandoffStatus::Pending };
+        if let Err(error) = self.transition_handoff(prepared, handoff_id, expected, status, error) {
+            return Err(if matches!(outcome, Ok(()) | Err(Uncertain(_))) {
+                Uncertain(format!("Prompt admission may have occurred, but its result could not be persisted: {error}. Inspect The Manager's conversation."))
+            } else { NotSent(error) });
         }
-        hub.wait_ready(&prepared.manager_id).map_err(|error| NotSent(format!("The Manager is not ready: {error}")))?;
-        let manager = registry.inspect(&prepared.manager_id, Origin::Human).map_err(NotSent)?;
-        if manager.kind != InstanceKind::Manager { return Err(NotSent("The target is no longer The Manager.".into())); }
-        let lease = registry.lease(&prepared.manager_id, Origin::Human, true).map_err(NotSent)?;
-        if prepared.needs_start {
-            if lease.session_id.is_none() { return Err(NotSent("The Manager did not report a session.".into())); }
-        } else if lease.generation != prepared.manager_generation || (prepared.manager_session_id.is_some() && lease.session_id != prepared.manager_session_id) {
-            return Err(NotSent("The Manager's session changed after you confirmed.".into()));
-        }
-        let path = self.request_dir(&request.request_id).join("plan.md");
-        plan::write_atomic(&path, &proposal.markdown).map_err(NotSent)?;
-        hub.send_dependency_update_plan(&prepared.manager_id, &lease, &handoff_message(request, proposal, &path))
+        outcome
     }
 
-    fn claim_handoff(&self, request_id: &str, revision_id: &str, manager_id: &str) -> Result<Claim> {
+    /// Queue rejection/cancellation/move failure is known-unsent. A callback already claimed for delivery owns its result.
+    pub(crate) fn fail_workspace_handoff(&self, handoff_id: &str, error: &str) -> Result<()> {
+        let Some(pending) = self.pending.lock().remove(handoff_id) else { return Ok(()); };
+        self.transition_handoff(&pending.prepared, handoff_id, HandoffStatus::Pending, HandoffStatus::KnownUnsent, Some(error.into()))
+    }
+
+    fn transition_handoff(&self, prepared: &Prepared, handoff_id: &str, expected: HandoffStatus, status: HandoffStatus, error: Option<String>) -> Result<()> {
+        let _gate = self.handoff_gate.lock();
+        let _lock = FileLock::acquire(self.request_dir(&prepared.request_id).join(format!("handoff-{}.lock", prepared.revision_id)))?;
+        let mut record = self.read_handoff(&prepared.request_id, &prepared.revision_id)?.ok_or("The claimed handoff record is missing")?;
+        if record.handoff_id.as_deref() != Some(handoff_id) || record.status != expected {
+            return Err("The handoff claim changed; no prompt was retried.".into());
+        }
+        record.status = status;
+        record.error = error;
+        record.updated_at = now_ms();
+        self.write_handoff(&prepared.request_id, &record)
+    }
+
+    fn claim_handoff(&self, request_id: &str, revision_id: &str, manager_id: &str, handoff_id: &str) -> Result<Claim> {
         let _gate = self.handoff_gate.lock();
         let _lock = FileLock::acquire(self.request_dir(request_id).join(format!("handoff-{revision_id}.lock")))?;
         if let Some(record) = self.read_handoff(request_id, revision_id)? {
             if record.status != HandoffStatus::KnownUnsent { return Ok(Claim::Blocked(record)); }
         }
-        let record = HandoffRecord { status: HandoffStatus::Attempting, manager_id: manager_id.into(), revision_id: revision_id.into(), error: None, updated_at: now_ms() };
+        let record = HandoffRecord { status: HandoffStatus::Pending, manager_id: manager_id.into(), revision_id: revision_id.into(), error: None, updated_at: now_ms(), handoff_id: Some(handoff_id.into()) };
         self.write_handoff(request_id, &record)?;
         Ok(Claim::Granted)
     }
@@ -567,18 +671,21 @@ impl DependencyUpdateService {
         }
     }
 
-    /// After a restart an unfinished attempt is uncertain: it is never unlocked or resent automatically.
+    /// Pending never admitted input; Attempting may have. Neither is replayed after a restart.
     fn recover_handoffs(&self, id: &str) {
         for item in fs::read_dir(self.request_dir(id)).into_iter().flatten().flatten() {
             let name = item.file_name().to_string_lossy().into_owned();
             let Some(revision) = name.strip_prefix("handoff-").and_then(|rest| rest.strip_suffix(".json")) else { continue; };
             if let Ok(Some(mut record)) = self.read_handoff(id, revision) {
-                if record.status == HandoffStatus::Attempting {
-                    record.status = HandoffStatus::Uncertain;
-                    record.error = Some(RESTART_UNCERTAIN.into());
-                    record.updated_at = now_ms();
-                    let _ = self.write_handoff(id, &record);
-                }
+                let (status, error) = match record.status {
+                    HandoffStatus::Pending => (HandoffStatus::KnownUnsent, RESTART_PENDING),
+                    HandoffStatus::Attempting => (HandoffStatus::Uncertain, RESTART_UNCERTAIN),
+                    _ => continue,
+                };
+                record.status = status;
+                record.error = Some(error.into());
+                record.updated_at = now_ms();
+                let _ = self.write_handoff(id, &record);
             }
         }
     }
@@ -943,16 +1050,24 @@ mod tests {
     use serde_json::json;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const VECTOR: &str = "0e9f21a4a8980361dd561bbe0c969bfc246e9f093ecf1b1571fec700f419a92b";
 
     /// A fixture bridge answers control actions through a closure and records them; it never launches a model.
     struct Peer {
         controls: Arc<Mutex<Vec<(String, Value)>>>,
+        changed: Arc<parking_lot::Condvar>,
     }
     impl Peer {
         fn count(&self, action: &str) -> usize { self.controls.lock().iter().filter(|(name, _)| name == action).count() }
+        fn wait_for(&self, action: &str) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut controls = self.controls.lock();
+            while !controls.iter().any(|(name, _)| name == action) {
+                assert!(!self.changed.wait_until(&mut controls, deadline).timed_out(), "missing fixture control {action}");
+            }
+        }
         fn prompts(&self) -> Vec<String> {
             self.controls.lock().iter().filter(|(name, _)| name == "prompt").map(|(_, payload)| payload["message"].as_str().unwrap_or_default().to_string()).collect()
         }
@@ -975,6 +1090,8 @@ mod tests {
         let ready = json!({"type":"event","eventId":"1","kind":"ready","payload":{"sessionId":session,"supported":true,"materialized":false}});
         socket.write_all(format!("{ready}\n").as_bytes()).unwrap();
         let controls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let changed = Arc::new(parking_lot::Condvar::new());
+        let notify = changed.clone();
         let log = controls.clone();
         let mut replies = socket.try_clone().unwrap();
         std::thread::spawn(move || {
@@ -985,6 +1102,7 @@ mod tests {
                     if frame["type"] == "control" && frame["action"] != "ownership" {
                         let action = frame["action"].as_str().unwrap_or_default().to_string();
                         log.lock().push((action.clone(), frame["payload"].clone()));
+                        notify.notify_all();
                         let response = match reply(&action) {
                             Ok(data) => json!({"type":"response","id":frame["id"],"ok":true,"data":data}),
                             Err(error) => json!({"type":"response","id":frame["id"],"ok":false,"error":error}),
@@ -996,28 +1114,40 @@ mod tests {
             }
         });
         hub.wait_ready(id).unwrap();
-        Peer { controls }
+        Peer { controls, changed }
     }
 
     struct Fixture {
         root: PathBuf,
         registry: Arc<Registry>,
         hub: Arc<ManagerHub>,
+        workspace: Arc<WorkspaceService>,
+        dependency_bound: AtomicBool,
     }
     impl Fixture {
         fn new() -> Self {
             let root = std::env::temp_dir().join(format!("omp-updates-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(root.join("project")).unwrap();
             fs::write(root.join("project").join("package.json"), r#"{"name":"fixture","dependencies":{"inside":"^1.0.0"}}"#).unwrap();
-            let registry = Arc::new(Registry::load(root.join("instances.json"), root.clone()).unwrap());
+            fs::create_dir_all(root.join("config")).unwrap();
+            let registry = Arc::new(Registry::load(root.join("config").join("instances.json"), root.clone()).unwrap());
             let hub = ManagerHub::bind(root.join("fixture-bridge.mjs")).unwrap();
             hub.bind_registry(Arc::downgrade(&registry)).unwrap();
             hub.install_terminal_service(crate::terminal::TerminalService::new(&root)).unwrap();
             registry.install_manager_hub(hub.clone()).unwrap();
-            Self { root, registry, hub }
+            let workspace = WorkspaceService::new(registry.clone(), hub.clone(), registry.config_root().to_path_buf());
+            hub.install_workspace_service(Arc::downgrade(&workspace)).unwrap();
+            Self { root, registry, hub, workspace, dependency_bound: AtomicBool::new(false) }
         }
         fn project(&self) -> PathBuf { PathBuf::from(fs::canonicalize(self.root.join("project")).unwrap().to_string_lossy().trim_start_matches("\\\\?\\")) }
-        fn service(&self) -> DependencyUpdateService { DependencyUpdateService::new(self.root.clone()) }
+        fn service(&self) -> Arc<DependencyUpdateService> {
+            let service = Arc::new(DependencyUpdateService::new(self.registry.config_root().to_path_buf()));
+            service.bind_workspace(self.workspace.clone()).unwrap();
+            if !self.dependency_bound.swap(true, Ordering::SeqCst) {
+                self.workspace.bind_dependency_updates(Arc::downgrade(&service)).unwrap();
+            }
+            service
+        }
         fn input(&self) -> CreateInput { CreateInput { project_path: self.project().to_string_lossy().into_owned(), ..Default::default() } }
 
         fn peer(&self, id: &str, kind: InstanceKind, session: &str, reply: impl Fn(&str) -> Result<Value, String> + Send + Sync + 'static) -> Peer {
@@ -1034,6 +1164,25 @@ mod tests {
             let manager = self.registry.create_manager(self.input()).unwrap();
             let peer = self.peer(&manager.id, InstanceKind::Manager, "manager-session", reply);
             (manager, peer)
+        }
+
+        /// Drive the real backend workspace transaction without launching a native process. These tests exercise
+        /// dependency persistence and dispatch, not native SDK relocation or model execution.
+        fn complete_handoff(&self, service: &DependencyUpdateService, request: &str, revision: &str) {
+            let record = service.read_handoff(request, revision).unwrap().unwrap();
+            let job = self.workspace.list().into_iter().find(|job| job.kind == crate::workspace::WorkspaceKind::DependencyPlan &&
+                job.coordinator_id == record.manager_id && job.status == crate::workspace::WorkspaceStatus::Pending).unwrap();
+            let lease = self.registry.lease(&record.manager_id, Origin::Human, true).unwrap();
+            self.workspace.begin(&record.manager_id, lease.generation, "fixture", &job.request_id).unwrap();
+            self.workspace.ready(&record.manager_id, lease.generation, "fixture", &json!({
+                "requestId": job.request_id, "cwd": job.target_folder, "sessionId": lease.session_id,
+                "sessionFile": null, "workspaceEpoch": lease.workspace_epoch + 1,
+            })).unwrap();
+            let postmove = self.registry.lease(&record.manager_id, Origin::Human, true).unwrap();
+            // Duplicate ready/completion can never resend the input.
+            service.complete_workspace_handoff(record.handoff_id.as_deref().unwrap(), &job.request_id, &postmove).unwrap();
+            self.workspace.complete(&record.manager_id, lease.generation, "fixture", &json!({"requestId":job.request_id}), false).unwrap();
+            assert!(matches!(service.read_handoff(request, revision).unwrap().unwrap().status, HandoffStatus::Accepted | HandoffStatus::KnownUnsent | HandoffStatus::Uncertain | HandoffStatus::Attempting));
         }
 
         fn source(&self) -> ReviewSource {
@@ -1064,6 +1213,7 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
+            self.workspace.shutdown();
             self.hub.shutdown();
             let _ = fs::remove_dir_all(&self.root);
         }
@@ -1257,41 +1407,52 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_exact_revision_reaches_the_manager_once_and_never_again() {
+    fn a_confirmed_revision_waits_for_workspace_commit_and_is_delivered_once_without_abort() {
         let fixture = Fixture::new();
         fixture.architect();
         let service = fixture.service();
-        let (request, revision) = drafted_proposal(&fixture, &service);
-        let (_, manager) = fixture.manager(|_| Ok(json!({"accepted": true})));
+        let source = fixture.source();
+        let admission = drafted(&fixture, &service, &source);
+        let request = admission.request_id;
+        let revision = fixture.submit(&service, &request, "Upgrade inside", "# Steps\nmigrate");
+        let (checking, checked_request, checked_revision) = (service.clone(), request.clone(), revision.clone());
+        let (_, manager) = fixture.manager(move |action| {
+            if action == "workspace_plan_prompt" {
+                assert_eq!(checking.read_handoff(&checked_request, &checked_revision).unwrap().unwrap().status, HandoffStatus::Attempting);
+            }
+            Ok(json!({"accepted": true}))
+        });
         let first = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap();
         let second = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap();
-        let handoff = service.confirm_handoff(&fixture.registry, &first.confirmation_token).unwrap();
-        assert_eq!(handoff.status, HandoffStatus::Accepted);
-        assert_eq!(manager.count("abort"), 1);
-        assert_eq!(manager.prompts().len(), 1);
-        let message = manager.prompts().remove(0);
+        assert_eq!(first.manager_working_directory, fixture.project().to_string_lossy());
+        assert_eq!(first.repository_folders, vec![fixture.project().to_string_lossy().into_owned()]);
+        assert_eq!(service.confirm_handoff(&fixture.registry, &first.confirmation_token).unwrap().status, HandoffStatus::Pending);
+        assert_eq!(service.confirm_handoff(&fixture.registry, &second.confirmation_token).unwrap().status, HandoffStatus::Pending);
+        assert_eq!((manager.count("abort"), manager.count("workspace_plan_prompt")), (0, 0));
+        assert!(!service.root.join(&request).join("plan.md").exists());
+        assert!(service.prepare_handoff(&fixture.registry, &request, &revision).is_err());
+        assert!(service.start(&fixture.registry, &fixture.project(), source, true, planning()).unwrap_err().contains("pending"));
+        manager.wait_for("workspace_change");
+        fixture.complete_handoff(&service, &request, &revision);
+        let log = manager.controls.lock();
+        let payload = &log.iter().find(|(name, _)| name == "workspace_plan_prompt").unwrap().1;
+        let message = payload["message"].as_str().unwrap();
         assert!(message.contains(&*fixture.project().to_string_lossy()) && message.contains("# Steps\nmigrate"));
         assert!(message.contains(&service.root.join(&request).join("plan.md").to_string_lossy().into_owned()));
-        assert_eq!(manager.controls.lock().iter().find(|(name, _)| name == "prompt").unwrap().1["source"], "human");
+        assert_eq!(payload["source"], "human");
+        drop(log);
         assert_eq!(fs::read_to_string(service.root.join(&request).join("plan.md")).unwrap(), "# Steps\nmigrate");
-        // The token is single use; a second token for the same revision cannot dispatch again, nor can a new prepare.
         assert!(service.confirm_handoff(&fixture.registry, &first.confirmation_token).is_err());
-        let repeated = service.confirm_handoff(&fixture.registry, &second.confirmation_token).unwrap();
-        assert_eq!(repeated.status, HandoffStatus::Accepted);
-        assert!(repeated.error.unwrap().contains("already"));
         assert!(service.prepare_handoff(&fixture.registry, &request, &revision).unwrap_err().contains("already handed over"));
-        assert_eq!((manager.count("abort"), manager.count("prompt")), (1, 1));
-        assert_eq!(service.read(&fixture.registry, &request).unwrap().handoff.unwrap().status, HandoffStatus::Accepted);
-        // Accepted state survives a restart.
-        let restored = fixture.service();
-        assert_eq!(restored.read(&fixture.registry, &request).unwrap().handoff.unwrap().status, HandoffStatus::Accepted);
+        assert_eq!((manager.count("abort"), manager.count("workspace_plan_prompt")), (0, 1));
+        assert_eq!(fixture.service().read(&fixture.registry, &request).unwrap().handoff.unwrap().status, HandoffStatus::Accepted);
     }
 
     #[test]
-    fn two_valid_tokens_confirmed_concurrently_send_exactly_once() {
+    fn concurrent_confirmation_tokens_claim_only_one_pending_workspace_job() {
         let fixture = Fixture::new();
         fixture.architect();
-        let service = Arc::new(fixture.service());
+        let service = fixture.service();
         let (request, revision) = drafted_proposal(&fixture, &service);
         let (_, manager) = fixture.manager(|_| Ok(json!({"accepted": true})));
         let tokens: Vec<_> = (0..4).map(|_| service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token).collect();
@@ -1300,13 +1461,14 @@ mod tests {
             let (service, registry, barrier) = (service.clone(), fixture.registry.clone(), barrier.clone());
             std::thread::spawn(move || { barrier.wait(); service.confirm_handoff(&registry, &token) })
         }).collect();
-        let outcomes: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
-        assert_eq!((manager.count("abort"), manager.count("prompt")), (1, 1));
-        assert!(outcomes.iter().any(|outcome| outcome.as_ref().is_ok_and(|handoff| handoff.status == HandoffStatus::Accepted && handoff.error.is_none())));
-        for outcome in outcomes {
-            // Losers see accepted/attempting state or a lock message; none dispatched.
-            if let Ok(handoff) = outcome { assert!(matches!(handoff.status, HandoffStatus::Accepted | HandoffStatus::Attempting)); }
+        for thread in threads {
+            assert_eq!(thread.join().unwrap().unwrap().status, HandoffStatus::Pending);
         }
+        assert_eq!(fixture.workspace.list().len(), 1);
+        assert_eq!(service.pending.lock().len(), 1);
+        manager.wait_for("workspace_change");
+        fixture.complete_handoff(&service, &request, &revision);
+        assert_eq!((manager.count("abort"), manager.count("workspace_plan_prompt")), (0, 1));
     }
 
     #[test]
@@ -1327,11 +1489,14 @@ mod tests {
         assert!(service.confirm_handoff(&fixture.registry, &replaced).unwrap_err().contains("replaced"));
         // Session changed after confirmation.
         let moved = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token;
-        service.prepared.lock().get_mut(&moved).unwrap().manager_generation += 1;
+        service.prepared.lock().get_mut(&moved).unwrap().manager_lease.generation += 1;
         assert!(service.confirm_handoff(&fixture.registry, &moved).unwrap_err().contains("changed"));
         let session = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token;
-        service.prepared.lock().get_mut(&session).unwrap().manager_session_id = Some("other-session".into());
+        service.prepared.lock().get_mut(&session).unwrap().manager_lease.session_id = Some("other-session".into());
         assert!(service.confirm_handoff(&fixture.registry, &session).is_err());
+        let workspace = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token;
+        service.prepared.lock().get_mut(&workspace).unwrap().manager_lease.workspace_epoch += 1;
+        assert!(service.confirm_handoff(&fixture.registry, &workspace).unwrap_err().contains("workspace changed"));
         // Changed revision after preparation.
         let stale = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token;
         fixture.submit(&service, &request, "Another title", "# Different plan");
@@ -1340,116 +1505,153 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_before_the_prompt_releases_the_claim_but_an_uncertain_prompt_never_does() {
-        let fixture = Fixture::new();
-        fixture.architect();
-        let service = fixture.service();
-        let (request, revision) = drafted_proposal(&fixture, &service);
-        let refuse_abort = Arc::new(AtomicUsize::new(1));
-        let gate = refuse_abort.clone();
-        let (_, manager) = fixture.manager(move |action| {
-            if action == "abort" && gate.fetch_sub(1, Ordering::SeqCst) == 1 { Err("busy".into()) } else { Ok(json!({})) }
-        });
-        let token = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token;
-        let unsent = service.confirm_handoff(&fixture.registry, &token).unwrap();
-        assert_eq!(unsent.status, HandoffStatus::KnownUnsent);
-        assert_eq!((manager.count("abort"), manager.count("prompt")), (1, 0));
-        // Explicit retry after a proven pre-prompt failure.
-        let token = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token;
-        assert_eq!(service.confirm_handoff(&fixture.registry, &token).unwrap().status, HandoffStatus::Accepted);
-        assert_eq!(manager.count("prompt"), 1);
-
-        // A prompt the bridge answers with an error may still have been delivered: uncertain, sticky, survives restart.
-        let other = Fixture::new();
-        other.architect();
-        let service = other.service();
-        let (request, revision) = drafted_proposal(&other, &service);
-        let (_, manager) = other.manager(|action| if action == "prompt" { Err("lost".into()) } else { Ok(json!({})) });
-        let token = service.prepare_handoff(&other.registry, &request, &revision).unwrap().confirmation_token;
-        let uncertain = service.confirm_handoff(&other.registry, &token).unwrap();
-        assert_eq!(uncertain.status, HandoffStatus::Uncertain);
-        assert!(uncertain.error.unwrap().contains("Inspect"));
-        assert!(service.prepare_handoff(&other.registry, &request, &revision).is_err());
-        let restored = other.service();
-        assert!(restored.prepare_handoff(&other.registry, &request, &revision).is_err());
-        assert_eq!(restored.read(&other.registry, &request).unwrap().handoff.unwrap().status, HandoffStatus::Uncertain);
-        assert_eq!(manager.count("prompt"), 1);
-    }
-
-    #[test]
-    fn an_unfinished_attempt_found_after_restart_is_uncertain_and_blocks_a_resend() {
+    fn changed_repository_context_requires_fresh_confirmation_before_claim_and_before_delivery() {
         let fixture = Fixture::new();
         fixture.architect();
         let service = fixture.service();
         let (request, revision) = drafted_proposal(&fixture, &service);
         let (manager_instance, manager) = fixture.manager(|_| Ok(json!({})));
-        assert!(matches!(service.claim_handoff(&request, &revision, &manager_instance.id).unwrap(), Claim::Granted));
-        assert!(matches!(service.claim_handoff(&request, &revision, &manager_instance.id).unwrap(), Claim::Blocked(_)));
+        let other = fixture.root.join("other-project");
+        fs::create_dir_all(&other).unwrap();
+        let worker = fixture.registry.create(CreateInput {
+            project_path: other.to_string_lossy().into_owned(), ..Default::default()
+        }).unwrap();
+        let old = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap();
+        fixture.registry.set_manager_owner(&worker.id, Some(&manager_instance.id)).unwrap();
+        assert_eq!(service.confirm_handoff(&fixture.registry, &old.confirmation_token).unwrap_err(), CONTEXT_CHANGED);
+        assert!(service.read_handoff(&request, &revision).unwrap().is_none());
+        let fresh = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap();
+        assert_eq!(fresh.repository_folders.len(), 2);
+        assert_eq!(service.confirm_handoff(&fixture.registry, &fresh.confirmation_token).unwrap().status, HandoffStatus::Pending);
+        manager.wait_for("workspace_change");
+        // A change after entry may commit the approved cwd, but cannot broaden or silently alter approved plan delivery.
+        fixture.registry.set_manager_owner(&worker.id, None).unwrap();
+        fixture.complete_handoff(&service, &request, &revision);
+        let record = service.read_handoff(&request, &revision).unwrap().unwrap();
+        assert_eq!(record.status, HandoffStatus::KnownUnsent);
+        assert_eq!(record.error.as_deref(), Some(CONTEXT_CHANGED));
+        assert_eq!(manager.count("workspace_plan_prompt"), 0);
+        assert_eq!(fixture.workspace.list().last().unwrap().status, crate::workspace::WorkspaceStatus::Applied);
+    }
+
+    #[test]
+    fn queue_failure_is_known_unsent_and_a_late_callback_cannot_claim_the_retry() {
+        let fixture = Fixture::new();
+        fixture.architect();
+        let service = fixture.service();
+        let (request, revision) = drafted_proposal(&fixture, &service);
+        let (_, manager) = fixture.manager(|_| Ok(json!({})));
+        let token = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token;
+        assert_eq!(service.confirm_handoff(&fixture.registry, &token).unwrap().status, HandoffStatus::Pending);
+        let old = service.read_handoff(&request, &revision).unwrap().unwrap().handoff_id.unwrap();
+        service.fail_workspace_handoff(&old, "Workspace move failed before prompt admission").unwrap();
+        assert_eq!(service.read_handoff(&request, &revision).unwrap().unwrap().status, HandoffStatus::KnownUnsent);
+        let token = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token;
+        assert_eq!(service.confirm_handoff(&fixture.registry, &token).unwrap().status, HandoffStatus::Pending);
+        let current = service.read_handoff(&request, &revision).unwrap().unwrap().handoff_id.unwrap();
+        assert_ne!(old, current);
+        service.fail_workspace_handoff(&old, "late cancellation").unwrap();
+        let lease = fixture.registry.lease(&find_manager(&fixture.registry).unwrap().id, Origin::Human, true).unwrap();
+        service.complete_workspace_handoff(&old, "stale-request", &lease).unwrap();
+        assert_eq!(service.read_handoff(&request, &revision).unwrap().unwrap().status, HandoffStatus::Pending);
+        assert_eq!((manager.count("abort"), manager.count("workspace_plan_prompt")), (0, 0));
+        service.fail_workspace_handoff(&current, "cancelled").unwrap();
+    }
+
+    #[test]
+    fn uncertain_prompt_admission_is_sticky_and_survives_restart() {
+        let fixture = Fixture::new();
+        fixture.architect();
+        let service = fixture.service();
+        let (request, revision) = drafted_proposal(&fixture, &service);
+        let (_, manager) = fixture.manager(|action| if action == "workspace_plan_prompt" { Err("lost acknowledgement".into()) } else { Ok(json!({})) });
+        let token = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token;
+        assert_eq!(service.confirm_handoff(&fixture.registry, &token).unwrap().status, HandoffStatus::Pending);
+        manager.wait_for("workspace_change");
+        fixture.complete_handoff(&service, &request, &revision);
+        let uncertain = service.read_handoff(&request, &revision).unwrap().unwrap();
+        assert_eq!(uncertain.status, HandoffStatus::Uncertain);
+        assert!(uncertain.error.unwrap().contains("Inspect"));
+        assert!(service.prepare_handoff(&fixture.registry, &request, &revision).is_err());
+        assert_eq!(fixture.service().read(&fixture.registry, &request).unwrap().handoff.unwrap().status, HandoffStatus::Uncertain);
+        assert_eq!((manager.count("abort"), manager.count("workspace_plan_prompt")), (0, 1));
+    }
+
+    #[test]
+    fn admitted_input_with_failed_accepted_persistence_keeps_attempting_for_uncertain_restart() {
+        let fixture = Fixture::new();
+        fixture.architect();
+        let service = fixture.service();
+        let (request, revision) = drafted_proposal(&fixture, &service);
+        let lock_path = service.request_dir(&request).join(format!("handoff-{revision}.lock"));
+        let inject_lock = lock_path.clone();
+        let (_, manager) = fixture.manager(move |action| {
+            if action == "workspace_plan_prompt" {
+                // A concurrent writer takes the durable-record lock after native admission, before Accepted saves.
+                OpenOptions::new().write(true).create_new(true).open(&inject_lock).unwrap();
+            }
+            Ok(json!({"accepted":true}))
+        });
+        let token = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap().confirmation_token;
+        assert_eq!(service.confirm_handoff(&fixture.registry, &token).unwrap().status, HandoffStatus::Pending);
+        manager.wait_for("workspace_change");
+        fixture.complete_handoff(&service, &request, &revision);
+        assert_eq!(service.read_handoff(&request, &revision).unwrap().unwrap().status, HandoffStatus::Attempting);
+        assert!(service.prepare_handoff(&fixture.registry, &request, &revision).is_err());
+        fs::remove_file(lock_path).unwrap();
+        assert_eq!(fixture.service().read(&fixture.registry, &request).unwrap().handoff.unwrap().status, HandoffStatus::Uncertain);
+        assert_eq!((manager.count("abort"), manager.count("workspace_plan_prompt")), (0, 1));
+    }
+
+    #[test]
+    fn restart_distinguishes_pending_known_unsent_from_attempting_uncertain() {
+        let fixture = Fixture::new();
+        fixture.architect();
+        let service = fixture.service();
+        let (request, revision) = drafted_proposal(&fixture, &service);
+        let (manager_instance, manager) = fixture.manager(|_| Ok(json!({})));
+        let claim = uuid::Uuid::new_v4().to_string();
+        assert!(matches!(service.claim_handoff(&request, &revision, &manager_instance.id, &claim).unwrap(), Claim::Granted));
+        assert!(matches!(service.claim_handoff(&request, &revision, &manager_instance.id, &claim).unwrap(), Claim::Blocked(_)));
         let restored = fixture.service();
-        assert_eq!(restored.read(&fixture.registry, &request).unwrap().handoff.unwrap().status, HandoffStatus::Uncertain);
-        let record = restored.read_handoff(&request, &revision).unwrap().unwrap();
-        assert!(record.error.unwrap().contains("app closed"));
-        assert!(restored.prepare_handoff(&fixture.registry, &request, &revision).is_err());
+        assert_eq!(restored.read(&fixture.registry, &request).unwrap().handoff.unwrap().status, HandoffStatus::KnownUnsent);
+        assert!(restored.prepare_handoff(&fixture.registry, &request, &revision).is_ok());
+        let mut record = restored.read_handoff(&request, &revision).unwrap().unwrap();
+        record.status = HandoffStatus::Attempting;
+        restored.write_handoff(&request, &record).unwrap();
+        let restarted = fixture.service();
+        assert_eq!(restarted.read(&fixture.registry, &request).unwrap().handoff.unwrap().status, HandoffStatus::Uncertain);
+        assert!(restarted.prepare_handoff(&fixture.registry, &request, &revision).is_err());
         assert!(manager.controls.lock().is_empty());
     }
 
     #[test]
-    fn a_stopped_manager_is_started_only_after_confirmation_and_its_new_session_receives_the_plan() {
-        let fixture = Fixture::new();
-        fixture.architect();
-        let manager = fixture.registry.create_manager(fixture.input()).unwrap();
-        let slot = Arc::new(Mutex::new(None::<Peer>));
-        let starts = Arc::new(AtomicUsize::new(0));
-        let (hub, slot_in, starts_in, manager_id) = (fixture.hub.clone(), slot.clone(), starts.clone(), manager.id.clone());
-        // Starting the fixture Manager stands in for the registry launching OMP, which tests never do.
-        let service = fixture.service().with_starter(Box::new(move |registry: &Registry, id: &str| {
-            assert_eq!(id, manager_id);
-            starts_in.fetch_add(1, Ordering::SeqCst);
-            *slot_in.lock() = Some(connect_peer(&hub, registry, id, InstanceKind::Manager, "resumed-session", |_| Ok(json!({"accepted": true}))));
-            Ok(())
-        }));
-        let (request, revision) = drafted_proposal(&fixture, &service);
-        let prepared = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap();
-        assert!(prepared.needs_start);
-        assert_eq!(starts.load(Ordering::SeqCst), 0, "preparing or cancelling must not start The Manager");
-        let handoff = service.confirm_handoff(&fixture.registry, &prepared.confirmation_token).unwrap();
-        assert_eq!(handoff.status, HandoffStatus::Accepted);
-        assert_eq!(starts.load(Ordering::SeqCst), 1);
-        let peer = slot.lock().take().unwrap();
-        assert_eq!((peer.count("abort"), peer.count("prompt")), (1, 1));
-        assert!(peer.prompts()[0].contains("# Steps\nmigrate"));
-    }
-
-    #[test]
-    fn a_manager_that_cannot_be_started_leaves_a_known_unsent_handoff_that_can_be_retried() {
+    fn preparing_a_stopped_manager_never_starts_it_and_enqueue_rejection_is_known_unsent() {
         let fixture = Fixture::new();
         fixture.architect();
         fixture.registry.create_manager(fixture.input()).unwrap();
-        let service = fixture.service().with_starter(Box::new(|_: &Registry, _: &str| Err("no OMP in the fixture".to_string())));
+        let service = fixture.service();
         let (request, revision) = drafted_proposal(&fixture, &service);
         let prepared = service.prepare_handoff(&fixture.registry, &request, &revision).unwrap();
+        assert!(prepared.needs_start);
+        assert!(!find_manager(&fixture.registry).unwrap().bridge_ready);
+        fixture.workspace.shutdown();
         let handoff = service.confirm_handoff(&fixture.registry, &prepared.confirmation_token).unwrap();
         assert_eq!(handoff.status, HandoffStatus::KnownUnsent);
-        assert!(handoff.error.unwrap().contains("could not be started"));
+        assert!(handoff.error.unwrap().contains("shutting down"));
         assert!(!service.root.join(&request).join("plan.md").exists());
-        assert!(service.prepare_handoff(&fixture.registry, &request, &revision).is_ok());
     }
 
     #[test]
-    fn only_a_manager_can_receive_the_dispatch_and_the_lease_must_match() {
+    fn no_plan_can_be_sent_outside_an_active_dependency_workspace_request() {
         let fixture = Fixture::new();
         let (architect, peer) = fixture.architect();
-        let hub = fixture.registry.manager_hub().unwrap().clone();
         let lease = fixture.registry.lease(&architect.id, Origin::Human, true).unwrap();
-        assert!(matches!(hub.send_dependency_update_plan(&architect.id, &lease, "x"), Err(UpdatePlanSendError::NotSent(_))));
+        assert!(matches!(fixture.hub.send_workspace_plan_prompt(&architect.id, &lease, "not-active", "x"), Err(UpdatePlanSendError::NotSent(_))));
         let (manager_instance, manager) = fixture.manager(|_| Ok(json!({})));
-        let mut stale = fixture.registry.lease(&manager_instance.id, Origin::Human, true).unwrap();
-        stale.ownership_epoch += 1;
-        assert!(matches!(hub.send_dependency_update_plan(&manager_instance.id, &stale, "x"), Err(UpdatePlanSendError::NotSent(_))));
-        assert!(manager.controls.lock().is_empty() && peer.controls.lock().is_empty());
         let current = fixture.registry.lease(&manager_instance.id, Origin::Human, true).unwrap();
-        hub.send_dependency_update_plan(&manager_instance.id, &current, "approved").unwrap();
-        assert_eq!((manager.count("abort"), manager.count("prompt")), (1, 1));
+        assert!(matches!(fixture.hub.send_workspace_plan_prompt(&manager_instance.id, &current, "not-active", "approved"), Err(UpdatePlanSendError::NotSent(_))));
+        assert!(manager.controls.lock().is_empty() && peer.controls.lock().is_empty());
     }
 
     #[test]

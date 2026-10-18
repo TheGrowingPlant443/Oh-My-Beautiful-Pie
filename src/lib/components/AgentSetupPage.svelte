@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api, type Instance, type SetupDraft, type SetupPaths, type SetupAdmission, type SetupItem, type SetupKind, type SetupRequest, type SetupScope } from "../api";
-  import { instances, instancesById, managerInstance, errorText, refreshInstances } from "../stores";
+  import { instances, instancesById, managerInstance, architectInstance, errorText, refreshInstances } from "../stores";
   import SessionView from "./SessionView.svelte";
-  let { draft = $bindable(), admission = $bindable(), projectContext, onback, onSetupManager, onOpenManager, onSelectSession, onPlan, onPlanChange, onSubagents, onCodeDiff }: {
-    draft: SetupDraft; admission: SetupAdmission | null; projectContext: Instance | null; onback: () => void; onSetupManager: () => void;
-    onOpenManager: () => void; onSelectSession: (id: string) => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void; onSubagents: (id: string) => void;
+  let { draft = $bindable(), admission = $bindable(), projectContext, onback, onSetupManager, onOpenManager, onSetupArchitect, onOpenArchitect, onSelectSession, onPlan, onPlanChange, onSubagents, onCodeDiff, onSystemOverview }: {
+    draft: SetupDraft; admission: SetupAdmission | null; projectContext: Instance | null; onback: () => void; onSetupManager: () => void; onSetupArchitect: () => void;
+    onOpenManager: () => void; onOpenArchitect: () => void; onSelectSession: (id: string) => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void; onSubagents: (id: string) => void; onSystemOverview?: (id: string) => void;
     onCodeDiff: (id: string) => void;
   } = $props();
   const steps = ["Scope", "What to create", "Describe", "Tools (optional)", "Review"];
@@ -34,6 +34,7 @@
     switch (draft.scope) {
       case "global": return paths?.globalAgentFolder;
       case "manager": return paths?.managerFolder;
+      case "architect": return paths?.architectFolder;
       case "repository": return repositoryRoot ? `${repositoryRoot}/.omp` : undefined;
       default: return undefined;
     }
@@ -42,6 +43,7 @@
     switch (draft.scope) {
       case "global": return "Global — default OMP profile";
       case "manager": return "The Manager — private setup";
+      case "architect": return "The Architect — private setup";
       case "repository": return `Repository — ${repositoryRoot ?? (repositoryLoading ? "Loading…" : "Unavailable")}`;
       default: return "Choose a scope first";
     }
@@ -71,6 +73,7 @@
     }
   });
   $effect(() => {
+    if (draft.scope && draft.scope !== "repository") draft.projectInstanceId = null;
     if (draft.scope !== "global" && draft.kinds.includes("profile")) draft.kinds = draft.kinds.filter(kind => kind !== "profile");
   });
   function slug(name: string): string { return name.trim().toLowerCase().replace(/\s+/g, "-"); }
@@ -118,6 +121,7 @@
   function request(): SetupRequest {
     if (!draft.scope) throw new Error("Choose a setup scope first");
     if (draft.scope === "manager" && !$managerInstance) throw new Error("Set up The Manager first");
+    if (draft.scope === "architect" && !$architectInstance) throw new Error("Set up The Architect first");
     if (draft.scope === "repository") {
       const source = draft.projectInstanceId ? $instancesById.get(draft.projectInstanceId) : undefined;
       if (source?.kind !== "instance" || (!draft.instanceId && (!repositoryAvailable || projectContext?.id !== source.id))) throw new Error("Repository setup requires a project");
@@ -162,7 +166,7 @@
     if (draft.scope === "repository" && (!sourceId || draft.projectInstanceId !== sourceId)) draft.scope = null;
     draft.instanceId = null;
     admission = null;
-    draft.projectInstanceId = sourceId;
+    draft.projectInstanceId = draft.scope === "repository" ? sourceId : null;
     draft.step = 0;
     error = "";
   }
@@ -173,9 +177,11 @@
     <button onclick={onback}>Back</button><h2>Agent setup</h2><span class="spacer"></span>
     <button onclick={() => editor("global")}>Open global .omp in VS Code</button>
     <button onclick={() => editor("manager")}>Open Manager folder in VS Code</button>
+    <button onclick={() => editor("architect")}>Open Architect folder in VS Code</button>
     {#if repositoryAvailable}<button disabled={repositoryLoading || !!repositoryError || !repositoryRoot} onclick={() => editor("repository")}>Open repository in VS Code</button>{/if}
   </header>
   <div class="folders dim"><span>Global folder: <code>{paths?.globalOmpFolder || (loading ? "Loading…" : "Unavailable")}</code></span><span>Manager folder: <code>{paths?.managerFolder || (loading ? "Loading…" : "Unavailable")}</code></span></div>
+  <div class="folders dim"><span>Architect folder: <code>{paths?.architectFolder || (loading ? "Loading…" : "Unavailable")}</code></span></div>
   {#if repositoryAvailable || draft.scope === "repository"}<div class="folders dim"><span>Repository: <code>{repositoryRoot || (repositoryLoading ? "Loading…" : "Unavailable")}</code></span><span>Setup folder: <code>{repositoryRoot ? `${repositoryRoot}/.omp` : "Unavailable"}</code></span></div>{/if}
   {#if repositoryError}<p class="err alert" role="alert">{repositoryError}</p>{/if}
   {#if error}<p class="err alert" role="alert">{error}</p>{/if}
@@ -186,12 +192,14 @@
         {#if admission?.promptSent === false}<p class="warn">Description was not sent. Complete native startup, then explicitly send it.</p><button disabled={busy} onclick={() => start(true)}>{busy ? "Sending…" : "Send setup description"}</button>
         {:else if admission?.promptSent === null}<p class="warn">Admission outcome is unknown. Inspect the native conversation before entering another request; automatic resend is disabled.</p>
         {:else if draft.scope === "repository"}<p class="dim">Existing project processes are not reloaded automatically. Reopen OMP from the repository root to use root-scoped rules/tools.</p>
+        {:else if draft.scope === "architect"}<p class="dim">Instructions load next Architect turn; skill/tool/rule catalogs need native reload or an explicit reopen. No automatic Architect restart.</p>
         {:else}<p class="dim">Instructions load next Manager turn; skill/tool/rule catalogs need native reload or an explicit reopen. No automatic Manager restart.</p>{/if}
-        {#if $managerInstance}<button onclick={onOpenManager}>Open The Manager</button>{/if}
+        {#if draft.scope === "architect" && $architectInstance}<button onclick={onOpenArchitect}>Open The Architect</button>
+        {:else if draft.scope === "manager" && $managerInstance}<button onclick={onOpenManager}>Open The Manager</button>{/if}
       </div>
     </div>
     {#if current}
-      <div class="native-session"><SessionView instance={current} instances={$instances} onSwitch={onSelectSession} onClose={onback} {onPlan} {onPlanChange} {onSubagents} {onCodeDiff} /></div>
+      <div class="native-session"><SessionView instance={current} instances={$instances} onSwitch={onSelectSession} onClose={onback} {onPlan} {onPlanChange} {onSubagents} {onCodeDiff} {onSystemOverview} /></div>
     {:else}<p class="dim">This setup session is no longer in the dashboard.</p>{/if}
   {:else}
     <nav aria-label="Agent setup steps">{#each steps as step, index}<button class:active={draft.step === index} aria-current={draft.step === index ? "step" : undefined} disabled={busy} onclick={() => draft.step = index}>{index + 1}. {step}</button>{/each}</nav>
@@ -202,10 +210,12 @@
           <p>Choose where the generated setup applies. You can create one item or a complete set of instructions, skills, tools and workflows.</p>
           <label class="choice"><input type="radio" name="setup-scope" value="global" bind:group={draft.scope} /><span><strong>Global — default OMP profile</strong><small>Native instructions under {paths?.globalAgentFolder || "the global OMP agent folder"}. Named profiles remain independent.</small></span></label>
           <label class="choice"><input type="radio" name="setup-scope" value="manager" bind:group={draft.scope} disabled={!$managerInstance} /><span><strong>Just The Manager</strong><small>Private app-owned setup; not loaded into workers or the Manager's project .omp folder.</small></span></label>
+          <label class="choice"><input type="radio" name="setup-scope" value="architect" bind:group={draft.scope} disabled={!$architectInstance} /><span><strong>Just the architect</strong><small>Private app-owned setup; not loaded into Manager, workers or the Architect's project .omp folder.</small></span></label>
           {#if repositoryAvailable}
             <label class="choice"><input type="radio" name="setup-scope" value="repository" bind:group={draft.scope} disabled={repositoryLoading || !!repositoryError || !repositoryRoot} /><span><strong>This repository</strong><small>Create native setup under {repositoryRoot ? `${repositoryRoot}/.omp` : (repositoryLoading ? "Loading…" : "an unavailable repository")}. Existing project sessions stay unchanged.</small></span></label>
           {/if}
           {#if !$managerInstance}<button onclick={onSetupManager}>Set up The Manager first</button>{/if}
+          {#if !$architectInstance}<button onclick={onSetupArchitect}>Set up The Architect first</button>{/if}
         {:else if draft.step === 1}
           <p>Choose what to create. You describe each selected item in the next step.</p>
           {#each choices.filter(choice => choice.kind !== "profile" || draft.scope === "global") as choice (choice.kind)}

@@ -1,6 +1,6 @@
 import type { Instance } from "./api";
 
-export type StartupTarget = "manager" | "project" | "latest" | "dashboard";
+export type StartupTarget = "manager" | "architect" | "project" | "latest" | "dashboard";
 export type ProjectLanguage = "maven" | "npm" | "pypi" | "cargo";
 export type ProjectRole = "backend" | "frontend";
 const LANGUAGES: readonly ProjectLanguage[] = ["maven", "npm", "pypi", "cargo"];
@@ -46,7 +46,7 @@ export function parseAppSettings(raw: string | null, legacyShowManager: string |
     version: 1,
     startupProjectId: typeof value.startupProjectId === "string" && value.startupProjectId.trim() ? value.startupProjectId : null,
     latestProjectId: typeof value.latestProjectId === "string" && value.latestProjectId.trim() ? value.latestProjectId : null,
-    startupTarget: value.startupTarget === "project" || value.startupTarget === "latest" || value.startupTarget === "dashboard" ? value.startupTarget : "manager",
+    startupTarget: value.startupTarget === "architect" || value.startupTarget === "project" || value.startupTarget === "latest" || value.startupTarget === "dashboard" ? value.startupTarget : "manager",
     showPreviousProjects: typeof value.showPreviousProjects === "boolean" ? value.showPreviousProjects : defaults.showPreviousProjects,
     showManagerTile: typeof value.showManagerTile === "boolean" ? value.showManagerTile : defaults.showManagerTile,
     previewSize: value.previewSize === 420 || value.previewSize === 1000 ? value.previewSize : 640,
@@ -75,6 +75,7 @@ export function resolveStartupTarget(settings: AppSettings, list: readonly Insta
   if (settings.startupTarget === "dashboard") return { instanceId: null, missingProject: false };
   const manager = list.find(row => row.kind === "manager");
   if (settings.startupTarget === "manager") return { instanceId: manager?.id ?? null, missingProject: false };
+  if (settings.startupTarget === "architect") return { instanceId: list.find(row => row.kind === "architect")?.id ?? null, missingProject: false };
   const id = settings.startupTarget === "project" ? settings.startupProjectId : settings.latestProjectId;
   const project = list.find(row => row.id === id && row.kind === "instance");
   return { instanceId: project?.id ?? manager?.id ?? null, missingProject: !project };

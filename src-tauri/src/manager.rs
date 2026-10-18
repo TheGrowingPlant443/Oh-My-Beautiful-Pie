@@ -3,8 +3,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use crate::instance::{
     ControlLease, CreateInput, Definition, Instance, InstanceKind, Origin, Registry,
@@ -13,6 +13,45 @@ use crate::session;
 use crate::plan;
 use crate::terminal::TerminalService;
 use serde_json::{json, Value};
+use tauri::Emitter;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HumanDecisionTarget {
+    pub instance_id: String,
+    pub request_id: String,
+    pub generation: u64,
+    pub session_id: Option<String>,
+    pub ownership_epoch: u64,
+    pub workspace_epoch: u64,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionRepository {
+    pub folder: Option<String>,
+    pub label: String,
+    pub scope: &'static str,
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanDecision {
+    pub target: HumanDecisionTarget,
+    pub created_at: u64,
+    pub instance_name: String,
+    pub instance_kind: InstanceKind,
+    pub agent_origin: Option<Value>,
+    pub repository: DecisionRepository,
+    pub method: String,
+    pub payload: Value,
+    pub answerable: bool,
+    pub human_only: bool,
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanDecisionSnapshot {
+    pub revision: u64,
+    pub items: Vec<HumanDecision>,
+}
 
 /// Identity of the Architect launch/session that produces a dependency result. `launch_id` is a SHA-256 of the
 /// private bridge token, never the token itself.
@@ -37,6 +76,7 @@ pub struct BridgeLaunch {
     pub token: String,
     pub extension_path: PathBuf,
     pub manager_setup_dir: PathBuf,
+    pub architect_setup_dir: PathBuf,
     pub architect_dir: PathBuf,
     pub terminal_dir: PathBuf,
     pub sdk_dir: Option<PathBuf>,
@@ -72,6 +112,9 @@ struct Decision {
     generation: u64,
     session_id: Option<String>,
     epoch: u64,
+    workspace_epoch: u64,
+    created_at: u64,
+    repository: DecisionRepository,
     payload: Value,
 }
 impl Decision {
@@ -92,6 +135,8 @@ struct HubState {
     subscriptions: HashMap<String, bool>,
     queues: HashMap<String, VecDeque<Value>>,
     exited: HashSet<(String, u64)>,
+    decisions_revision: u64,
+    decisions_fingerprint: Option<[u8; 32]>,
 }
 /// Result of sending an approved dependency update plan to The Manager.
 #[derive(Debug)]
@@ -107,6 +152,11 @@ pub struct ManagerHub {
     registry: OnceLock<Weak<Registry>>,
     browser: OnceLock<Arc<crate::browser::BrowserSupervisor>>,
     terminals: OnceLock<Arc<TerminalService>>,
+    workspace: OnceLock<Weak<crate::workspace::WorkspaceService>>,
+    code_quality: OnceLock<Weak<crate::code_quality::CodeQualityService>>,
+    app: OnceLock<tauri::AppHandle>,
+    decision_publication: Mutex<()>,
+    ready_changed: Condvar,
     state: Mutex<HubState>,
     closing: AtomicBool,
 }
@@ -158,6 +208,11 @@ impl ManagerHub {
             registry: OnceLock::new(),
             browser: OnceLock::new(),
             terminals: OnceLock::new(),
+            workspace: OnceLock::new(),
+            code_quality: OnceLock::new(),
+            app: OnceLock::new(),
+            decision_publication: Mutex::new(()),
+            ready_changed: Condvar::new(),
             state: Mutex::new(HubState::default()),
             closing: AtomicBool::new(false),
         });
@@ -193,6 +248,145 @@ impl ManagerHub {
     pub fn install_terminal_service(&self, terminals: Arc<TerminalService>) -> Result<()> {
         self.terminals.set(terminals).map_err(|_| "terminal service already installed".into())
     }
+    pub fn install_workspace_service(&self, service: Weak<crate::workspace::WorkspaceService>) -> Result<()> {
+        self.workspace.set(service).map_err(|_| "workspace service already installed".into())
+    }
+    pub fn install_code_quality_service(&self, service: Weak<crate::code_quality::CodeQualityService>) -> Result<()> {
+        self.code_quality.set(service).map_err(|_| "code quality service already installed".into())
+    }
+    pub fn bind_app(&self, app: tauri::AppHandle) -> Result<()> {
+        self.app.set(app).map_err(|_| "manager app already bound".into())
+    }
+    fn decision_repository(&self, registry: &Registry, id: &str) -> Result<DecisionRepository> {
+        let own = registry.workspace_metadata(id)?.definition;
+        let folder = if let Some(helper) = &own.helper {
+            registry.workspace_metadata(&helper.target).map(|target| target.definition.input.project_path).unwrap_or_else(|_| helper.repo.clone())
+        } else if let Some(target) = &own.plan_target {
+            registry.workspace_metadata(target)?.definition.input.project_path
+        } else { own.input.project_path.clone() };
+        let computed = own.kind != InstanceKind::Instance && self.workspace.get().and_then(Weak::upgrade)
+            .map(|service| service.computed_folders()).transpose()?.unwrap_or_default().iter()
+            .any(|known| crate::instance::same_folder(known, &folder)) &&
+            !registry.ordinary_project_folders().iter().any(|known| crate::instance::same_folder(known, &folder));
+        let real = registry.is_real_project_folder(&folder) && !computed;
+        let label = if own.kind != InstanceKind::Instance && !real {
+            let neutral = registry.coordinator_neutral_folder(own.kind)?;
+            if crate::instance::same_folder(&neutral, &folder) { "Temporary workspace".into() } else { "Shared workspace".into() }
+        } else {
+            std::path::Path::new(&folder).file_name().and_then(|part| part.to_str()).unwrap_or(&folder).to_owned()
+        };
+        Ok(DecisionRepository { folder: (!folder.is_empty()).then_some(folder), label, scope: if real { "repository" } else { "workspace" } })
+    }
+    /// One authority: every presentation snapshot is derived from the native pending records.
+    /// Serializing publication fences event/list races without holding Registry or hub locks during emit.
+    pub fn human_decisions(&self) -> Result<HumanDecisionSnapshot> {
+        use sha2::{Digest, Sha256};
+        let _publication = self.decision_publication.lock().map_err(|e| e.to_string())?;
+        let decisions: Vec<_> = self.state.lock().map_err(|e| e.to_string())?.decisions.values().cloned().collect();
+        let registry = self.registry()?;
+        let mut items = Vec::with_capacity(decisions.len());
+        for decision in decisions {
+            let Ok(metadata) = registry.workspace_metadata(&decision.worker) else { continue };
+            let lease = &metadata.lease;
+            if lease.generation != decision.generation || lease.session_id != decision.session_id ||
+                lease.ownership_epoch != decision.epoch || lease.workspace_epoch != decision.workspace_epoch { continue; }
+            let method = decision.payload["method"].as_str().unwrap_or("custom").to_owned();
+            let mut payload = decision.payload.clone();
+            // Native base IDs and authority fields are private; the full public target is the only answer address.
+            if let Some(object) = payload.as_object_mut() {
+                for key in ["requestId", "generation", "sessionId", "ownershipEpoch", "workspaceEpoch", "source"] { object.remove(key); }
+            }
+            items.push(HumanDecision {
+                target: HumanDecisionTarget { instance_id: decision.worker, request_id: decision.public_id,
+                    generation: decision.generation, session_id: decision.session_id, ownership_epoch: decision.epoch,
+                    workspace_epoch: decision.workspace_epoch },
+                created_at: decision.created_at,
+                instance_name: metadata.definition.input.name,
+                instance_kind: metadata.definition.kind,
+                agent_origin: decision.payload.get("agentOrigin").filter(|value| value.is_object()).cloned(),
+                repository: decision.repository,
+                answerable: matches!(method.as_str(), "approve" | "confirm" | "select" | "input" | "editor" | "askDialog"),
+                human_only: decision.payload["humanOnly"].as_bool().unwrap_or(false),
+                method, payload,
+            });
+        }
+        items.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.target.instance_id.cmp(&b.target.instance_id)).then_with(|| a.target.request_id.cmp(&b.target.request_id)));
+        let fingerprint: [u8; 32] = Sha256::digest(serde_json::to_vec(&items).map_err(|e| e.to_string())?).into();
+        let (revision, changed) = {
+            let mut state = self.state.lock().map_err(|e| e.to_string())?;
+            let changed = state.decisions_fingerprint != Some(fingerprint);
+            if changed { state.decisions_fingerprint = Some(fingerprint); state.decisions_revision += 1; }
+            (state.decisions_revision, changed)
+        };
+        let snapshot = HumanDecisionSnapshot { revision, items };
+        if changed { if let Some(app) = self.app.get() { let _ = app.emit("human_decisions", &snapshot); } }
+        Ok(snapshot)
+    }
+    fn publish_human_decisions(&self) {
+        if let Err(error) = self.human_decisions() { eprintln!("Human decisions: {error}"); }
+    }
+    pub fn respond_human_decision(&self, target: &HumanDecisionTarget, response: Value) -> Result<Value> {
+        self.respond_decision(&target.instance_id, &target.request_id, target.generation, Some(target), response, Origin::Human)
+    }
+    fn respond_decision(&self, id: &str, request: &str, generation: u64, target: Option<&HumanDecisionTarget>, response: Value, origin: Origin<'_>) -> Result<Value> {
+        let registry = self.registry()?;
+        let lease = registry.lease(id, origin, true)?;
+        let decision = self.state.lock().map_err(|e| e.to_string())?.decisions.get(request).cloned().ok_or("decision_already_resolved")?;
+        if generation != lease.generation || decision.worker != id || decision.generation != lease.generation ||
+            decision.epoch != lease.ownership_epoch || decision.session_id != lease.session_id || decision.workspace_epoch != lease.workspace_epoch ||
+            target.is_some_and(|target| target.session_id != lease.session_id || target.ownership_epoch != lease.ownership_epoch || target.workspace_epoch != lease.workspace_epoch) {
+            return Err("stale_generation".into());
+        }
+        if decision.payload["humanOnly"] == true && matches!(origin, Origin::Manager(_)) { return Err("human_only_decision".into()); }
+        if !matches!(decision.payload["method"].as_str(), Some("approve" | "confirm" | "select" | "input" | "editor" | "askDialog")) {
+            return Err("native_terminal_decision".into());
+        }
+        // Do not retire optimistically: native validation and the single native settlement guard decide the winner.
+        self.control(id, &lease, "reply_ui", json!({"requestId":decision.base_id,"response":response}), origin)
+    }
+
+    /// The repository a Code quality read may use, from the authenticated actor's own Registry definition: a helper reads
+    /// its target's project, a plan agent its plan target's project, every other agent its own working directory.
+    /// Returns (project folder, instance whose folder it is, that instance's workspace epoch) so the caller can detect a move.
+    fn quality_repository(registry: &Registry, actor: &Actor) -> Result<(String, String, u64)> {
+        let own = registry.workspace_metadata(&actor.id)?;
+        let target = own.definition.helper.as_ref().map(|link| link.target.clone()).or_else(|| own.definition.plan_target.clone());
+        let subject = match target {
+            Some(target) => registry.workspace_metadata(&target)?,
+            None => own,
+        };
+        Ok((subject.definition.input.project_path.clone(), subject.definition.id.clone(), subject.workspace_epoch))
+    }
+    pub(crate) fn workspace_control(&self, id: &str, lease: &ControlLease, action: &str, payload: Value) -> Result<Value> {
+        self.control(id, lease, action, payload, Origin::Human)
+    }
+    pub(crate) fn send_workspace_plan_prompt(&self, manager_id: &str, lease: &ControlLease, request_id: &str, message: &str) -> std::result::Result<(), UpdatePlanSendError> {
+        let service = self.workspace.get().and_then(Weak::upgrade).ok_or_else(|| UpdatePlanSendError::NotSent("Workspace service unavailable".into()))?;
+        if !service.allows_plan_prompt(manager_id, request_id) { return Err(UpdatePlanSendError::NotSent("Dependency workspace request is no longer active".into())); }
+        let registry = self.registry().map_err(UpdatePlanSendError::NotSent)?;
+        if registry.workspace_metadata(manager_id).map_err(UpdatePlanSendError::NotSent)?.definition.kind != InstanceKind::Manager {
+            return Err(UpdatePlanSendError::NotSent("The target is not The Manager".into()));
+        }
+        if registry.lease(manager_id, Origin::Human, true).map_err(UpdatePlanSendError::NotSent)? != *lease {
+            return Err(UpdatePlanSendError::NotSent("Manager lease changed before plan admission".into()));
+        }
+        self.control(manager_id, lease, "workspace_plan_prompt", json!({"requestId":request_id,"message":message}), Origin::Human)
+            .map(|_| ()).map_err(|error| if ["bridge_not_ready","stale_generation"].contains(&error.as_str()) || error.starts_with("workspace_plan_not_admitted:") { UpdatePlanSendError::NotSent(error) } else { UpdatePlanSendError::Uncertain(error) })
+    }
+    /// Opens the SDK's own hub in this existing native session without submitting input.
+    pub fn open_agent_hub(&self, id: &str, expected_generation: u64) -> Result<()> {
+        let registry = self.registry()?;
+        let lease = registry.lease(id, Origin::Human, false)?;
+        if lease.generation != expected_generation {
+            return Err("stale_generation".into());
+        }
+        if !registry.snapshot().iter().any(|row| row.id == id && row.capabilities.agent_hub) {
+            return Err("native_agent_hub_unavailable: Reopen this session with a compatible OMP version.".into());
+        }
+        self.control(id, &lease, "agent_hub", json!({}), Origin::Human)?;
+        Ok(())
+    }
+
     /// Human-only: kills one command, interrupts its agent like Esc and holds new scripts until a new prompt.
     pub fn kill_terminal_command(&self, id: &str, generation: u64, session_id: &str, execution_id: &str) -> Result<()> {
         let lease = self.registry()?.lease(id, Origin::Human, false)?;
@@ -240,6 +434,11 @@ impl ManagerHub {
                 .parent()
                 .ok_or("invalid bridge directory")?
                 .join("manager-setup"),
+            architect_setup_dir: self
+                .extension_path
+                .parent()
+                .ok_or("invalid bridge directory")?
+                .join("architect-setup"),
             architect_dir: self
                 .extension_path
                 .parent()
@@ -297,6 +496,7 @@ impl ManagerHub {
         if let Some(terminals) = self.terminals.get() {
             terminals.invalidate(id, generation);
         }
+        self.publish_human_decisions();
     }
     pub fn shutdown(&self) {
         self.closing.store(true, Ordering::Relaxed);
@@ -448,6 +648,9 @@ impl ManagerHub {
         if let Ok(s) = writer.lock() {
             let _ = s.shutdown(Shutdown::Both);
         }
+        if let Some(workspace) = self.workspace.get().and_then(Weak::upgrade) {
+            workspace.disconnected(&actor.id, actor.generation, &actor.connection_id);
+        }
         let current = {
             let Ok(mut state) = self.state.lock() else {
                 return;
@@ -480,6 +683,7 @@ impl ManagerHub {
             if let Ok(registry) = self.registry() {
                 registry.set_bridge_ready(&actor.id, actor.generation, false);
             }
+            self.clear_decisions(&actor.id);
         }
     }
     fn connection(&self, id: &str, ready: bool) -> Result<Connection> {
@@ -536,6 +740,7 @@ impl ManagerHub {
         payload["generation"] = json!(lease.generation);
         payload["sessionId"] = json!(lease.session_id);
         payload["ownershipEpoch"] = json!(lease.ownership_epoch);
+        payload["workspaceEpoch"] = json!(lease.workspace_epoch);
         payload["source"] = json!(match origin {
             Origin::Human => "human",
             Origin::Manager(_) => "manager",
@@ -674,7 +879,17 @@ impl ManagerHub {
             self.notify(&old, id, lease.generation, "ownership_lost", json!({}));
         }
         if let Some(owner) = &lease.manager_id {
-            self.notify(owner,id,lease.generation,"ownership_gained",json!({"pendingDecisions":decisions.iter().map(Decision::view).collect::<Vec<_>>()}));
+            let context = self.registry().and_then(|registry| {
+                Ok((registry.managed_repository_roots(owner)?, registry.workspace_metadata(owner)?.definition.input.project_path))
+            });
+            let (repositories, folder) = match context {
+                Ok(context) => (Some(context.0), Some(context.1)),
+                Err(error) => { eprintln!("Manager repository notification: {error}"); (None, None) }
+            };
+            self.notify(owner,id,lease.generation,"ownership_gained",json!({
+                "pendingDecisions":decisions.iter().map(Decision::view).collect::<Vec<_>>(),
+                "repositoryFolders":repositories,"managerWorkingDirectory":folder
+            }));
             for decision in decisions {
                 self.notify(
                     owner,
@@ -685,6 +900,7 @@ impl ManagerHub {
                 );
             }
         }
+        self.publish_human_decisions();
     }
     fn event(&self, actor: &Actor, frame: &Value) -> Result<()> {
         let kind = text(frame, "kind")?;
@@ -706,6 +922,7 @@ impl ManagerHub {
                         c.ready = payload["supported"] != false;
                     }
                 }
+                self.ready_changed.notify_all();
                 self.clear_decisions(&actor.id);
                 let lease = registry.lease(&actor.id, Origin::Human, false)?;
                 if let Ok(stream) = self.connection(&actor.id, false) {
@@ -748,6 +965,7 @@ impl ManagerHub {
                     );
                 }
                 self.update_decision_count(&actor.id);
+                self.publish_human_decisions();
             }
             "agent_started" => {}
             "terminal_command" | "terminal_output" | "terminal_hold" => {
@@ -771,6 +989,12 @@ impl ManagerHub {
         let registry = self.registry()?;
         let lease = registry.lease(&actor.id, Origin::Human, false)?;
         let base = text(payload, "requestId")?;
+        if actor.generation != lease.generation ||
+            payload.get("sessionId").is_some_and(|session| session.as_str() != lease.session_id.as_deref()) ||
+            payload.get("workspaceEpoch").is_some_and(|epoch| epoch.as_u64() != Some(lease.workspace_epoch)) {
+            return Err("stale_generation".into());
+        }
+        let repository = self.decision_repository(&registry, &actor.id)?;
         let decision = {
             let mut state = self.state.lock().map_err(|e| e.to_string())?;
             if state.decisions.values().any(|d| {
@@ -785,6 +1009,9 @@ impl ManagerHub {
                 generation: actor.generation,
                 session_id: lease.session_id,
                 epoch: lease.ownership_epoch,
+                workspace_epoch: lease.workspace_epoch,
+                created_at: payload["createdAt"].as_u64().unwrap_or_else(crate::dependency_security::now_ms),
+                repository,
                 payload: payload.clone(),
             };
             state
@@ -801,6 +1028,7 @@ impl ManagerHub {
                 decision.view(),
             );
         }
+        self.publish_human_decisions();
         Ok(())
     }
     fn update_decision_count(&self, id: &str) {
@@ -839,6 +1067,7 @@ impl ManagerHub {
             self.retire_notification(&id);
         }
         self.update_decision_count(id);
+        self.publish_human_decisions();
     }
     pub fn observe_processes(&self, rows: &[Instance]) {
         for row in rows {
@@ -857,25 +1086,20 @@ impl ManagerHub {
                     "process_exited",
                     json!({"exitCode":row.exit_code}),
                 );
+                if let Some(workspace)=self.workspace.get().and_then(Weak::upgrade) {
+                    workspace.process_exited(&row.id,row.generation);
+                }
                 self.invalidate(&row.id, row.generation);
             }
         }
+        self.publish_human_decisions();
     }
     pub(crate) fn wait_ready(&self, id: &str) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            if self.connection(id, true).is_ok() {
-                return Ok(());
-            }
-            let row = self.registry()?.inspect(id, Origin::Human)?;
-            if row.exit_code.is_some() {
-                return Err(row
-                    .last_error
-                    .unwrap_or_else(|| "process exited before bridge initialization".into()));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        Err("bridge_not_ready".into())
+        let state = self.state.lock().map_err(|e| e.to_string())?;
+        let (state, _) = self.ready_changed.wait_timeout_while(state, Duration::from_secs(20), |state| {
+            !self.closing.load(Ordering::Relaxed) && !state.clients.get(id).is_some_and(|client| client.ready && client.stream.is_some())
+        }).map_err(|e| e.to_string())?;
+        if state.clients.get(id).is_some_and(|client| client.ready && client.stream.is_some()) { Ok(()) } else { Err("bridge_not_ready".into()) }
     }
     pub fn prompt_human(&self, id: &str, message: &str) -> Result<Value> {
         let registry = self.registry()?;
@@ -940,7 +1164,7 @@ impl ManagerHub {
     /// Display-only: the bridge reads the saved app-owned result by UUID/kind and prints it when Architect is idle.
     /// No path, text or model prompt is accepted.
     pub fn show_dependency_result(&self, architect_id: &str, generation: u64, request_id: &str, kind: &str, replay: bool) -> Result<()> {
-        if !["security", "usage", "project", "updatePlan"].contains(&kind) || uuid::Uuid::parse_str(request_id).map(|id| id.to_string() != request_id).unwrap_or(true) {
+        if !["security", "usage", "project", "updatePlan", "dependencyDiscovery", "requirements", "systemOverview", "structureCurrent", "structureProposed"].contains(&kind) || uuid::Uuid::parse_str(request_id).map(|id| id.to_string() != request_id).unwrap_or(true) {
             return Err("Invalid dependency result request".into());
         }
         let registry = self.registry()?;
@@ -954,33 +1178,34 @@ impl ManagerHub {
         self.control(architect_id, &lease, "dependency_result", json!({"requestId": request_id, "kind": kind, "replay": replay}), Origin::Human)
             .map(|_| ())
     }
-    /// Backend-only dispatch of a human-approved dependency update plan to The Manager. It is not a bridge/Architect
-    /// action. The caller supplies the exact lease it confirmed; the target must still be The Manager with that lease
-    /// before the (explicitly confirmed) abort and again before the single Human-origin prompt.
-    pub(crate) fn send_dependency_update_plan(&self, manager_id: &str, lease: &ControlLease, message: &str) -> std::result::Result<(), UpdatePlanSendError> {
-        use UpdatePlanSendError::{NotSent, Uncertain};
-        let registry = self.registry().map_err(NotSent)?;
-        let check = || -> Result<()> {
-            if registry.inspect(manager_id, Origin::Human)?.kind != InstanceKind::Manager {
-                return Err("The target is not The Manager".into());
-            }
-            let current = registry.lease(manager_id, Origin::Human, true)?;
-            if current.generation != lease.generation || current.session_id != lease.session_id || current.ownership_epoch != lease.ownership_epoch {
-                return Err("stale_generation".into());
-            }
-            Ok(())
-        };
-        check().map_err(NotSent)?;
-        self.control(manager_id, lease, "abort", json!({}), Origin::Human)
-            .map_err(|e| NotSent(format!("The Manager could not be interrupted: {e}")))?;
-        check().map_err(|e| NotSent(format!("The Manager was interrupted but the plan was not sent: {e}")))?;
-        self.control(manager_id, lease, "prompt", json!({"message": message}), Origin::Human)
-            .map(|_| ())
-            .map_err(|e| if e == "bridge_not_ready" || e == "stale_generation" {
-                NotSent(format!("The Manager was interrupted but the plan was not sent: {e}"))
-            } else {
-                Uncertain(e)
-            })
+    /// Deliver an app-created, analysis-only visualization prompt through the human-only `project_visualization_prompt`
+    /// control. The bridge, not this prompt, guards the turn; one lease binds the generation check and the frame.
+    pub(crate) fn prompt_visualization(&self, id: &str, generation: u64, request_id: &str, kind: &str, message: &str) -> Result<Value> {
+        let registry = self.registry()?;
+        let lease = registry.lease(id, Origin::Human, true)?;
+        if lease.generation != generation {
+            return Err("stale_generation".into());
+        }
+        if registry.inspect(id, Origin::Human)?.kind != InstanceKind::Architect {
+            return Err("The Architect is no longer available".into());
+        }
+        self.control(id, &lease, "project_visualization_prompt", json!({"requestId": request_id, "kind": kind, "message": message}), Origin::Human)
+    }
+    /// Human-only read of the Architect's captured structure-source Markdown (`structure_sources`,
+    /// `structure_source_read`, `structure_source_select_last`). Never accepts a path.
+    pub(crate) fn architect_control(&self, id: &str, generation: u64, action: &str, payload: Value) -> Result<Value> {
+        if !["structure_sources", "structure_source_read", "structure_source_select_last"].contains(&action) {
+            return Err("Unsupported Architect control".into());
+        }
+        let registry = self.registry()?;
+        let lease = registry.lease(id, Origin::Human, false)?;
+        if lease.generation != generation {
+            return Err("stale_generation".into());
+        }
+        if registry.inspect(id, Origin::Human)?.kind != InstanceKind::Architect {
+            return Err("The Architect is no longer available".into());
+        }
+        self.control(id, &lease, action, payload, Origin::Human)
     }
     /// App-originated control of a plan agent's target: `Origin::Human`, so any session (including The Manager)
     /// can be interrupted and prompted. The target is derived from the registry, never from the payload.
@@ -1095,6 +1320,16 @@ impl ManagerHub {
         }
         let action = text(frame, "action")?;
         let p = &frame["payload"];
+        if matches!(action, "workspace_begin" | "workspace_ready" | "workspace_complete" | "workspace_failed" | "workspace_reconcile") {
+            if !registry.workspace_metadata(&actor.id).is_ok_and(|m| crate::instance::may_change_directory(&m.definition)) { return Err("unauthorized".into()); }
+            let service = self.workspace.get().and_then(Weak::upgrade).ok_or("workspace service unavailable")?;
+            return match action {
+                "workspace_begin" => service.begin(&actor.id, actor.generation, &actor.connection_id, text(p,"requestId")?),
+                "workspace_ready" => service.ready(&actor.id, actor.generation, &actor.connection_id, p),
+                "workspace_reconcile" => service.reconcile(&actor.id, actor.generation, p),
+                _ => service.complete(&actor.id, actor.generation, &actor.connection_id, p, action == "workspace_failed"),
+            };
+        }
         if matches!(action, "browser_prepare" | "browser_close_tab" | "browser_close_all" | "browser_tabs") {
             let fields: &[&str] = match action {
                 "browser_close_all" | "browser_tabs" => &[],
@@ -1118,6 +1353,19 @@ impl ManagerHub {
             if let Some(target) = registry.plan_target(&actor.id) {
                 return self.plan_action(&registry, &target, action, p);
             }
+        }
+        if action == "code_quality" {
+            // Read-only saved results for the caller's own repository, for every role; the repository comes from the
+            // authenticated actor's Registry definition, never from the payload.
+            let service = self.code_quality.get().and_then(Weak::upgrade).ok_or("code quality service unavailable")?;
+            let request: crate::code_quality::types::AgentReportRequest = serde_json::from_value(p.clone()).map_err(|e| format!("invalid_code_quality_payload: {e}"))?;
+            let (folder, subject, epoch) = Self::quality_repository(&registry, actor)?;
+            let result = service.agent_report(&folder, &request)?;
+            let after = registry.workspace_metadata(&subject)?;
+            if after.workspace_epoch != epoch || after.definition.input.project_path != folder {
+                return Err("workspace_changed: the working directory changed while reading; retry".into());
+            }
+            return Ok(result);
         }
         if actor.role != InstanceKind::Manager { return Err("unauthorized".into()); }
         let origin = Origin::Manager(&actor.id);
@@ -1275,39 +1523,7 @@ impl ManagerHub {
                 Ok(json!({"humanRequested":true}))
             }
             "respond" => {
-                let lease = registry.lease(id, origin, true)?;
-                let request = text(p, "requestId")?;
-                if p["generation"].as_u64() != Some(lease.generation) {
-                    return Err("stale_generation".into());
-                }
-                let decision = self
-                    .state
-                    .lock()
-                    .map_err(|e| e.to_string())?
-                    .decisions
-                    .get(request)
-                    .cloned()
-                    .ok_or("decision_already_resolved")?;
-                if decision.worker != id
-                    || decision.generation != lease.generation
-                    || decision.epoch != lease.ownership_epoch
-                    || decision.session_id != lease.session_id
-                {
-                    return Err("stale_generation".into());
-                }
-                if matches!(
-                    decision.payload["method"].as_str(),
-                    Some("terminal" | "custom")
-                ) {
-                    return Err("native_terminal_decision".into());
-                }
-                self.control(
-                    id,
-                    &lease,
-                    "reply_ui",
-                    json!({"requestId":decision.base_id,"response":p["response"]}),
-                    origin,
-                )
+                self.respond_decision(id, text(p, "requestId")?, p["generation"].as_u64().ok_or("generation is required")?, None, p["response"].clone(), origin)
             }
             _ => Err("invalid_action".into()),
         }
@@ -1317,6 +1533,61 @@ impl ManagerHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn human_decisions_cover_roles_preserve_repository_and_reject_stale_authority() {
+        let folder = std::env::temp_dir().join(format!("omp-human-inbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(folder.join("repo-a")).unwrap();
+        std::fs::create_dir_all(folder.join("repo-b")).unwrap();
+        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let input = |name: &str, repo: &str| CreateInput { name: name.into(), project_path: folder.join(repo).to_string_lossy().into(), ..Default::default() };
+        let manager = registry.create_manager(input("Manager", "repo-a")).unwrap();
+        let architect = registry.create_architect(input("Architect", "repo-b")).unwrap();
+        let worker = registry.create_owned(&manager.id, input("Worker", "repo-a")).unwrap();
+        let helper = registry.create_helper(&worker.id, crate::instance::HelperPurpose::Diff, worker.project_path.clone()).unwrap();
+        let plan = registry.create_planner(&worker.id).unwrap();
+        let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
+        hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        for row in [&manager, &architect, &worker, &helper, &plan] {
+            registry.apply_identity(&row.id, 0, &json!({"sessionId":row.id,"supported":true,"workspaceEpoch":0})).unwrap();
+            hub.register_decision(&Actor { id: row.id.clone(), generation: 0, role: row.kind, connection_id: String::new() },
+                &json!({"requestId":"native-base","method":"confirm","sessionId":row.id,"workspaceEpoch":0,"createdAt":1,"title":"Confirm","message":"Proceed?","humanOnly":true})).unwrap();
+        }
+        let initial = hub.human_decisions().unwrap();
+        assert_eq!(initial.items.len(), 5);
+        assert_eq!(hub.human_decisions().unwrap().revision, initial.revision);
+        let decision = initial.items.iter().find(|item| item.target.instance_id == worker.id).unwrap();
+        assert_eq!(decision.repository.folder.as_deref(), Some(worker.project_path.as_str()));
+        assert!(decision.payload.get("requestId").is_none());
+        assert!(decision.answerable && decision.human_only);
+        for id in [&helper.id, &plan.id] {
+            assert_eq!(initial.items.iter().find(|item| &item.target.instance_id == id).unwrap().repository.folder, decision.repository.folder);
+        }
+        let target = decision.target.clone();
+        for changed in [
+            HumanDecisionTarget { instance_id: architect.id.clone(), ..target.clone() },
+            HumanDecisionTarget { generation: 1, ..target.clone() },
+            HumanDecisionTarget { session_id: Some("another".into()), ..target.clone() },
+            HumanDecisionTarget { ownership_epoch: target.ownership_epoch + 1, ..target.clone() },
+            HumanDecisionTarget { workspace_epoch: 1, ..target.clone() },
+        ] {
+            assert_eq!(hub.respond_human_decision(&changed, json!(true)).unwrap_err(), "stale_generation");
+        }
+        assert_eq!(hub.respond_decision(&worker.id, &target.request_id, 0, None, json!(true), Origin::Manager(&manager.id)).unwrap_err(), "human_only_decision");
+        // A human passes ownership gates without transferring the worker. No live bridge in this fixture.
+        assert_eq!(hub.respond_human_decision(&target, json!(false)).unwrap_err(), "bridge_not_ready");
+        assert_eq!(registry.lease(&worker.id, Origin::Human, false).unwrap().manager_id.as_deref(), Some(manager.id.as_str()));
+        hub.event(&Actor { id: worker.id.clone(), generation: 0, role: worker.kind, connection_id: String::new() },
+            &json!({"kind":"decision_resolved","payload":{"requestId":"native-base","source":"native"}})).unwrap();
+        let resolved = hub.human_decisions().unwrap();
+        assert_eq!(resolved.items.len(), 4);
+        assert!(resolved.revision > initial.revision);
+        assert_eq!(hub.respond_human_decision(&target, json!(true)).unwrap_err(), "decision_already_resolved");
+        hub.clear_decisions(&architect.id);
+        assert_eq!(hub.human_decisions().unwrap().items.len(), 3);
+        hub.shutdown();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
     #[test]
     fn bounded_frames_reject_bad_json_and_wrong_capabilities() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1563,6 +1834,66 @@ mod tests {
         browser.shutdown();hub.shutdown();std::fs::remove_dir_all(folder).unwrap();
     }
     #[test]
+    fn workspace_acknowledgements_accept_ordinary_agents_but_not_helpers_or_plan_sessions() {
+        let folder = std::env::temp_dir().join(format!("omp-workspace-ack-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let worker = registry.create(CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let helper = registry.create_helper(&worker.id, crate::instance::HelperPurpose::Diff, worker.project_path.clone()).unwrap();
+        let planner = registry.create_planner(&worker.id).unwrap();
+        let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
+        hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        let ask = |id: &str| {
+            hub.launch(&Definition { id: id.into(), input: CreateInput::default(), session_path: None, kind: InstanceKind::Instance, manager_id: None, plan_target: None, helper: None }, 0).unwrap();
+            let actor = Actor { id: id.into(), generation: 0, role: InstanceKind::Instance, connection_id: String::new() };
+            hub.execute(&actor, &json!({"action":"workspace_begin","payload":{"requestId":"request"}})).unwrap_err()
+        };
+        assert_eq!(ask(&helper.id), "unauthorized");
+        assert_eq!(ask(&planner.id), "unauthorized");
+        // The ordinary agent passes the role gate; no workspace service is installed in this fixture.
+        assert_eq!(ask(&worker.id), "workspace service unavailable");
+        hub.shutdown();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn native_agent_hub_requires_current_generation_and_a_compatible_live_host() {
+        let folder = std::env::temp_dir().join(format!("omp-native-hub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let worker = registry.create(CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
+        hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        let launch = hub.launch(&Definition { id: worker.id.clone(), input: CreateInput::default(), session_path: None,
+            kind: InstanceKind::Instance, manager_id: None, plan_target: None, helper: None }, 0).unwrap();
+        assert_eq!(hub.open_agent_hub(&worker.id, 1).unwrap_err(), "stale_generation");
+        assert!(hub.open_agent_hub(&worker.id, 0).unwrap_err().starts_with("native_agent_hub_unavailable:"));
+        let mut socket = TcpStream::connect(&hub.endpoint).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket.write_all(format!("{}\n", json!({"type":"hello","id":"hello","protocol":1,"instanceId":worker.id,"generation":0,"token":launch.token})).as_bytes()).unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        assert_eq!(read_frame(&mut reader).unwrap().unwrap()["ok"], true);
+        socket.write_all(format!("{}\n", json!({"type":"event","eventId":"ready","kind":"ready","payload":{
+            "sessionId":"native","supported":true,"capabilities":{"agentHub":true}}})).as_bytes()).unwrap();
+        hub.wait_ready(&worker.id).unwrap();
+        assert_eq!(read_frame(&mut reader).unwrap().unwrap()["action"], "ownership");
+        let answered = std::thread::spawn(move || {
+            let frame = read_frame(&mut reader).unwrap().unwrap();
+            assert_eq!(frame["action"], "agent_hub");
+            assert_eq!(frame["payload"]["source"], "human");
+            assert_eq!(frame["payload"]["sessionId"], "native");
+            socket.write_all(format!("{}\n", json!({"type":"response","id":frame["id"],"ok":true,"data":{"opened":true}})).as_bytes()).unwrap();
+        });
+        hub.open_agent_hub(&worker.id, 0).unwrap();
+        answered.join().unwrap();
+        registry.set_bridge_ready(&worker.id, 0, false);
+        assert!(hub.open_agent_hub(&worker.id, 0).unwrap_err().starts_with("native_agent_hub_unavailable:"));
+        hub.shutdown();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
     fn an_authenticated_bridge_connection_stays_readable_after_the_hello_deadline() {
         let folder = std::env::temp_dir().join(format!("omp-bridge-idle-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&folder).unwrap();
@@ -1691,6 +2022,78 @@ mod tests {
         assert_eq!(ask(&idle_planner.id, "plan_handoff", json!({"summary": "s", "revision":info["revision"]})).unwrap_err(), plan::NOT_RUNNING);
         assert_eq!(registry.inspect(&idle.id, Origin::Human).unwrap().last_plan_handoff, None);
         hub.shutdown();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn code_quality_reads_resolve_only_the_authenticated_agents_repository() {
+        use crate::code_quality::{store, types::*};
+        use crate::instance::HelperPurpose;
+        let folder = std::env::temp_dir().join(format!("omp-manager-quality-{}", uuid::Uuid::new_v4()));
+        let (repo_a, repo_b) = (folder.join("repo-a"), folder.join("repo-b"));
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        let plain = |path: &std::path::Path| {
+            let text = std::fs::canonicalize(path).unwrap().to_string_lossy().to_string();
+            text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text)
+        };
+        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let input = |path: &std::path::Path| CreateInput { project_path: path.to_string_lossy().into(), ..Default::default() };
+        let worker_a = registry.create(input(&repo_a)).unwrap();
+        let worker_b = registry.create(input(&repo_b)).unwrap();
+        let helper = registry.create_helper(&worker_a.id, HelperPurpose::Git, plain(&repo_a)).unwrap();
+        let planner = registry.create_planner(&worker_b.id).unwrap();
+        let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
+        hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        let service = crate::code_quality::CodeQualityService::passive_for_tests(folder.clone());
+
+        let paths = store::Paths::new(folder.join("code-quality"));
+        let save = |repo: &std::path::Path| {
+            let (id, canonical) = (uuid::Uuid::new_v4().to_string(), plain(repo));
+            let project = QualityProject { folder: canonical.clone(), project_key: "omp-test".into(), scanner: Scanner::Cli, entry_file: None, image: None, build_args: vec![], prepare_npm_dependencies: false, exclusions: vec![] };
+            let scan = QualityScan {
+                id: id.clone(), folder: canonical.clone(), config: QualityConfig::default(), project, status: QualityScanStatus::Complete, phase: "Done".into(),
+                started_at: 1, finished_at: Some(2), snapshot_hash: String::new(), rules_hash: String::new(), tools: vec![], findings: vec![], warnings: vec![],
+                error: None, analysis_id: None, dashboard_url: None, quality_gate: None, log: vec![],
+            };
+            store::save_scan(&paths, &scan).unwrap();
+            store::save_project(&paths, &canonical, &store::ProjectFile { version: 1, project: None, recent: vec![id.clone()] }).unwrap();
+            id
+        };
+        let (scan_a, scan_b) = (save(&repo_a), save(&repo_b));
+
+        let actor = |id: &str| Actor { id: id.into(), generation: 0, role: InstanceKind::Instance, connection_id: String::new() };
+        let ask = |who: &str, payload: Value| hub.execute(&actor(who), &json!({"action": "code_quality", "payload": payload}));
+        for id in [&worker_a.id, &worker_b.id, &helper.id, &planner.id] {
+            hub.launch(&registry.workspace_metadata(id).unwrap().definition, 0).unwrap();
+        }
+        // Before the service is installed nothing is answered.
+        assert_eq!(ask(&worker_a.id, json!({"section": "scans"})).unwrap_err(), "code quality service unavailable");
+        hub.install_code_quality_service(Arc::downgrade(&service)).unwrap();
+
+        let listed = |who: &str| -> Vec<String> {
+            ask(who, json!({"section": "scans"})).unwrap()["scans"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(listed(&worker_a.id), [scan_a.clone()], "an ordinary agent reads its own working directory");
+        assert_eq!(listed(&worker_b.id), [scan_b.clone()]);
+        assert_eq!(listed(&helper.id), [scan_a.clone()], "a helper resolves its target's project, not its app-owned folder");
+        assert_eq!(listed(&planner.id), [scan_b.clone()], "a plan agent resolves its plan target's project");
+        assert_eq!(ask(&helper.id, json!({"section": "summary", "scanId": scan_a})).unwrap()["scan"]["id"], scan_a.as_str());
+        for (who, foreign) in [(&worker_a.id, &scan_b), (&worker_b.id, &scan_a), (&helper.id, &scan_b), (&planner.id, &scan_a)] {
+            for payload in [json!({"section": "summary", "scanId": foreign}), json!({"section": "findings", "scanId": foreign}),
+                json!({"section": "artifact", "scanId": foreign, "reportName": "t.json"})] {
+                assert_eq!(ask(who, payload).unwrap_err(), "That scan does not belong to this repository");
+            }
+        }
+        // The payload can never name a repository, instance or path.
+        for payload in [json!({"section": "scans", "folder": plain(&repo_b)}), json!({"section": "scans", "instanceId": worker_b.id}),
+            json!({"section": "scans", "path": plain(&repo_b)}), json!({"section": "export"}), json!({})] {
+            assert!(ask(&worker_a.id, payload.clone()).unwrap_err().starts_with("invalid_code_quality_payload"), "{payload}");
+        }
+        let replaced = Actor { connection_id: "replaced".into(), ..actor(&worker_a.id) };
+        assert_eq!(hub.execute(&replaced, &json!({"action": "code_quality", "payload": {"section": "scans"}})).unwrap_err(), "stale_generation");
+        hub.shutdown();
+        drop(service);
         std::fs::remove_dir_all(folder).unwrap();
     }
 }

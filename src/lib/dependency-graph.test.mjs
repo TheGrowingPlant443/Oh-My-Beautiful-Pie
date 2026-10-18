@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { visibleGraph, pendingDirect, nodeColor, nodeSize, pathToNode, focusCamera, packageTotals, buildPackageSearchIndex, searchPackages, exactNameMatch, parseDependencyPrefs, ROOT } from "./dependency-graph.ts";
+import { visibleGraph, pendingDirect, nodeColor, nodeSize, pathToNode, focusCamera, packageTotals, buildPackageSearchIndex, searchPackages, exactNameMatch, parseDependencyPrefs, filterGraphByEcosystem, validEcosystemChoice, ROOT } from "./dependency-graph.ts";
+import { projectEcosystems } from "./project-filter.ts";
 import { projectFolders } from "./repo-agents.ts";
 
 const node = (id, direct = false) => ({ id, name: id, version: null, resolvedVersions: [], declaredVersions: [], ecosystem: id === "project" ? "project" : "npm", direct, dev: false });
@@ -278,4 +279,44 @@ test("saved preferences: layer 2 fallback, explicit All and numbers kept, standa
   assert.equal(parseDependencyPrefs('{"hidePink":true}').hidePink, true);
   const saved = parseDependencyPrefs('{"folder":"C:/p","mode":"transitive","showAll":true,"presentation":"list"}');
   assert.deepEqual([saved.folder, saved.mode, saved.showAll, saved.presentation], ["C:/p", "transitive", true, "list"]);
+});
+
+const ecoNode = (id, ecosystem, direct = false) => ({ ...node(id, direct), ecosystem });
+const mixed = {
+  folder: "C:/m", key: "fedcba9876543210", notes: [], truncated: false,
+  nodes: [ecoNode("project", "project"), ecoNode("npm:a", "npm", true), ecoNode("npm:t", "npm"), ecoNode("pypi:p", "pypi", true), ecoNode("pypi:q", "pypi"), ecoNode("pypi:orphan", "pypi")],
+  edges: [["project", "npm:a"], ["project", "pypi:p"], ["npm:a", "npm:t"], ["pypi:p", "pypi:q"], ["npm:a", "pypi:q"], ["pypi:q", "npm:t"]],
+};
+
+test("the language choice is valid only while more than one ecosystem is present and still contains it", () => {
+  assert.equal(validEcosystemChoice("npm", new Set(["npm", "pypi"])), "npm");
+  assert.equal(validEcosystemChoice("all", new Set(["npm", "pypi"])), "all");
+  assert.equal(validEcosystemChoice("npm", new Set(["npm"])), "all");
+  assert.equal(validEcosystemChoice("maven", new Set(["npm", "pypi"])), "all");
+  assert.equal(validEcosystemChoice("npm", new Set()), "all");
+});
+
+test("filtering by ecosystem keeps the root, drops other languages and cross-ecosystem edges, and invents no edge", () => {
+  const npm = filterGraphByEcosystem(mixed, "npm");
+  assert.deepEqual(ids(npm), ["npm:a", "npm:t", "project"]);
+  assert.deepEqual(pairs(npm), ["npm:a>npm:t", "project>npm:a"]);
+  const pypi = filterGraphByEcosystem(mixed, "pypi");
+  assert.deepEqual(ids(pypi), ["project", "pypi:orphan", "pypi:p", "pypi:q"]);
+  assert.deepEqual(pairs(pypi), ["project>pypi:p", "pypi:p>pypi:q"]);
+  assert.equal(filterGraphByEcosystem(mixed, "all"), mixed);
+  // The scan itself is never mutated and the rest of the graph record is carried over.
+  assert.equal(mixed.nodes.length, 6);
+  assert.equal(mixed.edges.length, 6);
+  assert.equal(npm.key, mixed.key);
+});
+
+test("an orphan of the selected language appears only with Show all, and the Show all view never bypasses the language", () => {
+  const pypi = filterGraphByEcosystem(mixed, "pypi");
+  const none = { items: {}, updatedAt: null };
+  assert.deepEqual(ids(visibleGraph(pypi, none, "transitive", false)), ["project", "pypi:p", "pypi:q"]);
+  assert.deepEqual(ids(visibleGraph(pypi, none, "transitive", true)), ["project", "pypi:orphan", "pypi:p", "pypi:q"]);
+  assert.equal(visibleGraph(pypi, none, "transitive", true).nodes.some(entry => entry.ecosystem === "npm"), false);
+  assert.deepEqual(ids(visibleGraph(pypi, none, "direct", false)), ["project", "pypi:p"]);
+  assert.deepEqual([...projectEcosystems(mixed.nodes)].sort(), ["npm", "pypi"]);
+  assert.deepEqual([...projectEcosystems(filterGraphByEcosystem(mixed, "pypi").nodes)], ["pypi"]);
 });

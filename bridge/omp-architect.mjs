@@ -4,6 +4,8 @@ import path from 'node:path';
 import { createResultConsole, formatSecurityResult, formatUsageResult } from './omp-architect-console.mjs';
 import { registerDependencyContextTool } from './omp-architect-context.mjs';
 import { registerDependencyUpdateTool } from './omp-dependency-updates.mjs';
+import { registerProjectInsightTools } from './omp-project-insight.mjs';
+import { registerStructureSources } from './omp-structure-sources.mjs';
 
 // Only The Architect registers these app-owned dependency classification and security report tools.
 export const KEY = /^[0-9a-f]{16}$/;
@@ -324,7 +326,7 @@ export function loadSavedResultText(dir, kind, requestId) {
   return formatUsageResult({ ...request, contextId: request.contextId ?? null }, result);
 }
 
-export function registerClassifyTool(pi, dir) {
+export function registerClassifyTool(pi, dir, options = {}) {
   pi.registerTool({
     name: 'classify_dependencies',
     label: 'Classify Dependencies',
@@ -427,8 +429,15 @@ export function registerClassifyTool(pi, dir) {
   });
   registerDependencyContextTool(pi, dir, architectIdentity, resultConsole);
   registerDependencyUpdateTool(pi, dir, architectIdentity, resultConsole);
+  const visualization = registerProjectInsightTools(pi, dir, architectIdentity, resultConsole, options);
+  // Passive native-input capture of the human's pasted target Markdown; only these human-only controls ever read it.
+  const structure = registerStructureSources(pi, dir, architectIdentity, { currentContext: options.currentContext });
   return {
     // Display-only replay of an already saved result, by UUID and kind; never starts an analysis.
     showSaved: (ctx, kind, requestId, replay) => resultConsole.showSaved(ctx, dir, kind, requestId, { replay }),
+    // Human-only: submit the app's analysis-only visualization prompt for an admitted request (see omp-visualization-guard.mjs).
+    promptVisualization: (ctx, payload) => visualization.promptVisualization(ctx, payload),
+    // Human-only: structure_sources / structure_source_read / structure_source_select_last (see omp-structure-sources.mjs).
+    structureSources: (ctx, action, payload) => structure.structureSources(ctx, action, payload),
   };
 }
