@@ -251,8 +251,8 @@ test('the three Architect tools register, resolve the producer from the session 
     const enqueued = [];
     registerProjectInsightTools({ registerTool: tool => tools.push(tool), zod }, fixture.dir, ctx => { if (!ctx.ok) throw new Error('Architect identity unavailable'); return actor; },
       { registerKind: kind => kinds.push(kind), enqueue: (_ctx, item) => enqueued.push(item) });
-    assert.deepEqual(tools.map(tool => tool.name), ['repo_evidence', 'submit_dependency_discovery', 'submit_requirements_findings', 'system_overview_inspect', 'read_target_structure', 'submit_system_overview', 'submit_repository_structure']);
-    assert.deepEqual(kinds, ['dependencyDiscovery', 'requirements', 'systemOverview', 'structureCurrent', 'structureProposed']);
+    assert.deepEqual(tools.map(tool => tool.name), ['repo_evidence', 'submit_dependency_discovery', 'submit_requirements_findings', 'system_overview_inspect', 'read_target_structure', 'submit_system_overview', 'submit_helicopter', 'submit_repository_structure']);
+    assert.deepEqual(kinds, ['dependencyDiscovery', 'requirements', 'systemOverview', 'helicopter', 'structureCurrent', 'structureProposed']);
     const named = name => tools.find(tool => tool.name === name);
     const listed = await named('repo_evidence').execute('id', { requestId: fixture.requestId, action: 'list' }, undefined, undefined, { ok: true });
     assert.equal(JSON.parse(listed.content[0].text).entries[0].name, 'app.py');

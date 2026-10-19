@@ -17,7 +17,7 @@ pub type Result<T, E = String> = std::result::Result<T, E>;
 const MAX_REQUEST: usize = 600;
 
 /// Every bridge module the Architect extension imports; each is written next to the manager bridge when it changes.
-const BRIDGE_MODULES: [(&str, &str); 10] = [
+const BRIDGE_MODULES: [(&str, &str); 11] = [
     ("omp-architect.mjs", include_str!("../../bridge/omp-architect.mjs")),
     ("omp-architect-context.mjs", include_str!("../../bridge/omp-architect-context.mjs")),
     ("omp-architect-console.mjs", include_str!("../../bridge/omp-architect-console.mjs")),
@@ -28,6 +28,7 @@ const BRIDGE_MODULES: [(&str, &str); 10] = [
     ("omp-system-results.mjs", include_str!("../../bridge/omp-system-results.mjs")),
     ("omp-visualization-guard.mjs", include_str!("../../bridge/omp-visualization-guard.mjs")),
     ("omp-structure-sources.mjs", include_str!("../../bridge/omp-structure-sources.mjs")),
+    ("omp-srs.mjs", include_str!("../../bridge/omp-srs.mjs")),
 ];
 
 /// The agent imports these modules next to the bridge extension.

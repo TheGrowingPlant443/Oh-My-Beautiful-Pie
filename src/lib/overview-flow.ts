@@ -1,5 +1,5 @@
 import type { Edge, Node } from "@xyflow/svelte";
-import type { ViewEdge, ViewNode } from "./system-graph";
+import type { LoopKind, ViewEdge, ViewNode } from "./system-graph";
 
 /** What a card needs to draw itself; every string is rendered as plain text. */
 export interface OverviewNodeData extends Record<string, unknown> {
@@ -8,6 +8,8 @@ export interface OverviewNodeData extends Record<string, unknown> {
   matched: boolean;
   /** Opens or closes the container this card stands for. */
   onToggle: (id: string) => void;
+  /** Names a card's relationships to itself; source views say recursion, graph-domain views self-link. */
+  loopKind?: LoopKind;
 }
 export type OverviewFlowNode = Node<OverviewNodeData, "overview">;
 

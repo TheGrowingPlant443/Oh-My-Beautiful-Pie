@@ -39,6 +39,14 @@ export function installWorkspaceChanges(pi, options) {
   let epoch = 0, active = null, idleScheduled = false, detachHook, detachEvents;
   let admissionGuard = null;
   let transportLost = false;
+  const modelGates = new Set();
+  const promptFlows = new Set();
+  let markdownHold = null;
+  function releaseMarkdownHold() {
+    const hold = markdownHold;
+    markdownHold = null;
+    hold?.resolve();
+  }
   const waits = new Map();
   const completed = new Map();
   const reconcile = new Map();
@@ -105,6 +113,25 @@ export function installWorkspaceChanges(pi, options) {
     typeof mode.ui?.requestRender === 'function' && typeof mode.shutdown === 'function' &&
     typeof mode.session.agent?.addBeforeModelCallHook === 'function';
   const idle = () => root() && context.isIdle() && !context.hasPendingMessages() && !options.hasPendingDecisions();
+  function nativeGuardAvailable() {
+    return !disposed && root() && hookedAgent === mode?.session?.agent && typeof detachHook === 'function' &&
+      typeof mode?.session?.hasPostPromptWork === 'boolean' && typeof mode.sessionManager?.getBranch === 'function' &&
+      typeof mode.sessionManager?.appendCustomEntry === 'function';
+  }
+  function quiescence() {
+    const session = mode?.session;
+    const reasons = [];
+    if (!root() || disposed) reasons.push('native_session_unavailable');
+    if (session?.isStreaming || !context?.isIdle()) reasons.push('streaming');
+    if (session?.isCompacting) reasons.push('compacting');
+    if (context?.hasPendingMessages() || session?.agent?.hasQueuedMessages?.()) reasons.push('pending_messages');
+    if (options.hasPendingDecisions()) reasons.push('pending_decisions');
+    if (session?.hasPostPromptWork !== false) reasons.push('post_prompt_work');
+    if (promptFlows.size) reasons.push('prompt_flow_unsettled');
+    if (active || head) reasons.push('workspace_transition');
+    if (markdownHold) reasons.push('markdown_deployment');
+    return { quiescent: reasons.length === 0, reasons };
+  }
   const binding = request => request.sessionId === identity().sessionId && options.isLeaseCurrent(request) &&
     ((active?.request === request && active.ready) || request.workspaceEpoch === epoch);
   const report = error => options.emit('workspace_error', { error: String(error.message ?? error), ...identity() });
@@ -126,9 +153,11 @@ export function installWorkspaceChanges(pi, options) {
     const agent = mode?.session?.agent;
     hookedAgent = agent;
     if (!agent?.addBeforeModelCallHook) return;
-    detachHook = agent.addBeforeModelCallHook(async signal => {
+    detachHook = agent.addBeforeModelCallHook(async (signal, nativeContext) => {
+      if (markdownHold) await markdownHold.promise;
       if (admissionGuard) await admissionGuard.promise;
       if (disposed || !root()) return;
+      for (const gate of modelGates) await gate(signal, nativeContext);
       if (active) {
         active.streaming = true;
         active.boundary.resolve();
@@ -325,8 +354,12 @@ export function installWorkspaceChanges(pi, options) {
     return setToolUi.value.call(this, ui, hasUI, ...args);
   };
   const promptWrapper = prompt && async function (...args) {
+    const owned = this === mode?.session && !disposed;
+    while (owned && markdownHold) await markdownHold.promise;
+    const flow = {};
+    if (owned) promptFlows.add(flow);
     try { return await prompt.value.apply(this, args); }
-    finally { scheduleIdle(); }
+    finally { promptFlows.delete(flow); scheduleIdle(); }
   };
   const waitWrapper = wait && async function (id, ...args) {
     const manager = this.session?.sessionManager;
@@ -346,6 +379,34 @@ export function installWorkspaceChanges(pi, options) {
     return [target, name, original, wrapper];
   });
   const api = {
+    nativeGuardAvailable,
+    quiescence,
+    addBeforeModelCallGate(gate) {
+      modelGates.add(gate);
+      return () => modelGates.delete(gate);
+    },
+    nativeSessionEntries() {
+      if (!nativeGuardAvailable()) throw new Error('native_srs_guard_unavailable');
+      return mode.sessionManager.getBranch();
+    },
+    appendNativeEntry(customType, data) {
+      if (!nativeGuardAvailable()) throw new Error('native_srs_guard_unavailable');
+      return mode.sessionManager.appendCustomEntry(customType, data);
+    },
+    holdMarkdown(transactionId) {
+      if (typeof transactionId !== 'string' || !transactionId.trim()) throw new Error('invalid_transaction');
+      if (markdownHold?.transactionId === transactionId) return { held: true, ...identity() };
+      if (!nativeGuardAvailable()) throw new Error(WORKSPACE_COMPATIBILITY_ERROR);
+      const status = quiescence();
+      if (!status.quiescent) throw new Error(`native_session_busy: ${status.reasons.join(', ')}`);
+      markdownHold = { transactionId, ...Promise.withResolvers() };
+      return { held: true, ...identity() };
+    },
+    releaseMarkdown(transactionId) {
+      if (markdownHold && markdownHold.transactionId !== transactionId) throw new Error('stale_transaction');
+      releaseMarkdownHold();
+      return { released: true };
+    },
     identity,
     nativeUiCapabilities() {
       const capabilities = { agentHub: nativeHubReady() };
@@ -386,7 +447,7 @@ export function installWorkspaceChanges(pi, options) {
     },
     attachContext(ctx) {
       if (ctx.agent?.kind !== 'main') return;
-      if (context && context.sessionManager.getSessionId() !== ctx.sessionManager.getSessionId()) head = null;
+      if (context && context.sessionManager.getSessionId() !== ctx.sessionManager.getSessionId()) { head = null; releaseMarkdownHold(); }
       context = ctx;
       catchUpUi();
       options.nativeUi?.revalidate();
@@ -431,6 +492,8 @@ export function installWorkspaceChanges(pi, options) {
     },
     async dispose() {
       disposed = true; head = null;
+      releaseMarkdownHold();
+      modelGates.clear();
       active?.boundary.resolve();
       if (active) await active.done.catch(report);
       detachHook?.(); detachEvents?.();

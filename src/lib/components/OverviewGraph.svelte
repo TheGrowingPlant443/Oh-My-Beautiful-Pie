@@ -15,10 +15,10 @@
   import LayoutWorker from "../overview-layout.worker?worker";
   import { LayoutClient, positionMap, type LayoutPositions, type LayoutStatus, type LayoutWorkerLike } from "../overview-layout";
   import type { Camera } from "../system-overview";
-  import { COLUMN_W, gradeProven, relationColor, ROW_H, type Projection, type ViewNode } from "../system-graph";
+  import { COLUMN_W, edgeArrow, gradeProven, relationColor, ROW_H, type Projection, type ViewNode } from "../system-graph";
 
-  let { projection, layoutKey, selectedNode, selectedEdge, matched, camera, onSelectNode, onSelectEdge, onCamera, onLayout }: {
-    projection: Projection; layoutKey: string; selectedNode: string | null; selectedEdge: string | null; matched: ReadonlySet<string>; camera: Camera | null;
+  let { projection, layoutKey, selectedNode, selectedEdge, matched, camera, label = "Large dependency graph", onSelectNode, onSelectEdge, onCamera, onLayout }: {
+    projection: Projection; layoutKey: string; selectedNode: string | null; selectedEdge: string | null; matched: ReadonlySet<string>; camera: Camera | null; label?: string;
     onSelectNode: (id: string | null) => void; onSelectEdge: (id: string | null) => void; onCamera: (camera: Camera) => void; onLayout: (status: LayoutStatus) => void;
   } = $props();
 
@@ -49,20 +49,23 @@
       const started = performance.now();
       const cached = layoutCache.get(key);
       const maxX = Math.max(1, ...view.nodes.map(node => Math.abs(node.x))), maxY = Math.max(1, ...view.nodes.map(node => Math.abs(node.y)));
-      const built = new Graph({ type: "directed", multi: true });
+      // Mixed multigraph: parallel and opposite records keep their own edges; only directed ones get an arrowhead.
+      const built = new Graph({ type: "mixed", multi: true });
       for (const [index, node] of view.nodes.entries()) {
         const start = cached?.get(node.id) ?? { x: (node.x / Math.max(maxX, COLUMN_W)) * 100 + (index % 7) * 1e-3, y: (node.y / Math.max(maxY, ROW_H)) * 100 + (index % 11) * 1e-3 };
         built.addNode(node.id, { label: node.label, labelVisibility: view.nodes.length <= 60 ? "visible" : "auto", size: nodeSize(node), color: nodeColor(node), x: start.x, y: start.y });
       }
       for (const edge of view.edges) {
-        built.addEdgeWithKey(edge.id, edge.source, edge.target, { size: 1 + Math.min(3, Math.log10(edge.count + 1) * 1.5), color: relationColor(edge.relation), opacity: gradeProven(edge.grade) && !edge.response ? 1 : 0.45 });
+        const attributes = { size: 1 + Math.min(3, Math.log10(edge.count + 1) * 1.5), color: relationColor(edge.relation), opacity: gradeProven(edge.grade) && !edge.response ? 1 : 0.45, head: edgeArrow(edge) ? "arrow" : "none" };
+        if (edgeArrow(edge)) built.addDirectedEdgeWithKey(edge.id, edge.source, edge.target, attributes);
+        else built.addUndirectedEdgeWithKey(edge.id, edge.source, edge.target, attributes);
       }
       const sigma = new Sigma(built, container, {
-        primitives: { edges: { extremities: [extremityArrow({ lengthRatio: 4, widthRatio: 3 })], defaultHead: "arrow" } },
+        primitives: { edges: { extremities: [extremityArrow({ lengthRatio: 4, widthRatio: 3 })] } },
         settings: { enableCameraRotation: false, enableCameraMouseRotation: false, enableCameraPanning: true, enableCameraZooming: true, minCameraRatio: 0.02, maxCameraRatio: 5, renderEdgeLabels: false, labelRenderedSizeThreshold: 6, labelDensity: 0.6, itemSizesReference: "screen", enableEdgeEvents: true },
         styles: {
           nodes: [{ color: { attribute: "color" }, size: { attribute: "size", defaultValue: 6 }, label: { attribute: "label" }, labelVisibility: { attribute: "labelVisibility", defaultValue: "auto" }, labelColor: "#dfe6ef" }, { whenState: "isHovered", then: { labelVisibility: "visible" } }],
-          edges: [{ color: { attribute: "color" }, size: { attribute: "size", defaultValue: 1 }, opacity: { attribute: "opacity", defaultValue: 1 } }],
+          edges: [{ color: { attribute: "color" }, size: { attribute: "size", defaultValue: 1 }, opacity: { attribute: "opacity", defaultValue: 1 }, head: { attribute: "head", defaultValue: "none" } }],
         },
       });
       renderer = sigma;
@@ -128,7 +131,7 @@
   });
   $effect(() => () => { client.dispose(); });
 </script>
-<div class="sigma" bind:this={host} role="application" aria-label="Large dependency graph"></div>
+<div class="sigma" bind:this={host} role="application" aria-label={label}></div>
 <style>
   .sigma { width: 100%; height: 100%; min-height: 0; background: #0d131c; }
 </style>

@@ -1,8 +1,10 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { api, type Instance, type SetupDraft, type SetupPaths, type SetupAdmission, type SetupItem, type SetupKind, type SetupRequest, type SetupScope } from "../api";
   import { instances, instancesById, managerInstance, architectInstance, errorText, refreshInstances } from "../stores";
   import SessionView from "./SessionView.svelte";
+  import AgentMarkdownPanel from "./AgentMarkdownPanel.svelte";
+  import { agentMarkdownTargetKey, agentSetupPreview, createAgentMarkdownStore, type AgentMarkdownTarget } from "../agent-markdown";
   let { draft = $bindable(), admission = $bindable(), projectContext, onback, onSetupManager, onOpenManager, onSetupArchitect, onOpenArchitect, onSelectSession, onPlan, onPlanChange, onSubagents, onCodeDiff, onSystemOverview }: {
     draft: SetupDraft; admission: SetupAdmission | null; projectContext: Instance | null; onback: () => void; onSetupManager: () => void; onSetupArchitect: () => void;
     onOpenManager: () => void; onOpenArchitect: () => void; onSelectSession: (id: string) => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void; onSubagents: (id: string) => void; onSystemOverview?: (id: string) => void;
@@ -30,6 +32,24 @@
   let repositoryLoading = $state(false);
   const repositoryAvailable = $derived(projectContext?.kind === "instance");
   const current = $derived(draft.instanceId ? $instancesById.get(draft.instanceId) : undefined);
+  const previewMarkdown = createAgentMarkdownStore();
+  const markdownTarget = $derived<AgentMarkdownTarget | null>(draft.scope === "repository"
+    ? (draft.projectInstanceId ? { kind: "repository", projectInstanceId: draft.projectInstanceId } : null)
+    : draft.scope ? { kind: draft.scope } : null);
+  const markdownTargetKey = $derived(markdownTarget ? agentMarkdownTargetKey(markdownTarget) : "");
+  const markdownStatus = $derived($previewMarkdown.status && markdownTargetKey === agentMarkdownTargetKey($previewMarkdown.status.target) ? $previewMarkdown.status : null);
+  const setupWorkRevision = $derived(`${current?.id ?? ""}:${current?.activity ?? ""}:${current?.status ?? ""}:${current?.generation ?? ""}:${current?.todoDone ?? ""}:${current?.todoTotal ?? ""}`);
+  $effect(() => {
+    markdownTargetKey;
+    const requested = untrack(() => markdownTarget);
+    if (requested) untrack(() => { void previewMarkdown.selectTarget(requested); });
+    else untrack(() => previewMarkdown.cancel());
+  });
+  let lastWorkRevision = "";
+  $effect(() => {
+    const revision = setupWorkRevision;
+    if (revision !== lastWorkRevision) { lastWorkRevision = revision; untrack(() => { void previewMarkdown.refresh(); }); }
+  });
   const target = $derived.by(() => {
     switch (draft.scope) {
       case "global": return paths?.globalAgentFolder;
@@ -52,7 +72,9 @@
   onMount(() => {
     let disposed = false;
     void api.getSetupPaths().then(value => { if (!disposed) paths = value; }).catch(e => { if (!disposed) error = errorText(e); }).finally(() => { if (!disposed) loading = false; });
-    return () => { disposed = true; };
+    const focus = (): void => { void previewMarkdown.refresh(); };
+    window.addEventListener("focus", focus);
+    return () => { disposed = true; previewMarkdown.dispose(); window.removeEventListener("focus", focus); };
   });
   $effect(() => {
     const id = draft.projectInstanceId;
@@ -96,20 +118,8 @@
       if (!entries(kind).length) add(kind);
     } else draft.kinds = draft.kinds.filter(candidate => candidate !== kind);
   }
-  function output(item: SetupItem): string[] {
-    const name = slug(item.name);
-    let files: string[];
-    switch (item.kind) {
-      case "agents": files = [name ? `agent-instructions/${name}/AGENTS.md` : "AGENTS.md"]; break;
-      case "rules": files = ["RULES.md"]; break;
-      case "skill": files = [`skills/${name}/SKILL.md`, "SKILLS.md"]; break;
-      case "workflow": files = [`rules/workflow-${name}.md`]; break;
-      case "plugin": files = [`extensions/${name}/package.json`, `extensions/${name}/index.ts`]; break;
-      case "profile": return [`${paths?.globalOmpFolder ?? "<global .omp folder>"}/profiles/${name}/agent/config.yml`];
-      case "tool": files = [`tools/${name}/index.ts`, ...(item.language === "python" ? [`tools/${name}/run.py`] : item.language === "bash" ? [`tools/${name}/run.sh`] : [])]; break;
-    }
-    if (draft.scope === "repository") return target ? files.map(file => `${target}/${file}`) : [];
-    return files;
+  function output(item: SetupItem): { nativePath: string; sourcePath: string | null }[] {
+    return agentSetupPreview(item, target ?? "<native setup folder>", markdownStatus, paths?.globalOmpFolder ?? "<global .omp folder>");
   }
   function reviewTitle(item: SetupItem): string {
     if (item.kind === "rules") return "Rules.md";
@@ -120,6 +130,7 @@
   }
   function request(): SetupRequest {
     if (!draft.scope) throw new Error("Choose a setup scope first");
+    if (!markdownStatus || $previewMarkdown.busy) throw new Error($previewMarkdown.error || "Wait for the Markdown source status before reviewing setup destinations");
     if (draft.scope === "manager" && !$managerInstance) throw new Error("Set up The Manager first");
     if (draft.scope === "architect" && !$architectInstance) throw new Error("Set up The Architect first");
     if (draft.scope === "repository") {
@@ -153,6 +164,7 @@
       admission = retry && draft.instanceId ? await api.sendAgentSetup(draft.instanceId, input) : await api.startAgentSetup(input);
       draft.instanceId = admission.instance.id;
       await refreshInstances();
+      await previewMarkdown.refresh();
       if (admission.error) error = admission.error;
     } catch (e) { error = errorText(e); }
     finally { busy = false; }
@@ -185,10 +197,12 @@
   {#if repositoryAvailable || draft.scope === "repository"}<div class="folders dim"><span>Repository: <code>{repositoryRoot || (repositoryLoading ? "Loading…" : "Unavailable")}</code></span><span>Setup folder: <code>{repositoryRoot ? `${repositoryRoot}/.omp` : "Unavailable"}</code></span></div>{/if}
   {#if repositoryError}<p class="err alert" role="alert">{repositoryError}</p>{/if}
   {#if error}<p class="err alert" role="alert">{error}</p>{/if}
+  <AgentMarkdownPanel setupTarget={markdownTarget} {projectContext} {repositoryRoot} refreshKey={setupWorkRevision} onChanged={() => void previewMarkdown.refresh()} />
+  {#if $previewMarkdown.error}<p class="err alert" role="alert">Markdown routing status: {$previewMarkdown.error}</p>{/if}
   {#if draft.instanceId}
     <div class="session-summary panel">
       <header><strong>{scopeTitle}</strong><span class="spacer"></span><button disabled={busy} onclick={newSetup}>New setup</button></header>
-      <div class="summary-body"><p>Review and approve the actual native OMP plan below. Existing files must be preserved; completion and generated paths are reported by OMP.</p>
+      <div class="summary-body"><p>Review and approve the actual OMP plan below. {markdownStatus?.enabled ? "Markdown assets are written to the enabled vault source; native code and configuration stay in their runtime folders. Review Apply above after the agent finishes, then reload or reopen OMP." : "Native setup remains authoritative; existing files must be preserved."} Completion and generated paths are reported by OMP.</p>
         {#if admission?.promptSent === false}<p class="warn">Description was not sent. Complete native startup, then explicitly send it.</p><button disabled={busy} onclick={() => start(true)}>{busy ? "Sending…" : "Send setup description"}</button>
         {:else if admission?.promptSent === null}<p class="warn">Admission outcome is unknown. Inspect the native conversation before entering another request; automatic resend is disabled.</p>
         {:else if draft.scope === "repository"}<p class="dim">Existing project processes are not reloaded automatically. Reopen OMP from the repository root to use root-scoped rules/tools.</p>
@@ -259,11 +273,11 @@
         {:else if draft.step === REVIEW}
           <p><strong>{scopeTitle}</strong></p>
           <p class="mono">{target || "Target folder unavailable"}</p>
-          {#each selected as item}<article class="review-item"><h4>{reviewTitle(item)}</h4><p class="description">{item.description}</p>{#each output(item) as file}<code>{file}</code>{/each}</article>{/each}
+          {#each selected as item}<article class="review-item"><h4>{reviewTitle(item)}</h4><p class="description">{item.description}</p>{#each output(item) as file}{#if file.sourcePath}<span>Markdown source (written by setup):</span><code>{file.sourcePath}</code><span>Native runtime (only after reviewed Apply):</span><code>{file.nativePath}</code>{:else}<span>Native destination:</span><code>{file.nativePath}</code>{/if}{/each}</article>{/each}
           {#if !selected.length}<p class="warn">No descriptions yet. Select and describe at least one item in the preceding steps.</p>{/if}
-          <p class="dim">A real, human-controlled OMP session will propose a native plan. No target files are written before you approve. No credentials, dependencies, telemetry, automatic workflows, or unrelated code are installed.</p>
+          <p class="dim">A real, human-controlled OMP session will propose a plan. No target files are written before you approve. {markdownStatus?.enabled ? "Only Markdown assets are routed to the vault; scripts, tools, plugin code, profile configuration and credentials stay native. Skill references to native resources are preserved. Markdown needs a separate reviewed Apply and native reload/reopen." : "This target has not enabled Markdown migration: all setup destinations remain native, even if a vault is bound."} No credentials, dependencies, telemetry, automatic workflows, or unrelated code are installed.</p>
           {#if draft.scope === "repository"}<p class="dim">Existing project processes are not reloaded or restarted automatically. A nearer .omp or nested cwd can change discovery; reopen OMP from this repository root for root-scoped rules/tools.</p>{/if}
-          <button class="primary" disabled={busy || !paths || !draft.scope || (draft.scope === "repository" && (repositoryLoading || !!repositoryError || !repositoryRoot))} onclick={() => start()}>{busy ? "Starting native setup…" : "Start setup agent"}</button>
+          <button class="primary" disabled={busy || !paths || !draft.scope || !markdownStatus || $previewMarkdown.busy || (draft.scope === "repository" && (repositoryLoading || !!repositoryError || !repositoryRoot))} onclick={() => start()}>{busy ? "Starting native setup…" : "Start setup agent"}</button>
         {/if}
       </div>
       <footer>{#if draft.step > 0}<button disabled={busy} onclick={() => draft.step--}>Previous</button>{/if}<span class="spacer"></span>{#if draft.step < REVIEW}<button class="primary" disabled={busy} onclick={next}>{draft.step === 3 && !entries("tool").length ? "Skip" : "Next"}</button>{/if}</footer>

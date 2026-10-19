@@ -1,0 +1,670 @@
+//! Passive discovery of Obsidian and Cognee and the explicit, narrow ways they are opened.
+//!
+//! Probing only inspects files: nothing is launched, no CLI or Python is run, no Obsidian or Cognee setting, registry
+//! entry or store is written, and no note is copied. Obsidian is opened only through an `obsidian://` URI handed to its
+//! own executable; Cognee only through a loopback http(s) URL the human configured for an already running UI.
+use super::dto::*;
+use super::fsio::{self, err, shown, validate_relative};
+use super::{KnowledgeService, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+const OBSIDIAN_DOWNLOAD: &str = "https://obsidian.md/download";
+const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
+const MAX_REGISTERED_VAULTS: usize = 1000;
+
+#[derive(Clone, Debug)]
+pub(crate) enum ExeSetting {
+    Auto,
+    Fixed(PathBuf),
+    Disabled,
+}
+
+/// Where discovery looks. [`Environment::from_process`] reads the optional `OMP_KNOWLEDGE_*` overrides used by isolated
+/// smoke runs (`OMP_KNOWLEDGE_OBSIDIAN_EXE` may be `none` to simulate an absent Obsidian).
+#[derive(Clone, Debug)]
+pub(crate) struct Environment {
+    pub obsidian_exe: ExeSetting,
+    pub obsidian_registry: Option<PathBuf>,
+    pub cognee_home: Option<PathBuf>,
+    pub protected: Vec<PathBuf>,
+}
+
+impl Environment {
+    pub(crate) fn from_process() -> Self {
+        let variable = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+        let obsidian_exe = match variable("OMP_KNOWLEDGE_OBSIDIAN_EXE") {
+            Some(value) if value.to_str().is_some_and(|v| v.eq_ignore_ascii_case("none")) => ExeSetting::Disabled,
+            Some(value) => ExeSetting::Fixed(PathBuf::from(value)),
+            None => ExeSetting::Auto,
+        };
+        Self {
+            obsidian_exe,
+            obsidian_registry: variable("OMP_KNOWLEDGE_OBSIDIAN_REGISTRY").map(PathBuf::from),
+            cognee_home: variable("OMP_KNOWLEDGE_COGNEE_HOME").map(PathBuf::from),
+            protected: Vec::new(),
+        }
+    }
+
+    /// Nothing is discovered anywhere (tests).
+    #[cfg(test)]
+    pub(crate) fn isolated() -> Self {
+        Self { obsidian_exe: ExeSetting::Disabled, obsidian_registry: None, cognee_home: None, protected: Vec::new() }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct CogneeSettings {
+    pub ui_url: Option<String>,
+    pub installation_folder: Option<String>,
+    /// Written only by explicit configuration, never by a passive probe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installation_evidence: Option<CogneeEvidence>,
+    /// Positive observations survive subsequent inspection errors during this service's lifetime.
+    #[serde(skip)]
+    observed_installation: Option<CogneeEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CogneeEvidence {
+    pub folder: String,
+    pub version: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CogneeProbeError {
+    pub message: String,
+    pub evidence: Option<CogneeEvidence>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct ObsidianSettings {
+    pub executable: Option<String>,
+    pub declined_projects: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct Integrations {
+    pub version: u32,
+    pub cognee: CogneeSettings,
+    pub obsidian: ObsidianSettings,
+    /// Registered external Graphify output folders by project key.
+    pub graphify_outputs: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(windows)]
+mod version {
+    use std::ffi::c_void;
+    #[repr(C)]
+    pub struct FixedFileInfo {
+        pub signature: u32,
+        pub struct_version: u32,
+        pub file_version_ms: u32,
+        pub file_version_ls: u32,
+        pub product_version_ms: u32,
+        pub product_version_ls: u32,
+        pub rest: [u32; 7],
+    }
+    #[link(name = "version")]
+    extern "system" {
+        pub fn GetFileVersionInfoSizeW(file: *const u16, handle: *mut u32) -> u32;
+        pub fn GetFileVersionInfoW(file: *const u16, handle: u32, length: u32, data: *mut c_void) -> i32;
+        pub fn VerQueryValueW(block: *const c_void, sub_block: *const u16, buffer: *mut *mut c_void, length: *mut u32) -> i32;
+    }
+}
+
+/// The file version resource of an executable (read-only metadata; the program is not run).
+#[cfg(windows)]
+fn executable_version(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut handle = 0u32;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call.
+    let size = unsafe { version::GetFileVersionInfoSizeW(wide.as_ptr(), &mut handle) };
+    if size == 0 || size > 16 * 1024 * 1024 {
+        return None;
+    }
+    let mut data = vec![0u8; size as usize];
+    // SAFETY: `data` has exactly `size` writable bytes.
+    if unsafe { version::GetFileVersionInfoW(wide.as_ptr(), 0, size, data.as_mut_ptr().cast()) } == 0 {
+        return None;
+    }
+    let root: Vec<u16> = "\\".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buffer: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut length = 0u32;
+    // SAFETY: `data` holds a version block; on success `buffer` points inside it for `length` bytes.
+    if unsafe { version::VerQueryValueW(data.as_ptr().cast(), root.as_ptr(), &mut buffer, &mut length) } == 0 || buffer.is_null() || (length as usize) < std::mem::size_of::<version::FixedFileInfo>() {
+        return None;
+    }
+    // SAFETY: bounds were checked above; the block is not aligned for u32 reads, so read unaligned.
+    let info = unsafe { std::ptr::read_unaligned(buffer as *const version::FixedFileInfo) };
+    if info.signature != 0xFEEF_04BD {
+        return None;
+    }
+    Some(format!("{}.{}.{}", info.file_version_ms >> 16, info.file_version_ms & 0xFFFF, info.file_version_ls >> 16))
+}
+
+#[cfg(target_os = "macos")]
+fn executable_version(path: &Path) -> Option<String> {
+    let plist = path.parent()?.parent()?.join("Info.plist");
+    let text = String::from_utf8(fsio::read_regular_bounded(&plist, 1024 * 1024).ok()?).ok()?;
+    let after = &text[text.find("CFBundleShortVersionString")?..];
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")?;
+    Some(after[start..start + end].trim().to_string())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn executable_version(_path: &Path) -> Option<String> {
+    None
+}
+
+fn platform_obsidian_candidates(home: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if cfg!(windows) {
+        if let Some(base) = var("LOCALAPPDATA") {
+            found.push(base.join("Programs").join("Obsidian").join("Obsidian.exe"));
+        }
+        for name in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+            if let Some(base) = var(name) {
+                found.push(base.join("Obsidian").join("Obsidian.exe"));
+            }
+        }
+        found.push(PathBuf::from("C:/Program Files/Obsidian/Obsidian.exe"));
+    } else if cfg!(target_os = "macos") {
+        found.push(PathBuf::from("/Applications/Obsidian.app/Contents/MacOS/Obsidian"));
+        found.push(home.join("Applications/Obsidian.app/Contents/MacOS/Obsidian"));
+    } else {
+        found.push(PathBuf::from("/usr/bin/obsidian"));
+        found.push(PathBuf::from("/usr/local/bin/obsidian"));
+        found.push(PathBuf::from("/opt/Obsidian/obsidian"));
+    }
+    let mut seen = BTreeSet::new();
+    found.retain(|p| seen.insert(fsio::norm(p)));
+    found
+}
+
+enum Registry {
+    Absent,
+    Unreadable(String),
+    Vaults(Vec<(String, PathBuf)>),
+}
+
+enum Lookup {
+    Registered(String),
+    NotRegistered,
+    Unknown,
+}
+
+fn forward(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn launch_detached(program: &Path, argument: &str) -> Result<()> {
+    let mut command = Command::new(program);
+    command.arg(argument).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    crate::code_diff::no_console(&mut command);
+    let child = command.spawn().map_err(|e| err("Could not start Obsidian", e))?;
+    #[cfg(unix)]
+    {
+        let mut child = child;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+    #[cfg(not(unix))]
+    drop(child);
+    Ok(())
+}
+
+/// The Cognee UI URL rule: credential-free http(s) on a loopback host, no query or fragment.
+pub(crate) fn validate_cognee_url(text: &str) -> Result<String> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > 512 || text.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("Enter the address of your running Cognee UI, for example http://127.0.0.1:3000".into());
+    }
+    let url = reqwest::Url::parse(text).map_err(|_| "That is not a valid address".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Only http:// or https:// addresses are accepted".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("The address may not contain a user name or password".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("The address may not contain a query or fragment".into());
+    }
+    match url.host_str() {
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]") => Ok(url.to_string()),
+        _ => Err("Only loopback addresses are accepted: localhost, 127.0.0.1 or ::1".into()),
+    }
+}
+
+fn open_loopback_url(url: &str) -> Result<()> {
+    let url = validate_cognee_url(url)?;
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler").arg(&url);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(&url);
+        command
+    };
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(&url);
+        command
+    };
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    crate::code_diff::no_console(&mut command);
+    command.spawn().map(|_| ()).map_err(|e| err("Could not open the Cognee UI", e))
+}
+
+/// Only a missing directory is absence. Enumeration and entry errors must remain diagnostic.
+pub(crate) fn cognee_version(folder: &Path) -> Result<Option<String>> {
+    fn entries(path: &Path) -> Result<Option<fs::ReadDir>> {
+        match fs::read_dir(path) {
+            Ok(entries) => Ok(Some(entries)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(err("Cannot inspect Cognee package metadata", error)),
+        }
+    }
+    let mut site_packages = Vec::new();
+    if cfg!(windows) {
+        site_packages.push(folder.join("venv").join("Lib").join("site-packages"));
+    } else if let Some(entries) = entries(&folder.join("venv").join("lib"))? {
+        for entry in entries {
+            let entry = entry.map_err(|error| err("Cannot enumerate Cognee Python environments", error))?;
+            if entry.file_name().to_str().is_some_and(|name| name.starts_with("python")) {
+                site_packages.push(entry.path().join("site-packages"));
+            }
+        }
+    }
+    let mut versions = BTreeSet::new();
+    for dir in site_packages {
+        let Some(entries) = entries(&dir)? else { continue };
+        for entry in entries {
+            let entry = entry.map_err(|error| err("Cannot enumerate Cognee package metadata", error))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(version) = name.strip_prefix("cognee-").and_then(|name| name.strip_suffix(".dist-info")) else { continue };
+            if version.starts_with(|c: char| c.is_ascii_digit()) && version.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '!' | '_' | '-')) {
+                let kind = entry.file_type().map_err(|error| err("Cannot inspect Cognee package metadata entry", error))?;
+                if !kind.is_dir() {
+                    return Err("Cognee package metadata is not a plain folder".into());
+                }
+                versions.insert(version.to_string());
+            }
+        }
+    }
+    Ok(versions.into_iter().next())
+}
+
+/// Passive metadata discovery: a CLI file or a `cognee-<version>.dist-info` folder. Nothing is imported or run.
+/// Positive CLI evidence is retained even if package metadata cannot be enumerated.
+pub(crate) fn probe_cognee_folder(folder: &Path) -> Result<Option<CogneeEvidence>, CogneeProbeError> {
+    let cli = if cfg!(windows) { folder.join("venv").join("Scripts").join("cognee-cli.exe") } else { folder.join("venv").join("bin").join("cognee-cli") };
+    let cli_result = match fs::metadata(&cli) {
+        Ok(meta) if meta.is_file() => Ok(true),
+        Ok(_) => Err("The Cognee CLI path is not a file".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(err("Cannot inspect the Cognee CLI", error)),
+    };
+    let version_result = cognee_version(folder);
+    let evidence = (matches!(&cli_result, Ok(true)) || matches!(&version_result, Ok(Some(_)))).then(|| CogneeEvidence {
+        folder: folder.to_string_lossy().into_owned(),
+        version: version_result.as_ref().ok().and_then(|version| version.clone()),
+    });
+    let mut problems = Vec::new();
+    if let Err(problem) = cli_result {
+        problems.push(problem);
+    }
+    if let Err(problem) = version_result {
+        problems.push(problem);
+    }
+    if problems.is_empty() {
+        Ok(evidence)
+    } else {
+        Err(CogneeProbeError { message: problems.join("; "), evidence })
+    }
+}
+
+impl KnowledgeService {
+    fn obsidian_executable(&self, configured: Option<&str>) -> std::result::Result<Option<PathBuf>, String> {
+        let candidates: Vec<PathBuf> = match &self.env.obsidian_exe {
+            ExeSetting::Disabled => Vec::new(),
+            ExeSetting::Fixed(path) => vec![path.clone()],
+            ExeSetting::Auto => {
+                let mut list: Vec<PathBuf> = configured.map(PathBuf::from).into_iter().collect();
+                list.extend(platform_obsidian_candidates(&self.home));
+                list
+            }
+        };
+        let mut problem = None;
+        for candidate in candidates {
+            match fs::metadata(&candidate) {
+                Ok(meta) if meta.is_file() => return Ok(Some(candidate)),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => problem = Some(format!("{}: {e}", candidate.display())),
+            }
+        }
+        match problem {
+            Some(problem) => Err(problem),
+            None => Ok(None),
+        }
+    }
+
+    fn obsidian_registry_file(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.env.obsidian_registry {
+            return Some(path.clone());
+        }
+        let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+        if cfg!(windows) {
+            var("APPDATA").map(|p| p.join("obsidian").join("obsidian.json"))
+        } else if cfg!(target_os = "macos") {
+            Some(self.home.join("Library/Application Support/obsidian/obsidian.json"))
+        } else {
+            Some(self.home.join(".config/obsidian/obsidian.json"))
+        }
+    }
+
+    /// Reads Obsidian's list of known vaults (read-only; never modified).
+    fn read_obsidian_registry(&self) -> Registry {
+        let Some(file) = self.obsidian_registry_file() else { return Registry::Absent };
+        match fs::symlink_metadata(&file) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Registry::Absent,
+            Err(e) => return Registry::Unreadable(e.to_string()),
+            Ok(_) => {}
+        }
+        let bytes = match fsio::read_regular_bounded(&file, MAX_REGISTRY_BYTES) {
+            Ok(bytes) => bytes,
+            Err(e) => return Registry::Unreadable(e),
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return Registry::Unreadable("obsidian.json is not valid JSON".into()) };
+        let mut vaults = Vec::new();
+        if let Some(map) = value.get("vaults").and_then(|v| v.as_object()) {
+            for (id, entry) in map.iter().take(MAX_REGISTERED_VAULTS) {
+                if let Some(path) = entry.get("path").and_then(|p| p.as_str()).filter(|p| !p.is_empty()) {
+                    vaults.push((id.clone(), PathBuf::from(path)));
+                }
+            }
+        }
+        Registry::Vaults(vaults)
+    }
+
+    fn lookup_registration(&self, root: &Path) -> Lookup {
+        match self.read_obsidian_registry() {
+            Registry::Vaults(vaults) => {
+                let best = vaults.into_iter().filter(|(_, path)| fsio::same_or_inside(path, root)).max_by_key(|(_, path)| fsio::norm(path).len());
+                match best {
+                    Some((id, path)) if fsio::same_path(&path, root) => Lookup::Registered(id),
+                    Some(_) => Lookup::Unknown,
+                    None => Lookup::NotRegistered,
+                }
+            }
+            Registry::Absent | Registry::Unreadable(_) => Lookup::Unknown,
+        }
+    }
+
+    pub(crate) fn probe_obsidian(&self) -> ObsidianCapability {
+        self.probe_obsidian_for(false)
+    }
+
+    pub(crate) fn probe_obsidian_for(&self, declined_for_project: bool) -> ObsidianCapability {
+        let configured = self.state.lock().integrations.obsidian.executable.clone();
+        let registered = || match self.read_obsidian_registry() {
+            Registry::Vaults(vaults) => vaults.into_iter().map(|(_, p)| p).filter(|p| p.is_dir()).map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        match self.obsidian_executable(configured.as_deref()) {
+            Ok(Some(path)) => {
+                let version = executable_version(&path);
+                let message = version.is_none().then(|| "Obsidian is installed; its version could not be read".to_string());
+                ObsidianCapability { state: ObsidianState::Installed, version, executable: Some(path.to_string_lossy().into_owned()), registered_vaults: registered(), message, declined_for_project }
+            }
+            Ok(None) => ObsidianCapability { state: ObsidianState::Absent, version: None, executable: None, registered_vaults: Vec::new(), message: Some("Obsidian was not found".into()), declined_for_project },
+            Err(problem) => ObsidianCapability { state: ObsidianState::Unreadable, version: None, executable: None, registered_vaults: Vec::new(), message: Some(format!("Obsidian could not be inspected: {problem}")), declined_for_project },
+        }
+    }
+
+    pub(crate) fn probe_cognee(&self) -> CogneeCapability {
+        self.probe_cognee_with(probe_cognee_folder)
+    }
+
+    /// The injectable file probe keeps error handling deterministic in regression tests.
+    pub(crate) fn probe_cognee_with(&self, probe: impl FnOnce(&Path) -> Result<Option<CogneeEvidence>, CogneeProbeError>) -> CogneeCapability {
+        let (settings, settings_error) = {
+            let state = self.state.lock();
+            (state.integrations.cognee.clone(), state.integrations_error.clone())
+        };
+        let folder = self.env.cognee_home.clone().or_else(|| settings.installation_folder.as_deref().map(PathBuf::from)).or_else(|| {
+            std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()).map(|base| PathBuf::from(base).join("Cognee")).filter(|_| cfg!(windows))
+        });
+        let mut problems = Vec::new();
+        if let Some(error) = settings_error {
+            problems.push(format!("Integration settings are unreadable: {error}"));
+        }
+        let ui_url = match settings.ui_url.as_deref().map(validate_cognee_url).transpose() {
+            Ok(url) => url,
+            Err(error) => {
+                problems.push(format!("The saved Cognee UI address is invalid: {error}"));
+                None
+            }
+        };
+        let previous = folder.as_deref().and_then(|folder| {
+            settings.observed_installation.iter().chain(settings.installation_evidence.iter())
+                .find(|evidence| fsio::same_path(Path::new(&evidence.folder), folder)).cloned()
+                // Older settings saved a folder only after validating an installation.
+                .or_else(|| settings.installation_folder.as_deref().filter(|saved| fsio::same_path(Path::new(saved), folder))
+                    .map(|saved| CogneeEvidence { folder: saved.to_string(), version: None }))
+        });
+        let result = match folder.as_deref() {
+            Some(folder) if !folder.is_absolute() => Err(CogneeProbeError { message: "The saved Cognee installation folder is not absolute".into(), evidence: None }),
+            Some(folder) => probe(folder),
+            None => Ok(None),
+        };
+        let found = match result {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                problems.push(error.message);
+                error.evidence
+            }
+        };
+        if !problems.is_empty() {
+            let evidence = found.map(|mut evidence| {
+                if evidence.version.is_none() {
+                    evidence.version = previous.as_ref().and_then(|previous| previous.version.clone());
+                }
+                evidence
+            }).or(previous);
+            if let Some(evidence) = &evidence {
+                self.state.lock().integrations.cognee.observed_installation = Some(evidence.clone());
+            }
+            return CogneeCapability {
+                state: CogneeState::Unreadable,
+                installed: evidence.as_ref().map(|_| true),
+                version: evidence.as_ref().and_then(|evidence| evidence.version.clone()),
+                ui_url,
+                message: Some(format!("Cognee could not be fully inspected: {}. No application was started or changed.", problems.join("; "))),
+                installation_folder: folder.map(|folder| folder.to_string_lossy().into_owned()),
+            };
+        }
+        match found {
+            Some(evidence) => {
+                // In-memory only: capability queries never write settings or any Cognee store.
+                self.state.lock().integrations.cognee.observed_installation = Some(evidence.clone());
+                let message = ui_url.is_none().then(|| "Cognee is installed; its UI is not configured".to_string());
+                CogneeCapability { state: CogneeState::Installed, installed: Some(true), version: evidence.version, ui_url, message, installation_folder: Some(evidence.folder) }
+            }
+            None => CogneeCapability { state: CogneeState::Absent, installed: Some(false), version: None, ui_url, message: Some("Cognee was not found".into()), installation_folder: folder.map(|folder| folder.to_string_lossy().into_owned()) },
+        }
+    }
+
+    /// Saves (or, with `None`, clears) the address of an already running Cognee UI and an alternate installation
+    /// folder. Nothing is started, imported or contacted.
+    pub fn configure_cognee_ui(&self, url: Option<&str>, installation_folder: Option<&str>) -> Result<CogneeCapability> {
+        let url = url.map(str::trim).filter(|u| !u.is_empty()).map(validate_cognee_url).transpose()?;
+        let evidence = match installation_folder.map(str::trim).filter(|f| !f.is_empty()) {
+            None => None,
+            Some(folder) => {
+                let path = Path::new(folder);
+                if !path.is_absolute() {
+                    return Err("Choose an absolute Cognee installation folder".into());
+                }
+                let meta = fs::symlink_metadata(path).map_err(|e| err("Cannot inspect the Cognee folder", e))?;
+                if !meta.is_dir() || crate::code_quality::snapshot::is_link(&meta) {
+                    return Err("The Cognee installation folder must be a plain folder".into());
+                }
+                let canonical = crate::setup::canonical(path).map_err(|e| err("Cannot resolve the Cognee folder", e))?;
+                let evidence = probe_cognee_folder(&canonical).map_err(|error| format!("Cognee could not be inspected: {}", error.message))?
+                    .ok_or_else(|| format!("No Cognee installation was found in {}", shown(folder)))?;
+                Some(evidence)
+            }
+        };
+        {
+            let mut state = self.state.lock();
+            if let Some(error) = &state.integrations_error {
+                return Err(format!("Integration settings are unreadable: {error}"));
+            }
+            let mut settings = state.integrations.clone();
+            let previous = settings.cognee.observed_installation.clone();
+            let installation_evidence = evidence.clone().or_else(|| url.as_ref().and(previous.clone()));
+            settings.cognee = CogneeSettings {
+                ui_url: url,
+                installation_folder: evidence.as_ref().map(|evidence| evidence.folder.clone()),
+                installation_evidence,
+                observed_installation: previous,
+            };
+            self.save_integrations(&settings)?;
+            state.integrations = settings;
+        }
+        Ok(self.probe_cognee())
+    }
+
+    /// Opens the configured, already running Cognee UI externally. Never starts Cognee or any of its services.
+    pub fn open_cognee_ui(&self) -> Result<()> {
+        let capability = self.probe_cognee();
+        match capability.state {
+            CogneeState::Unreadable => return Err(capability.message.unwrap_or_else(|| "Cognee could not be inspected".into())),
+            CogneeState::Absent => return Err("Cognee is not installed".into()),
+            CogneeState::Installed => {}
+        }
+        let url = capability.ui_url.ok_or("Cognee is installed; its UI is not configured")?;
+        open_loopback_url(&url)
+    }
+
+    /// Records that the human declined Obsidian for this project, so Markdown mode is offered without asking again.
+    pub fn record_obsidian_decline(&self, folder: &str) -> Result<()> {
+        let repository = self.repository_root(folder)?;
+        let mut state = self.state.lock();
+        if let Some(error) = &state.integrations_error {
+            return Err(format!("Integration settings are unreadable: {error}"));
+        }
+        let mut settings = state.integrations.clone();
+        settings.obsidian.declined_projects.insert(fsio::norm(&repository));
+        self.save_integrations(&settings)?;
+        state.integrations = settings;
+        Ok(())
+    }
+
+    /// Saves (or clears) an Obsidian executable to use instead of the platform defaults.
+    pub fn configure_obsidian_executable(&self, executable: Option<&str>) -> Result<ObsidianCapability> {
+        let executable = match executable.map(str::trim).filter(|e| !e.is_empty()) {
+            None => None,
+            Some(path) => {
+                let candidate = Path::new(path);
+                let named = candidate.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_lowercase().contains("obsidian"));
+                if !candidate.is_absolute() || !candidate.is_file() || !named {
+                    return Err("Choose the Obsidian executable (an absolute path to Obsidian.exe)".into());
+                }
+                Some(path.to_string())
+            }
+        };
+        {
+            let mut state = self.state.lock();
+            if let Some(error) = &state.integrations_error {
+                return Err(format!("Integration settings are unreadable: {error}"));
+            }
+            let mut settings = state.integrations.clone();
+            settings.obsidian.executable = executable;
+            self.save_integrations(&settings)?;
+            state.integrations = settings;
+        }
+        Ok(self.probe_obsidian())
+    }
+
+    fn obsidian_program(&self) -> Result<PathBuf> {
+        let configured = self.state.lock().integrations.obsidian.executable.clone();
+        self.obsidian_executable(configured.as_deref())
+            .map_err(|problem| format!("Obsidian could not be inspected: {problem}"))?
+            .ok_or_else(|| "Obsidian is not installed".to_string())
+    }
+
+    /// Opens a vault note (or the vault) in the real Obsidian application, separately from OMP Manager. A vault folder
+    /// Obsidian does not know yet is reported (`needs_vault_registration`) instead of being registered for the user.
+    pub fn open_knowledge_note(&self, vault_id: &str, path: Option<&str>) -> Result<OpenNoteResult> {
+        let vault = self.vault_root(vault_id)?;
+        if vault.mode != VaultMode::Obsidian {
+            return Err("This vault uses Markdown mode; open it in the in-app documents view".into());
+        }
+        let note = match path.filter(|p| !p.is_empty()) {
+            Some(path) => {
+                let components = validate_relative(path)?;
+                if !components.last().is_some_and(|n| fsio::is_markdown_name(n)) {
+                    return Err("Not a Markdown vault document".into());
+                }
+                let (_file, absolute) = fsio::open_components(&vault.root, &components)?;
+                Some(absolute)
+            }
+            None => None,
+        };
+        let program = self.obsidian_program()?;
+        let lookup = self.lookup_registration(&vault.root);
+        let vault_path = vault.root.to_string_lossy().into_owned();
+        let uri = match (&note, &lookup) {
+            (Some(note), _) => format!("obsidian://open?path={}", fsio::percent_encode(&forward(note))),
+            (None, Lookup::Registered(id)) => format!("obsidian://open?vault={}", fsio::percent_encode(id)),
+            (None, _) => format!("obsidian://open?path={}", fsio::percent_encode(&forward(&vault.root))),
+        };
+        if matches!(lookup, Lookup::NotRegistered) {
+            return Ok(OpenNoteResult {
+                opened: false,
+                uri,
+                needs_vault_registration: true,
+                vault_path,
+                message: Some("Obsidian does not know this folder yet. Register it with Obsidian's vault manager (Open folder as vault), then try again.".into()),
+            });
+        }
+        launch_detached(&program, &uri)?;
+        Ok(OpenNoteResult { opened: true, uri, needs_vault_registration: false, vault_path, message: None })
+    }
+
+    /// Opens Obsidian's own vault manager (`obsidian://choose-vault`). Obsidian's settings are never edited.
+    pub fn open_obsidian_vault_manager(&self) -> Result<()> {
+        let program = self.obsidian_program()?;
+        launch_detached(&program, "obsidian://choose-vault")
+    }
+
+    /// Opens the official Obsidian download page; no installer is downloaded or run.
+    pub fn open_obsidian_download(&self) -> Result<()> {
+        crate::code_diff::open_url(OBSIDIAN_DOWNLOAD, false)
+    }
+
+    /// Opens a credential-free https link with the validated system opener.
+    pub fn open_knowledge_link(&self, url: &str) -> Result<()> {
+        crate::code_diff::open_url(url, false)
+    }
+}

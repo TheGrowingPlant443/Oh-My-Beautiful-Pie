@@ -2,10 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildIndex, chooseRenderer, defaultExpanded, edgeCountsReconcile, FLOW_MAX_EDGES, FLOW_MAX_NODES, layoutLayers, matchNodes, modelFromDirectories, modelFromNeighbors, modelFromOverview,
-  modelFromSystem, node, placeholderSystemModel, projectGraph, revealPath, scopeModel, SIGMA_MAX_EDGES, SIGMA_MAX_NODES, stronglyConnected, edgeDashed, gradeProven, clipText,
+  modelFromSystem, node, placeholderSystemModel, projectGraph, revealPath, scopeModel, SIGMA_MAX_EDGES, SIGMA_MAX_NODES, stronglyConnected, edgeDashed, gradeProven, clipText, edgeArrow, loopText, gradeText,
 } from "./system-graph.ts";
 
-const edge = (id, source, target, extra = {}) => ({ id, source, target, relation: "calls", grade: "resolvedStatic", derived: false, label: "calls", count: 1, evidenceIds: [`site:${id}`], truncated: false, ...extra });
+const edge = (id, source, target, extra = {}) => ({ id, source, target, direction: "directed", relation: "calls", grade: "resolvedStatic", derived: false, label: "calls", count: 1, evidenceIds: [`site:${id}`], truncated: false, ...extra });
 const leaf = (id, parentId = null, extra = {}) => node({ id, label: id, parentId, ...extra });
 const dir = (id, parentId = null) => node({ id, label: id, parentId, synthetic: true, kind: "directory" });
 
@@ -390,4 +390,43 @@ test("directory aggregates report direct plus nested files, and opened directori
   }
   const opened = projectGraph(index, { mode: "source", expanded: new Set(["root", "src"]) });
   assert.deepEqual(opened.nodes.map(item => [item.id, item.memberCount]).sort(), [["root", 2], ["src", 3], ["src/a", 5], ["src/b", 1]]);
+});
+
+test("directed and undirected records are never aggregated together and opposite directions stay separate arrows", () => {
+  const index = buildIndex({
+    nodes: [leaf("a"), leaf("b")],
+    edges: [
+      edge("d1", "a", "b"), edge("d2", "b", "a"), edge("d3", "a", "b"),
+      edge("u1", "a", "b", { direction: "undirected", relation: "link" }), edge("u2", "b", "a", { direction: "undirected", relation: "link" }),
+    ],
+  });
+  const view = projectGraph(index, { mode: "source", expanded: new Set() });
+  assert.equal(view.edges.length, 3, "a>b, b>a and one undirected line");
+  const forward = view.edges.find(item => item.direction === "directed" && item.source === "a");
+  assert.deepEqual(forward.edgeIds, ["d1", "d3"], "parallel directed records keep their ids");
+  assert.equal(view.edges.find(item => item.direction === "directed" && item.source === "b").edgeIds[0], "d2");
+  const mutual = view.edges.find(item => item.direction === "undirected");
+  assert.deepEqual([...mutual.edgeIds].sort(), ["u1", "u2"], "the undirected pair is one line that remembers both stored records");
+  assert.equal(edgeArrow(mutual), false);
+  assert.equal(edgeArrow(forward), true);
+  assert.ok(edgeCountsReconcile(index, view));
+});
+
+test("self links keep their graph-domain name and ids, and extracted provenance is trusted while inferred is dashed", () => {
+  const index = buildIndex({ nodes: [leaf("a")], edges: [edge("s1", "a", "a", { direction: "undirected", relation: "link" })] });
+  const view = projectGraph(index, { mode: "source", expanded: new Set(), loopKind: "selfLink" });
+  assert.equal(view.loopKind, "selfLink");
+  assert.equal(view.nodes[0].selfLoops, 1);
+  assert.deepEqual(view.nodes[0].selfLoopIds, ["s1"]);
+  assert.equal(loopText(view.loopKind, 1), "Self-link");
+  assert.equal(loopText("recursion", 2), "recursive references");
+  assert.equal(edgeDashed({ grade: "EXTRACTED", response: false }), false);
+  assert.equal(edgeDashed({ grade: "INFERRED", response: false }), true);
+  assert.equal(edgeDashed({ grade: "AMBIGUOUS", response: false }), true);
+  assert.equal(gradeText("AMBIGUOUS"), "Ambiguous (Graphify)");
+});
+
+test("the Architect system builder produces directed edges", () => {
+  const system = modelFromSystem({ nodes: [{ id: "a", kind: "application", label: "A", description: "", parentId: null, evidenceIds: [] }, { id: "b", kind: "database", label: "B", description: "", parentId: null, evidenceIds: [] }], edges: [{ id: "e", sourceId: "a", targetId: "b", relation: "writes", label: "", certainty: "inferred", evidenceIds: [], staticFactId: null }] });
+  assert.deepEqual(system.edges.map(item => item.direction), ["directed"]);
 });

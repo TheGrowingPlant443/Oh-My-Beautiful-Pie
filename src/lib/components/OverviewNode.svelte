@@ -2,7 +2,7 @@
   import { Handle, Position } from "@xyflow/svelte";
   import type { NodeProps } from "@xyflow/svelte";
   import type { OverviewFlowNode } from "../overview-flow";
-  import { clipText, NODE_H, NODE_W } from "../system-graph";
+  import { clipText, loopText, NODE_H, NODE_W } from "../system-graph";
   let { data, selected }: NodeProps<OverviewFlowNode> = $props();
   const view = $derived(data.view);
   const evidenceLabel = $derived.by(() => {
@@ -24,7 +24,7 @@
   <div class="top">
     <span class="kind">{view.kind}</span>
     {#if evidenceLabel}<span class="evidence" class:warn={view.evidence === "partial" || view.evidence === "failed" || view.evidence === "unsupported" || view.evidence === "skipped"}>{evidenceLabel}</span>{/if}
-    {#if view.selfLoops > 0}<span class="badge" title={`${view.selfLoops} recursive reference${view.selfLoops === 1 ? "" : "s"} to itself`}>↻ {view.selfLoops}</span>{/if}
+    {#if view.selfLoops > 0}<span class="badge" title={`${view.selfLoops} ${loopText(data.loopKind ?? "recursion", view.selfLoops)}${data.loopKind === "selfLink" ? "" : " to itself"}`}>↻ {view.selfLoops}</span>{/if}
     {#if view.cyclic && view.memberCount > 1}<span class="badge" title="Strongly connected component">cycle</span>{/if}
   </div>
   <strong class="label" title={view.label}>{clipText(view.label, 60)}</strong>

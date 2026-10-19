@@ -7,14 +7,19 @@ import {
 } from "./system-graph";
 import type {
   CoverageRow, NeighborRow, OverviewGroupRow, ProjectInsightStatus, SourceFileRow, SourceIndexPage, SourceIndexQuery,
-  SourceIndexSelection, SourceIndexStatus, SourceSiteRow, SourceSymbolRow, SystemOverviewPayload,
+  SourceIndexSelection, SourceIndexStatus, SourceSiteRow, SourceSymbolRow, SystemOverviewPayload, HelicopterPayload,
 } from "./api";
 import type { api as backend } from "./api";
 import { EMPTY_INVENTORY, type GenerateOutcome, type GenerateRequest, type InventoryState, type StructureHost, type VisualizationSink } from "./overview-types";
+import { modelFromHelicopter } from "./helicopter-graph";
 
-export type OverviewTab = "system" | "files" | "functions";
+export type OverviewTab = "helicopter" | "system" | "files" | "functions";
 export type OverviewArea = "diagram" | "structure";
-export type SourceTab = Exclude<OverviewTab, "system">;
+/** The two tabs that show a picture the existing Architect generated. Each keeps its own saved revisions, selection and admission. */
+export type ArchitectTab = "helicopter" | "system";
+export type SourceTab = "files" | "functions";
+export const isSourceTab = (tab: OverviewTab): tab is SourceTab => tab === "files" || tab === "functions";
+const SLOT_KIND: Record<ArchitectTab, "systemOverview" | "helicopter"> = { system: "systemOverview", helicopter: "helicopter" };
 
 export type OverviewApi = Pick<typeof backend, "getSourceIndex" | "startSourceIndex" | "readSourceIndexJob" | "cancelSourceIndex" | "querySourceIndex" | "requestSystemVisualization" | "readProjectInsight" | "getProjectInsight">;
 
@@ -115,6 +120,7 @@ export interface OverviewState {
   search: Record<SourceTab, SearchResults>;
   coverage: CoverageState;
   system: SystemRevisions;
+  helicopter: SystemRevisions;
   views: Record<OverviewTab, TabView>;
   back: BackEntry[];
   tickets: VisualizationTicket[];
@@ -133,6 +139,7 @@ export interface OverviewHooks {
 
 
 const blankView = (): TabView => ({ search: "", expanded: null, selectedNode: null, selectedEdge: null, camera: null, relations: null, grades: null, derived: true, scope: null, neighborhood: null, page: 0 });
+const blankRevisions = (): SystemRevisions => ({ revisions: [], selectedId: null, loading: false, error: null, admitting: false });
 const blankLevel = (): LevelData => ({ snapshotId: null, status: "idle", mode: "nodes", total: 0, loaded: 0, groups: [], files: [], symbols: [], directories: [], extra: { nodes: [], edges: [] }, error: null });
 const blankSearch = (): SearchResults => ({ text: "", status: "idle", items: [], total: 0, nextOffset: null, error: null });
 const blankCoverage = (): CoverageState => ({ status: "idle", snapshotId: null, items: [], total: 0, nextOffset: null, error: null });
@@ -141,8 +148,8 @@ const blankIndex = (): IndexView => ({ phase: "idle", selected: null, attempt: n
 export function initialOverviewState(): OverviewState {
   return {
     folder: "", tab: "system", area: "diagram", index: blankIndex(), levels: { files: blankLevel(), functions: blankLevel() }, inventory: EMPTY_INVENTORY, inspector: null, hood: null,
-    search: { files: blankSearch(), functions: blankSearch() }, coverage: blankCoverage(), system: { revisions: [], selectedId: null, loading: false, error: null, admitting: false },
-    views: { system: blankView(), files: blankView(), functions: blankView() }, back: [], tickets: [], navigationEpoch: 0,
+    search: { files: blankSearch(), functions: blankSearch() }, coverage: blankCoverage(), system: blankRevisions(), helicopter: blankRevisions(),
+    views: { helicopter: blankView(), system: blankView(), files: blankView(), functions: blankView() }, back: [], tickets: [], navigationEpoch: 0,
   };
 }
 
@@ -162,6 +169,12 @@ export function selectedSystemResult(state: Pick<OverviewState, "system">): { st
   return { status, result: status.result };
 }
 
+export function selectedHelicopterResult(state: Pick<OverviewState, "helicopter">): { status: ProjectInsightStatus; result: HelicopterPayload } | null {
+  const status = state.helicopter.revisions.find(item => item.requestId === state.helicopter.selectedId);
+  if (!status || status.state !== "completed" || status.result?.kind !== "helicopter") return null;
+  return { status, result: status.result };
+}
+
 function inScope(item: ModelNode, scope: Scope): boolean {
   const path = item.path;
   if (path === null) return false;
@@ -176,6 +189,11 @@ export function deriveModel(state: OverviewState, tab: OverviewTab): { model: Gr
     const found = selectedSystemResult(state);
     if (found) return { model: modelFromSystem(found.result), sites: [], note: null };
     return { model: placeholderSystemModel(baseName(state.folder.replace(/[\\/]+$/, "")) || "Application"), sites: [], note: null };
+  }
+  if (tab === "helicopter") {
+    // No generated business view yet: nothing is invented around an empty page.
+    const found = selectedHelicopterResult(state);
+    return { model: found ? modelFromHelicopter(found.result) : { nodes: [], edges: [] }, sites: [], note: null };
   }
   const level = state.levels[tab];
   const view = state.views[tab];
@@ -235,6 +253,11 @@ export interface SystemOverviewStore extends Readable<OverviewState>, Visualizat
   loadSystem(): Promise<void>;
   selectSystemRevision(requestId: string): void;
   generateSystem(regenerate: boolean): Promise<GenerateOutcome>;
+  /** Passive read of the saved Helicopter revisions; never generates. */
+  loadHelicopter(): Promise<void>;
+  selectHelicopterRevision(requestId: string): void;
+  /** Explicit user action: ask the existing Architect for the plain-language business view of the selected snapshot. */
+  generateHelicopter(regenerate: boolean): Promise<GenerateOutcome>;
   generate(request: GenerateRequest): Promise<GenerateOutcome>;
   structureHost(): StructureHost;
   /** Every user navigation: pending automatic returns lose their eligibility. */
@@ -261,7 +284,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
   let epoch = 0;
   let pollTimer: number | null = null;
   const autoStarted = new Set<string>();
-  const sequences = { search: { files: 0, functions: 0 }, inspector: 0, hood: 0, coverage: 0, inventory: 0, system: 0 };
+  const sequences = { search: { files: 0, functions: 0 }, inspector: 0, hood: 0, coverage: 0, inventory: 0, system: 0, helicopter: 0 };
 
   const snapshotId = (): string | null => effectiveIndex(state)?.snapshotId ?? null;
   const setLevel = (level: SourceTab, patch: Partial<LevelData>): void => commit({ levels: { ...state.levels, [level]: { ...state.levels[level], ...patch } } });
@@ -314,7 +337,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
       back: [],
     });
     const wanted = state.tab;
-    if (wanted !== "system" && state.area === "diagram") void ensureLevel(wanted);
+    if (isSourceTab(wanted) && state.area === "diagram") void ensureLevel(wanted);
     if (state.area === "structure") void ensureInventory();
   }
 
@@ -368,7 +391,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
     generation++;
     epoch++;
     stopPolling();
-    sequences.system++; sequences.inspector++; sequences.hood++; sequences.coverage++; sequences.inventory++;
+    sequences.system++; sequences.helicopter++; sequences.inspector++; sequences.hood++; sequences.coverage++; sequences.inventory++;
     sequences.search.files++; sequences.search.functions++;
     // A new project: pending automatic returns belong to the previous one.
     book.invalidateAutoReturn(ticket => repoKey(ticket.folder) !== repoKey(folder));
@@ -381,7 +404,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
     const mine = generation;
     await loadIndex(true, mine);
     if (mine !== generation) return;
-    await loadSystem();
+    await Promise.all([loadSystem(), loadHelicopter()]);
     if (mine === generation && state.area === "structure") void ensureInventory();
   }
 
@@ -492,7 +515,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
         if (!own) nodes.set(member, { id: member, kind: level === "files" ? "file" : symbol?.kind ?? "function", label: level === "files" ? baseName(file?.path ?? member) : symbol?.qualifiedName || symbol?.name || member, subtitle: file?.path ?? symbol?.path ?? "", description: "", parentId: parentNode, synthetic: false, evidence: "parsed", role: null, evidenceIds: [], memberCount: 1, cyclic: true, selfLoops: 0, selfLoopIds: [], lazyMembers: [], path: file?.path ?? symbol?.path ?? null, ref: member });
         for (const row of page.items) {
           if (row.kind !== "edge" || !members.has(row.peerId)) continue;
-          edges.set(row.edge.id, { id: row.edge.id, source: member, target: row.peerId, relation: row.edge.relation, grade: row.edge.resolution, derived: false, label: row.edge.relation, count: 1, evidenceIds: row.edge.evidenceIds, truncated: false });
+          edges.set(row.edge.id, { id: row.edge.id, source: member, target: row.peerId, direction: "directed", relation: row.edge.relation, grade: row.edge.resolution, derived: false, label: row.edge.relation, count: 1, evidenceIds: row.edge.evidenceIds, truncated: false });
         }
       }
       setLevel(level, { extra: { nodes: [...levelData.extra.nodes, ...nodes.values()], edges: [...levelData.extra.edges, ...edges.values()] } });
@@ -541,36 +564,40 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
   // ---- saved system diagram + visualization statuses -------------------------------------------------------
 
   /** Newest first by creation time; a late older result is kept in the list but never displaces a newer selection. */
-  function mergeRevision(status: ProjectInsightStatus): void {
-    if (status.kind !== "systemOverview" || repoKey(status.folder) !== repoKey(state.folder)) return;
-    const others = state.system.revisions.filter(item => item.requestId !== status.requestId);
-    const known = state.system.revisions.find(item => item.requestId === status.requestId);
+  function mergeRevision(slot: ArchitectTab, status: ProjectInsightStatus): void {
+    const kind = SLOT_KIND[slot];
+    if (status.kind !== kind || repoKey(status.folder) !== repoKey(state.folder)) return;
+    const current = state[slot];
+    const others = current.revisions.filter(item => item.requestId !== status.requestId);
+    const known = current.revisions.find(item => item.requestId === status.requestId);
     // Never regress a revision to an older state (a late read of a pending request after completion).
     const next = known?.state === "completed" && status.state !== "completed" ? known : status;
     const revisions = [next, ...others].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-    const completed = (item: ProjectInsightStatus | undefined): boolean => item?.state === "completed" && item.result?.kind === "systemOverview";
-    const current = revisions.find(item => item.requestId === state.system.selectedId);
+    const completed = (item: ProjectInsightStatus | undefined): boolean => item?.state === "completed" && item.result?.kind === kind;
+    const selected = revisions.find(item => item.requestId === current.selectedId);
     const newest = revisions.find(item => completed(item) && !item.supersededBy);
-    let selectedId = state.system.selectedId;
-    if (!current || !completed(current)) selectedId = newest?.requestId ?? selectedId;
-    else if (completed(next) && next.requestId !== current.requestId && (next.createdAt ?? 0) > (current.createdAt ?? 0) && !next.supersededBy) selectedId = next.requestId;
-    commit({ system: { ...state.system, revisions, selectedId } });
+    let selectedId = current.selectedId;
+    if (!selected || !completed(selected)) selectedId = newest?.requestId ?? selectedId;
+    else if (completed(next) && next.requestId !== selected.requestId && (next.createdAt ?? 0) > (selected.createdAt ?? 0) && !next.supersededBy) selectedId = next.requestId;
+    commit({ [slot]: { ...current, revisions, selectedId } } as Partial<OverviewState>);
   }
 
-  async function loadSystem(): Promise<void> {
+  /** Passive: reads what is saved for the kind; never asks the Architect. */
+  async function loadSaved(slot: ArchitectTab): Promise<void> {
     if (!state.folder) return;
-    const mine = generation, sequence = ++sequences.system;
-    commit({ system: { ...state.system, loading: true, error: null } });
+    const mine = generation, sequence = ++sequences[slot];
+    commit({ [slot]: { ...state[slot], loading: true, error: null } } as Partial<OverviewState>);
     try {
-      // Passive: reads what is saved; never asks the Architect.
-      const found = await api.getProjectInsight(state.folder, "systemOverview");
-      if (mine !== generation || sequence !== sequences.system) return;
-      commit({ system: { ...state.system, loading: false } });
-      if (found) mergeRevision(found);
+      const found = await api.getProjectInsight(state.folder, SLOT_KIND[slot]);
+      if (mine !== generation || sequence !== sequences[slot]) return;
+      commit({ [slot]: { ...state[slot], loading: false } } as Partial<OverviewState>);
+      if (found) mergeRevision(slot, found);
     } catch (error) {
-      if (mine === generation && sequence === sequences.system) commit({ system: { ...state.system, loading: false, error: errorText(error) } });
+      if (mine === generation && sequence === sequences[slot]) commit({ [slot]: { ...state[slot], loading: false, error: errorText(error) } } as Partial<OverviewState>);
     }
   }
+  const loadSystem = (): Promise<void> => loadSaved("system");
+  const loadHelicopter = (): Promise<void> => loadSaved("helicopter");
 
   // ---- tickets ---------------------------------------------------------------------------------------------
 
@@ -588,28 +615,36 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
   }, repoKey);
 
   function receive(status: ProjectInsightStatus): void {
-    if (status.kind === "systemOverview") mergeRevision(status);
+    if (status.kind === "systemOverview") mergeRevision("system", status);
+    else if (status.kind === "helicopter") mergeRevision("helicopter", status);
     else if (status.kind === "structureCurrent" || status.kind === "structureProposed") structureSink?.receive(status);
   }
 
   /** Makes the store show the corresponding view of a finished ticket (the parent then navigates to the page). */
   function applyTicketTarget(ticket: VisualizationTicket): void {
     if (repoKey(ticket.folder) !== repoKey(state.folder)) { void switchFolder(ticket.folder); }
-    if (ticket.destinationTab === "system") {
-      commit({ tab: "system", area: "diagram" });
-      if (ticket.selectedRevisionId && state.system.revisions.some(item => item.requestId === ticket.selectedRevisionId && item.state === "completed")) commit({ system: { ...state.system, selectedId: ticket.selectedRevisionId } });
+    if (ticket.destinationTab === "system" || ticket.destinationTab === "helicopter") {
+      const slot: ArchitectTab = ticket.destinationTab;
+      commit({ tab: slot, area: "diagram" });
+      const wanted = ticket.selectedRevisionId;
+      if (wanted && state[slot].revisions.some(item => item.requestId === wanted && item.state === "completed")) commit({ [slot]: { ...state[slot], selectedId: wanted } } as Partial<OverviewState>);
     } else commit({ area: "structure" });
     persist();
   }
 
+  /** The Architect-generated picture a request kind fills, or null for the structure kinds (they have their own store). */
+  const slotOf = (kind: GenerateRequest["kind"]): ArchitectTab | null => kind === "systemOverview" ? "system" : kind === "helicopter" ? "helicopter" : null;
+
   async function generate(request: GenerateRequest): Promise<GenerateOutcome> {
-    if (request.kind === "systemOverview") commit({ system: { ...state.system, admitting: true, error: null } });
+    const slot = slotOf(request.kind);
+    const settle = (admitting: boolean, error: string | null): void => { if (slot) commit({ [slot]: { ...state[slot], admitting, error } } as Partial<OverviewState>); };
+    settle(true, null);
     try {
       const outcome = await book.generate(request);
-      if (request.kind === "systemOverview") commit({ system: { ...state.system, admitting: false, error: outcome.error } });
+      settle(false, outcome.error);
       return outcome;
     } catch (error) {
-      if (request.kind === "systemOverview") commit({ system: { ...state.system, admitting: false, error: errorText(error) } });
+      settle(false, errorText(error));
       return { admitted: false, status: null, error: errorText(error), uncertain: false };
     }
   }
@@ -624,7 +659,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
       if (state.folder === "") {
         let saved: { folder?: string; tab?: OverviewTab } = {};
         try { saved = JSON.parse(storage?.getItem(PREFS_KEY) ?? "{}") as typeof saved; } catch { saved = {}; }
-        if (saved.tab === "files" || saved.tab === "functions" || saved.tab === "system") commit({ tab: saved.tab });
+        if (saved.tab === "files" || saved.tab === "functions" || saved.tab === "system" || saved.tab === "helicopter") commit({ tab: saved.tab });
         await switchFolder(target || saved.folder || "");
         return;
       }
@@ -665,12 +700,12 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
       if (state.tab === tab && state.area === "diagram") return;
       commit({ tab, area: "diagram" });
       persist();
-      if (tab !== "system") void ensureLevel(tab);
+      if (isSourceTab(tab)) void ensureLevel(tab);
     },
     setArea(area) {
       commit({ area });
       if (area === "structure") void ensureInventory();
-      else if (state.tab !== "system") void ensureLevel(state.tab);
+      else if (isSourceTab(state.tab)) void ensureLevel(state.tab);
     },
     setSearch(tab, text) { setView(tab, { search: text }); },
     runSearch,
@@ -678,7 +713,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
     setFilters(tab, patch) { setView(tab, patch); },
     select(tab, nodeId, edgeId = null, ref = null) {
       setView(tab, { selectedNode: nodeId, selectedEdge: edgeId });
-      if (tab !== "system" && nodeId && ref) void inspect(tab, ref, false);
+      if (isSourceTab(tab) && nodeId && ref) void inspect(tab, ref, false);
     },
     setCamera(tab, camera) { setView(tab, { camera }); },
     openNeighborhood(level, target) {
@@ -710,8 +745,12 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
       return true;
     },
     loadSystem,
+    loadHelicopter,
     selectSystemRevision(requestId) {
       if (state.system.revisions.some(item => item.requestId === requestId && item.state === "completed")) commit({ system: { ...state.system, selectedId: requestId } });
+    },
+    selectHelicopterRevision(requestId) {
+      if (state.helicopter.revisions.some(item => item.requestId === requestId && item.state === "completed")) commit({ helicopter: { ...state.helicopter, selectedId: requestId } });
     },
     generateSystem(regenerate) {
       const index = effectiveIndex(state);
@@ -722,6 +761,16 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
       const newest = state.system.revisions[0];
       const failed = newest?.state === "failed" && newest.snapshotId === index.snapshotId ? newest.requestId : null;
       return generate({ kind: "systemOverview", folder: index.folder, snapshotId: index.snapshotId, supersedesRequestId: regenerate ? previous : failed, area: "system" });
+    },
+    generateHelicopter(regenerate) {
+      const index = effectiveIndex(state);
+      if (!index?.snapshotId) return Promise.resolve({ admitted: false, status: null, error: "Build the source index first.", uncertain: false });
+      const previous = selectedHelicopterResult(state)?.status.requestId ?? null;
+      // Same rule as the System diagram: after a failed request (an ended Architect session) a plain request would return that failure
+      // forever, so Generate explicitly supersedes it.
+      const newest = state.helicopter.revisions[0];
+      const failed = newest?.state === "failed" && newest.snapshotId === index.snapshotId ? newest.requestId : null;
+      return generate({ kind: "helicopter", folder: index.folder, snapshotId: index.snapshotId, supersedesRequestId: regenerate ? previous : failed, area: "helicopter" });
     },
     generate,
     structureHost() {

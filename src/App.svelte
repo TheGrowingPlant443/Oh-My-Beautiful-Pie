@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { humanDecisions } from "./lib/human-decisions";
   import type { HumanDecisionSnapshot } from "./lib/api";
@@ -26,6 +26,12 @@
   import DependencyTreePage from "./lib/components/DependencyTreePage.svelte";
   import CodeQualityPage from "./lib/components/CodeQualityPage.svelte";
   import SystemOverviewPage from "./lib/components/SystemOverviewPage.svelte";
+  import GraphifyView from "./lib/components/GraphifyView.svelte";
+  import CogneeDialog from "./lib/components/CogneeDialog.svelte";
+  import { knowledge, cogneeVisible, graphifyVisible } from "./lib/knowledge";
+  import SrsStartDialog from "./lib/components/SrsStartDialog.svelte";
+  import SrsDocumentationPage from "./lib/components/SrsDocumentationPage.svelte";
+  import { srs } from "./lib/srs";
   import { systemOverview } from "./lib/system-overview-instance";
   import { dashboardInstances, resolveStartupTarget } from "./lib/settings";
   import { awaitNativeAgentHub, describeNativeHubError } from "./lib/native-agent-hub";
@@ -62,7 +68,29 @@
   });
   let openedIds = $state<ReadonlySet<string>>(new Set());
   let settingsOpen = $state(false);
-  let view = $state<"dashboard" | "agent_setup" | "code_diff" | "git_graph" | "terminals" | "dependency_tree" | "system_overview" | "code_quality">("dashboard");
+  let view = $state<"dashboard" | "agent_setup" | "code_diff" | "git_graph" | "terminals" | "dependency_tree" | "system_overview" | "code_quality" | "graphify" | "srs_documentation">("dashboard");
+  let srsStartFolder = $state<string | null>(null);
+  let srsPageFolder = $state<string | null>(null);
+  let srsPageJob = $state<string | null>(null);
+  function openSrsStart(folder: string): void { srsStartFolder = folder; }
+  function openSrsPage(folder: string, jobId: string | null = null): void {
+    srsStartFolder = null; planChange = null; srsPageFolder = folder; srsPageJob = jobId;
+    void api.setBrowserView(null, null, null).catch(error => reportError("Hide browser", error));
+    view = "srs_documentation";
+  }
+  let graphifyFolder = $state<string | null>(null);
+  let cogneeOpen = $state(false);
+  // Passive, sequence-fenced capability probes: startup (global), the shown System overview project, and window focus.
+  const overviewFolder = $derived(view === "system_overview" ? $systemOverview.folder || null : null);
+  $effect(() => { const folder = overviewFolder; untrack(() => void knowledge.probe(folder)); });
+  $effect(() => {
+    const onFocus = (): void => { void knowledge.probe(untrack(() => overviewFolder)); };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  });
+  const graphifyAvailability = $derived(graphifyVisible($knowledge.capabilities) && $knowledge.capabilities?.folder === overviewFolder
+    ? { present: true, state: $knowledge.capabilities.graphify.state, message: $knowledge.capabilities.graphify.message }
+    : null);
   let configOpen = $state(false);
   let configMode = $state<"save" | "import">("save");
   let setupDraft = $state<SetupDraft>({ scope: null, kinds: [], items: [], step: 0, instanceId: null, projectInstanceId: null });
@@ -98,7 +126,7 @@
   // Set by the mounted Code diff page; resolves false when the user keeps unsaved edits.
   let diffGuard: (() => Promise<boolean>) | null = null;
   let popoverOpen = $state(false);
-  const browserHidden = $derived(settingsOpen || dialogOpen || configOpen || !!panel || popoverOpen);
+  const browserHidden = $derived(settingsOpen || dialogOpen || configOpen || cogneeOpen || srsStartFolder !== null || !!panel || popoverOpen);
   const focused = $derived(focusedId ? $instancesById.get(focusedId) : undefined);
   const panelOwner = $derived(panel ? $instancesById.get(panel.id) : undefined);
   const planTarget = $derived(planChange ? $instancesById.get(planChange.targetId) : undefined);
@@ -123,6 +151,7 @@
     if (view === "code_diff" && diffGuard && !await diffGuard()) return;
     hubSequence++;
     systemOverview.noteNavigation();
+    srs.noteNavigation();
     await action();
   }
   function openCodeDiff(id: string): void {
@@ -148,6 +177,11 @@
     planChange = null;
     void api.setBrowserView(null, null, null).catch(error => reportError("Hide browser", error));
     view = "system_overview";
+  }
+  function openGraphify(folder: string): void {
+    graphifyFolder = folder;
+    planChange = null;
+    view = "graphify";
   }
   // The repository an agent works on: its own folder; a helper's or plan agent's target project; for the
   // Manager and Architect their committed folder, or the last remembered real folder when it is a temporary or computed shared folder.
@@ -400,6 +434,14 @@
       quiescent: ticket => { const architect = ticket.producer ? $instancesById.get(ticket.producer.instanceId) : $architectInstance; return !!architect && architect.activity === "idle" && architect.pendingDecisionCount === 0 && !architect.humanRequest; },
       returnToOverview: () => openSystemOverview(true),
     });
+    srs.attach({
+      architectId: () => $architectInstance?.id ?? null,
+      openArchitect: id => onOpenArchitect(id),
+      following: ticket => view === "dashboard" && !planChange && !panel && focusedId === (ticket.producer?.instanceId ?? $architectInstance?.id ?? null),
+      quiescent: ticket => { const architect = ticket.producer ? $instancesById.get(ticket.producer.instanceId) : $architectInstance; return !!architect && architect.activity === "idle" && architect.pendingDecisionCount === 0 && !architect.humanRequest; },
+      returnToDocumentation: ticket => openSrsPage(ticket.folder, ticket.jobId),
+    });
+    void srs.connect().catch(() => undefined);
     let unlisten: (() => void) | undefined;
     let disconnectDecisions: (() => void) | undefined;
     void humanDecisions.connect({
@@ -422,7 +464,7 @@
     function onToggle(): void { popoverOpen = !!document.querySelector("[popover]:popover-open"); }
     window.addEventListener("keydown", onTabKey, true);
     document.addEventListener("toggle", onToggle, true);
-    return () => { disposed = true; unlisten?.(); disconnectDecisions?.(); window.removeEventListener("keydown", onTabKey, true); document.removeEventListener("toggle", onToggle, true); };
+    return () => { disposed = true; unlisten?.(); disconnectDecisions?.(); srs.disposeStore(); window.removeEventListener("keydown", onTabKey, true); document.removeEventListener("toggle", onToggle, true); };
   });
 </script>
 <svelte:window onkeydown={e => { if (e.key === "Escape" && !document.querySelector("dialog[open], [popover]:popover-open") && panel) panel = null; }} />
@@ -437,8 +479,14 @@
     <button disabled={initializing} onclick={() => openConfig("import")}>Import config</button>
     <button disabled={initializing} class:active={view === "agent_setup"} onclick={() => requestNavigation(openAgentSetup)}>Agent setup</button>
     <button disabled={initializing} class:active={view === "terminals"} title="Every agent's history, human decisions and live commands" onclick={() => requestNavigation(openTerminals)}>Terminals{#if $humanDecisions.items.length}<span class="pill">{$humanDecisions.items.length}</span>{/if}</button>
+    {#if cogneeVisible($knowledge.capabilities)}
+      <button disabled={initializing} title="Open your existing Cognee interface. Nothing is installed, started or changed." onclick={() => cogneeOpen = true}>Cognee</button>
+    {/if}
     {#each $systemOverview.tickets.filter(ticket => ticket.lateResult && ticket.state === "completed").slice(0, 1) as ticket (ticket.key)}
       <button class="primary" title="A requested diagram or structure preview was saved while you were elsewhere" onclick={() => systemOverview.openResult(ticket.key)}>Open System overview result</button>
+    {/each}
+    {#each $srs.tickets.filter(ticket => ticket.lateResult && $srs.jobs.get(ticket.jobId)?.state === "completed").slice(0, 1) as ticket (ticket.jobId)}
+      <button class="primary" title="An SRS finished while you were elsewhere" onclick={() => srs.openResult(ticket.jobId)}>Open SRS documentation</button>
     {/each}
     <button aria-label="The Architect" disabled={openingArchitect || initializing} onclick={() => requestNavigation(openArchitect)}>The Architect</button>
     <button aria-label="The Manager" disabled={openingManager || initializing} onclick={() => requestNavigation(openManager)}>The Manager{#if needsHuman}<span class="pill warn">Needs you</span>{/if}</button>
@@ -454,7 +502,7 @@
       {#if !$architectInstance}<button onclick={() => configureCoordinator("architect", false)}>Configure manually — The Architect</button>{/if}
     </div>
   {/if}
-  <main class:focused={(view === "dashboard" && (!!focused || !!planChange)) || view === "code_diff" || view === "git_graph" || view === "terminals" || view === "dependency_tree" || view === "system_overview" || view === "code_quality"}>
+  <main class:focused={(view === "dashboard" && (!!focused || !!planChange)) || view === "code_diff" || view === "git_graph" || view === "terminals" || view === "dependency_tree" || view === "system_overview" || view === "code_quality" || view === "graphify" || view === "srs_documentation"}>
     {#if initializing}
       <p role="status">Loading workspace…</p>
     {:else if view === "agent_setup"}
@@ -464,8 +512,12 @@
     {:else if view === "dependency_tree"}
       <DependencyTreePage initialFolder={analyzerInitialFolder} onBack={() => focus($architectInstance?.id ?? null)} {onOpenArchitect} onOpenManager={openManager} onOpenCodeQuality={openCodeQualityFromDependency} />
     {:else if view === "system_overview"}
-      <SystemOverviewPage initialFolder={overviewEntry.folder} resume={overviewEntry.resume} onBack={() => requestNavigation(() => focus($architectInstance?.id ?? null))} {onOpenArchitect}
+      <SystemOverviewPage initialFolder={overviewEntry.folder} resume={overviewEntry.resume} onBack={() => requestNavigation(() => focus($architectInstance?.id ?? null))} {onOpenArchitect} onGraphify={openGraphify} graphify={graphifyAvailability} onSrsDocumentation={openSrsStart}
         architect={$architectInstance ? { id: $architectInstance.id, generation: $architectInstance.generation, ready: $architectInstance.bridgeReady && $architectInstance.status === "running" } : null} />
+    {:else if view === "graphify" && graphifyFolder}
+      <GraphifyView folder={graphifyFolder} onBack={() => openSystemOverview(true)} />
+    {:else if view === "srs_documentation" && srsPageFolder}
+      <SrsDocumentationPage folder={srsPageFolder} initialJobId={srsPageJob} onBack={() => openSystemOverview(true)} onCreate={openSrsStart} onOpenArchitect={async id => { let opened = false; await requestNavigation(async () => { opened = await onOpenArchitect(id); }); return opened; }} />
     {:else if view === "code_quality"}
       <CodeQualityPage initialFolder={analyzerInitialFolder} onBack={closeCodeQuality} backLabel={qualityBackLabel} />
     {:else if view === "git_graph" && diffInstanceId}
@@ -486,6 +538,10 @@
 <NewInstanceDialog open={dialogOpen} purpose={dialogPurpose} onclose={() => dialogOpen = false} oncreated={created} />
 <GlobalConfigDialog open={configOpen} mode={configMode} initialSourceId={focused?.id || $managerInstance?.id || null} onclose={() => configOpen = false} />
 <SettingsDialog open={settingsOpen} onclose={() => settingsOpen = false} />
+<CogneeDialog open={cogneeOpen} onClose={() => cogneeOpen = false} />
+<SrsStartDialog open={srsStartFolder !== null} folder={srsStartFolder ?? ""} architectModel={$architectInstance?.model ?? null}
+  onClose={() => srsStartFolder = null} onExisting={folder => openSrsPage(folder)}
+  onStarted={() => { srsStartFolder = null; }} onOpenArchitect={() => requestNavigation(openArchitect)} />
 {#if panel && panelOwner}
   <div class="backdrop" role="presentation" onclick={e => { if (e.target === e.currentTarget) panel = null; }}>
     <div class="viewer panel" role="dialog" aria-modal="true" aria-label="OMP plan">

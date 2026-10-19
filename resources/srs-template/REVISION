@@ -1,0 +1,12 @@
+source=https://github.com/jam01/SRS-Template
+branch=master
+revision=3965e951fa5ea1c1dd1bbc7a66b7f35f7e85c006
+committed=2025-11-03
+license=CC0-1.0 (see LICENSE)
+note=Files are byte-identical to upstream at this revision (git blob ids below match the upstream tree). Do not edit; update by pinning a new revision.
+# sha256  git-blob-sha1  bytes  file
+db13d79f2301de14c32fcdaacbbc0b3b58b3f68c3d5daf8192995463f2f1fe22  eb77525316106de2d0823c82eaed9a7936836a7f  981  LICENSE
+e3b0b98872db58ad2ddba8948c0d7eb3c371c1972da2d27e13ed61199706f328  7663ee5a072cab3ea97a7135c331fd4ffbe89607  500  req-template-bare.md
+2970538243f6c788cfe2b6fd217139d0c9a029f1d287b9783072a54383c12a8d  c5fd7162efb23a230f2e35ca1c8a565efd35dbca  2335  req-template.md
+a2914e7932443e3178c39a53acebee967fa5afb9e000c31d7e2886509843f88a  25002b1aa246f198498c580002cca5e7ef8daea4  7234  srs-template-bare.md
+6389dc1326249881ed765736e74872a73703e0a2bf5ba7148a94a52574c4a6c6  bf7d35e7c92ee7ffd42c25efb1a47f0931b4d27f  24339  srs-template.md

@@ -8,6 +8,18 @@ use serde_json::{json, Value};
 
 use crate::config;
 use crate::instance::{CreateInput, Instance, InstanceKind, Origin, Registry};
+use crate::agent_markdown::{AgentMarkdownService, MarkdownRoutes};
+
+static MARKDOWN_SERVICE: parking_lot::Mutex<Option<std::sync::Weak<AgentMarkdownService>>> = parking_lot::Mutex::new(None);
+/// Hold through instruction loading/admission; Apply's exclusive gate protects the complete recoverable batch.
+pub fn instruction_read_admission() -> Result<crate::agent_markdown::ReadAdmission> {
+    // Recovery needs the exclusive gate; a thread already inside an admission was recovered when it entered.
+    if !crate::agent_markdown::nested() {
+        let service=MARKDOWN_SERVICE.lock().as_ref().and_then(std::sync::Weak::upgrade);
+        if let Some(service)=service {service.recover()?;}
+    }
+    crate::agent_markdown::read_admission()
+}
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
 
@@ -77,6 +89,7 @@ struct Job {
 pub struct SetupService {
     root: PathBuf,
     jobs: Mutex<HashMap<String, Job>>,
+    markdown: std::sync::OnceLock<Arc<AgentMarkdownService>>,
 }
 
 fn slug(raw: &str) -> Result<String> {
@@ -241,6 +254,7 @@ pub fn scan_agent_files(paths: &SetupPaths, kind: InstanceKind) -> Vec<AgentFile
     scan_roots(&roots)
 }
 pub fn agent_files(registry: &Registry, kind: InstanceKind) -> AgentFiles {
+    let _admission=match instruction_read_admission() {Ok(guard)=>guard,Err(error)=>return AgentFiles{files:Vec::new(),error:Some(error)}};
     match paths(registry) {
         Ok(paths) => AgentFiles {
             files: scan_agent_files(&paths, kind),
@@ -545,7 +559,11 @@ pub(crate) fn open_editor_folder(folder: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn prompt(request: &SetupRequest, paths: &SetupPaths, repository_root: Option<&Path>) -> Result<String> {
+    prompt_with_routes(request,paths,repository_root,&MarkdownRoutes::default())
+}
+fn prompt_with_routes(request: &SetupRequest, paths: &SetupPaths, repository_root: Option<&Path>, routes: &MarkdownRoutes) -> Result<String> {
     let repository_target;
     let target = match request.scope {
         SetupScope::Global => &paths.global_agent_folder,
@@ -556,8 +574,16 @@ fn prompt(request: &SetupRequest, paths: &SetupPaths, repository_root: Option<&P
             &repository_target
         }
     };
+    let markdown_source=routes.scope.as_ref().map(|r|r.source_root.as_path());
     let mut text = format!("Create the user-requested OMP Agent setup below in {}. Scope: {:?}. Platform: {}.\n\nREVIEW FIRST: You are in native plan mode. Read existing assets, preserve unrelated content, and write only your native plan until the human selects a native execution option. Propose the complete plan using write to xd://propose. Do this setup inline; do not use subagents or other models to generate it. The workflows being authored may describe future native delegation, but do not execute those workflows now.\n\nAfter human approval, implement real files and validate their native loading and behavior. Never modify config.yml/config.yaml, auth or credential databases, app default snapshots, bridge/index.ts entrypoints, installed OMP, or unrelated files. Never download or install dependencies/interpreters, add telemetry/updaters/autostart, or run unreviewed external code. Read existing targets before proposing changes. Report actual changed paths and verification; do not claim completion from merely writing files.\n\n", target.display(), request.scope, std::env::consts::OS);
     for item in &request.items {
+        let source_file=match item.kind {
+            SetupKind::Agents=>Some(if item.name.is_empty(){"AGENTS.md".into()}else{format!("{AGENT_FILES_DIR}/{}/AGENTS.md",item.name)}),
+            SetupKind::Rules=>Some("RULES.md".into()),
+            SetupKind::Skill=>Some(format!("skills/{}/SKILL.md",item.name)),
+            SetupKind::Workflow=>Some(format!("rules/workflow-{}.md",item.name)),
+            _=>None,
+        };
         let file = match item.kind {
             SetupKind::Agents if item.name.is_empty() => "AGENTS.md".into(),
             SetupKind::Agents => format!("{AGENT_FILES_DIR}/{}/AGENTS.md", item.name),
@@ -594,16 +620,28 @@ fn prompt(request: &SetupRequest, paths: &SetupPaths, repository_root: Option<&P
                 _ => target.join(&file).display().to_string(),
             }
         } else { file };
+        let file=if let (Some(root),Some(relative))=(markdown_source,source_file.as_deref()) {
+            let mut file=root.join(relative).display().to_string();
+            if item.kind==SetupKind::Skill {file.push_str(&format!(" and {}",root.join("SKILLS.md").display()));}
+            file
+        }else{file};
         text.push_str(&format!(
             "Requested {:?}: {file}\nDescription:\n{}\n",
             item.kind, item.description
         ));
+        if let (Some(root),true)=(markdown_source,matches!(item.kind,SetupKind::Agents|SetupKind::Rules|SetupKind::Skill|SetupKind::Workflow)) {
+            text.push_str(&format!("Markdown source folder: {}. OMP runtime folder: {}. Author requested .md assets ONLY at the Markdown source folder, at their unchanged runtime-relative paths. Never update their native deployed copies from this setup session. They become active only after the human reviews Apply to OMP. Keep tools, every companion script, plugin modules/manifests, configuration and credentials native; never copy them into the vault. Preserve script-relative references in skill Markdown: the deployed Markdown will have its original runtime-relative location. Report native-only dependencies, do not relocate them. Optional tool/plugin documentation uses the corresponding tools/{}/ or extensions/{}/ Markdown namespace here; executable content stays native.\n",root.display(),target.display(),item.name,item.name));
+        }
+        if let Some(profile)=routes.profiles.get(&item.name).filter(|_|item.kind==SetupKind::Profile) {
+            text.push_str(&format!("For this explicitly enabled profile, requested Markdown only goes to {} using original profile-runtime-relative paths, not {}. Its config.yml and all executable/tools/plugin files stay native. Only create profile Markdown actually requested in the description. Never copy credentials. Reviewed Apply to OMP is required before Markdown becomes active.\n",profile.source_root.display(),profile.native_root.display()));
+        }
         match item.kind {
             SetupKind::Agents if item.name.is_empty() => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
             SetupKind::Rules => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
             SetupKind::Agents if request.scope == SetupScope::Repository => text.push_str("Create a standalone named instruction file, not merged into AGENTS.md. It is not automatically loaded and is not in this GUI's Persona catalog. Use it through an explicit --append-system-prompt file argument. No frontmatter is required.\n"),
             SetupKind::Agents => text.push_str("Create a standalone, named instruction file with plain Markdown instructions for an agent. Do not merge it into the scope's AGENTS.md. OMP does not load it automatically: the user selects it per dashboard instance, and OMP appends it to that session's system prompt. No frontmatter is required.\n"),
             SetupKind::Profile => text.push_str(&format!("Create the native OMP profile `{name}` at {root}/profiles/{name}/agent/. This overrides the general rule against modifying config.yml: write that profile's config.yml with native OMP settings that implement the description (for example plan.enabled: true and plan.defaultOnStartup: true start sessions in plan mode; modelRoles select models). Validate that it loads with native Settings.loadReadOnly using that agent directory. Add AGENTS.md, rules, skills or tools inside that profile only if the description asks. Never create or copy credentials or agent.db and never modify the default profile; tell the human the profile has its own login (run /login inside it). If the profile already exists read it first and make only surgical changes.\n", name = item.name, root = paths.global_omp_folder.display())),
+            SetupKind::Skill if markdown_source.is_some() => text.push_str("Create SKILL.md at its requested Markdown source path with YAML name/description and concrete reusable steps. Update SKILLS.md in the same Markdown source root as a readable catalog pointing to the real deployed skill, preserving other entries. The catalog itself is not a native skill. Companion scripts stay in the OMP runtime folder; keep their original references unchanged and do not write them to the Markdown source folder.\n"),
             SetupKind::Skill => text.push_str("Create native SKILL.md with YAML name/description and concrete reusable steps. Update SKILLS.md as a readable catalog pointing to the real skill, preserving other entries. The catalog itself is not a native skill.\n"),
             SetupKind::Workflow => text.push_str("Use native rule frontmatter description, alwaysApply: true, agents: [main]. Describe semantic trigger, native delegation/reviewer steps, required evidence, completion/decision handling, and stop conditions. Use installed native agents; if a required reviewer is unavailable, request human guidance. No scheduler or automatic hooks.\n"),
             SetupKind::Plugin => text.push_str(&format!("Create the native OMP plugin package `{name}` in the `extensions/{name}/` folder of the target above. package.json must be {{\"name\":\"{name}\",\"version\":\"0.1.0\",\"private\":true,\"type\":\"module\",\"description\":<one line from the request>,\"omp\":{{\"extensions\":[\"index.ts\"]}}}}; index.ts must export a default factory that receives the injected native ExtensionAPI and registers real behavior for the description (api.registerTool, api.registerCommand, api.on hooks as needed). Read the installed OMP's examples/extensions and its ExtensionAPI types first. ExtensionAPI registered tools use execute(toolCallId, params, signal, onUpdate, ctx), unlike tools/ native CustomTool factories. This overrides the general rule against editing bridge/index.ts entrypoints only for this plugin's own package.json and index.ts; never touch either coordinator setup root index.ts. Add package-local skills/ tools/ or rules/ folders only when the description needs them. No import-time side effects, no placeholder or no-op tools, no dependency installation or publishing, no `omp plugin link`/install, and do not edit the installed OMP. If the package already exists read it first and change only the requested behavior; never overwrite a different package. After approval validate that the package loads natively and exercise one harmless behavior with a fixture, then tell the human that running sessions need a native reload or an explicit reopen to load it.\n", name = item.name)),
@@ -627,6 +665,9 @@ fn prompt(request: &SetupRequest, paths: &SetupPaths, repository_root: Option<&P
             text.push_str("Global native assets apply to the default OMP profile. Existing sessions need native reload or an explicit user reopen for skill/tool/rule catalogs. Do not restart coordinators automatically. This session is human-controlled: wait for human plan review.");
         }
     }
+    if markdown_source.is_some() || !routes.profiles.is_empty() {
+        text.push_str("\n\nMARKDOWN EXCEPTION: every requested Markdown asset whose line above names a Markdown source folder is authored only there and is deployed after explicit human review (Apply to OMP). Do not edit its native deployed copy. Tools, companion scripts, plugin entrypoints/manifests and native configuration remain at their native destinations exactly as requested; never copy them into the Markdown source.");
+    }
     Ok(text)
 }
 
@@ -635,7 +676,14 @@ impl SetupService {
         Self {
             root,
             jobs: Mutex::new(HashMap::new()),
+            markdown: std::sync::OnceLock::new(),
         }
+    }
+    pub fn install_markdown(&self,service:Arc<AgentMarkdownService>)->Result<()> {
+        service.recover()?;
+        self.markdown.set(service.clone()).map_err(|_|"Markdown service already installed")?;
+        *MARKDOWN_SERVICE.lock()=Some(Arc::downgrade(&service));
+        Ok(())
     }
     pub fn start(
         &self,
@@ -730,6 +778,8 @@ impl SetupService {
         let hub = registry
             .manager_hub()
             .ok_or("manager bridge not initialized")?;
+        let routes=self.markdown.get().map(|service|service.routes(registry,&request)).transpose()?.unwrap_or_default();
+        let _admission=instruction_read_admission()?;
         let text = {
             let mut jobs = self.jobs.lock().map_err(|e| e.to_string())?;
             let job = jobs
@@ -741,7 +791,7 @@ impl SetupService {
                         .into(),
                 );
             }
-            let text = prompt(&request, &job.paths, job.repository_root.as_deref())?;
+            let text = prompt_with_routes(&request, &job.paths, job.repository_root.as_deref(), &routes)?;
             job.sending = true;
             text
         };

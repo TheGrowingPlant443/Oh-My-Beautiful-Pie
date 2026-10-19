@@ -1247,6 +1247,188 @@ pub async fn open_code_quality_sso_login(window: tauri::WebviewWindow, state: St
     let service = state.code_quality.clone();
     blocking(move || service.open_sso_login(&url)).await
 }
+use crate::knowledge as k;
+macro_rules! knowledge_only {
+    ($window:expr) => {
+        if $window.label() != "main" { return Err("unauthorized window".into()); }
+    };
+}
+#[tauri::command]
+pub async fn get_knowledge_capabilities(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: Option<String>) -> Result<k::KnowledgeCapabilities> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.get_knowledge_capabilities(folder.as_deref())).await
+}
+#[tauri::command]
+pub async fn list_knowledge_vaults(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<Vec<k::VaultBinding>> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.list_knowledge_vaults()).await
+}
+#[tauri::command]
+pub async fn prepare_knowledge_vault(window: tauri::WebviewWindow, state: State<'_, AppState>, scope: k::ScopeRequest, folder: Option<String>, destination: String, mode: k::VaultMode) -> Result<k::VaultPreparation> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.prepare_knowledge_vault(scope, folder.as_deref(), &destination, mode)).await
+}
+#[tauri::command]
+pub async fn confirm_knowledge_vault(window: tauri::WebviewWindow, state: State<'_, AppState>, token: String) -> Result<k::VaultBinding> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.confirm_knowledge_vault(&token)).await
+}
+#[tauri::command]
+pub async fn open_knowledge_note(window: tauri::WebviewWindow, state: State<'_, AppState>, vault_id: String, path: Option<String>) -> Result<k::OpenNoteResult> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.open_knowledge_note(&vault_id, path.as_deref())).await
+}
+#[tauri::command]
+pub async fn open_obsidian_vault_manager(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<()> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.open_obsidian_vault_manager()).await
+}
+#[tauri::command]
+pub async fn open_knowledge_link(window: tauri::WebviewWindow, state: State<'_, AppState>, url: String) -> Result<()> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.open_knowledge_link(&url)).await
+}
+#[tauri::command]
+pub async fn open_obsidian_download(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<()> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.open_obsidian_download()).await
+}
+#[tauri::command]
+pub async fn record_obsidian_decline(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String) -> Result<()> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.record_obsidian_decline(&folder)).await
+}
+#[tauri::command]
+pub async fn configure_obsidian_executable(window: tauri::WebviewWindow, state: State<'_, AppState>, executable: Option<String>) -> Result<k::ObsidianCapability> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.configure_obsidian_executable(executable.as_deref())).await
+}
+#[tauri::command]
+pub async fn list_vault_entries(window: tauri::WebviewWindow, state: State<'_, AppState>, vault_id: String, prefix: String, offset: usize, limit: usize) -> Result<k::VaultEntryPage> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.list_vault_entries(&vault_id, &prefix, offset, limit)).await
+}
+#[tauri::command]
+pub async fn read_vault_document(window: tauri::WebviewWindow, state: State<'_, AppState>, vault_id: String, path: String, offset: u64, expected_hash: Option<String>) -> Result<k::VaultDocumentPage> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.read_vault_document(&vault_id, &path, offset, expected_hash.as_deref())).await
+}
+#[tauri::command]
+pub async fn query_vault_links(window: tauri::WebviewWindow, state: State<'_, AppState>, vault_id: String, query: k::VaultLinkQuery) -> Result<k::VaultQueryAnswer> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.query_vault_links(&vault_id, &query)).await
+}
+#[tauri::command]
+pub async fn refresh_vault_index(window: tauri::WebviewWindow, state: State<'_, AppState>, vault_id: String) -> Result<k::VaultRefresh> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.refresh_vault_index(&vault_id)).await
+}
+#[tauri::command]
+pub async fn open_graphify_artifact(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String) -> Result<k::GraphifyArtifact> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.open_graphify_artifact(&folder)).await
+}
+#[tauri::command]
+pub async fn register_graphify_output(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String, directory: String) -> Result<k::KnowledgeCapabilities> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.register_graphify_output(&folder, &directory)).await
+}
+#[tauri::command]
+pub async fn read_graphify_graph(window: tauri::WebviewWindow, state: State<'_, AppState>, artifact_id: String, section: k::GraphifySection, offset: usize, limit: usize) -> Result<k::GraphifyPage> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.read_graphify_graph(&artifact_id, section, offset, limit)).await
+}
+#[tauri::command]
+pub async fn query_graphify_graph(window: tauri::WebviewWindow, state: State<'_, AppState>, artifact_id: String, query: k::GraphifyQuery) -> Result<k::GraphifyQueryPage> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.query_graphify_graph(&artifact_id, &query)).await
+}
+#[tauri::command]
+pub async fn configure_cognee_ui(window: tauri::WebviewWindow, state: State<'_, AppState>, url: Option<String>, installation_folder: Option<String>) -> Result<k::CogneeCapability> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.configure_cognee_ui(url.as_deref(), installation_folder.as_deref())).await
+}
+#[tauri::command]
+pub async fn open_cognee_ui(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<()> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.open_cognee_ui()).await
+}
+#[tauri::command]
+pub async fn get_agent_markdown_status(window: tauri::WebviewWindow, state: State<'_, AppState>, target: crate::agent_markdown::KnowledgeAssetTarget) -> Result<crate::agent_markdown::MarkdownStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, service) = (state.registry.clone(), state.agent_markdown.clone());
+    blocking(move || service.status(&registry, target)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn prepare_agent_markdown_import(window: tauri::WebviewWindow, state: State<'_, AppState>, target: crate::agent_markdown::KnowledgeAssetTarget, selectedNativeIds: Option<Vec<String>>) -> Result<crate::agent_markdown::MarkdownPreparation> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, service) = (state.registry.clone(), state.agent_markdown.clone());
+    blocking(move || service.prepare_import(&registry, target, selectedNativeIds)).await
+}
+#[tauri::command]
+pub async fn confirm_agent_markdown_import(window: tauri::WebviewWindow, state: State<'_, AppState>, token: String) -> Result<crate::agent_markdown::MarkdownStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, service) = (state.registry.clone(), state.agent_markdown.clone());
+    blocking(move || service.confirm_import(&registry, &token)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn prepare_agent_markdown_apply(window: tauri::WebviewWindow, state: State<'_, AppState>, target: crate::agent_markdown::KnowledgeAssetTarget, sourceRevision: String) -> Result<crate::agent_markdown::MarkdownPreparation> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, service) = (state.registry.clone(), state.agent_markdown.clone());
+    blocking(move || service.prepare_apply(&registry, target, &sourceRevision)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn apply_agent_markdown(app: AppHandle, window: tauri::WebviewWindow, state: State<'_, AppState>, token: String, selectedIds: Vec<String>) -> Result<crate::agent_markdown::MarkdownStatus> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (registry, service) = (state.registry.clone(), state.agent_markdown.clone());
+    blocking(move || { let result = service.apply(&registry, &token, selectedIds); publish(&app, &registry); result }).await
+}
+#[tauri::command]
+pub async fn check_graphify_artifact(window: tauri::WebviewWindow, state: State<'_, AppState>, artifact_id: String) -> Result<k::GraphifyArtifactCheck> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.check_graphify_artifact(&artifact_id)).await
+}
+macro_rules! srs_only { ($window:expr) => { if $window.label() != "main" { return Err("unauthorized window".into()); } }; }
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn prepare_srs_scope(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String, vaultId: String, evidenceFolders: Vec<String>, exclusions: Vec<String>) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.prepare_srs_scope(&folder, &vaultId, evidenceFolders, exclusions)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn start_srs(window: tauri::WebviewWindow, state: State<'_, AppState>, scopeToken: String) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.start_srs(&scopeToken)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn get_srs_job(window: tauri::WebviewWindow, state: State<'_, AppState>, jobId: String) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.get_srs_job(&jobId)).await
+}
+#[tauri::command]
+pub async fn list_srs_jobs(window: tauri::WebviewWindow, state: State<'_, AppState>, folder: String, offset: usize, limit: usize) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.list_srs_jobs(&folder, offset, limit)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn pause_srs(window: tauri::WebviewWindow, state: State<'_, AppState>, jobId: String) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.pause_srs(&jobId)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn cancel_srs(window: tauri::WebviewWindow, state: State<'_, AppState>, jobId: String) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.cancel_srs(&jobId)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn prepare_srs_resume(window: tauri::WebviewWindow, state: State<'_, AppState>, jobId: String, mode: String) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.prepare_srs_resume(&jobId, &mode)).await
+}
+#[tauri::command]
+pub async fn resume_srs(window: tauri::WebviewWindow, state: State<'_, AppState>, token: String) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.resume_srs(&token)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn dispose_srs_item(window: tauri::WebviewWindow, state: State<'_, AppState>, jobId: String, expectedRevision: u64, itemId: String, disposition: String, rationale: String, answer: Option<crate::srs::Answer>) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.dispose_srs_item(&jobId, expectedRevision, &itemId, &disposition, &rationale, answer)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn query_srs_job(window: tauri::WebviewWindow, state: State<'_, AppState>, jobId: String, section: String, offset: u64, limit: u64) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.query_srs_job(&jobId, &section, offset, limit)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn open_srs_documents(window: tauri::WebviewWindow, state: State<'_, AppState>, jobId: String) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.open_srs_documents(&jobId)).await
+}
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn rebind_srs_vault(window: tauri::WebviewWindow, state: State<'_, AppState>, jobId: String, vaultId: String) -> Result<serde_json::Value> {
+    srs_only!(window); let s = state.srs.clone(); blocking(move || s.rebind_srs_vault(&jobId, &vaultId)).await
+}
 pub fn tick(app: AppHandle, registry: Arc<Registry>, terminals: Arc<crate::terminal::TerminalService>, closing: Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {
         loop {

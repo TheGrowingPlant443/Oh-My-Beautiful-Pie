@@ -44,10 +44,14 @@ export interface ModelNode {
   ref: string | null;
 }
 
+export type EdgeDirection = "directed" | "undirected";
+
 export interface ModelEdge {
   id: string;
   source: string;
   target: string;
+  /** `directed`: source -> target is meaningful (calls, requests, business flow). `undirected`: a mutual relationship; source/target only record the stored order. Containment is never an edge. */
+  direction: EdgeDirection;
   relation: string;
   /** Source index: resolution. Architect system diagram: certainty. */
   grade: string;
@@ -350,6 +354,8 @@ export interface ProjectionOptions {
   /** Zero-based window when even the fully aggregated projection exceeds the renderer cap. */
   page?: number;
   limits?: ProjectionLimits;
+  /** What a model edge from a node to itself is called: source-code `recursion` (default) or a graph-domain `selfLink` (notes, Graphify). */
+  loopKind?: LoopKind;
 }
 
 export interface ViewNode {
@@ -385,10 +391,14 @@ export interface ViewNode {
   degree: number;
 }
 
+export type LoopKind = "recursion" | "selfLink";
+
 export interface ViewEdge {
   id: string;
   source: string;
   target: string;
+  /** Directed and undirected records are never aggregated together. */
+  direction: EdgeDirection;
   relation: string;
   grade: string;
   derived: boolean;
@@ -422,9 +432,11 @@ export interface Projection {
   paged: { page: number; pages: number; pageSize: number } | null;
   expanded: string[];
   columns: number;
+  /** How a card's self-relationships are named: source-code recursion or a graph-domain self-link. */
+  loopKind: LoopKind;
 }
 
-interface ViewEdgeDraft { source: string; target: string; relation: string; grade: string; derived: boolean; label: string; edgeIds: string[]; evidenceIds: Set<string>; count: number; truncated: boolean }
+interface ViewEdgeDraft { source: string; target: string; direction: EdgeDirection; relation: string; grade: string; derived: boolean; label: string; edgeIds: string[]; evidenceIds: Set<string>; count: number; truncated: boolean }
 interface Aggregate {
   shown: Set<string>;
   edges: Map<string, ViewEdgeDraft>;
@@ -492,7 +504,9 @@ function aggregate(index: GraphIndex, expanded: ReadonlySet<string>, options: Pr
     const from = repOf(edge.source), to = repOf(edge.target);
     if (edge.source === edge.target) { addRecursion(from, edge.count, edge.id); recursionTotal += edge.count; continue; }
     if (from === to) { internal.set(from, (internal.get(from) ?? 0) + edge.count); internalTotal += edge.count; continue; }
-    const key = `${from}>${to}|${edge.relation}|${edge.grade}|${edge.derived ? 1 : 0}`;
+    // Directed and undirected records never share an arrow; opposite directed edges stay separate arrows; an undirected pair is one line whichever order it was stored in.
+    const ends = edge.direction === "undirected" && compareText(to, from) < 0 ? `${to}~${from}` : `${from}${edge.direction === "undirected" ? "~" : ">"}${to}`;
+    const key = `${ends}|${edge.relation}|${edge.grade}|${edge.derived ? 1 : 0}`;
     const draft = edges.get(key);
     if (draft) {
       draft.edgeIds.push(edge.id);
@@ -500,7 +514,7 @@ function aggregate(index: GraphIndex, expanded: ReadonlySet<string>, options: Pr
       draft.count += edge.count;
       draft.truncated ||= edge.truncated;
       if (draft.label !== edge.label) draft.label = "";
-    } else edges.set(key, { source: from, target: to, relation: edge.relation, grade: edge.grade, derived: edge.derived, label: edge.label, edgeIds: [edge.id], evidenceIds: new Set(edge.evidenceIds), count: edge.count, truncated: edge.truncated });
+    } else edges.set(key, { source: from, target: to, direction: edge.direction, relation: edge.relation, grade: edge.grade, derived: edge.derived, label: edge.label, edgeIds: [edge.id], evidenceIds: new Set(edge.evidenceIds), count: edge.count, truncated: edge.truncated });
   }
   return { shown, edges, internal, recursion, recursionTotal, filtered, internalTotal };
 }
@@ -633,7 +647,7 @@ export function projectGraph(index: GraphIndex, options: ProjectionOptions): Pro
     const cycle = layout.component.get(draft.source) === layout.component.get(draft.target);
     const response = draft.relation === "responds";
     edges.push({
-      id: key, source: draft.source, target: draft.target, relation: draft.relation, grade: draft.grade, derived: draft.derived, label: draft.label,
+      id: key, source: draft.source, target: draft.target, direction: draft.direction, relation: draft.relation, grade: draft.grade, derived: draft.derived, label: draft.label,
       count: draft.count, edgeIds: draft.edgeIds, evidenceIds: [...draft.evidenceIds], truncated: draft.truncated, cycle, response,
       back: !response && !cycle && layout.column.get(draft.target)! <= layout.column.get(draft.source)!,
     });
@@ -659,7 +673,7 @@ export function projectGraph(index: GraphIndex, options: ProjectionOptions): Pro
     accounted: { internal: measured.internalTotal, recursion: measured.recursionTotal, filtered: measured.filtered, dangling: danglingCount(index), openContainers: openHidden },
     aggregated: nodes.some(item => item.collapsed) || automatic && fitted.collapsed > 0, reason: reasons.length ? reasons.join(" ") : null,
     paged: pages > 1 ? { page, pages, pageSize } : null,
-    expanded: [...expanded], columns: layout.columns,
+    expanded: [...expanded], columns: layout.columns, loopKind: options.loopKind ?? "recursion",
   };
 }
 
@@ -703,7 +717,7 @@ export function modelFromSystem(payload: SystemOverviewPayload): GraphModel {
     });
   });
   const edges: ModelEdge[] = payload.edges.map(item => ({
-    id: item.id, source: item.sourceId, target: item.targetId, relation: item.relation, grade: item.certainty, derived: false, label: item.label,
+    id: item.id, source: item.sourceId, target: item.targetId, direction: "directed", relation: item.relation, grade: item.certainty, derived: false, label: item.label,
     count: 1, evidenceIds: item.staticFactId ? [...item.evidenceIds, item.staticFactId] : item.evidenceIds, truncated: false,
   }));
   return { nodes, edges };
@@ -821,7 +835,7 @@ export function modelFromOverview(input: OverviewInput): GraphModel {
     for (const link of group.links) {
       const to = nodeOfGroup.get(link.targetGroupId) ?? link.targetGroupId;
       edges.push({
-        id: `${group.id}>${link.targetGroupId}|${link.relation}|${link.resolution}|${link.derived ? 1 : 0}`, source: from, target: to, relation: link.relation,
+        id: `${group.id}>${link.targetGroupId}|${link.relation}|${link.resolution}|${link.derived ? 1 : 0}`, source: from, target: to, direction: "directed", relation: link.relation,
         grade: link.resolution, derived: link.derived, label: link.relation, count: link.count, evidenceIds: link.edgeIds, truncated: link.edgeIdsTruncated || link.count > link.edgeIds.length,
       });
     }
@@ -842,7 +856,7 @@ export function modelFromDirectories(groups: readonly OverviewGroupRow[]): Graph
   for (const group of groups) {
     for (const link of group.links) {
       edges.push({
-        id: `${group.id}>${link.targetGroupId}|${link.relation}|${link.resolution}|${link.derived ? 1 : 0}`, source: group.id, target: link.targetGroupId, relation: link.relation,
+        id: `${group.id}>${link.targetGroupId}|${link.relation}|${link.resolution}|${link.derived ? 1 : 0}`, source: group.id, target: link.targetGroupId, direction: "directed", relation: link.relation,
         grade: link.resolution, derived: link.derived, label: link.relation, count: link.count, evidenceIds: link.edgeIds, truncated: link.edgeIdsTruncated || link.count > link.edgeIds.length,
       });
     }
@@ -874,14 +888,14 @@ export function modelFromNeighbors(input: NeighborhoodInput): { model: GraphMode
       peer(row.peerId, row.peerLabel);
       const outgoing = row.direction === "out";
       edges.push({
-        id: row.edge.id, source: outgoing ? input.centerId : row.peerId, target: outgoing ? row.peerId : input.centerId, relation: row.edge.relation,
+        id: row.edge.id, source: outgoing ? input.centerId : row.peerId, target: outgoing ? row.peerId : input.centerId, direction: "directed", relation: row.edge.relation,
         grade: row.edge.resolution, derived: false, label: row.edge.relation, count: 1, evidenceIds: row.edge.evidenceIds, truncated: false,
       });
     } else if (row.kind === "aggregate" && row.peerId) {
       peer(row.peerId, row.peerLabel);
       const outgoing = row.direction === "out";
       edges.push({
-        id: `agg:${row.direction}:${row.peerId}:${row.relation}:${row.resolution}`, source: outgoing ? input.centerId : row.peerId, target: outgoing ? row.peerId : input.centerId,
+        id: `agg:${row.direction}:${row.peerId}:${row.relation}:${row.resolution}`, source: outgoing ? input.centerId : row.peerId, target: outgoing ? row.peerId : input.centerId, direction: "directed",
         relation: row.relation, grade: row.resolution, derived: true, label: row.relation, count: row.count, evidenceIds: row.edgeIds, truncated: row.edgeIdsTruncated || row.count > row.edgeIds.length,
       });
     } else if (row.kind === "site") sites.push(row.site);
@@ -923,6 +937,7 @@ export function revealPath(index: GraphIndex, id: string, expanded: ReadonlySet<
 export const RELATION_COLORS: Record<string, string> = {
   calls: "#4ea1ff", imports: "#8b9bb4", includes: "#8b9bb4", reexports: "#a371f7", references: "#61708a", renders: "#3fb950", macros: "#d29922", instantiates: "#d29922",
   requests: "#4ea1ff", responds: "#3fb950", publishes: "#d29922", subscribes: "#d29922", reads: "#2bb8b8", writes: "#f0883e", authorizes: "#ff69b4",
+  link: "#4ea1ff", embed: "#a371f7",
 };
 export const relationColor = (relation: string): string => RELATION_COLORS[relation] ?? "#8b9bb4";
 
@@ -938,12 +953,20 @@ export function gradeText(grade: string): string {
     case "declared": return "Declared by static fact";
     case "inferred": return "Inferred by the Architect";
     case "unknown": return "Unknown";
+    case "EXTRACTED": return "Extracted from source (Graphify)";
+    case "INFERRED": return "Inferred (Graphify)";
+    case "AMBIGUOUS": return "Ambiguous (Graphify)";
+    case "resolvedLink": return "Resolved link";
     default: return grade;
   }
 }
-export const gradeProven = (grade: string): boolean => grade === "resolvedStatic" || grade === "declared";
+export const gradeProven = (grade: string): boolean => grade === "resolvedStatic" || grade === "declared" || grade === "EXTRACTED" || grade === "resolvedLink";
 /** Arrow dash: proven solid, everything else dashed so an inference is never mistaken for a proven edge. */
 export const edgeDashed = (edge: Pick<ViewEdge, "grade" | "response">): boolean => edge.response || !gradeProven(edge.grade);
+/** Only directed records get an arrowhead; an undirected relationship is a plain line. */
+export const edgeArrow = (edge: Pick<ViewEdge, "direction">): boolean => edge.direction === "directed";
+/** Name of a card's relationships to itself: source recursion, or a graph-domain self-link. */
+export const loopText = (kind: LoopKind, count: number): string => kind === "selfLink" ? (count === 1 ? "Self-link" : "Self-links") : count === 1 ? "recursive reference" : "recursive references";
 
 /** Display-only clipping; the full text always stays in the model and is shown on selection. */
 export function clipText(text: string, max: number): string {

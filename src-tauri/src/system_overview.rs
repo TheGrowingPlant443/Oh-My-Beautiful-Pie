@@ -1,5 +1,5 @@
 //! Typed, strictly validated results of the Architect-assisted system visualizations (`systemOverview`,
-//! `structureCurrent`, `structureProposed`) and the narrow seams the project-insight service needs to build them.
+//! `helicopter`, `structureCurrent`, `structureProposed`) and the narrow seams the project-insight service needs to build them.
 //!
 //! The Architect only ever interprets an immutable, app-owned source-index snapshot. Nothing it says is trusted until it
 //! has been checked here against that snapshot: every cited path must be an inventoried file, its content hash must equal
@@ -239,6 +239,73 @@ pub struct SystemOverviewResult {
     pub completed_at: u64,
 }
 
+// ---- helicopter (plain-language business flow) ---------------------------------------------------------------------
+
+/// What a business node is, in business terms. `BusinessGroup` is containment only: a journey that holds steps, never a step.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum HelicopterKind { Actor, Trigger, Activity, Decision, Outcome, ExternalParty, BusinessGroup }
+
+/// A business flow is never statically proven, so only `inferred` (evidence-backed reading) or `unknown` (Needs clarification).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum HelicopterCertainty { Inferred, Unknown }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HelicopterNode {
+    pub id: String,
+    pub kind: HelicopterKind,
+    pub label: String,
+    #[serde(deserialize_with = "required_nullable")]
+    pub parent_id: Option<String>,
+    pub description: String,
+    pub evidence_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HelicopterEdge {
+    pub id: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub label: String,
+    pub evidence_ids: Vec<String>,
+    pub certainty: HelicopterCertainty,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HelicopterCapability {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub node_ids: Vec<String>,
+    pub evidence_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HelicopterPayload {
+    pub schema_version: u32,
+    pub snapshot_id: String,
+    pub purpose: String,
+    pub nodes: Vec<HelicopterNode>,
+    pub edges: Vec<HelicopterEdge>,
+    pub capabilities: Vec<HelicopterCapability>,
+    pub evidence: Vec<EvidenceRef>,
+    pub coverage: Vec<CoverageEntry>,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HelicopterResult {
+    #[serde(flatten)]
+    pub payload: HelicopterPayload,
+    pub completed_at: u64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MappingOperation { Unchanged, Rename, Move, Split, Merge, Create, Remove }
@@ -470,10 +537,15 @@ pub fn validate_system(payload: SystemOverviewPayload, expected_snapshot: &str, 
         check_refs(&format!("Edge '{}'", edge.id), &edge.evidence_ids, &evidence_ids)?;
         check_certainty(edge, snapshot)?;
     }
-    for entry in &payload.coverage {
+    check_coverage(&payload.coverage, &evidence_ids)?;
+    Ok(payload)
+}
+
+fn check_coverage(coverage: &[CoverageEntry], evidence_ids: &HashSet<&str>) -> Result<()> {
+    for entry in coverage {
         check_text("Coverage area", &entry.area, 500, true)?;
         check_text(&format!("Coverage '{}' notes", entry.area), &entry.notes, NOTE_LIMIT, false)?;
-        check_refs(&format!("Coverage '{}'", entry.area), &entry.evidence_ids, &evidence_ids)?;
+        check_refs(&format!("Coverage '{}'", entry.area), &entry.evidence_ids, evidence_ids)?;
         match entry.status {
             CoverageStatus::Inspected if entry.evidence_ids.is_empty() => return Err(format!("Coverage '{}' is marked inspected without evidence", entry.area)),
             CoverageStatus::NotFound | CoverageStatus::Unresolved | CoverageStatus::Excluded if entry.notes.trim().is_empty() => {
@@ -482,7 +554,7 @@ pub fn validate_system(payload: SystemOverviewPayload, expected_snapshot: &str, 
             _ => (),
         }
     }
-    Ok(payload)
+    Ok(())
 }
 
 /// `declared` is a claim about static facts: it needs evidence and an indexed declaration or resolved static edge.
@@ -509,6 +581,121 @@ fn check_certainty(edge: &SystemEdge, snapshot: Option<&Snapshot>) -> Result<()>
     }
     if snapshot.symbol_ids().contains(fact) { return Ok(()); }
     Err(format!("Edge '{}' names staticFactId '{fact}', which is neither an indexed declaration nor an indexed edge of this snapshot", edge.id))
+}
+
+// ---- helicopter validation ---------------------------------------------------------------------------------------
+
+const MAX_CAPABILITY_NODES: usize = 500;
+const SOURCE_EXTENSIONS: [&str; 34] = [
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "java", "kt", "go", "cs", "cpp", "c", "h", "hpp", "rb", "php", "swift", "svelte", "vue",
+    "json", "yml", "yaml", "toml", "xml", "sql", "sh", "ps1", "gradle", "ini", "env", "lock", "properties",
+];
+const PATH_ROOTS: [&str; 8] = ["src/", "lib/", "app/", "docs/", "test/", "tests/", "packages/", "node_modules/"];
+
+/// Business-facing text carries no code: file paths, file names, call syntax and identifiers belong in evidence records,
+/// which the view hides by default. `Some(kind)` names what the text looks like.
+pub(crate) fn technical_marker(value: &str) -> Option<&'static str> {
+    if value.contains('`') { return Some("inline code"); }
+    if ["::", "=>", "->", "()"].iter().any(|syntax| value.contains(syntax)) { return Some("code syntax"); }
+    for raw in value.split_whitespace() {
+        let token = raw.trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''));
+        if token.len() < 2 { continue; }
+        let bytes = token.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/') { return Some("a file path"); }
+        if token.contains('/') || token.contains('\\') {
+            let rooted = token.starts_with(['/', '\\']) || token.starts_with("./") || token.starts_with("../") || token.starts_with("~/") || PATH_ROOTS.iter().any(|root| token.starts_with(root));
+            let last = token.rsplit(['/', '\\']).next().unwrap_or_default();
+            let extension = last.rsplit_once('.').map(|(_, extension)| extension).is_some_and(|extension| (1..=5).contains(&extension.len()) && extension.chars().all(|ch| ch.is_ascii_alphanumeric()) && !extension.chars().all(|ch| ch.is_ascii_digit()));
+            if rooted || extension { return Some("a file path"); }
+        } else if let Some((stem, extension)) = token.rsplit_once('.') {
+            if !stem.is_empty() && SOURCE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) { return Some("a source file name"); }
+        }
+        let underscore = token.char_indices().any(|(at, ch)| ch == '_' && token[..at].chars().next_back().is_some_and(char::is_alphanumeric) && token[at + 1..].chars().next().is_some_and(char::is_alphanumeric));
+        if underscore { return Some("a code identifier"); }
+    }
+    None
+}
+
+fn business_text(what: &str, value: &str, maximum: usize, required: bool) -> Result<()> {
+    check_text(what, value, maximum, required)?;
+    if let Some(kind) = technical_marker(value) {
+        return Err(format!("{what} looks like {kind}. Describe it in plain business words and cite the repository only through evidenceIds"));
+    }
+    Ok(())
+}
+
+pub fn validate_helicopter(payload: HelicopterPayload, expected_snapshot: &str, snapshot: Option<&Snapshot>) -> Result<HelicopterPayload> {
+    if payload.schema_version != SCHEMA { return Err("Unsupported helicopter schema version".into()); }
+    if payload.snapshot_id != expected_snapshot { return Err("The helicopter view was produced for a different source snapshot".into()); }
+    if payload.nodes.len() > MAX_NODES { return Err(format!("At most {MAX_NODES} nodes are allowed")); }
+    if payload.edges.len() > MAX_EDGES { return Err(format!("At most {MAX_EDGES} edges are allowed")); }
+    if payload.capabilities.len() > MAX_NODES { return Err(format!("At most {MAX_NODES} capabilities are allowed")); }
+    if payload.coverage.len() > MAX_COVERAGE { return Err(format!("At most {MAX_COVERAGE} coverage entries are allowed")); }
+    business_text("Purpose", &payload.purpose, NOTE_LIMIT, true)?;
+    check_list("Limitation", &payload.limitations, MAX_LIMITATIONS, NOTE_LIMIT)?;
+    if payload.nodes.is_empty() && payload.limitations.is_empty() { return Err("A helicopter view without nodes must explain why in limitations".into()); }
+    if !payload.nodes.is_empty() && payload.capabilities.is_empty() { return Err("A helicopter view with nodes must list the business capabilities it found".into()); }
+    let evidence_ids = check_evidence(&payload.evidence, snapshot)?;
+
+    let mut kinds: HashMap<&str, HelicopterKind> = HashMap::new();
+    for node in &payload.nodes {
+        check_id("Node", &node.id)?;
+        if kinds.insert(node.id.as_str(), node.kind).is_some() { return Err(format!("Duplicate node id '{}'", node.id)); }
+        business_text(&format!("Node '{}' label", node.id), &node.label, LABEL_LIMIT, true)?;
+        business_text(&format!("Node '{}' description", node.id), &node.description, NOTE_LIMIT, false)?;
+        check_refs(&format!("Node '{}'", node.id), &node.evidence_ids, &evidence_ids)?;
+        if node.kind != HelicopterKind::BusinessGroup && node.evidence_ids.is_empty() {
+            return Err(format!("Node '{}' cites no evidence; only a journey grouping may stand without it, so name what is unclear as limitations instead of inventing it", node.id));
+        }
+    }
+    for node in &payload.nodes {
+        let Some(parent) = &node.parent_id else { continue; };
+        if parent == &node.id { return Err(format!("Node '{}' cannot contain itself", node.id)); }
+        match kinds.get(parent.as_str()) {
+            None => return Err(format!("Node '{}' has unknown parent '{parent}'", node.id)),
+            Some(HelicopterKind::BusinessGroup) => (),
+            Some(_) => return Err(format!("Node '{}' sits inside '{parent}', which is not a journey grouping; only a businessGroup contains other nodes", node.id)),
+        }
+    }
+    check_containment(&payload.nodes.iter().map(|node| (node.id.as_str(), node.parent_id.as_deref())).collect::<Vec<_>>())?;
+
+    let mut edge_ids: HashSet<&str> = HashSet::new();
+    for edge in &payload.edges {
+        check_id("Edge", &edge.id)?;
+        if !edge_ids.insert(edge.id.as_str()) { return Err(format!("Duplicate edge id '{}'", edge.id)); }
+        for (side, end) in [("source", &edge.source_id), ("target", &edge.target_id)] {
+            match kinds.get(end.as_str()) {
+                None => return Err(format!("Edge '{}' has a dangling {side} '{end}'", edge.id)),
+                Some(HelicopterKind::BusinessGroup) => return Err(format!("Edge '{}' has a journey grouping as its {side}; a flow connects steps, containment is never a flow", edge.id)),
+                Some(_) => (),
+            }
+        }
+        business_text(&format!("Edge '{}' label", edge.id), &edge.label, LABEL_LIMIT, false)?;
+        check_refs(&format!("Edge '{}'", edge.id), &edge.evidence_ids, &evidence_ids)?;
+        if edge.certainty == HelicopterCertainty::Inferred && edge.evidence_ids.is_empty() {
+            return Err(format!("Edge '{}' is inferred but cites no evidence; mark it unknown (Needs clarification) instead", edge.id));
+        }
+    }
+
+    let mut capability_ids: HashSet<&str> = HashSet::new();
+    for capability in &payload.capabilities {
+        check_id("Capability", &capability.id)?;
+        if !capability_ids.insert(capability.id.as_str()) { return Err(format!("Duplicate capability id '{}'", capability.id)); }
+        business_text(&format!("Capability '{}' label", capability.id), &capability.label, LABEL_LIMIT, true)?;
+        business_text(&format!("Capability '{}' description", capability.id), &capability.description, NOTE_LIMIT, false)?;
+        if capability.node_ids.is_empty() || capability.node_ids.len() > MAX_CAPABILITY_NODES {
+            return Err(format!("Capability '{}' must name between 1 and {MAX_CAPABILITY_NODES} nodes", capability.id));
+        }
+        let mut named: HashSet<&str> = HashSet::new();
+        for id in &capability.node_ids {
+            if !kinds.contains_key(id.as_str()) { return Err(format!("Capability '{}' names unknown node '{id}'", capability.id)); }
+            if !named.insert(id.as_str()) { return Err(format!("Capability '{}' names node '{id}' twice", capability.id)); }
+        }
+        check_refs(&format!("Capability '{}'", capability.id), &capability.evidence_ids, &evidence_ids)?;
+        if capability.evidence_ids.is_empty() { return Err(format!("Capability '{}' cites no evidence; do not invent product capabilities", capability.id)); }
+    }
+    check_coverage(&payload.coverage, &evidence_ids)?;
+    Ok(payload)
 }
 
 // ---- structure validation ----------------------------------------------------------------------------------------
@@ -812,6 +999,25 @@ Every inventoried area must be covered or listed in coverage as notFound, unreso
 Use certainty declared ONLY when you can name the indexed fact (a declaration or resolved static edge id from system_overview_inspect) in staticFactId; otherwise use inferred or unknown. \
 Finish with submit_system_overview with requestId \"{id}\", snapshotId from the request context, schemaVersion 1, nodes[{{id,kind,label,parentId,description,evidenceIds}}] (kinds application, logicGroup, actor, service, sidecar, cache, database, queue, storage, external, entrypoint), \
 edges[{{id,sourceId,targetId,relation,label,evidenceIds,certainty,staticFactId}}] (relations calls, imports, includes, reexports, references, renders, requests, responds, publishes, subscribes, reads, writes, authorizes), \
+evidence[{{id,path,lineStart,lineEnd,contentHash}}], coverage[{{area,status,evidenceIds,notes}}] and limitations[]. Your output is labelled Architect analysis in the app.")
+}
+
+/// The plain-language business view. It runs in the same existing Architect conversation as every other visualization, so
+/// the prompt names earlier discussion as orientation only: this request's snapshot evidence is the sole authority.
+pub fn helicopter_prompt(facts: &PromptFacts) -> String {
+    let (id, context) = (facts.request_id, facts.context);
+    format!("Helicopter business view request. Request id: {id}. Submit exactly once with submit_helicopter.\n\n\
+<project-insight-request>\n{context}\n</project-insight-request>\n\n\
+{COMMON_RULES}\n\n\
+Describe what this product does for the people who use it, in plain business language for readers who do not program. Show: who is involved (actor), what starts a journey (trigger), the business steps (activity) and choices (decision) that follow, what each journey ends with (outcome), and the outside parties it depends on (externalParty). \
+Use everyday verbs and domain words a business owner would use (for example \"Customer books an appointment\", \"Clinic confirms the slot\", \"Appointment is cancelled\"). Do NOT put file paths, file names, function or class names, protocols, framework or library names, infrastructure or configuration keys in any label, description, purpose, capability or edge label; the technical proof belongs ONLY in evidence records, which the app hides by default. Text that looks like a path, code or an identifier is rejected. \
+Group the steps into a few meaningful journeys (kind businessGroup, nested with parentId; only a businessGroup may contain other nodes and it is never an edge endpoint) so the default picture stays small, and still list EVERY business capability you identify in capabilities[] with the node ids that realize it, so none disappears when journeys are collapsed. \
+Include the unhappy paths the evidence shows (cancellation, rejection, error, timeout, retry). Show only what the evidence supports: every node except a businessGroup, every capability and every inferred edge MUST cite evidence you actually read, and you must never invent a product capability, actor or step. Where evidence is missing or ambiguous, set the edge certainty to unknown, begin that node's or capability's description with \"Needs clarification:\" and explain what is unclear; never fill gaps with plausible guesses. \
+Describe the CURRENT observed behavior only: do not propose redesigns or improvements in this view. \
+This is the same Architect conversation as your other analyses. You may use relevant earlier discussion in it as orientation, but the repository snapshot and evidence of THIS request are authoritative; anything said about another repository, another snapshot or an earlier version is not a business fact here. You do not need any other overview to have been produced first, and you must not assume one exists. \
+Every inventoried area must be covered or listed in coverage as notFound, unresolved or excluded with notes, and an inspected area needs evidence. \
+Finish with submit_helicopter with requestId \"{id}\", schemaVersion 1, snapshotId from the request context, purpose (one or two plain sentences), nodes[{{id,kind,label,parentId,description,evidenceIds}}] (kinds actor, trigger, activity, decision, outcome, externalParty, businessGroup), \
+edges[{{id,sourceId,targetId,label,evidenceIds,certainty}}] (certainty inferred or unknown; a decision's outgoing edges are labelled with the answer, for example \"Yes\" or \"No\"), capabilities[{{id,label,description,nodeIds,evidenceIds}}], \
 evidence[{{id,path,lineStart,lineEnd,contentHash}}], coverage[{{area,status,evidenceIds,notes}}] and limitations[]. Your output is labelled Architect analysis in the app.")
 }
 
@@ -1162,6 +1368,140 @@ mod tests {
         ]);
         let accepted = check_structure(&fixture, &proposed_context(), shapes).unwrap();
         assert_eq!(accepted.conflicts.len(), 1);
+    }
+
+    // ---- helicopter ------------------------------------------------------------------------------------------------
+
+    fn helicopter(fixture: &Fixture) -> Value {
+        json!({
+            "schemaVersion": 1, "snapshotId": SNAPSHOT, "purpose": "Lets customers book, change and cancel clinic appointments.",
+            "nodes": [
+                { "id": "customer", "kind": "actor", "label": "Customer", "parentId": null, "description": "Someone who wants to see the clinic", "evidenceIds": ["e1"] },
+                { "id": "asks", "kind": "trigger", "label": "Customer asks for an appointment", "parentId": "booking", "description": "", "evidenceIds": ["e1"] },
+                { "id": "booking", "kind": "businessGroup", "label": "Booking an appointment", "parentId": null, "description": "", "evidenceIds": [] },
+                { "id": "free", "kind": "decision", "label": "Is a slot free?", "parentId": "booking", "description": "", "evidenceIds": ["e1"] },
+                { "id": "confirm", "kind": "activity", "label": "Clinic confirms the visit", "parentId": "booking", "description": "", "evidenceIds": ["e1"] },
+                { "id": "cancelled", "kind": "outcome", "label": "Appointment is cancelled", "parentId": null, "description": "Needs clarification: whether a fee applies", "evidenceIds": ["e2"] },
+                { "id": "pay", "kind": "externalParty", "label": "Payment provider", "parentId": null, "description": "", "evidenceIds": ["e2"] },
+            ],
+            "edges": [
+                { "id": "h1", "sourceId": "customer", "targetId": "asks", "label": "", "evidenceIds": ["e1"], "certainty": "inferred" },
+                { "id": "h2", "sourceId": "asks", "targetId": "free", "label": "", "evidenceIds": ["e1"], "certainty": "inferred" },
+                { "id": "h3", "sourceId": "free", "targetId": "confirm", "label": "Yes", "evidenceIds": ["e1"], "certainty": "inferred" },
+                { "id": "h4", "sourceId": "free", "targetId": "cancelled", "label": "No", "evidenceIds": [], "certainty": "unknown" },
+                { "id": "h5", "sourceId": "confirm", "targetId": "pay", "label": "Deposit is taken", "evidenceIds": ["e2"], "certainty": "inferred" },
+            ],
+            "capabilities": [
+                { "id": "cap-book", "label": "Book a visit", "description": "", "nodeIds": ["asks", "free", "confirm"], "evidenceIds": ["e1"] },
+                { "id": "cap-cancel", "label": "Cancel a visit", "description": "", "nodeIds": ["cancelled"], "evidenceIds": ["e2"] },
+            ],
+            "evidence": [fixture.evidence("e1", "src/app.ts", 1, 3), fixture.evidence("e2", "docker-compose.yml", 2, 3)],
+            "coverage": [{ "area": "compose", "status": "inspected", "evidenceIds": ["e2"], "notes": "" }],
+            "limitations": [],
+        })
+    }
+
+    fn check_helicopter(fixture: &Fixture, body: Value) -> Result<HelicopterPayload> {
+        let payload: HelicopterPayload = serde_json::from_value(body).map_err(|error| error.to_string())?;
+        validate_helicopter(payload, SNAPSHOT, Some(&fixture.snapshot))
+    }
+
+    #[test]
+    fn a_business_flow_with_journeys_decisions_outcomes_and_uncertainty_is_accepted_whole() {
+        let fixture = Fixture::new();
+        let payload = check_helicopter(&fixture, helicopter(&fixture)).unwrap();
+        assert_eq!(payload.nodes.len(), 7);
+        assert_eq!(payload.capabilities.len(), 2);
+        // An edge without evidence is only allowed as an explicit unknown; the same edge cannot claim to be inferred.
+        assert_eq!(payload.edges[3].certainty, HelicopterCertainty::Unknown);
+        let mut inferred = helicopter(&fixture);
+        inferred["edges"][3]["certainty"] = json!("inferred");
+        assert!(check_helicopter(&fixture, inferred).unwrap_err().contains("Needs clarification"));
+        // A product with no discoverable nodes must say why instead of rendering an empty success.
+        let mut empty = helicopter(&fixture);
+        empty["nodes"] = json!([]);
+        empty["edges"] = json!([]);
+        empty["capabilities"] = json!([]);
+        assert!(check_helicopter(&fixture, empty.clone()).unwrap_err().contains("explain why"));
+        empty["limitations"] = json!(["Only configuration files were present"]);
+        assert!(check_helicopter(&fixture, empty).is_ok());
+    }
+
+    #[test]
+    fn the_helicopter_never_accepts_invented_dangling_technical_or_structurally_wrong_content() {
+        let fixture = Fixture::new();
+        let mutate = |change: &dyn Fn(&mut Value)| { let mut body = helicopter(&fixture); change(&mut body); body };
+        let cases = [
+            (mutate(&|body| body["nodes"][1]["evidenceIds"] = json!([])), "cites no evidence"),
+            (mutate(&|body| body["capabilities"][0]["evidenceIds"] = json!([])), "do not invent product capabilities"),
+            (mutate(&|body| body["capabilities"][0]["nodeIds"] = json!(["ghost"])), "unknown node"),
+            (mutate(&|body| body["capabilities"][0]["nodeIds"] = json!(["asks", "asks"])), "twice"),
+            (mutate(&|body| body["capabilities"][0]["nodeIds"] = json!([])), "between 1 and"),
+            (mutate(&|body| body["capabilities"] = json!([])), "must list the business capabilities"),
+            (mutate(&|body| body["capabilities"][1]["id"] = json!("cap-book")), "Duplicate capability"),
+            (mutate(&|body| body["edges"][0]["targetId"] = json!("ghost")), "dangling"),
+            (mutate(&|body| body["edges"][0]["targetId"] = json!("booking")), "containment is never a flow"),
+            (mutate(&|body| body["edges"][0]["sourceId"] = json!("booking")), "containment is never a flow"),
+            (mutate(&|body| body["nodes"][1]["parentId"] = json!("customer")), "not a journey grouping"),
+            (mutate(&|body| body["nodes"][1]["parentId"] = json!("ghost")), "unknown parent"),
+            (mutate(&|body| body["nodes"][2]["parentId"] = json!("booking")), "cannot contain itself"),
+            (mutate(&|body| { body["nodes"][2]["parentId"] = json!("inner"); body["nodes"].as_array_mut().unwrap().push(json!({ "id": "inner", "kind": "businessGroup", "label": "Inner", "parentId": "booking", "description": "", "evidenceIds": [] })); }), "Containment cycle"),
+            (mutate(&|body| body["nodes"][3]["id"] = json!("asks")), "Duplicate node"),
+            (mutate(&|body| body["edges"][1]["id"] = json!("h1")), "Duplicate edge"),
+            (mutate(&|body| body["nodes"][0]["kind"] = json!("application")), "unknown variant"),
+            (mutate(&|body| body["edges"][0]["certainty"] = json!("declared")), "unknown variant"),
+            (mutate(&|body| body["edges"][0]["relation"] = json!("calls")), "unknown field"),
+            (mutate(&|body| body["edges"][0]["evidenceIds"] = json!(["missing"])), "unknown evidence"),
+            (mutate(&|body| body["evidence"][0]["contentHash"] = json!(sha("different"))), "does not match"),
+            (mutate(&|body| body["schemaVersion"] = json!(2)), "Unsupported"),
+            (mutate(&|body| body["snapshotId"] = json!("another")), "different source snapshot"),
+            (mutate(&|body| body["purpose"] = json!("")), "Purpose"),
+            (mutate(&|body| body["purpose"] = json!("Reads src/app.ts to find bookings")), "file path"),
+            (mutate(&|body| body["nodes"][4]["label"] = json!("Calls createOrder()")), "code syntax"),
+            (mutate(&|body| body["nodes"][4]["label"] = json!("Stores order_id")), "code identifier"),
+            (mutate(&|body| body["nodes"][4]["description"] = json!("see app.ts")), "source file name"),
+            (mutate(&|body| body["edges"][2]["label"] = json!("`yes`")), "inline code"),
+            (mutate(&|body| body["capabilities"][0]["description"] = json!("lives in lib/booking")), "file path"),
+            (mutate(&|body| body["nodes"][6]["description"] = json!("https://pay.example.com/v1")), "credential"),
+            (mutate(&|body| body["nodes"][0]["label"] = json!("x".repeat(201))), "label"),
+            (mutate(&|body| body["coverage"][0]["evidenceIds"] = json!([])), "without evidence"),
+        ];
+        for (body, expected) in cases {
+            let error = check_helicopter(&fixture, body.clone()).unwrap_err();
+            assert!(error.contains(expected), "{error} for {body}");
+        }
+        let mut many = helicopter(&fixture);
+        many["nodes"] = Value::Array((0..2001).map(|n| json!({ "id": format!("n{n}"), "kind": "activity", "label": "Step", "parentId": null, "description": "", "evidenceIds": ["e1"] })).collect());
+        many["edges"] = json!([]);
+        many["capabilities"][0]["nodeIds"] = json!(["n1"]);
+        many["capabilities"][1]["nodeIds"] = json!(["n2"]);
+        assert!(check_helicopter(&fixture, many).unwrap_err().contains("At most 2000 nodes"));
+    }
+
+    #[test]
+    fn business_text_rejects_code_and_paths_but_keeps_everyday_slashes_and_parentheses() {
+        for ok in ["Pay and/or refund", "24/7 support", "Customer (or clinic) cancels", "Cancel the visit(s)", "Version 4.5 is announced.", "e.g. a late cancellation", "Wait for the clinic's reply, then continue."] {
+            assert_eq!(technical_marker(ok), None, "{ok}");
+        }
+        for (bad, kind) in [
+            ("C:\\data\\orders.csv", "a file path"), ("open ./config/app", "a file path"), ("src/booking", "a file path"), ("see notes/readme.md", "a file path"),
+            ("handlers/order.ts is used", "a file path"), ("start main.py", "a source file name"), ("uses a => b", "code syntax"), ("Order::new", "code syntax"),
+            ("order_total", "a code identifier"), ("call `run`", "inline code"),
+        ] {
+            assert_eq!(technical_marker(bad), Some(kind), "{bad}");
+        }
+    }
+
+    #[test]
+    fn helicopter_prompt_is_plain_language_evidence_bound_and_does_not_require_another_view() {
+        let context = prompt_context("C:/repo", "helicopter", SNAPSHOT, "ab", None, None, None);
+        let id = "0b1c9c7e-5a43-4c52-9c4e-444444444444";
+        let text = helicopter_prompt(&PromptFacts { request_id: id, context: &context, has_base: false });
+        for needle in [
+            "submit_helicopter", "repo_evidence", "system_overview_inspect", "Needs clarification", "businessGroup", "capabilities[", "CURRENT observed behavior",
+            "authoritative", "do not need any other overview", "never invent", "Architect analysis", id,
+        ] { assert!(text.contains(needle), "{needle}"); }
+        assert!(!text.contains("submit_system_overview"));
     }
 
     struct FakeSources { text: String, row_hash: String, session: String, live: bool, pages: usize }

@@ -171,7 +171,7 @@ export interface RequirementItem {
 }
 export interface ProjectRequirements { folder: string; items: RequirementItem[]; limitations: string[]; }
 export type ManifestStatus = "present" | "missing";
-export type VisualizationKind = "systemOverview" | "structureCurrent" | "structureProposed";
+export type VisualizationKind = "systemOverview" | "helicopter" | "structureCurrent" | "structureProposed";
 export type ProjectInsightKind = "dependencyDiscovery" | "requirements" | VisualizationKind;
 export type ProjectInsightState = "pending" | "submitted" | "completed" | "uncertain" | "failed";
 /** An Architect finding from repository files. `verified` is true only when the cited path exists inside the project. */
@@ -184,6 +184,7 @@ export type ProjectInsightResult =
   | { kind: "dependencyDiscovery"; items: DiscoveredDependency[]; searchedAreas: string[]; limitations: string[] }
   | { kind: "requirements"; items: RequirementItem[]; searchedAreas: string[]; limitations: string[] }
   | ({ kind: "systemOverview"; completedAt?: number } & SystemOverviewPayload)
+  | ({ kind: "helicopter"; completedAt?: number } & HelicopterPayload)
   | ({ kind: "structureCurrent" | "structureProposed"; completedAt?: number } & StructurePayload);
 /** The Architect session a saved request is bound to. */
 export interface InsightProducer { instanceId: string; generation: number; launchId: string; sessionId: string }
@@ -269,6 +270,15 @@ export interface SystemEdgePayload { id: string; sourceId: string; targetId: str
 export interface SystemCoveragePayload { area: string; status: "inspected" | "notFound" | "unresolved" | "excluded"; evidenceIds: string[]; notes: string }
 export interface SystemOverviewPayload {
   schemaVersion: 1; snapshotId: string; nodes: SystemNodePayload[]; edges: SystemEdgePayload[]; evidence: EvidenceRef[]; coverage: SystemCoveragePayload[]; limitations: string[];
+}
+export type HelicopterKind = "actor" | "trigger" | "activity" | "decision" | "outcome" | "externalParty" | "businessGroup";
+export type HelicopterCertainty = "inferred" | "unknown";
+export interface HelicopterNodePayload { id: string; kind: HelicopterKind; label: string; parentId: string | null; description: string; evidenceIds: string[] }
+export interface HelicopterEdgePayload { id: string; sourceId: string; targetId: string; label: string; evidenceIds: string[]; certainty: HelicopterCertainty }
+export interface HelicopterCapabilityPayload { id: string; label: string; description: string; nodeIds: string[]; evidenceIds: string[] }
+export interface HelicopterPayload {
+  schemaVersion: 1; snapshotId: string; purpose: string; nodes: HelicopterNodePayload[]; edges: HelicopterEdgePayload[];
+  capabilities: HelicopterCapabilityPayload[]; evidence: EvidenceRef[]; coverage: SystemCoveragePayload[]; limitations: string[];
 }
 export type StructureOperation = "unchanged" | "rename" | "move" | "split" | "merge" | "create" | "remove";
 export interface StructureEntryPayload { id: string; parentId: string | null; label: string; path: string | null; pattern: string | null; members: string[]; purpose: string; evidenceIds: string[] }

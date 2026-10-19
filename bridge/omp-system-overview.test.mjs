@@ -5,8 +5,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  loadInsightResultText, registerProjectInsightTools, repoEvidence, saveRepositoryStructure, saveSystemOverview,
+  TOOL_HELICOPTER, loadInsightResultText, registerProjectInsightTools, repoEvidence, saveHelicopter, saveRepositoryStructure, saveSystemOverview,
 } from './omp-project-insight.mjs';
+import { formatVisualizationResult, technicalMarker } from './omp-system-results.mjs';
 import { readTargetStructure, systemOverviewInspect } from './omp-source-snapshot.mjs';
 
 const actor = { instanceId: 'architect-fixture', generation: 7, launchId: 'launch-fixture', sessionId: 'session-fixture' };
@@ -567,5 +568,214 @@ test('project_visualization_prompt rejects invalid, mismatched, wrong-producer a
     await assert.rejects(control.promptVisualization(ctx, { ...good, requestId: fixture.requestId }), /already ended/);
     const bare = registerProjectInsightTools(pi, fixture.dir, () => actor);
     await assert.rejects(bare.promptVisualization(ctx, good), /native_prompt_unavailable/);
+  } finally { cleanup(fixture); }
+});
+
+// ---- helicopter ------------------------------------------------------------------------------------------------
+
+const helicopter = (fixture, overrides = {}) => ({
+  requestId: fixture.requestId, schemaVersion: 1, snapshotId: fixture.snapshotId, purpose: 'Lets customers book, change and cancel clinic appointments.',
+  nodes: [
+    { id: 'customer', kind: 'actor', label: 'Customer', parentId: null, description: 'Someone who wants to see the clinic', evidenceIds: ['e-app'] },
+    { id: 'asks', kind: 'trigger', label: 'Customer asks for an appointment', parentId: 'booking', description: '', evidenceIds: ['e-app'] },
+    { id: 'booking', kind: 'businessGroup', label: 'Booking an appointment', parentId: null, description: '', evidenceIds: [] },
+    { id: 'free', kind: 'decision', label: 'Is a slot free?', parentId: 'booking', description: '', evidenceIds: ['e-app'] },
+    { id: 'confirm', kind: 'activity', label: 'Clinic confirms the visit', parentId: 'booking', description: '', evidenceIds: ['e-app'] },
+    { id: 'cancelled', kind: 'outcome', label: 'Appointment is cancelled', parentId: null, description: 'Needs clarification: whether a fee applies', evidenceIds: ['e-compose'] },
+    { id: 'pay', kind: 'externalParty', label: 'Payment provider', parentId: null, description: '', evidenceIds: ['e-compose'] },
+  ],
+  edges: [
+    { id: 'h1', sourceId: 'customer', targetId: 'asks', label: '', evidenceIds: ['e-app'], certainty: 'inferred' },
+    { id: 'h2', sourceId: 'asks', targetId: 'free', label: '', evidenceIds: ['e-app'], certainty: 'inferred' },
+    { id: 'h3', sourceId: 'free', targetId: 'confirm', label: 'Yes', evidenceIds: ['e-app'], certainty: 'inferred' },
+    { id: 'h4', sourceId: 'free', targetId: 'cancelled', label: 'No', evidenceIds: [], certainty: 'unknown' },
+    { id: 'h5', sourceId: 'confirm', targetId: 'pay', label: 'Deposit is taken', evidenceIds: ['e-compose'], certainty: 'inferred' },
+  ],
+  capabilities: [
+    { id: 'cap-book', label: 'Book a visit', description: '', nodeIds: ['asks', 'free', 'confirm'], evidenceIds: ['e-app'] },
+    { id: 'cap-cancel', label: 'Cancel a visit', description: '', nodeIds: ['cancelled'], evidenceIds: ['e-compose'] },
+  ],
+  evidence: [evidenceRecord('e-app', 'src/app.ts', APP, 1, 4), evidenceRecord('e-compose', 'docker-compose.yml', COMPOSE, 2, 3)],
+  coverage: [{ area: 'src', status: 'inspected', evidenceIds: ['e-app'], notes: '' }],
+  limitations: [],
+  ...overrides,
+});
+
+test('a helicopter view is validated against the snapshot, saved as its own kind with the admitted producer and never overwritten', () => {
+  const fixture = setup('helicopter');
+  try {
+    assert.deepEqual(saveHelicopter(fixture.dir, helicopter(fixture), actor), { requestId: fixture.requestId, saved: true });
+    const saved = resultOf(fixture);
+    assert.equal(saved.kind, 'helicopter');
+    assert.equal(saved.architectSessionId, actor.sessionId);
+    assert.equal(saved.snapshotId, fixture.snapshotId);
+    assert.equal(saved.capabilities.length, 2);
+    assert.equal(saved.edges.find(edge => edge.id === 'h4').certainty, 'unknown');
+    assert.equal(saved.nodes.find(node => node.id === 'booking').kind, 'businessGroup');
+    assert.throws(() => saveHelicopter(fixture.dir, helicopter(fixture), actor), /already completed/);
+    const replay = loadInsightResultText(fixture.dir, 'helicopter', fixture.requestId);
+    assert.match(replay, /Helicopter view \(Architect analysis[\s\S]*Purpose: Lets customers[\s\S]*\[journey\] Booking an appointment[\s\S]*Is a slot free\? -> Appointment is cancelled \(No\) \[Needs clarification\][\s\S]*Business capabilities \(2\)[\s\S]*Cancel a visit/);
+    // The business replay never leaks repository paths or hashes.
+    assert.doesNotMatch(replay, /src\/app\.ts|docker-compose|[0-9a-f]{64}/);
+    assert.throws(() => loadInsightResultText(fixture.dir, 'systemOverview', fixture.requestId), /not a systemOverview request/);
+  } finally { cleanup(fixture); }
+  // Each submitter only serves its own kind, so a System result can never be stored as a Helicopter result or the reverse.
+  const wrongForHelicopter = setup('systemOverview');
+  try { rejects(() => saveHelicopter(wrongForHelicopter.dir, helicopter(wrongForHelicopter), actor), /not a helicopter request/); } finally { cleanup(wrongForHelicopter); }
+  const wrongForSystem = setup('helicopter');
+  try { rejects(() => saveSystemOverview(wrongForSystem.dir, overview(wrongForSystem), actor), /not a systemOverview request/); } finally { cleanup(wrongForSystem); }
+  const otherProducer = setup('helicopter');
+  try { rejects(() => saveHelicopter(otherProducer.dir, helicopter(otherProducer), { ...actor, sessionId: 'another' }), /different Architect/); } finally { cleanup(otherProducer); }
+});
+
+test('helicopter rules: evidence, journeys, containment, capabilities, enums and uncertainty are enforced before anything is published', () => {
+  const fixture = setup('helicopter');
+  try {
+    const bad = (mutate, pattern) => { const payload = helicopter(fixture); mutate(payload); rejects(() => saveHelicopter(fixture.dir, payload, actor), pattern); };
+    bad(payload => { payload.nodes[1].evidenceIds = []; }, /cites no evidence/);
+    bad(payload => { payload.edges[3].certainty = 'inferred'; }, /Needs clarification/);
+    bad(payload => { payload.edges[0].certainty = 'declared'; }, /certainty must be inferred or unknown/);
+    bad(payload => { payload.nodes[0].kind = 'application'; }, /kind must be one of actor, trigger/);
+    bad(payload => { payload.nodes[1].id = 'customer'; }, /duplicated/);
+    bad(payload => { payload.nodes[1].parentId = 'customer'; }, /not a journey grouping/);
+    bad(payload => { payload.nodes[1].parentId = 'ghost'; }, /unknown parent/);
+    bad(payload => { payload.nodes[2].parentId = 'booking'; }, /cannot contain itself/);
+    bad(payload => { payload.nodes[2].parentId = 'inner'; payload.nodes.push({ id: 'inner', kind: 'businessGroup', label: 'Inner', parentId: 'booking', description: '', evidenceIds: [] }); }, /containment cycle/);
+    bad(payload => { payload.edges[0].targetId = 'ghost'; }, /dangling target/);
+    bad(payload => { payload.edges[0].targetId = 'booking'; }, /containment is never a flow/);
+    bad(payload => { payload.edges[0].sourceId = 'booking'; }, /containment is never a flow/);
+    bad(payload => { payload.edges[1].id = 'h1'; }, /duplicated/);
+    bad(payload => { payload.edges[0].relation = 'calls'; }, /unknown field/);
+    bad(payload => { payload.edges[0].evidenceIds = ['nope']; }, /unknown evidence/);
+    bad(payload => { payload.capabilities = []; }, /must list the business capabilities/);
+    bad(payload => { payload.capabilities[0].nodeIds = []; }, /between 1 and 500 nodes/);
+    bad(payload => { payload.capabilities[0].nodeIds = ['ghost']; }, /unknown node/);
+    bad(payload => { payload.capabilities[0].nodeIds = ['asks', 'asks']; }, /names a node twice/);
+    bad(payload => { payload.capabilities[0].evidenceIds = []; }, /do not invent product capabilities/);
+    bad(payload => { payload.capabilities[1].id = 'cap-book'; }, /duplicated/);
+    bad(payload => { payload.purpose = ''; }, /purpose must be non-empty/);
+    bad(payload => { payload.snapshotId = randomUUID(); }, /snapshotId must be/);
+    bad(payload => { payload.schemaVersion = 2; }, /schemaVersion/);
+    bad(payload => { payload.evidence[0].contentHash = sha('other'); }, /does not match the snapshot file/);
+    bad(payload => { payload.coverage[0].evidenceIds = []; }, /without evidence/);
+    bad(payload => { payload.coverage = []; }, /coverage must account/);
+    bad(payload => { payload.nodes[0].label = 'x'.repeat(201); }, /at most 200/);
+    bad(payload => { payload.nodes = Array.from({ length: 2001 }, (_, index) => ({ id: `n${index}`, kind: 'activity', label: 'n', parentId: null, description: '', evidenceIds: ['e-app'] })); payload.edges = []; payload.capabilities[0].nodeIds = ['n1']; payload.capabilities[1].nodeIds = ['n2']; }, /at most 2000/);
+    // No node at all is acceptable only with a stated reason.
+    const empty = payload => { payload.nodes = []; payload.edges = []; payload.capabilities = []; };
+    bad(empty, /must state its limitations/);
+    bad(payload => { payload.limitations = ['x'.repeat(2001)]; }, /at most 2000/);
+    const none = helicopter(fixture, { limitations: ['Only configuration files were present.'] });
+    empty(none);
+    saveHelicopter(fixture.dir, none, actor);
+    assert.deepEqual(resultOf(fixture).nodes, []);
+  } finally { cleanup(fixture); }
+});
+
+test('helicopter business text stays plain language: code, paths, identifiers, URLs and secrets are refused everywhere it is shown', () => {
+  const fixture = setup('helicopter');
+  try {
+    const bad = (mutate, pattern) => { const payload = helicopter(fixture); mutate(payload); rejects(() => saveHelicopter(fixture.dir, payload, actor), pattern); };
+    bad(payload => { payload.purpose = 'Reads src/app.ts to find bookings'; }, /purpose looks like a file path/);
+    bad(payload => { payload.nodes[4].label = 'Calls createOrder()'; }, /label looks like code syntax/);
+    bad(payload => { payload.nodes[4].label = 'Stores order_id'; }, /code identifier/);
+    bad(payload => { payload.nodes[4].description = 'see app.ts'; }, /source file name/);
+    bad(payload => { payload.edges[2].label = '`yes`'; }, /inline code/);
+    bad(payload => { payload.capabilities[0].description = 'lives in lib/booking'; }, /file path/);
+    bad(payload => { payload.capabilities[0].label = 'C:\\data\\orders'; }, /file path/);
+    bad(payload => { payload.nodes[6].description = 'https://pay.example.com/v1/charge'; }, /raw URL/);
+    bad(payload => { payload.nodes[6].description = 'password = "hunter2hunter2"'; }, /secret or credential/);
+    // Evidence records keep the technical proof; limitations and coverage may name areas.
+    const ok = helicopter(fixture, { limitations: ['Only src/app.ts and docker-compose.yml were readable.'], coverage: [{ area: 'src/app.ts', status: 'inspected', evidenceIds: ['e-app'], notes: 'application code' }] });
+    ok.nodes[4].description = 'Pay and/or refund, 24/7 support, (or the clinic) cancels the visit(s). e.g. a late cancellation';
+    saveHelicopter(fixture.dir, ok, actor);
+  } finally { cleanup(fixture); }
+});
+
+test('technicalMarker agrees with the backend on what counts as code or a path', () => {
+  for (const ok of ['Pay and/or refund', '24/7 support', 'Customer (or clinic) cancels', 'Cancel the visit(s)', 'Version 4.5 is announced.', 'e.g. a late cancellation', "Wait for the clinic's reply, then continue."]) {
+    assert.equal(technicalMarker(ok), null, ok);
+  }
+  for (const [bad, kind] of [
+    ['C:\\data\\orders.csv', 'a file path'], ['open ./config/app', 'a file path'], ['src/booking', 'a file path'], ['see notes/readme.md', 'a file path'],
+    ['handlers/order.ts is used', 'a file path'], ['start main.py', 'a source file name'], ['uses a => b', 'code syntax'], ['Order::new', 'code syntax'],
+    ['order_total', 'a code identifier'], ['call `run`', 'inline code'],
+  ]) assert.equal(technicalMarker(bad), kind, bad);
+});
+
+test('submit_helicopter is a registered strict tool bound to the producer and its own kind, and announces the saved view', async () => {
+  const fixture = setup('helicopter');
+  try {
+    const tools = [];
+    const schema = { optional() { return this; }, nullable() { return this; } };
+    const zod = Object.fromEntries(['object', 'array', 'string', 'number', 'enum'].map(name => [name, () => schema]));
+    const enqueued = [];
+    registerProjectInsightTools({ registerTool: tool => tools.push(tool), zod }, fixture.dir, ctx => { if (!ctx.ok) throw new Error('Architect identity unavailable'); return actor; },
+      { registerKind() {}, enqueue: (_ctx, item) => enqueued.push(item) });
+    const named = name => tools.find(tool => tool.name === name);
+    assert.equal(TOOL_HELICOPTER, 'submit_helicopter');
+    assert.ok(named('submit_helicopter'));
+    assert.equal(named('submit_helicopter').approval(), 'read');
+    // Another kind's submitter cannot save into a helicopter request, an unresolved producer is a tool error.
+    assert.equal((await named('submit_system_overview').execute('id', overview(fixture), undefined, undefined, { ok: true })).isError, true);
+    assert.equal((await named('submit_repository_structure').execute('id', structure(fixture), undefined, undefined, { ok: true })).isError, true);
+    assert.equal((await named('submit_helicopter').execute('id', helicopter(fixture), undefined, undefined, { ok: false })).isError, true);
+    assert.equal(existsSync(path.join(fixture.folder, 'result.json')), false);
+    // The shared evidence/index tools serve a helicopter request exactly like the other visualizations.
+    assert.equal(JSON.parse((await named('system_overview_inspect').execute('id', { requestId: fixture.requestId, section: 'files' }, undefined, undefined, { ok: true })).content[0].text).total, 3);
+    const invalid = await named('submit_helicopter').execute('id', helicopter(fixture, { purpose: 'Opens src/app.ts' }), undefined, undefined, { ok: true });
+    assert.equal(invalid.isError, true);
+    assert.match(invalid.content[0].text, /purpose looks like a file path/);
+    const saved = await named('submit_helicopter').execute('id', helicopter(fixture), undefined, undefined, { ok: true });
+    assert.equal(saved.isError, undefined);
+    assert.equal(enqueued.length, 1);
+    assert.equal(enqueued[0].kind, 'helicopter');
+    assert.equal((await named('submit_helicopter').execute('id', helicopter(fixture), undefined, undefined, { ok: true })).isError, true);
+  } finally { cleanup(fixture); }
+  const reader = setup('helicopter');
+  try {
+    assert.equal(JSON.parse(systemOverviewInspect(reader.dir, { requestId: reader.requestId, section: 'files' }, actor)).total, 3);
+    assert.deepEqual(JSON.parse(repoEvidence(reader.dir, { requestId: reader.requestId, action: 'list' }, actor)).entries.map(entry => entry.name), ['docker-compose.yml', 'src']);
+    assert.throws(() => repoEvidence(reader.dir, { requestId: reader.requestId, action: 'list' }, { ...actor, generation: 8 }), /different Architect/);
+  } finally { cleanup(reader); }
+});
+
+test('replay formatting is exhaustive per kind: an unknown kind fails closed instead of printing a wrong layout', () => {
+  assert.throws(() => formatVisualizationResult({ kind: 'surprise', folder: 'C:/p' }, { snapshotId: 's', limitations: [] }), /no console replay for request kind "surprise"/);
+  const withHelicopter = formatVisualizationResult({ kind: 'helicopter', folder: 'C:/p' }, {
+    snapshotId: 's', purpose: 'P', nodes: [], edges: [], capabilities: [], coverage: [], limitations: ['Only configuration was readable.'],
+  });
+  assert.match(withHelicopter, /Helicopter view[\s\S]*Purpose: P[\s\S]*Limitations:\n {2}- Only configuration was readable\./);
+});
+
+test('project_visualization_prompt admits a helicopter request in the existing Architect session; its guard allows only its own submitter', async () => {
+  const fixture = setup('helicopter');
+  try {
+    const sent = [];
+    const handlers = new Map();
+    const pi = { registerTool() {}, zod: new Proxy({}, { get: () => () => ({ optional() { return this; }, nullable() { return this; } }) }), on: (name, handler) => handlers.set(name, handler) };
+    const control = registerProjectInsightTools(pi, fixture.dir, ctx => { if (!ctx.ok) throw new Error('Architect identity unavailable'); return actor; }, undefined, {
+      submitPrompt: (message, callbacks) => { sent.push(message); callbacks.onPromptAdmitted(); return new Promise(() => {}); },
+    });
+    const ctx = { ok: true, agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
+    const payload = { requestId: fixture.requestId, kind: 'helicopter', message: 'Describe the business.', source: 'human', generation: 7 };
+    // A System request id cannot be admitted as a helicopter prompt (and the reverse), so the kinds never share an admission.
+    await assert.rejects(control.promptVisualization(ctx, { ...payload, kind: 'systemOverview' }), /not a systemOverview request/);
+    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, duplicate: false });
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /^Describe the business\.\n\n\[omp-visualization-request id=/);
+    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, duplicate: true });
+    assert.equal(sent.length, 1);
+    handlers.get('before_agent_start')({ prompt: sent[0] }, ctx);
+    assert.equal(control.guard.states()[0].kind, 'helicopter');
+    assert.equal(control.guard.states()[0].state, 'active');
+    assert.equal(handlers.get('tool_call')({ toolName: 'bash', input: { command: 'ls' } }, ctx).block, true);
+    assert.equal(handlers.get('tool_call')({ toolName: 'submit_system_overview', input: { requestId: fixture.requestId } }, ctx).block, true);
+    assert.equal(handlers.get('tool_call')({ toolName: 'submit_repository_structure', input: { requestId: fixture.requestId } }, ctx).block, true);
+    assert.equal(handlers.get('tool_call')({ toolName: 'repo_evidence', input: { requestId: fixture.requestId, action: 'list' } }, ctx), undefined);
+    // The helicopter turn must be able to call ITS submitter (this fails if the guard still maps every non-System kind to the structure tool).
+    assert.equal(handlers.get('tool_call')({ toolName: 'submit_helicopter', input: { requestId: fixture.requestId } }, ctx), undefined);
+    handlers.get('tool_result')({ toolName: 'submit_helicopter', input: { requestId: fixture.requestId }, isError: false }, ctx);
+    assert.equal(control.guard.states()[0].state, 'submitted');
   } finally { cleanup(fixture); }
 });

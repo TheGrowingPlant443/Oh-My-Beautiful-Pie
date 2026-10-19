@@ -1,7 +1,7 @@
 import { SCHEMA, clean, containsSecret, list, object, openRequest, producerFields, publishResult, text, validRelativePath } from './omp-insight-base.mjs';
 import { citationContext } from './omp-source-snapshot.mjs';
 
-// Validation and storage of the three visualization results (`systemOverview`, `structureCurrent`, `structureProposed`).
+// Validation and storage of the four visualization results (`systemOverview`, `helicopter`, `structureCurrent`, `structureProposed`).
 // The Rust service is authoritative and re-validates the stored file; these checks keep a bad submission from being
 // published at all. Nothing is silently trimmed: every violation is a precise, actionable error.
 export const SYSTEM_NODE_KINDS = ['application', 'logicGroup', 'actor', 'service', 'sidecar', 'cache', 'database', 'queue', 'storage', 'external', 'entrypoint'];
@@ -145,6 +145,136 @@ const systemResult = (payload, actor, { request }) => ({
 
 export const saveSystemOverview = (dir, payload, actor) => publishResult(dir, payload, actor, 'systemOverview', validateSystemOverview, systemResult);
 
+// ---- helicopter (plain-language business flow) ----------------------------------------------------------------
+
+export const HELICOPTER_NODE_KINDS = ['actor', 'trigger', 'activity', 'decision', 'outcome', 'externalParty', 'businessGroup'];
+export const HELICOPTER_CERTAINTIES = ['inferred', 'unknown'];
+const HELICOPTER_KIND_WORDS = { actor: 'who', trigger: 'starts when', activity: 'step', decision: 'decision', outcome: 'result', externalParty: 'outside party', businessGroup: 'journey' };
+const HELICOPTER_KEYS = ['requestId', 'schemaVersion', 'snapshotId', 'purpose', 'nodes', 'edges', 'capabilities', 'evidence', 'coverage', 'limitations'];
+const MAX_CAPABILITY_NODES = 500;
+const SOURCE_EXTENSIONS = new Set(['rs', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'java', 'kt', 'go', 'cs', 'cpp', 'c', 'h', 'hpp', 'rb', 'php', 'swift', 'svelte', 'vue', 'json', 'yml', 'yaml', 'toml', 'xml', 'sql', 'sh', 'ps1', 'gradle', 'ini', 'env', 'lock', 'properties']);
+const PATH_ROOTS = ['src/', 'lib/', 'app/', 'docs/', 'test/', 'tests/', 'packages/', 'node_modules/'];
+const EDGE_PUNCTUATION = /^[.,;:!?()[\]"']+|[.,;:!?()[\]"']+$/g;
+
+/**
+ * Business-facing text carries no code: file paths, file names, call syntax and identifiers belong in evidence records,
+ * which the view hides by default. Returns what the text looks like, or null. Mirrors `technical_marker` in system_overview.rs.
+ */
+export function technicalMarker(value) {
+  if (value.includes('`')) return 'inline code';
+  if (['::', '=>', '->', '()'].some(syntax => value.includes(syntax))) return 'code syntax';
+  for (const raw of value.split(/\s+/)) {
+    const token = raw.replace(EDGE_PUNCTUATION, '');
+    if (token.length < 2) continue;
+    if (/^[A-Za-z]:[\\/]/.test(token)) return 'a file path';
+    if (token.includes('/') || token.includes('\\')) {
+      const rooted = /^[/\\]/.test(token) || token.startsWith('./') || token.startsWith('../') || token.startsWith('~/') || PATH_ROOTS.some(root => token.startsWith(root));
+      const last = token.split(/[/\\]/).pop() ?? '';
+      const dot = last.lastIndexOf('.');
+      const extension = dot >= 0 ? last.slice(dot + 1) : '';
+      if (rooted || (/^[A-Za-z0-9]{1,5}$/.test(extension) && !/^\d+$/.test(extension))) return 'a file path';
+    } else {
+      const dot = token.lastIndexOf('.');
+      if (dot > 0 && SOURCE_EXTENSIONS.has(token.slice(dot + 1).toLowerCase())) return 'a source file name';
+    }
+    if (/[\p{L}\p{N}]_[\p{L}\p{N}]/u.test(token)) return 'a code identifier';
+  }
+  return null;
+}
+
+function businessWords(value, max, label, options) {
+  words(value, max, label, options);
+  const kind = typeof value === 'string' ? technicalMarker(value) : null;
+  if (kind) throw new Error(`${label} looks like ${kind}. Describe it in plain business words and cite the repository only through evidenceIds`);
+  return value;
+}
+
+export function validateHelicopter(payload, _folder, { request, requestDir, dir }) {
+  exactKeys(payload, HELICOPTER_KEYS, 'the helicopter view');
+  common(payload, request);
+  businessWords(payload.purpose, LIMITS.description, 'purpose', { required: true });
+  const cite = citationContext(dir, requestDir, request);
+  const evidenceIds = validateEvidence(payload, cite);
+  const kinds = new Map();
+  const nodeIds = new Set();
+  boundedList(payload.nodes, LIMITS.nodes, 'nodes').forEach((node, index) => {
+    const label = `nodes[${index}]`;
+    exactKeys(node, ['id', 'kind', 'label', 'parentId', 'description', 'evidenceIds'], label);
+    identifier(node.id, `${label}.id`, nodeIds);
+    if (!HELICOPTER_NODE_KINDS.includes(node.kind)) throw new Error(`${label}.kind must be one of ${HELICOPTER_NODE_KINDS.join(', ')}`);
+    kinds.set(node.id, node.kind);
+    businessWords(node.label, LIMITS.label, `${label}.label`, { required: true });
+    businessWords(node.description, LIMITS.description, `${label}.description`);
+    if (node.parentId !== null && typeof node.parentId !== 'string') throw new Error(`${label}.parentId must be null or a journey node id`);
+    citations(node.evidenceIds, evidenceIds, label);
+    if (node.kind !== 'businessGroup' && node.evidenceIds.length === 0) throw new Error(`${label} cites no evidence; only a journey grouping may stand without it, so name what is unclear as limitations instead of inventing it`);
+  });
+  const parents = new Map(payload.nodes.map(node => [node.id, node.parentId]));
+  for (const node of payload.nodes) {
+    if (node.parentId === null) continue;
+    if (node.parentId === node.id) throw new Error(`node "${node.id}" cannot contain itself`);
+    if (!kinds.has(node.parentId)) throw new Error(`node "${node.id}" has unknown parent "${node.parentId}"`);
+    if (kinds.get(node.parentId) !== 'businessGroup') throw new Error(`node "${node.id}" sits inside "${node.parentId}", which is not a journey grouping; only a businessGroup contains other nodes`);
+  }
+  for (const node of payload.nodes) {
+    for (let step = node.parentId, count = 0; step !== null; step = parents.get(step), count++) {
+      if (step === node.id || count > parents.size) throw new Error(`node "${node.id}" is part of a containment cycle`);
+    }
+  }
+  const edgeIds = new Set();
+  boundedList(payload.edges, LIMITS.edges, 'edges').forEach((edge, index) => {
+    const label = `edges[${index}]`;
+    exactKeys(edge, ['id', 'sourceId', 'targetId', 'label', 'evidenceIds', 'certainty'], label);
+    identifier(edge.id, `${label}.id`, edgeIds);
+    for (const [side, end] of [['source', edge.sourceId], ['target', edge.targetId]]) {
+      if (!kinds.has(end)) throw new Error(`${label} has a dangling ${side} (${String(end).slice(0, 80)})`);
+      if (kinds.get(end) === 'businessGroup') throw new Error(`${label} has a journey grouping as its ${side}; a flow connects steps, containment is never a flow`);
+    }
+    businessWords(edge.label, LIMITS.label, `${label}.label`);
+    citations(edge.evidenceIds, evidenceIds, label);
+    if (!HELICOPTER_CERTAINTIES.includes(edge.certainty)) throw new Error(`${label}.certainty must be inferred or unknown`);
+    if (edge.certainty === 'inferred' && edge.evidenceIds.length === 0) throw new Error(`${label} is inferred but cites no evidence; mark it unknown (Needs clarification) instead`);
+  });
+  const capabilityIds = new Set();
+  boundedList(payload.capabilities, LIMITS.nodes, 'capabilities').forEach((capability, index) => {
+    const label = `capabilities[${index}]`;
+    exactKeys(capability, ['id', 'label', 'description', 'nodeIds', 'evidenceIds'], label);
+    identifier(capability.id, `${label}.id`, capabilityIds);
+    businessWords(capability.label, LIMITS.label, `${label}.label`, { required: true });
+    businessWords(capability.description, LIMITS.description, `${label}.description`);
+    if (!Array.isArray(capability.nodeIds) || capability.nodeIds.length === 0 || capability.nodeIds.length > MAX_CAPABILITY_NODES) throw new Error(`${label} must name between 1 and ${MAX_CAPABILITY_NODES} nodes`);
+    for (const id of capability.nodeIds) if (typeof id !== 'string' || !kinds.has(id)) throw new Error(`${label} names unknown node "${String(id).slice(0, 80)}"`);
+    if (new Set(capability.nodeIds).size !== capability.nodeIds.length) throw new Error(`${label} names a node twice`);
+    citations(capability.evidenceIds, evidenceIds, label);
+    if (capability.evidenceIds.length === 0) throw new Error(`${label} cites no evidence; do not invent product capabilities`);
+  });
+  boundedList(payload.coverage, LIMITS.coverage, 'coverage').forEach((entry, index) => {
+    const label = `coverage[${index}]`;
+    exactKeys(entry, ['area', 'status', 'evidenceIds', 'notes'], label);
+    words(entry.area, LIMITS.label, `${label}.area`, { required: true });
+    if (!COVERAGE_STATUSES.includes(entry.status)) throw new Error(`${label}.status must be one of ${COVERAGE_STATUSES.join(', ')}`);
+    words(entry.notes, LIMITS.description, `${label}.notes`);
+    citations(entry.evidenceIds, evidenceIds, label);
+    if (entry.status === 'inspected' && entry.evidenceIds.length === 0) throw new Error(`${label} is "inspected" without evidence`);
+  });
+  if (payload.coverage.length === 0) throw new Error('coverage must account for the inventoried areas (inspected, notFound, unresolved or excluded)');
+  if (payload.nodes.length === 0 && payload.limitations.length === 0) throw new Error('an empty helicopter view must state its limitations');
+  if (payload.nodes.length > 0 && payload.capabilities.length === 0) throw new Error('a helicopter view with nodes must list the business capabilities it found');
+}
+
+const helicopterResult = (payload, actor, { request }) => ({
+  requestId: payload.requestId, kind: 'helicopter', ...producerFields(actor),
+  schemaVersion: SCHEMA, snapshotId: request.snapshotId, purpose: payload.purpose,
+  nodes: payload.nodes.map(({ id, kind, label, parentId, description, evidenceIds }) => ({ id, kind, label, parentId, description, evidenceIds: [...evidenceIds] })),
+  edges: payload.edges.map(({ id, sourceId, targetId, label, evidenceIds, certainty }) => ({ id, sourceId, targetId, label, evidenceIds: [...evidenceIds], certainty })),
+  capabilities: payload.capabilities.map(({ id, label, description, nodeIds, evidenceIds }) => ({ id, label, description, nodeIds: [...nodeIds], evidenceIds: [...evidenceIds] })),
+  evidence: payload.evidence.map(({ id, path: file, lineStart, lineEnd, contentHash }) => ({ id, path: file, lineStart, lineEnd, contentHash })),
+  coverage: payload.coverage.map(({ area, status, evidenceIds, notes }) => ({ area, status, evidenceIds: [...evidenceIds], notes })),
+  limitations: [...payload.limitations], completedAt: Date.now(),
+});
+
+export const saveHelicopter = (dir, payload, actor) => publishResult(dir, payload, actor, 'helicopter', validateHelicopter, helicopterResult);
+
 // ---- repository structure --------------------------------------------------------------------------------------
 
 const STRUCTURE_KEYS = ['requestId', 'schemaVersion', 'snapshotId', 'sourceId', 'sourceHash', 'baseRequestId', 'supersedesRequestId', 'entries', 'conventions', 'mappings', 'conflicts', 'evidence', 'limitations'];
@@ -283,23 +413,39 @@ const more = (items, shown) => (items.length > shown ? [`  ... ${items.length - 
 /** Replay text of a saved visualization result (a summary: the diagram itself is shown in the app). */
 export function formatVisualizationResult(request, result) {
   const out = [];
-  if (request.kind === 'systemOverview') {
-    out.push('System overview (Architect analysis of the indexed source; not verified runtime traffic)', `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`, '');
-    const label = new Map(result.nodes.map(node => [node.id, node.label]));
-    out.push(`Elements (${result.nodes.length}):`, ...result.nodes.slice(0, LISTED).map(node => `  - [${node.kind}] ${node.label}${node.parentId ? ` (in ${label.get(node.parentId) ?? node.parentId})` : ''}`), ...more(result.nodes, LISTED));
-    out.push('', `Relationships (${result.edges.length}):`, ...result.edges.slice(0, LISTED).map(edge => `  - ${label.get(edge.sourceId) ?? edge.sourceId} -${edge.relation}-> ${label.get(edge.targetId) ?? edge.targetId} [${edge.certainty}]${edge.label ? `: ${edge.label}` : ''}`), ...more(result.edges, LISTED));
-    out.push('', `Coverage (${result.coverage.length}):`, ...result.coverage.slice(0, LISTED).map(item => `  - ${item.area}: ${item.status}${item.notes ? ` - ${item.notes}` : ''}`), ...more(result.coverage, LISTED));
-  } else {
-    out.push(request.kind === 'structureProposed'
-      ? 'Proposed repository structure (a visualization of the target Markdown; the Markdown remains the source of truth)'
-      : 'Current repository structure and naming (Architect analysis of the indexed source)', `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`);
-    if (result.sourceId) out.push(`Target document: ${result.sourceId} (sha256 ${result.sourceHash})`);
-    out.push('', `Groups (${result.entries.length}):`, ...result.entries.slice(0, LISTED).map(entry => `  - ${entry.label}${entry.path ? ` (${entry.path})` : entry.pattern ? ` (${entry.pattern})` : ''}: ${entry.purpose}`), ...more(result.entries, LISTED));
-    out.push('', `Conventions (${result.conventions.length}):`, ...result.conventions.slice(0, LISTED).map(item => `  - ${item.scope}: ${item.current}${item.proposed ? ` -> ${item.proposed}` : ''}`), ...more(result.conventions, LISTED));
-    if (request.kind === 'structureProposed') {
-      out.push('', `Mappings (${result.mappings.length}):`, ...result.mappings.slice(0, LISTED).map(item => `  - ${item.operation}: ${item.fromPaths.join(', ') || '(none)'} -> ${item.toPaths.join(', ') || '(none)'}`), ...more(result.mappings, LISTED));
-      out.push('', 'Target document conflicts:', ...(result.conflicts.length ? result.conflicts.map(item => `  - ${item}`) : ['  - none reported']));
+  switch (request.kind) {
+    case 'systemOverview': {
+      out.push('System overview (Architect analysis of the indexed source; not verified runtime traffic)', `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`, '');
+      const label = new Map(result.nodes.map(node => [node.id, node.label]));
+      out.push(`Elements (${result.nodes.length}):`, ...result.nodes.slice(0, LISTED).map(node => `  - [${node.kind}] ${node.label}${node.parentId ? ` (in ${label.get(node.parentId) ?? node.parentId})` : ''}`), ...more(result.nodes, LISTED));
+      out.push('', `Relationships (${result.edges.length}):`, ...result.edges.slice(0, LISTED).map(edge => `  - ${label.get(edge.sourceId) ?? edge.sourceId} -${edge.relation}-> ${label.get(edge.targetId) ?? edge.targetId} [${edge.certainty}]${edge.label ? `: ${edge.label}` : ''}`), ...more(result.edges, LISTED));
+      out.push('', `Coverage (${result.coverage.length}):`, ...result.coverage.slice(0, LISTED).map(item => `  - ${item.area}: ${item.status}${item.notes ? ` - ${item.notes}` : ''}`), ...more(result.coverage, LISTED));
+      break;
     }
+    case 'helicopter': {
+      out.push('Helicopter view (Architect analysis of the indexed source, in business terms; observed behavior, not verified runtime behavior)', `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`, '', `Purpose: ${result.purpose}`, '');
+      const label = new Map(result.nodes.map(node => [node.id, node.label]));
+      out.push(`Journeys, people and steps (${result.nodes.length}):`, ...result.nodes.slice(0, LISTED).map(node => `  - [${HELICOPTER_KIND_WORDS[node.kind] ?? node.kind}] ${node.label}${node.parentId ? ` (in ${label.get(node.parentId) ?? node.parentId})` : ''}`), ...more(result.nodes, LISTED));
+      out.push('', `Flow (${result.edges.length}):`, ...result.edges.slice(0, LISTED).map(edge => `  - ${label.get(edge.sourceId) ?? edge.sourceId} -> ${label.get(edge.targetId) ?? edge.targetId}${edge.label ? ` (${edge.label})` : ''}${edge.certainty === 'unknown' ? ' [Needs clarification]' : ''}`), ...more(result.edges, LISTED));
+      out.push('', `Business capabilities (${result.capabilities.length}):`, ...result.capabilities.slice(0, LISTED).map(item => `  - ${item.label}${item.description ? `: ${item.description}` : ''}`), ...more(result.capabilities, LISTED));
+      out.push('', `Coverage (${result.coverage.length}):`, ...result.coverage.slice(0, LISTED).map(item => `  - ${item.area}: ${item.status}${item.notes ? ` - ${item.notes}` : ''}`), ...more(result.coverage, LISTED));
+      break;
+    }
+    case 'structureCurrent':
+    case 'structureProposed': {
+      out.push(request.kind === 'structureProposed'
+        ? 'Proposed repository structure (a visualization of the target Markdown; the Markdown remains the source of truth)'
+        : 'Current repository structure and naming (Architect analysis of the indexed source)', `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`);
+      if (result.sourceId) out.push(`Target document: ${result.sourceId} (sha256 ${result.sourceHash})`);
+      out.push('', `Groups (${result.entries.length}):`, ...result.entries.slice(0, LISTED).map(entry => `  - ${entry.label}${entry.path ? ` (${entry.path})` : entry.pattern ? ` (${entry.pattern})` : ''}: ${entry.purpose}`), ...more(result.entries, LISTED));
+      out.push('', `Conventions (${result.conventions.length}):`, ...result.conventions.slice(0, LISTED).map(item => `  - ${item.scope}: ${item.current}${item.proposed ? ` -> ${item.proposed}` : ''}`), ...more(result.conventions, LISTED));
+      if (request.kind === 'structureProposed') {
+        out.push('', `Mappings (${result.mappings.length}):`, ...result.mappings.slice(0, LISTED).map(item => `  - ${item.operation}: ${item.fromPaths.join(', ') || '(none)'} -> ${item.toPaths.join(', ') || '(none)'}`), ...more(result.mappings, LISTED));
+        out.push('', 'Target document conflicts:', ...(result.conflicts.length ? result.conflicts.map(item => `  - ${item}`) : ['  - none reported']));
+      }
+      break;
+    }
+    default: throw new Error(`no console replay for request kind "${String(request.kind).slice(0, 80)}"`);
   }
   out.push('', 'Limitations:', ...(result.limitations.length ? result.limitations.map(item => `  - ${item}`) : ['  - none stated']));
   return out.join('\n');

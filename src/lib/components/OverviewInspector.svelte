@@ -1,12 +1,14 @@
 <script lang="ts">
   import type { EvidenceRef, NeighborRow, SourceFileRow, SourceSiteRow, SourceSymbolRow } from "../api";
   import type { Inspector, OverviewTab } from "../system-overview";
-  import { clipText, gradeProven, gradeText, type ViewEdge, type ViewNode } from "../system-graph";
+  import { clipText, edgeArrow, gradeProven, gradeText, loopText, type LoopKind, type ViewEdge, type ViewNode } from "../system-graph";
 
-  let { tab, node, edge, inspector, evidence, symbol, file, onDrillFiles, onDrillFunctions, onNeighborhood, onPeer, onMore }: {
+  let { tab, node, edge, inspector, evidence, symbol, file, loopKind = "recursion", onDrillFiles, onDrillFunctions, onNeighborhood, onPeer, onMore }: {
     tab: OverviewTab; node: ViewNode | null; edge: ViewEdge | null; inspector: Inspector | null;
     /** Evidence records of the shown Architect analysis (system tab only), by id. */
     evidence: ReadonlyMap<string, EvidenceRef>; symbol: SourceSymbolRow | null; file: SourceFileRow | null;
+    /** Graph-domain views name a node's relationship to itself a self-link, not source-code recursion. */
+    loopKind?: LoopKind;
     onDrillFiles: (paths: string[], label: string) => void; onDrillFunctions: (path: string, label: string) => void;
     onNeighborhood: (node: ViewNode) => void; onPeer: (id: string, label: string | null) => void; onMore: () => void;
   } = $props();
@@ -29,6 +31,7 @@
     <h3>Relationship</h3>
     <p><strong>{edge.relation}</strong>{edge.count > 1 ? ` × ${edge.count.toLocaleString()}` : ""}{edge.derived ? " · derived from function-level references" : ""}</p>
     <p class:proven={gradeProven(edge.grade)} class="grade">{gradeText(edge.grade)}{tab === "system" ? " · Architect analysis, not verified runtime traffic" : ""}</p>
+    {#if !edgeArrow(edge)}<p class="dim">Undirected: a mutual relationship, drawn without an arrowhead. Open the records below for the stored source and target.</p>{/if}
     {#if edge.response}<p class="dim">A response: it points back to its caller and is not a new request.</p>{/if}
     {#if edge.cycle}<p class="dim">Both ends are in the same strongly connected component.</p>{/if}
     {#if edge.label}<p>{edge.label}</p>{/if}
@@ -52,7 +55,7 @@
     {#if node.path}<p><code>{node.path}</code></p>{/if}
     {#if file}<p class="dim">{file.language ?? "no parser"} · {file.bytes.toLocaleString()} bytes · {file.status}{file.diagnostics.length ? ` · ${file.diagnostics.join("; ")}` : ""}</p>{/if}
     {#if symbol}<p class="dim">Lines {symbol.span.lineStart}–{symbol.span.lineEnd} · bytes {symbol.span.byteStart}–{symbol.span.byteEnd}{symbol.region ? ` · region ${symbol.region}` : ""}</p>{/if}
-    {#if node.selfLoops > 0}<p class="dim">↻ {node.selfLoops.toLocaleString()} recursive reference{node.selfLoops === 1 ? "" : "s"} to itself.</p>{/if}
+    {#if node.selfLoops > 0}<p class="dim">↻ {node.selfLoops.toLocaleString()} {loopText(loopKind, node.selfLoops)}{loopKind === "selfLink" ? "" : " to itself"}.</p>{/if}
     {#if node.internal > 0}<p class="dim">{node.internal.toLocaleString()} relationship{node.internal === 1 ? "" : "s"} entirely inside this group.</p>{/if}
     <div class="actions">
       {#if tab === "system" && evidencePaths.length}<button onclick={() => onDrillFiles(evidencePaths, node.label)}>Show files</button>{/if}

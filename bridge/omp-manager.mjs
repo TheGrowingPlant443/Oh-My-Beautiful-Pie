@@ -7,6 +7,7 @@ import { registerClassifyTool } from './omp-architect.mjs';
 import { installWorkspaceChanges } from './omp-workspace.mjs';
 import { registerCodeQualityTool } from './omp-code-quality.mjs';
 import { installNativeDecisions } from './omp-native-ui.mjs';
+import { installSrsBridge } from './omp-srs.mjs';
 
 const MAX_FRAME = 64 * 1024 * 1024;
 const ACTIONS = ['list','create','start','stop','restart','remove','send','interrupt','screen','transcript','plan','subagents','respond','keys','subscribe','request_human'];
@@ -123,7 +124,7 @@ export async function confirmedPlanHandoff(request, ctx, payload, signal) {
 // including The Manager and unowned workers. Manager-originated control still needs an owned instance.
 // Killing a terminal command also interrupts the agent, so it is never available to a model or a Manager.
 export function controlAllowed({ role, owner, action, source }) {
-  if (['agent_hub','terminal_kill','dependency_result','workspace_change','cancel_workspace_change','workspace_plan_prompt','project_visualization_prompt','structure_sources','structure_source_read','structure_source_select_last'].includes(action)) return source === 'human';
+  if (['agent_hub','terminal_kill','dependency_result','workspace_change','cancel_workspace_change','workspace_plan_prompt','project_visualization_prompt','structure_sources','structure_source_read','structure_source_select_last','srs_stage_prompt','srs_stage_status','srs_pause','setup_markdown_hold','setup_markdown_release'].includes(action)) return source === 'human';
   if (source === 'human') return action === 'prompt' || action === 'abort' || action === 'reply_ui';
   return role === 'instance' && !!owner;
 }
@@ -213,6 +214,7 @@ export default function managerBridge(pi) {
   let lastStopTurn;
   let lastCompleted;
   let startupShown = false;
+  let srs;
   const pending = new Map();
   const calls = new Map();
   const seen = new Set();
@@ -232,6 +234,8 @@ export default function managerBridge(pi) {
     socket.write(encoded);
   }
   function emit(kind, payload) {
+    const stage = srs?.correlation();
+    if (stage && ['agent_started', 'completed', 'turn_error', 'turn_aborted', 'ready', 'session_changed'].includes(kind)) payload = { ...payload, srs: stage };
     const event = { type: 'event', eventId: identifier(), kind, sessionId: context?.sessionManager.getSessionId(), payload };
     try { write(event); }
     catch {
@@ -252,6 +256,7 @@ export default function managerBridge(pi) {
     pending, nativeAnswer, emit,
     identity: () => ({ instanceId, generation, ...workspace.identity() }),
     opportunity: () => workspace.opportunity(),
+    srs: () => srs?.ask,
   });
   const workspace = installWorkspaceChanges(pi, {
     request, emit, role, nativeUi,
@@ -275,6 +280,7 @@ export default function managerBridge(pi) {
   if (process.env.OMP_MANAGER_HELPER_REPO) registerRepoInspectTool(pi, process.env.OMP_MANAGER_HELPER_REPO);
   // Set only for The Architect: the one tool that saves its basic/chosen dependency judgements.
   const architectTools = process.env.OMP_MANAGER_ARCHITECT_DIR ? registerClassifyTool(pi, process.env.OMP_MANAGER_ARCHITECT_DIR, { submitPrompt: (message, callbacks) => workspace.submitPrompt(message, callbacks), currentContext: () => context }) : null;
+  if (architectTools) srs = installSrsBridge(pi, { request, workspace, currentContext: () => context });
   function resolveTerminalRequests() {
     for (const item of [...pending.values()]) if (['terminal','custom'].includes(item.request.method) && item.advisory) item.finish('native', undefined);
   }
@@ -284,6 +290,7 @@ export default function managerBridge(pi) {
     if (ctx.mode !== 'tui') throw new Error('OMP compatibility: desktop bridge requires native TUI');
     terminal?.attachContext(ctx);
     workspace.attachContext(ctx);
+    srs?.attachContext(ctx);
     return true;
   }
   async function control(frame) {
@@ -306,6 +313,12 @@ export default function managerBridge(pi) {
       if (frame.action === 'workspace_change' && !workspaceChangeRole({ role, architect: !!architectTools, helper: !!process.env.OMP_MANAGER_HELPER_REPO, plan: process.env.OMP_MANAGER_PLAN_SESSION === '1' })) throw new Error('Agent working directory required');
       return workspace.control(frame.action, payload);
     }
+    if (['srs_stage_prompt', 'srs_stage_status', 'srs_pause'].includes(frame.action)) {
+      if (!srs || !architectTools) throw new Error('not_controlled');
+      return srs.control(frame.action, payload, context);
+    }
+    if (frame.action === 'setup_markdown_hold') return workspace.holdMarkdown(payload.transactionId);
+    if (frame.action === 'setup_markdown_release') return workspace.releaseMarkdown(payload.transactionId);
     if (frame.action === 'prompt') {
       if (typeof payload.message !== 'string') throw new Error('message is required');
       // A prompt typed by the human is the only app-originated input that ends a Kill process hold.
@@ -319,7 +332,7 @@ export default function managerBridge(pi) {
     if (frame.action === 'dependency_result') {
       // Display-only replay by UUID and kind from the app-owned directory; no path, text or model prompt is accepted.
       if (!architectTools) throw new Error('not_controlled');
-      if (typeof payload.requestId !== 'string' || !['security', 'usage', 'project', 'updatePlan', 'dependencyDiscovery', 'requirements', 'systemOverview', 'structureCurrent', 'structureProposed'].includes(payload.kind)) throw new Error('invalid dependency result request');
+      if (typeof payload.requestId !== 'string' || !['security', 'usage', 'project', 'updatePlan', 'dependencyDiscovery', 'requirements', 'systemOverview', 'helicopter', 'structureCurrent', 'structureProposed'].includes(payload.kind)) throw new Error('invalid dependency result request');
       architectTools.showSaved(context, payload.kind, payload.requestId, payload.replay === true);
       return { accepted: true };
     }
@@ -347,6 +360,7 @@ export default function managerBridge(pi) {
       if (frame.id === 'hello') {
         if (!frame.ok) { socket?.destroy(); return; }
         authenticated = true;
+        srs?.reconnect();
         emit('ready', identity());
         for (const event of offlineEvents.splice(0)) write(event);
         terminal?.resync();
@@ -400,6 +414,7 @@ export default function managerBridge(pi) {
     client.on('close', () => {
       if (socket === client) { authenticated = false; socket = undefined; }
       workspace.disconnected();
+      srs?.disconnected();
       for (const call of calls.values()) { context.clearTimer(call.timeout); call.reject(new Error('bridge disconnected; inspect state before retrying')); }
       calls.clear();
     });
@@ -448,7 +463,8 @@ export default function managerBridge(pi) {
     function settled() {
       if (closing || version !== completionVersion || pending.size || lastCompleted === key) return;
       // agent_end precedes final native prompt unwinding; wait for native quiescence.
-      if (!context.isIdle() || context.hasPendingMessages()) { ctx.setTimeout(settled, 50); return; }
+      if (!context.isIdle() || context.hasPendingMessages() || (srs && workspace.nativeGuardAvailable() && !workspace.quiescence().quiescent)) { ctx.setTimeout(settled, 50); return; }
+      srs?.settled();
       lastCompleted = key;
       const message = finalMessage;
       const reason = message?.stopReason;
@@ -484,6 +500,7 @@ export default function managerBridge(pi) {
     terminal?.dispose();
     disposeBrowser();
     nativeUi.dispose();
+    srs?.dispose();
     socket?.destroy();
   });
 }

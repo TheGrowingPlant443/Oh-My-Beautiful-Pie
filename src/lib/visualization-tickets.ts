@@ -14,7 +14,8 @@ export interface VisualizationTicket {
   kind: VisualizationKind;
   sourceId: string | null;
   producer: InsightProducer | null;
-  destinationTab: "system" | "structure";
+  /** Where the validated result is shown: the Helicopter or System tab, or the repository-structure area. */
+  destinationTab: "helicopter" | "system" | "structure";
   /** The revision this ticket produced (the admitted request); a different, newer revision is never substituted. */
   selectedRevisionId: string | null;
   navigationEpoch: number;

@@ -154,6 +154,7 @@ pub struct ManagerHub {
     terminals: OnceLock<Arc<TerminalService>>,
     workspace: OnceLock<Weak<crate::workspace::WorkspaceService>>,
     code_quality: OnceLock<Weak<crate::code_quality::CodeQualityService>>,
+    srs: OnceLock<Weak<crate::srs::SrsService>>,
     app: OnceLock<tauri::AppHandle>,
     decision_publication: Mutex<()>,
     ready_changed: Condvar,
@@ -210,6 +211,7 @@ impl ManagerHub {
             terminals: OnceLock::new(),
             workspace: OnceLock::new(),
             code_quality: OnceLock::new(),
+            srs: OnceLock::new(),
             app: OnceLock::new(),
             decision_publication: Mutex::new(()),
             ready_changed: Condvar::new(),
@@ -254,8 +256,69 @@ impl ManagerHub {
     pub fn install_code_quality_service(&self, service: Weak<crate::code_quality::CodeQualityService>) -> Result<()> {
         self.code_quality.set(service).map_err(|_| "code quality service already installed".into())
     }
+    pub fn install_srs_service(&self, service: Weak<crate::srs::SrsService>) -> Result<()> {
+        self.srs.set(service).map_err(|_| "SRS service already installed".into())
+    }
+    fn srs_lifecycle(&self, id: &str, generation: u64, kind: &str, payload: Value) {
+        let Some(service) = self.srs.get().and_then(Weak::upgrade) else { return };
+        let producer = (|| -> Result<DependencyProducer> {
+            let lease = self.registry()?.lease(id, Origin::Human, false)?;
+            let state = self.state.lock().map_err(|e| e.to_string())?;
+            let client = state.clients.get(id).ok_or("bridge_not_ready")?;
+            if client.role != InstanceKind::Architect || client.generation != generation { return Err("stale_generation".into()); }
+            Ok(DependencyProducer { instance_id: id.into(), generation, launch_id: launch_hash(&client.token), session_id: lease.session_id.ok_or("session_not_ready")? })
+        })();
+        if let Ok(producer) = producer { service.on_architect_lifecycle(&producer, crate::srs::SrsLifecycle { kind: kind.into(), payload }); }
+    }
+    /// Only persisted, human-started SRS jobs can authorize these captured-native controls.
+    pub(crate) fn srs_control(&self, producer: &DependencyProducer, action: &str, payload: Value) -> Result<Value> {
+        if !["srs_stage_prompt", "srs_stage_status", "srs_pause"].contains(&action) { return Err("invalid_srs_control".into()); }
+        let service = self.srs.get().and_then(Weak::upgrade).ok_or("SRS service unavailable")?;
+        service.authorize_control(producer, action, &payload)?;
+        let registry = self.registry()?;
+        let lease = registry.lease(&producer.instance_id, Origin::Human, true)?;
+        if self.dependency_producer(&producer.instance_id, producer.generation)? != *producer { return Err("stale_generation".into()); }
+        self.control(&producer.instance_id, &lease, action, payload, Origin::Human)
+    }
+    pub(crate) fn respond_srs_ask(&self, producer: &DependencyProducer, invocation: &str, response: Value) -> Result<Value> {
+        let decision = self.state.lock().map_err(|e| e.to_string())?.decisions.values()
+            .find(|d| d.worker == producer.instance_id && d.generation == producer.generation && d.base_id == invocation).cloned().ok_or("decision_already_resolved")?;
+        let target = HumanDecisionTarget { instance_id: decision.worker, request_id: decision.public_id, generation: decision.generation, session_id: decision.session_id, ownership_epoch: decision.epoch, workspace_epoch: decision.workspace_epoch };
+        self.respond_human_decision(&target, response)
+    }
     pub fn bind_app(&self, app: tauri::AppHandle) -> Result<()> {
         self.app.set(app).map_err(|_| "manager app already bound".into())
+    }
+    /// Conservatively holds every connected running app-managed OMP session at its native quiescent boundary for one
+    /// Apply transaction. No Registry/hub state lock is held across the polling sleep; any failure releases earlier holds.
+    pub(crate) fn hold_markdown_sessions(self: &Arc<Self>, registry: &Arc<Registry>, transaction_id: &str) -> Result<Box<dyn Send>> {
+        let mut guard = MarkdownHold { hub: self.clone(), transaction_id: transaction_id.into(), held: Vec::new() };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
+        let targets: Vec<String> = registry.snapshot().into_iter().filter(|row| row.status == "running" || row.status == "starting").map(|row| row.id).collect();
+        for id in targets {
+            loop {
+                if self.closing.load(Ordering::Relaxed) { return Err("manager bridge closed".into()); }
+                match self.connection(&id, true) {
+                    Ok(_) => {}
+                    // Not connected, so no native session can read instructions through this bridge.
+                    Err(_) => break,
+                }
+                let lease = match registry.lease(&id, Origin::Human, true) { Ok(lease) => lease, Err(_) => break };
+                match self.control(&id, &lease, "setup_markdown_hold", json!({"transactionId": transaction_id}), Origin::Human) {
+                    Ok(_) => { guard.held.push((id.clone(), lease)); break; }
+                    Err(error) if error.contains("native_session_busy") => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err("native_session_busy: an app-managed OMP session did not reach a quiet boundary in ten minutes; nothing was applied".into());
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    // A session that stopped between listing and holding is no longer a reader.
+                    Err(error) if error == "bridge_not_ready" || error == "stale_generation" => break,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(Box::new(guard))
     }
     fn decision_repository(&self, registry: &Registry, id: &str) -> Result<DecisionRepository> {
         let own = registry.workspace_metadata(id)?.definition;
@@ -456,6 +519,7 @@ impl ManagerHub {
         })
     }
     pub fn invalidate(&self, id: &str, generation: u64) {
+        self.srs_lifecycle(id, generation, "disconnect", Value::Null);
         let stream = {
             let Ok(mut state) = self.state.lock() else {
                 return;
@@ -499,6 +563,7 @@ impl ManagerHub {
         self.publish_human_decisions();
     }
     pub fn shutdown(&self) {
+        if let Some(service) = self.srs.get().and_then(Weak::upgrade) { service.shutdown(); }
         self.closing.store(true, Ordering::Relaxed);
         let streams = {
             let Ok(mut state) = self.state.lock() else {
@@ -680,6 +745,7 @@ impl ManagerHub {
             current
         };
         if current {
+            self.srs_lifecycle(&actor.id, actor.generation, "disconnect", Value::Null);
             if let Ok(registry) = self.registry() {
                 registry.set_bridge_ready(&actor.id, actor.generation, false);
             }
@@ -906,6 +972,13 @@ impl ManagerHub {
         let kind = text(frame, "kind")?;
         let payload = &frame["payload"];
         let registry = self.registry()?;
+        if actor.role == InstanceKind::Architect {
+            let lifecycle = if kind == "session_changed" {
+                let old = registry.lease(&actor.id, Origin::Human, false)?.session_id;
+                if payload["sessionId"].as_str() == old.as_deref() { "ready" } else { "session_changed" }
+            } else { kind };
+            self.srs_lifecycle(&actor.id, actor.generation, lifecycle, payload.clone());
+        }
         if registry.lease(&actor.id, Origin::Human, false)?.generation != actor.generation {
             return Err("stale_generation".into());
         }
@@ -994,7 +1067,16 @@ impl ManagerHub {
             payload.get("workspaceEpoch").is_some_and(|epoch| epoch.as_u64() != Some(lease.workspace_epoch)) {
             return Err("stale_generation".into());
         }
-        let repository = self.decision_repository(&registry, &actor.id)?;
+        let mut repository = self.decision_repository(&registry, &actor.id)?;
+        if actor.role == InstanceKind::Architect && payload["method"] == "askDialog" {
+            if let Some(service) = self.srs.get().and_then(Weak::upgrade) {
+                let producer = self.dependency_producer(&actor.id, actor.generation)?;
+                if let Some(folder) = service.native_question_repository(&producer, base)? {
+                    let label = std::path::Path::new(&folder).file_name().and_then(|name| name.to_str()).unwrap_or(&folder).to_owned();
+                    repository = DecisionRepository { folder: Some(folder), label, scope: "repository" };
+                }
+            }
+        }
         let decision = {
             let mut state = self.state.lock().map_err(|e| e.to_string())?;
             if state.decisions.values().any(|d| {
@@ -1164,7 +1246,7 @@ impl ManagerHub {
     /// Display-only: the bridge reads the saved app-owned result by UUID/kind and prints it when Architect is idle.
     /// No path, text or model prompt is accepted.
     pub fn show_dependency_result(&self, architect_id: &str, generation: u64, request_id: &str, kind: &str, replay: bool) -> Result<()> {
-        if !["security", "usage", "project", "updatePlan", "dependencyDiscovery", "requirements", "systemOverview", "structureCurrent", "structureProposed"].contains(&kind) || uuid::Uuid::parse_str(request_id).map(|id| id.to_string() != request_id).unwrap_or(true) {
+        if !["security", "usage", "project", "updatePlan", "dependencyDiscovery", "requirements", "systemOverview", "helicopter", "structureCurrent", "structureProposed"].contains(&kind) || uuid::Uuid::parse_str(request_id).map(|id| id.to_string() != request_id).unwrap_or(true) {
             return Err("Invalid dependency result request".into());
         }
         let registry = self.registry()?;
@@ -1185,6 +1267,9 @@ impl ManagerHub {
         let lease = registry.lease(id, Origin::Human, true)?;
         if lease.generation != generation {
             return Err("stale_generation".into());
+        }
+        if self.srs.get().and_then(Weak::upgrade).is_some_and(|s| s.has_active_generation(id)) {
+            return Err("srs_active: Pause SRS and continue before generating another overview analysis.".into());
         }
         if registry.inspect(id, Origin::Human)?.kind != InstanceKind::Architect {
             return Err("The Architect is no longer available".into());
@@ -1320,6 +1405,12 @@ impl ManagerHub {
         }
         let action = text(frame, "action")?;
         let p = &frame["payload"];
+        if matches!(action, "srs_tool" | "srs_ask_map" | "srs_ask_receipt" | "srs_ask_retired" | "srs_stage_admitted" | "srs_stage_validate" | "srs_stage_yielded") {
+            if actor.role != InstanceKind::Architect { return Err("unauthorized".into()); }
+            let producer = self.dependency_producer(&actor.id, actor.generation)?;
+            let service = self.srs.get().and_then(Weak::upgrade).ok_or("SRS service unavailable")?;
+            return service.handle_bridge(&producer, action, p.clone());
+        }
         if matches!(action, "workspace_begin" | "workspace_ready" | "workspace_complete" | "workspace_failed" | "workspace_reconcile") {
             if !registry.workspace_metadata(&actor.id).is_ok_and(|m| crate::instance::may_change_directory(&m.definition)) { return Err("unauthorized".into()); }
             let service = self.workspace.get().and_then(Weak::upgrade).ok_or("workspace service unavailable")?;
@@ -2095,5 +2186,28 @@ mod tests {
         hub.shutdown();
         drop(service);
         std::fs::remove_dir_all(folder).unwrap();
+    }
+}
+
+struct MarkdownHold {
+    hub: Arc<ManagerHub>,
+    transaction_id: String,
+    held: Vec<(String, ControlLease)>,
+}
+impl Drop for MarkdownHold {
+    fn drop(&mut self) {
+        for (id, lease) in self.held.drain(..) {
+            let _ = self.hub.control(&id, &lease, "setup_markdown_release", json!({"transactionId": self.transaction_id}), Origin::Human);
+        }
+    }
+}
+
+/// Adapter installed once into the Markdown service; fails closed when the hub is unavailable.
+pub struct HubMarkdownBoundary(pub Weak<Registry>);
+impl crate::agent_markdown::MarkdownBoundary for HubMarkdownBoundary {
+    fn hold(&self, transaction_id: &str, _target: &crate::agent_markdown::KnowledgeAssetTarget) -> Result<Box<dyn Send>> {
+        let registry = self.0.upgrade().ok_or("registry unavailable")?;
+        let hub = registry.manager_hub().ok_or("manager bridge not initialized")?;
+        hub.hold_markdown_sessions(&registry, transaction_id)
     }
 }

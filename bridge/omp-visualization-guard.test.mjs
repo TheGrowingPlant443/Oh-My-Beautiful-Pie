@@ -147,15 +147,37 @@ test('a queued visualization prompt survives the end of unrelated work and a dro
   assert.equal(second.states().length, 0);
 });
 
-test('a new turn without the nonce ends a finished visualization guard; an unfinished sibling stays pending', () => {
+test('a new human turn without the nonce ends a finished visualization guard at the provider barrier; an unfinished sibling stays pending', async () => {
   const guard = createVisualizationGuard();
   const { ctx } = fakeContext();
   guard.beforeAgentStart({ prompt: admit(guard, ctx) }, ctx);
   const queued = admit(guard, ctx, STRUCTURE, 'structureCurrent');
   guard.beforeAgentStart({ prompt: 'the user asks something else' }, ctx);
+  assert.equal(call(guard, ctx, 'bash', { command: 'ls' }).block, true, 'uncertain provenance is closed until the provider barrier decides');
+  await guard.beforeModelCall(ctx, { messages: [{ role: 'user', content: 'the user asks something else', timestamp: 10 }] });
   assert.deepEqual(guard.states(), [{ requestId: STRUCTURE, kind: 'structureCurrent', state: 'pending' }]);
   assert.ok(queued);
   assert.equal(call(guard, ctx, 'bash', { command: 'ls' }), undefined);
+});
+
+test('a native automatic compaction continuation keeps the visualization restrictions and an unknown one fails closed', async () => {
+  const guard = createVisualizationGuard();
+  const { ctx } = fakeContext();
+  guard.beforeAgentStart({ prompt: admit(guard, ctx) }, ctx);
+  assert.match(guard.compacting({}, ctx).context[0], /read-only systemOverview request/);
+  guard.agentEnd({ willContinue: true }, ctx);
+  guard.beforeAgentStart({ prompt: 'Resume the user\'s latest intent.' }, ctx);
+  assert.equal(call(guard, ctx, 'bash', {}).block, true);
+  await guard.beforeModelCall(ctx, { messages: [{ role: 'user', content: 'summary', timestamp: 1 }, { role: 'developer', synthetic: true, attribution: 'agent', content: 'Resume' }] });
+  assert.equal(guard.states()[0].state, 'active');
+  assert.equal(call(guard, ctx, 'bash', { command: 'ls' }).block, true, 'compaction did not release the guard');
+  assert.equal(call(guard, ctx, TOOLS.systemSubmit, { requestId: SYSTEM }), undefined);
+  // An unlabelled continuation never becomes unrestricted: the provider call is refused.
+  const unknown = createVisualizationGuard();
+  unknown.beforeAgentStart({ prompt: admit(unknown, ctx) }, ctx);
+  unknown.beforeAgentStart({ prompt: 'something unattributed' }, ctx);
+  await assert.rejects(unknown.beforeModelCall(ctx, { messages: [{ role: 'assistant', content: 'x' }] }), /continuation_uncertain/);
+  assert.equal(call(unknown, ctx, 'bash', {}).block, true);
 });
 
 test('two prompts batched into one turn share the turn and each keeps its own submitter', () => {
@@ -220,7 +242,7 @@ test('discard removes a refused prompt guard so a retry is a fresh admission', (
 test('registration wires the native hooks and enforcement flows through them', async () => {
   const handlers = new Map();
   const guard = registerVisualizationGuard({ on: (name, handler) => handlers.set(name, handler) });
-  assert.deepEqual([...handlers.keys()].sort(), ['agent_end', 'before_agent_start', 'context', 'session_shutdown', 'session_switch', 'tool_call', 'tool_result']);
+  assert.deepEqual([...handlers.keys()].sort(), ['agent_end', 'before_agent_start', 'context', 'session.compacting', 'session_compact', 'session_shutdown', 'session_switch', 'tool_call', 'tool_result']);
   const { ctx } = fakeContext();
   const text = admit(guard, ctx);
   await handlers.get('before_agent_start')({ prompt: text }, ctx);

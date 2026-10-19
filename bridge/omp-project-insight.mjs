@@ -5,13 +5,13 @@ import {
   nullableText, object, openRequest, producerFields, publishResult, readBoundedJson, readEvidence, requestFolder, stat, text, textList, validRelativePath,
 } from './omp-insight-base.mjs';
 import { readTargetStructure, snapshotReference, systemOverviewInspect, visualizationEvidence } from './omp-source-snapshot.mjs';
-import { CERTAINTIES, COVERAGE_STATUSES, MAPPING_OPERATIONS, SYSTEM_NODE_KINDS, SYSTEM_RELATIONS, formatVisualizationResult, saveRepositoryStructure, saveSystemOverview } from './omp-system-results.mjs';
+import { CERTAINTIES, COVERAGE_STATUSES, HELICOPTER_CERTAINTIES, HELICOPTER_NODE_KINDS, MAPPING_OPERATIONS, SYSTEM_NODE_KINDS, SYSTEM_RELATIONS, formatVisualizationResult, saveHelicopter, saveRepositoryStructure, saveSystemOverview } from './omp-system-results.mjs';
 import { MAX_PROMPT_BYTES, TOOLS, createVisualizationGuard, registerVisualizationGuard } from './omp-visualization-guard.mjs';
 
 export { KINDS, MAX_LIST_ENTRIES, MAX_READ_BYTES, containsSecret, evidenceExcluded, insightRoot, validRelativePath };
 
 // Architect-only project-insight tools: a read-only, request-bound repository evidence reader and the producer-bound
-// result submissions (dependencyDiscovery, requirements, systemOverview, structureCurrent, structureProposed). `dir` is
+// result submissions (dependencyDiscovery, requirements, systemOverview, helicopter, structureCurrent, structureProposed). `dir` is
 // OMP_MANAGER_ARCHITECT_DIR; the request directories live in its sibling `project-insight/`. No tool argument is ever a
 // folder, an absolute path or a directory name other than a validated request id, and nothing here executes, installs,
 // writes into the project or reads the network. Shared primitives live in omp-insight-base.mjs; the visualization
@@ -21,6 +21,7 @@ export const TOOL_DISCOVERY = 'submit_dependency_discovery';
 export const TOOL_REQUIREMENTS = 'submit_requirements_findings';
 export const TOOL_SYSTEM_INSPECT = TOOLS.inspect;
 export const TOOL_SYSTEM_OVERVIEW = TOOLS.systemSubmit;
+export const TOOL_HELICOPTER = 'submit_helicopter';
 export const TOOL_STRUCTURE = TOOLS.structureSubmit;
 export const TOOL_TARGET = TOOLS.target;
 
@@ -118,7 +119,7 @@ const requirementsResult = (payload, actor) => ({
 // `dir` comes only from OMP_MANAGER_ARCHITECT_DIR. Results are published exclusively and never overwritten (see publishResult).
 export const saveDependencyDiscovery = (dir, payload, actor) => publishResult(dir, payload, actor, 'dependencyDiscovery', validateDiscovery, discoveryResult);
 export const saveRequirementsFindings = (dir, payload, actor) => publishResult(dir, payload, actor, 'requirements', validateRequirements, requirementsResult);
-export { saveRepositoryStructure, saveSystemOverview };
+export { saveHelicopter, saveRepositoryStructure, saveSystemOverview };
 
 // ---- console replay --------------------------------------------------------------------------------------------
 
@@ -126,6 +127,7 @@ const bullets = items => items.map(item => `  - ${item}`);
 
 export function formatInsightResult(request, result) {
   if (VISUALIZATION_KINDS.includes(request.kind)) return formatVisualizationResult(request, result);
+  if (request.kind !== 'dependencyDiscovery' && request.kind !== 'requirements') throw new Error(`no console replay for request kind "${String(request.kind).slice(0, 80)}"`);
   const header = request.kind === 'dependencyDiscovery'
     ? `Dependency discovery (Architect findings from repository files; nothing was installed or changed)\nProject: ${request.folder}`
     : `Project requirements findings (Architect findings, unverified; the app's own detections are separate)\nProject: ${request.folder}`;
@@ -177,7 +179,7 @@ export function registerProjectInsightTools(pi, dir, producerFor, resultConsole,
     name: TOOL_EVIDENCE,
     label: 'Read Repository Evidence',
     loadMode: 'essential',
-    description: 'Read-only access to the repository named by the app request (pass its requestId). action "list" shows one directory (path empty for the repository root; pages of 200 entries, continue with nextOffset passed as offset); action "read" returns up to 64 KiB of one text file from the byte offset, with nextOffset to continue. System overview and Repository structure requests read the immutable indexed snapshot (reads also report sha256, lineStart/lineEnd and totalLines for citations; credential-looking lines are redacted). Links, .git, dependency and build-output directories and secret files (.env*, keys, certificates) are never available. Nothing is executed. This is the only way to inspect the repository for a project-insight request.',
+    description: 'Read-only access to the repository named by the app request (pass its requestId). action "list" shows one directory (path empty for the repository root; pages of 200 entries, continue with nextOffset passed as offset); action "read" returns up to 64 KiB of one text file from the byte offset, with nextOffset to continue. System overview, Helicopter and Repository structure requests read the immutable indexed snapshot (reads also report sha256, lineStart/lineEnd and totalLines for citations; credential-looking lines are redacted). Links, .git, dependency and build-output directories and secret files (.env*, keys, certificates) are never available. Nothing is executed. This is the only way to inspect the repository for a project-insight request.',
     parameters: z.object({ requestId: z.string(), action: z.enum(['list', 'read']), path: z.string().optional(), offset: z.number().optional() }),
     approval: () => 'read',
     async execute(_id, params, signal, _update, ctx) {
@@ -237,7 +239,7 @@ export function registerProjectInsightTools(pi, dir, producerFor, resultConsole,
     name: TOOL_SYSTEM_INSPECT,
     label: 'Inspect Source Index',
     loadMode: 'essential',
-    description: 'Read-only, paged queries over the saved source index of the snapshot bound to a System overview or Repository structure request (pass its requestId; the app supplies the snapshot, never a path). section "inventory": directory children (id = directory path, empty for the root; the first page also carries totals by language and parse status); "coverage": files that are not fully parsed plus per-language coverage and limitations; "files": all files, or with id (file id or path) that file\'s declarations; "symbols": all declarations, or with id one declaration\'s call sites; "neighbors": id of a file or declaration -> in/out edges with their evidence sites plus its unresolved sites. offset/limit (1-200) page every result (at most 1 MiB). The index records static facts only; an unresolved or dynamic site is not proof that no connection exists, and nothing here verifies runtime behaviour.',
+    description: 'Read-only, paged queries over the saved source index of the snapshot bound to a System overview, Helicopter or Repository structure request (pass its requestId; the app supplies the snapshot, never a path). section "inventory": directory children (id = directory path, empty for the root; the first page also carries totals by language and parse status); "coverage": files that are not fully parsed plus per-language coverage and limitations; "files": all files, or with id (file id or path) that file\'s declarations; "symbols": all declarations, or with id one declaration\'s call sites; "neighbors": id of a file or declaration -> in/out edges with their evidence sites plus its unresolved sites. offset/limit (1-200) page every result (at most 1 MiB). The index records static facts only; an unresolved or dynamic site is not proof that no connection exists, and nothing here verifies runtime behaviour.',
     parameters: z.object({ requestId: z.string(), section: z.enum(['inventory', 'coverage', 'files', 'symbols', 'neighbors']), id: z.string().optional(), offset: z.number().optional(), limit: z.number().optional() }),
     approval: () => 'read',
     async execute(_id, params, signal, _update, ctx) {
@@ -280,6 +282,30 @@ export function registerProjectInsightTools(pi, dir, producerFor, resultConsole,
         const saved = saveSystemOverview(dir, params, producerFor(ctx));
         announce(ctx, 'systemOverview', saved.requestId);
         return ok(`Saved system overview ${saved.requestId}.`);
+      } catch (error) { return failure(error); }
+    },
+  });
+  pi.registerTool({
+    name: TOOL_HELICOPTER,
+    label: 'Submit Helicopter View',
+    loadMode: 'essential',
+    description: 'Save the plain-language BUSINESS-FLOW view for the exact app requestId (schemaVersion 1; snapshotId exactly as in the request), written for readers who do not program. purpose: one or two plain sentences. nodes {id,kind,label<=200,parentId|null,description<=2000,evidenceIds}: kinds actor (who is involved), trigger (what starts a journey), activity (a business step), decision (a choice), outcome (how a journey ends), externalParty (an outside party), businessGroup (a journey grouping; the only kind that may contain other nodes, never an edge endpoint). edges {id,sourceId,targetId,label,evidenceIds,certainty}: a flow between steps (label a decision\'s answer, e.g. "Yes"), certainty "inferred" (REQUIRES evidence) or "unknown" (shown as Needs clarification; use it instead of guessing). capabilities {id,label,description,nodeIds,evidenceIds}: EVERY business capability you identified, each citing evidence and naming the nodes that realize it. Every node except a businessGroup must cite evidence; never invent capabilities, actors or steps. No file paths, file or function names, code, protocols, framework names or infrastructure in purpose, labels or descriptions (they are rejected): technical proof belongs only in evidence {id,path,lineStart,lineEnd,contentHash} with the whole-file sha256 repo_evidence returned. coverage {area,status inspected|notFound|unresolved|excluded,evidenceIds,notes} must account for every inventoried area. No raw URLs or credentials. Describe observed current behavior only, not redesigns. Limits: 2000 nodes, 5000 edges, 2000 capabilities, 2000 evidence records, 8 MiB. Nothing is trimmed; violations are rejected. Terminal prose alone does not submit it.',
+    parameters: z.object({
+      requestId: z.string(), schemaVersion: z.number(), snapshotId: z.string(), purpose: z.string(),
+      nodes: z.array(z.object({ id: z.string(), kind: z.enum(HELICOPTER_NODE_KINDS), label: z.string(), parentId: z.string().nullable(), description: z.string(), evidenceIds: z.array(z.string()) })),
+      edges: z.array(z.object({ id: z.string(), sourceId: z.string(), targetId: z.string(), label: z.string(), evidenceIds: z.array(z.string()), certainty: z.enum(HELICOPTER_CERTAINTIES) })),
+      capabilities: z.array(z.object({ id: z.string(), label: z.string(), description: z.string(), nodeIds: z.array(z.string()), evidenceIds: z.array(z.string()) })),
+      evidence: z.array(evidenceRecord),
+      coverage: z.array(z.object({ area: z.string(), status: z.enum(COVERAGE_STATUSES), evidenceIds: z.array(z.string()), notes: z.string() })),
+      limitations: z.array(z.string()),
+    }),
+    approval: () => 'read',
+    async execute(_id, params, signal, _update, ctx) {
+      if (signal?.aborted) throw signal.reason;
+      try {
+        const saved = saveHelicopter(dir, params, producerFor(ctx));
+        announce(ctx, 'helicopter', saved.requestId);
+        return ok(`Saved helicopter view ${saved.requestId}.`);
       } catch (error) { return failure(error); }
     },
   });

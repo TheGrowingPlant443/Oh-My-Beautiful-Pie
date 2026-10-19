@@ -1,0 +1,2 @@
+# Vendored upstream SRS template: byte-for-byte as pinned (hashes recorded in REVISION); never normalise line endings.
+resources/srs-template/* -text

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent_markdown;
 mod architect;
 mod browser;
 #[cfg(windows)]
@@ -28,6 +29,8 @@ mod project_insight;
 mod project_requirements;
 mod session;
 mod setup;
+mod knowledge;
+mod srs;
 mod source_index;
 mod system_overview;
 mod terminal;
@@ -57,7 +60,10 @@ pub struct AppState {
     pub dependency_project_review: Arc<dependency_project_review::DependencyProjectReviewService>,
     pub dependency_updates: Arc<dependency_updates::DependencyUpdateService>,
     pub project_insight: Arc<project_insight::ProjectInsightService>,
+    pub knowledge: Arc<knowledge::KnowledgeService>,
     pub source_index: Arc<source_index::SourceIndexService>,
+    pub agent_markdown: Arc<agent_markdown::AgentMarkdownService>,
+    pub srs: Arc<srs::SrsService>,
     pub inhouse: Arc<inhouse::InhouseService>,
     #[cfg(windows)]
     pub browser_host: Arc<browser_window::BrowserHost>,
@@ -144,10 +150,26 @@ fn main() {
             let source_index = source_index::SourceIndexService::new(folder.clone());
             let project_insight = Arc::new(project_insight::ProjectInsightService::new(folder.clone()));
             project_insight.bind_source_facts(source_index.clone());
+            let knowledge = knowledge::KnowledgeService::new(folder.clone(), registry.home.clone());
+            let setup_service = Arc::new(setup::SetupService::new(folder.clone()));
+            let agent_markdown = agent_markdown::AgentMarkdownService::new(registry.config_root().to_path_buf(), knowledge.clone());
+            setup_service.install_markdown(agent_markdown.clone()).map_err(std::io::Error::other)?;
+            let srs = srs::SrsService::new(folder.clone(), knowledge.clone());
+            {
+                use tauri::Emitter;
+                let handle = app.handle().clone();
+                srs.set_notifier(Box::new(move |status| { let _ = handle.emit("srs_job", status); })).map_err(std::io::Error::other)?;
+            }
+            srs.bind_registry(Arc::downgrade(&registry)).map_err(std::io::Error::other)?;
+            hub.install_srs_service(Arc::downgrade(&srs)).map_err(std::io::Error::other)?;
+            agent_markdown.install_boundary(Arc::new(manager::HubMarkdownBoundary(Arc::downgrade(&registry)))).map_err(std::io::Error::other)?;
             app.manage(AppState {
                 registry,
                 workspace,
                 closing,
+                knowledge,
+                agent_markdown,
+                srs,
                 browser: browser.clone(),
                 code_diff: Arc::new(code_diff::DiffService::new()),
                 code_quality,
@@ -162,7 +184,7 @@ fn main() {
                 inhouse,
                 #[cfg(windows)]
                 browser_host: browser_host.clone(),
-                setup: Arc::new(setup::SetupService::new(folder)),
+                setup: setup_service,
                 plan: Arc::new(plan::PlanService::new()),
                 helpers: Arc::new(helper_agent::HelperService::new()),
             });
@@ -303,6 +325,44 @@ fn main() {
             commands::attach_user_terminal,
             commands::write_user_terminal,
             commands::resize_user_terminal,
+            commands::get_knowledge_capabilities,
+            commands::list_knowledge_vaults,
+            commands::prepare_knowledge_vault,
+            commands::confirm_knowledge_vault,
+            commands::open_knowledge_note,
+            commands::open_obsidian_vault_manager,
+            commands::open_knowledge_link,
+            commands::open_obsidian_download,
+            commands::record_obsidian_decline,
+            commands::configure_obsidian_executable,
+            commands::list_vault_entries,
+            commands::read_vault_document,
+            commands::query_vault_links,
+            commands::refresh_vault_index,
+            commands::open_graphify_artifact,
+            commands::register_graphify_output,
+            commands::read_graphify_graph,
+            commands::query_graphify_graph,
+            commands::configure_cognee_ui,
+            commands::open_cognee_ui,
+            commands::get_agent_markdown_status,
+            commands::prepare_agent_markdown_import,
+            commands::confirm_agent_markdown_import,
+            commands::prepare_agent_markdown_apply,
+            commands::check_graphify_artifact,
+            commands::prepare_srs_scope,
+            commands::start_srs,
+            commands::get_srs_job,
+            commands::list_srs_jobs,
+            commands::pause_srs,
+            commands::cancel_srs,
+            commands::prepare_srs_resume,
+            commands::resume_srs,
+            commands::dispose_srs_item,
+            commands::query_srs_job,
+            commands::open_srs_documents,
+            commands::rebind_srs_vault,
+            commands::apply_agent_markdown,
             commands::close_user_terminal,
         ])
         .build(tauri::generate_context!())
@@ -314,9 +374,11 @@ fn main() {
                 api.prevent_exit();
                 let registry = state.registry.clone();
                 let quality = state.code_quality.clone();
+                let srs = state.srs.clone();
                 let workspace = state.workspace.clone();
                 let handle = handle.clone();
                 std::thread::spawn(move || {
+                    srs.shutdown();
                     workspace.shutdown();
                     quality.shutdown();
                     registry.shutdown();

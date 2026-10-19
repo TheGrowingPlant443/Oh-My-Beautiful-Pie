@@ -4,11 +4,11 @@
   import "@xyflow/svelte/dist/style.css";
   import type { Camera } from "../system-overview";
   import type { OverviewFlowEdge, OverviewFlowNode } from "../overview-flow";
-  import { edgeDashed, gradeText, NODE_H, NODE_W, relationColor, type Projection } from "../system-graph";
+  import { edgeArrow, edgeDashed, gradeText, NODE_H, NODE_W, relationColor, type Projection } from "../system-graph";
   import OverviewNode from "./OverviewNode.svelte";
 
-  let { projection, selectedNode, selectedEdge, matched, camera, onSelectNode, onSelectEdge, onToggle, onCamera }: {
-    projection: Projection; selectedNode: string | null; selectedEdge: string | null; matched: ReadonlySet<string>; camera: Camera | null;
+  let { projection, selectedNode, selectedEdge, matched, camera, label = "System overview diagram", onSelectNode, onSelectEdge, onToggle, onCamera }: {
+    projection: Projection; selectedNode: string | null; selectedEdge: string | null; matched: ReadonlySet<string>; camera: Camera | null; label?: string;
     onSelectNode: (id: string | null) => void; onSelectEdge: (id: string | null) => void; onToggle: (id: string) => void; onCamera: (camera: Camera) => void;
   } = $props();
   const nodeTypes: NodeTypes = { overview: OverviewNode };
@@ -20,7 +20,7 @@
   $effect(() => {
     nodes = projection.nodes.map((view): OverviewFlowNode => ({
       id: view.id, type: "overview", position: { x: view.x, y: view.y }, width: NODE_W, height: NODE_H, draggable: false, connectable: false,
-      selected: view.id === selectedNode, data: { view, matched: matched.has(view.id), onToggle },
+      selected: view.id === selectedNode, data: { view, matched: matched.has(view.id), onToggle, loopKind: projection.loopKind },
     }));
   });
   $effect(() => {
@@ -32,15 +32,15 @@
         id: edge.id, source: edge.source, target: edge.target, type: "smoothstep", selectable: false, focusable: true, interactionWidth: 18,
         label: `${edge.relation}${edge.count > 1 ? ` ×${edge.count.toLocaleString()}` : ""}${edge.derived ? " (from calls)" : ""}${edge.cycle ? " ↺" : ""}`,
         labelStyle: "font-size:10px",
-        ariaLabel: `${edge.relation} from ${edge.source} to ${edge.target}, ${gradeText(edge.grade)}`,
-        markerEnd: { type: MarkerType.ArrowClosed, color },
+        ariaLabel: `${edge.relation} ${edgeArrow(edge) ? "from" : "between"} ${edge.source} ${edgeArrow(edge) ? "to" : "and"} ${edge.target}, ${gradeText(edge.grade)}`,
+        ...(edgeArrow(edge) ? { markerEnd: { type: MarkerType.ArrowClosed, color } } : {}),
         style: `stroke:${color};stroke-width:${width};stroke-dasharray:${edgeDashed(edge) ? "6 4" : "none"};opacity:${edge.response ? 0.75 : 1}`,
         data: { edge },
       };
     });
   });
 </script>
-<div class="flow" role="application" aria-label="System overview diagram">
+<div class="flow" role="application" aria-label={label}>
   {#key signature}
     <SvelteFlow bind:nodes bind:edges {nodeTypes} colorMode="dark" fitView={!camera} fitViewOptions={{ maxZoom: 1, padding: 0.12 }}
       initialViewport={camera ? { x: camera.x, y: camera.y, zoom: camera.ratio } : undefined} minZoom={0.1}

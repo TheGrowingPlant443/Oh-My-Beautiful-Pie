@@ -8,6 +8,24 @@
   import { confirmDanger } from "../ui";
   import ProjectPicker from "./ProjectPicker.svelte";
   import CodeQualitySettings from "./CodeQualitySettings.svelte";
+  import { open as pickFile } from "@tauri-apps/plugin-dialog";
+  import { get } from "svelte/store";
+  import { knowledge, knowledgeApi } from "../knowledge";
+  import CogneeDialog from "./CogneeDialog.svelte";
+  let cogneeOpen = $state(false);
+  let integrationError = $state<string | null>(null);
+  let integrationBusy = $state(false);
+  async function locateObsidian(): Promise<void> {
+    integrationError = null;
+    try {
+      const selected = await pickFile({ directory: false, multiple: false, title: "Select your installed Obsidian application" });
+      if (typeof selected !== "string") return;
+      integrationBusy = true;
+      await knowledgeApi.configureObsidian(selected);
+      await knowledge.probe(get(knowledge).folder);
+    } catch (error) { integrationError = String(error); }
+    finally { integrationBusy = false; }
+  }
   let { open, onclose }: { open: boolean; onclose: () => void } = $props();
   let dialog = $state<HTMLDialogElement>();
   const startupProject = $derived($instances.find(row => row.kind === "instance" && row.id === $appSettings.startupProjectId));
@@ -131,10 +149,18 @@
       {#if knownError}<small class="dim">{knownError}</small>{/if}
       {#if knownMessage}<small class="dim">{knownMessage}</small>{/if}
       <small class="dim">Packages The Architect judged standard (built in) are remembered across projects so it is not asked about them again, and can be removed from the tree with the "Remove known standard packages" button. Transitive packages found only under those built-in packages are derived and remembered with them (the count includes these derived packages). Clearing forgets this list, including the derived transitive packages; per-project classifications stay.</small>
+      <h3>Optional knowledge integrations</h3>
+      <small class="dim">Discovery is read-only. Installation, Obsidian vault registration, and running the Cognee UI remain manual. No integration is installed or started by these settings.</small>
+      <p>Obsidian: {$knowledge.capabilities?.obsidian.state ?? "Not checked"} {$knowledge.capabilities?.obsidian.version ?? ""}</p>
+      <button disabled={integrationBusy} onclick={locateObsidian}>Locate installed Obsidian…</button>
+      <button disabled={integrationBusy} onclick={() => void knowledge.probe(get(knowledge).folder)}>Check integrations again</button>
+      <button onclick={() => cogneeOpen = true}>Configure existing Cognee UI…</button>
+      {#if integrationError}<small class="err" role="alert">{integrationError}</small>{/if}
       {#if open}<CodeQualitySettings />{/if}
     </div>
   </section>
 </dialog>
+<CogneeDialog open={open && cogneeOpen} onClose={() => cogneeOpen = false} />
 
 <style>
   .native-dialog { border: none; padding: 0; border-radius: var(--radius); background: var(--panel); color: var(--text); max-width: 95vw; max-height: 90vh; }

@@ -14,7 +14,7 @@ export interface GenerateRequest {
   /** Present only for an explicit regeneration; creates a new immutable request that names its predecessor. */
   supersedesRequestId?: string | null;
   /** Which area the parent returns to when this exact request's validated result is saved. */
-  area: "system" | "structure";
+  area: "helicopter" | "system" | "structure";
 }
 
 export interface GenerateOutcome {
@@ -54,3 +54,9 @@ export interface StructureHost {
 export interface VisualizationSink {
   receive(status: ProjectInsightStatus): void;
 }
+
+/**
+ * What the parent knows about a project's Graphify output (a passive, sequence-fenced capability probe). The System overview shows its
+ * Graphify button only when `present`; a present but unreadable artifact is reported by the Graphify view itself, never as "absent".
+ */
+export interface GraphifyAvailability { present: boolean; state: string; message: string | null }

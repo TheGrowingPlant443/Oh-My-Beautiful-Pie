@@ -63,7 +63,7 @@ test("opening reads the saved index and saved diagram passively; nothing asks th
   assert.equal(count(h.calls, "start"), 0, "a saved index is never re-indexed on mount");
   assert.equal(count(h.calls, "request"), 0, "no model request on mount");
   assert.equal(h.hooks.opened.length, 0);
-  assert.deepEqual(h.calls.filter(call => call[0] === "getInsight").map(call => call[2]), ["systemOverview"]);
+  assert.deepEqual(h.calls.filter(call => call[0] === "getInsight").map(call => call[2]), ["systemOverview", "helicopter"]);
 });
 
 test("a repository with no index is indexed locally once; reopening or failing never starts another silently", async () => {
@@ -342,4 +342,218 @@ test("an open neighbourhood keeps its own rows while another node's callers load
   assert.equal(s.hood.id, "c");
   const { model } = deriveModel(s, "files");
   assert.deepEqual(model.nodes.map(node => node.id).sort(), ["c", "p1", "p2"]);
+});
+
+// ---- Helicopter --------------------------------------------------------------------------------------------------
+
+const helicopterPayload = {
+  kind: "helicopter", schemaVersion: 1, snapshotId: "snap-1", purpose: "Lets customers book visits.",
+  nodes: [
+    { id: "customer", kind: "actor", label: "Customer", parentId: null, description: "", evidenceIds: ["e1"] },
+    { id: "journey", kind: "businessGroup", label: "Booking a visit", parentId: null, description: "", evidenceIds: [] },
+    { id: "book", kind: "activity", label: "Clinic books the visit", parentId: "journey", description: "", evidenceIds: ["e1"] },
+    { id: "done", kind: "outcome", label: "Visit is confirmed", parentId: null, description: "Needs clarification: whether a reminder is sent", evidenceIds: ["e1"] },
+  ],
+  edges: [
+    { id: "h1", sourceId: "customer", targetId: "book", label: "", evidenceIds: ["e1"], certainty: "inferred" },
+    { id: "h2", sourceId: "book", targetId: "done", label: "", evidenceIds: [], certainty: "unknown" },
+  ],
+  capabilities: [{ id: "cap", label: "Book a visit", description: "", nodeIds: ["book", "done"], evidenceIds: ["e1"] }],
+  evidence: [{ id: "e1", path: "src/app.ts", lineStart: 1, lineEnd: 2, contentHash: "h" }], coverage: [], limitations: [],
+};
+const helicopterInsight = (state, extra = {}) => insight(state, { requestId: "hel-1", kind: "helicopter", createdAt: 20, ...extra });
+const completedHelicopter = (extra = {}) => helicopterInsight("completed", { result: helicopterPayload, resultHash: "r", ...extra });
+
+test("Helicopter mounts passively: its saved views are read, nothing is generated or invented", async () => {
+  const h = setup();
+  await h.store.enter({ folder: "C:/repo" });
+  await h.flush();
+  assert.deepEqual(h.calls.filter(call => call[0] === "getInsight").map(call => call[2]).sort(), ["helicopter", "systemOverview"]);
+  assert.equal(count(h.calls, "request"), 0);
+  assert.equal(h.hooks.opened.length, 0);
+  h.store.setTab("helicopter");
+  const s = h.snapshot();
+  assert.equal(s.tab, "helicopter");
+  assert.deepEqual(deriveModel(s, "helicopter").model, { nodes: [], edges: [] }, "no generated view: nothing is drawn");
+  assert.equal(count(h.calls, "query"), 0, "the business tab never loads source levels");
+  assert.equal(count(h.calls, "request"), 0);
+  assert.match(h.memory.get("omp-manager.system-overview"), /"tab":"helicopter"/);
+  // System stays the default for a project that was never opened before.
+  assert.equal(setup().snapshot().tab, "system");
+});
+
+test("a saved Helicopter view selects itself and derives a directed business graph", async () => {
+  const h = setup();
+  h.state.insight = completedHelicopter();
+  await h.store.enter({ folder: "C:/repo" });
+  await h.flush();
+  // getInsight answers every kind with the same record in this fake; only a record of the asked kind may land in its slice.
+  assert.equal(h.snapshot().system.revisions.length, 0);
+  assert.equal(h.snapshot().helicopter.selectedId, "hel-1");
+  const { model } = deriveModel(h.snapshot(), "helicopter");
+  assert.deepEqual(model.nodes.map(node => node.id), ["customer", "journey", "book", "done"]);
+  assert.ok(model.edges.length === 2 && model.edges.every(edge => edge.direction === "directed"));
+  assert.equal(model.edges[1].grade, "unknown");
+  assert.equal(h.snapshot().helicopter.revisions[0].state, "completed");
+});
+
+test("Helicopter then System, and System then Helicopter, are two explicit requests to the same Architect with no hidden prerequisite", async () => {
+  for (const order of [["helicopter", "system"], ["system", "helicopter"]]) {
+    const h = setup();
+    const saved = new Map();
+    h.api.readProjectInsight = async id => saved.get(id) ?? (id === "hel-1" ? helicopterInsight("pending") : insight("pending"));
+    await h.store.enter({ folder: "C:/repo" });
+    for (const view of order) {
+      h.state.admit = view === "helicopter" ? helicopterInsight("pending") : insight("pending");
+      const outcome = await (view === "helicopter" ? h.store.generateHelicopter(false) : h.store.generateSystem(false));
+      assert.equal(outcome.admitted, true, view);
+    }
+    const requests = h.calls.filter(call => call[0] === "request");
+    assert.deepEqual(requests.map(call => call[2]), order.map(view => view === "helicopter" ? "helicopter" : "systemOverview"));
+    assert.ok(requests.every(call => call[3] === "snap-1" && call[1] === "C:/repo"), "both are bound to the same snapshot of the same project");
+    assert.deepEqual(h.hooks.opened, ["arch", "arch"], "both open the one existing Architect; no other session or transfer exists");
+    assert.deepEqual(h.calls.map(call => call[0]).filter(name => !["get", "getInsight", "request", "readInsight"].includes(name)), [], "no context-transfer or extra analysis call exists");
+    // The helicopter request names no predecessor and the other kind's absence never blocks it.
+    assert.deepEqual(requests.find(call => call[2] === "helicopter").slice(4), [null, null, null]);
+    assert.equal(h.snapshot().tickets.length, 2);
+    assert.equal(h.snapshot().system.admitting, false);
+    assert.equal(h.snapshot().helicopter.admitting, false);
+    // Each result lands in its own slice and opens its own tab; the other view is untouched.
+    saved.set("hel-1", completedHelicopter());
+    saved.set("sys-1", insight("completed", { result: payload, resultHash: "s" }));
+    await h.tick();
+    await h.tick();
+    const s = h.snapshot();
+    assert.equal(s.helicopter.selectedId, "hel-1");
+    assert.equal(s.system.selectedId, "sys-1");
+    assert.equal(s.helicopter.revisions.every(item => item.kind === "helicopter"), true);
+    assert.equal(s.system.revisions.every(item => item.kind === "systemOverview"), true);
+    assert.equal(count(h.calls, "request"), 2, "polling never resends");
+  }
+});
+
+test("generating one view never admits the other and a click while admitting is a single request", async () => {
+  const h = setup();
+  await h.store.enter({ folder: "C:/repo" });
+  const gate = { release: null };
+  h.api.requestSystemVisualization = (...args) => new Promise(resolve => { h.calls.push(["request", ...args]); gate.release = () => resolve(helicopterInsight("pending")); });
+  const first = h.store.generateHelicopter(false);
+  const second = h.store.generateHelicopter(false);
+  await h.flush();
+  assert.equal(h.snapshot().helicopter.admitting, true);
+  assert.equal(h.snapshot().system.admitting, false, "the other view is not affected");
+  gate.release();
+  await Promise.all([first, second]);
+  assert.equal(count(h.calls, "request"), 1, "a double click joins the admission in flight");
+  assert.equal(h.calls.some(call => call[0] === "request" && call[2] === "systemOverview"), false);
+  assert.equal(h.snapshot().helicopter.admitting, false);
+});
+
+test("a refused Helicopter request stays in the page with its error and leaves the System view alone", async () => {
+  const h = setup();
+  await h.store.enter({ folder: "C:/repo" });
+  h.api.requestSystemVisualization = async () => { throw new Error("Architect is not running"); };
+  const outcome = await h.store.generateHelicopter(false);
+  assert.equal(outcome.admitted, false);
+  assert.equal(h.snapshot().helicopter.error, "Architect is not running");
+  assert.equal(h.snapshot().system.error, null);
+  assert.equal(h.snapshot().tickets.length, 0);
+  assert.equal(h.hooks.opened.length, 0);
+});
+
+test("a finished Helicopter result returns to the Helicopter tab and selects exactly the requested revision", async () => {
+  const h = setup();
+  await h.store.enter({ folder: "C:/repo" });
+  h.store.setTab("files");
+  h.state.admit = helicopterInsight("pending");
+  h.state.insightRead = helicopterInsight("pending");
+  await h.store.generateHelicopter(false);
+  h.store.noteNavigation();
+  h.state.insightRead = completedHelicopter();
+  await h.tick();
+  await h.tick();
+  // Navigation after the click made it a late action; opening it takes the user to the Helicopter tab, never elsewhere.
+  assert.equal(h.hooks.returned.length, 0);
+  const [ticket] = h.snapshot().tickets;
+  assert.equal(ticket.kind, "helicopter");
+  assert.equal(ticket.lateResult, true);
+  assert.equal(h.snapshot().tab, "files", "nothing stole the screen");
+  assert.equal(h.store.openResult(ticket.key), true);
+  assert.equal(h.snapshot().tab, "helicopter");
+  assert.equal(h.snapshot().helicopter.selectedId, "hel-1");
+  assert.deepEqual(h.hooks.returned, [ticket.key]);
+});
+
+test("Helicopter revisions: a late older result never replaces the newer selection, regeneration names its predecessor, failures supersede", async () => {
+  const h = setup();
+  h.state.insight = completedHelicopter({ requestId: "new", createdAt: 50 });
+  await h.store.enter({ folder: "C:/repo" });
+  await h.flush();
+  assert.equal(h.snapshot().helicopter.selectedId, "new");
+  h.store.receive(completedHelicopter({ requestId: "old", createdAt: 5 }));
+  assert.equal(h.snapshot().helicopter.selectedId, "new");
+  assert.equal(h.snapshot().helicopter.revisions.length, 2);
+  h.store.receive(helicopterInsight("pending", { requestId: "new", createdAt: 50 }));
+  assert.equal(h.snapshot().helicopter.revisions.find(item => item.requestId === "new").state, "completed", "a late read cannot regress a completed revision");
+  h.store.selectHelicopterRevision("old");
+  assert.equal(h.snapshot().helicopter.selectedId, "old");
+  h.store.selectHelicopterRevision("not-completed-or-unknown");
+  assert.equal(h.snapshot().helicopter.selectedId, "old");
+  h.store.selectHelicopterRevision("new");
+  h.state.admit = helicopterInsight("pending", { requestId: "newer", createdAt: 60 });
+  await h.store.generateHelicopter(true);
+  assert.equal(h.calls.find(call => call[0] === "request")[6], "new", "supersedesRequestId");
+  // After a failed request (a stopped Architect session) a plain Generate supersedes it instead of returning the same failure.
+  h.store.receive(helicopterInsight("failed", { requestId: "dead", createdAt: 90, message: "The Architect session that was asked for this result was stopped" }));
+  h.state.admit = helicopterInsight("pending", { requestId: "fresh", createdAt: 95 });
+  await h.store.generateHelicopter(false);
+  assert.equal(h.calls.filter(call => call[0] === "request")[1][6], "dead");
+});
+
+test("statuses of another kind or project, and unknown kinds, never enter the Helicopter slice", async () => {
+  const h = setup();
+  const structure = [];
+  h.store.attachStructureSink({ receive: status => structure.push(status.requestId) });
+  await h.store.enter({ folder: "C:/repo" });
+  h.store.receive(completedHelicopter({ folder: "C:/elsewhere" }));
+  h.store.receive(completedHelicopter({ kind: "mystery", requestId: "m-1" }));
+  h.store.receive(insight("completed", { requestId: "sys-x", result: payload, resultHash: "x" }));
+  h.store.receive(insight("completed", { requestId: "st-1", kind: "structureCurrent" }));
+  assert.equal(h.snapshot().helicopter.revisions.length, 0);
+  assert.equal(h.snapshot().system.revisions.length, 1);
+  assert.deepEqual(structure, ["st-1"], "an unknown kind fails closed: it reaches no view at all");
+  h.store.receive(completedHelicopter());
+  assert.equal(h.snapshot().helicopter.revisions.length, 1);
+  assert.equal(h.snapshot().system.revisions.length, 1);
+});
+
+test("a saved-view read for the previous folder cannot land after a folder switch", async () => {
+  const h = setup();
+  const gates = [];
+  h.api.getProjectInsight = (folder, kind) => new Promise(resolve => gates.push(() => resolve(kind === "helicopter" ? completedHelicopter({ folder, requestId: `hel-${folder}` }) : null)));
+  const first = h.store.enter({ folder: "C:/one" });
+  await h.flush();
+  const second = h.store.switchFolder("C:/two");
+  await h.flush();
+  while (gates.length) { gates.shift()(); await h.flush(); }
+  await Promise.all([first, second]);
+  const s = h.snapshot();
+  assert.equal(s.folder, "C:/two");
+  assert.ok(s.helicopter.revisions.every(item => item.folder === "C:/two"), "nothing from C:/one remains");
+});
+
+test("a replaced or failed Helicopter request is reported, never completed", async () => {
+  const h = setup();
+  await h.store.enter({ folder: "C:/repo" });
+  h.state.admit = helicopterInsight("pending");
+  h.api.readProjectInsight = async () => helicopterInsight("failed", { message: "The Architect session that was asked for this result was stopped, switched or replaced before it answered. Ask again." });
+  await h.store.generateHelicopter(false);
+  await h.tick();
+  await h.tick();
+  const [ticket] = h.snapshot().tickets;
+  assert.equal(ticket.state, "failed");
+  assert.match(ticket.message, /stopped, switched or replaced/);
+  assert.equal(h.snapshot().helicopter.selectedId, null);
+  assert.equal(deriveModel(h.snapshot(), "helicopter").model.nodes.length, 0);
+  assert.equal(h.hooks.returned.length, 0);
 });

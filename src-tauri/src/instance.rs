@@ -1266,6 +1266,9 @@ impl Registry {
     }
     /// `fresh` begins a new OMP session instead of resuming the saved one.
     pub fn start_with(&self, id: &str, origin: Origin<'_>, fresh: bool) -> Result<(), String> {
+        // Apply to OMP holds the exclusive gate; recover any interrupted Markdown batch and keep Persona/instruction
+        // loading plus native launch on one side of it. Taken before the lifecycle/records locks, never nested.
+        let _instruction_admission = crate::setup::instruction_read_admission()?;
         let _lifecycle = self.lifecycle.lock();
         let (definition, generation, hub) = {
             let mut records = self.records.lock().map_err(|e| e.to_string())?;

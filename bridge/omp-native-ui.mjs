@@ -35,7 +35,7 @@ function promptFields(method, args, options) {
 
 // The caller owns the one authoritative pending map; this module only installs
 // capture and the shared synchronous native/human/Manager settlement boundary.
-export function installNativeDecisions({ pending, identity, emit, opportunity, nativeAnswer }) {
+export function installNativeDecisions({ pending, identity, emit, opportunity, nativeAnswer, srs }) {
   const origins = new AsyncLocalStorage();
   const patches = new Set();
   let disposed = false;
@@ -70,35 +70,70 @@ export function installNativeDecisions({ pending, identity, emit, opportunity, n
         let captured;
         try { captured = captureIdentity(); } catch (error) { return Promise.reject(error); }
         const requestId = crypto.randomUUID();
-        const request = immutable({ ...captured, requestId, method, humanOnly: options.ompManagerHumanOnly === true, ...promptFields(method, args, options) });
-        const localAbort = new AbortController();
-        const nativeArgs = [...args];
-        const { ompManagerHumanOnly: _humanOnly, ...nativeOptions } = options;
-        nativeArgs[optionsIndex] = { ...nativeOptions, signal: options.signal ? AbortSignal.any([options.signal, localAbort.signal]) : localAbort.signal };
-        return new Promise((resolve, reject) => {
-          let settled = false;
-          const onAbort = () => finish('native', cancellation(method));
-          const finish = (source, value, error) => {
-            if (settled) return false;
-            settled = true;
-            options.signal?.removeEventListener('abort', onAbort);
-            pending.delete(requestId);
-            // Remove the real overlay/queued dialog before releasing the tool.
-            // Its native callback may race this answer; the guard is already set.
-            if (source !== 'native') localAbort.abort();
-            emit('decision_resolved', { requestId, source, sessionId: request.sessionId });
-            opportunity();
-            if (error) reject(error); else resolve(value);
-            return true;
-          };
-          pending.set(requestId, { request, finish, signal: options.signal, advisory: false });
-          options.signal?.addEventListener('abort', onAbort, { once: true });
-          if (options.signal?.aborted) { onAbort(); return; }
-          emit('needs_decision', request);
-          try {
-            Promise.resolve(descriptor.value.apply(ui, nativeArgs)).then(value => finish('native', value), error => finish('native', undefined, error));
-          } catch (error) { finish('native', undefined, error); }
-        });
+        const srsHooks = method === 'askDialog' && ['main', 'unattributed'].includes(captured.agentOrigin.kind) ? srs?.() : null;
+        const mapped = !!srsHooks?.active();
+        const begin = () => {
+          if (disposed || !sameSession(captured)) throw new Error('stale_generation');
+          const effective = mapped ? { ...options, ompManagerHumanOnly: true, acceptImages: false } : options;
+          // Undefined disables the SDK's recommendation timeout for this invocation only.
+          if (mapped) delete effective.timeout;
+          const request = immutable({ ...captured, requestId, method, humanOnly: effective.ompManagerHumanOnly === true, ...promptFields(method, args, effective) });
+          const localAbort = new AbortController();
+          const nativeArgs = [...args];
+          const { ompManagerHumanOnly: _humanOnly, ...nativeOptions } = effective;
+          nativeArgs[optionsIndex] = { ...nativeOptions, signal: options.signal ? AbortSignal.any([options.signal, localAbort.signal]) : localAbort.signal };
+          return new Promise((resolve, reject) => {
+            let settled = false;
+            const onAbort = () => finish('native', cancellation(method));
+            const finish = (source, value, error) => {
+              if (settled) return false;
+              // Claim synchronously, before receipt I/O or any native/Manager race.
+              settled = true;
+              options.signal?.removeEventListener('abort', onAbort);
+              pending.delete(requestId);
+              if (source !== 'native') localAbort.abort();
+              const release = (answer, problem) => {
+                emit('decision_resolved', { requestId, source, sessionId: request.sessionId });
+                opportunity();
+                if (problem) reject(problem); else resolve(answer);
+              };
+              if (!mapped) { release(value, error); return true; }
+              void (async () => {
+                let answer = value, problem = error;
+                try {
+                  let reason = source === 'retired' ? 'retired' : options.signal?.aborted ? 'aborted' : error ? 'failed' :
+                    value?.kind === 'chat' ? 'chat' : value?.results?.some(result => result.timedOut === true) ? 'timeout' :
+                    value?.kind !== 'submit' ? 'cancelled' : null;
+                  if (reason) {
+                    await srsHooks.retired(requestId, reason);
+                    if (reason === 'timeout') answer = undefined;
+                  } else {
+                    if (!['human', 'native'].includes(source)) throw new Error('human_only_decision');
+                    if (!sameSession(request)) throw new Error('stale_generation');
+                    answer = nativeAnswer(request, value);
+                    const receipt = await srsHooks.receipt(requestId, source === 'human' ? 'human' : 'nativeHuman', answer.results);
+                    if (typeof receipt?.receiptId !== 'string' || !receipt.receiptId) throw new Error('srs_answer_receipt_not_persisted');
+                  }
+                } catch (failure) {
+                  problem = failure;
+                  localAbort.abort();
+                  try { await srsHooks.retired(requestId, 'failed'); } catch { /* Failed persistence remains unanswered; native tool rejects. */ }
+                }
+                release(answer, problem);
+              })();
+              return true;
+            };
+            pending.set(requestId, { request, finish, signal: options.signal, advisory: false });
+            options.signal?.addEventListener('abort', onAbort, { once: true });
+            if (options.signal?.aborted) { onAbort(); return; }
+            emit('needs_decision', request);
+            try {
+              Promise.resolve(descriptor.value.apply(ui, nativeArgs)).then(value => finish('native', value), error => finish('native', undefined, error));
+            } catch (error) { finish('native', undefined, error); }
+          });
+        };
+        // Mapping is durable before the native dialog can be answered. No timeout runs while mapping.
+        return mapped ? Promise.resolve(srsHooks.map(requestId, args[0])).then(begin) : begin();
       };
       patch.wrappers.set(method, wrapper);
       Object.defineProperty(ui, method, { ...descriptor, value: wrapper });

@@ -172,3 +172,57 @@ test("an explicit regeneration is a new request that names its predecessor; the 
   assert.equal(h.book.list().length, 1);
   assert.equal(h.book.list()[0].requestId, "req-2");
 });
+
+const helicopterRequest = { kind: "helicopter", folder: "C:/repo", snapshotId: "snap", area: "helicopter" };
+
+test("a Helicopter request has its own ticket, returns to the Helicopter tab and never resends", async () => {
+  const h = harness();
+  h.env.admit = h.status("pending", { requestId: "hel-1", kind: "helicopter" });
+  h.env.reads = [h.status("pending", { requestId: "hel-1", kind: "helicopter" })];
+  await h.book.generate(helicopterRequest);
+  const [ticket] = h.book.list();
+  assert.equal(ticket.kind, "helicopter");
+  assert.equal(ticket.destinationTab, "helicopter");
+  assert.equal(ticket.requestId, "hel-1");
+  assert.equal(ticket.producer.sessionId, "s", "bound to the producer the backend admitted it with");
+  assert.deepEqual(h.log.opened, ["arch"]);
+  h.env.reads = [h.status("pending", { requestId: "hel-1", kind: "helicopter" }), h.status("completed", { requestId: "hel-1", kind: "helicopter", result: { kind: "helicopter" }, resultHash: "h" })];
+  await h.advance(3000);
+  assert.equal(h.book.list()[0].state, "completed");
+  assert.deepEqual(h.log.returned, [ticket.key]);
+  assert.equal(h.log.request.length, 1);
+});
+
+test("a Helicopter result that arrives after navigation is a late action and opens only on request", async () => {
+  const h = harness();
+  h.env.admit = h.status("pending", { requestId: "hel-1", kind: "helicopter" });
+  h.env.reads = [h.status("pending", { requestId: "hel-1", kind: "helicopter" })];
+  await h.book.generate(helicopterRequest);
+  h.env.epoch++;
+  h.env.reads = [h.status("completed", { requestId: "hel-1", kind: "helicopter", result: { kind: "helicopter" }, resultHash: "h" })];
+  await h.advance(3000);
+  assert.deepEqual(h.log.returned, []);
+  const [ticket] = h.book.list();
+  assert.equal(ticket.lateResult, true);
+  assert.equal(h.book.openResult(ticket.key), true);
+  assert.deepEqual(h.log.returned, [ticket.key]);
+});
+
+test("System and Helicopter requests for one snapshot are independent tickets on the same Architect; neither triggers the other", async () => {
+  for (const order of [["systemOverview", "helicopter"], ["helicopter", "systemOverview"]]) {
+    const h = harness({ admitState: "completed" });
+    const saved = { systemOverview: { requestId: "sys-1", result: { kind: "systemOverview" } }, helicopter: { requestId: "hel-1", kind: "helicopter", result: { kind: "helicopter" } } };
+    const requests = { systemOverview: h.request, helicopter: helicopterRequest };
+    for (const kind of order) {
+      h.env.admit = h.status("completed", { ...saved[kind], resultHash: "h" });
+      await h.book.generate(requests[kind]);
+    }
+    assert.deepEqual(h.log.request.map(args => args[1]), order, "each explicit click sends exactly its own kind");
+    const tickets = h.book.list();
+    assert.equal(tickets.length, 2);
+    assert.notEqual(tickets[0].key, tickets[1].key);
+    assert.deepEqual(tickets.map(ticket => ticket.destinationTab).sort(), ["helicopter", "system"]);
+    assert.deepEqual(new Set(tickets.map(ticket => ticket.producer.sessionId)).size, 1, "both are bound to the one existing Architect session");
+    assert.deepEqual(h.log.opened, [], "saved results open passively without focusing the Architect");
+  }
+});

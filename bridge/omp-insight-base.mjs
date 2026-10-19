@@ -5,8 +5,8 @@ import path from 'node:path';
 // Shared primitives of the Architect's request-bound project-insight tools: request directories below the app-owned
 // `project-insight/` root, bounded JSON reads, the evidence reader's path rules and the immutable result publisher.
 // Nothing here takes a folder or an absolute path from a tool argument, executes, installs or reads the network.
-export const KINDS = ['dependencyDiscovery', 'requirements', 'systemOverview', 'structureCurrent', 'structureProposed'];
-export const VISUALIZATION_KINDS = ['systemOverview', 'structureCurrent', 'structureProposed'];
+export const KINDS = ['dependencyDiscovery', 'requirements', 'systemOverview', 'helicopter', 'structureCurrent', 'structureProposed'];
+export const VISUALIZATION_KINDS = ['systemOverview', 'helicopter', 'structureCurrent', 'structureProposed'];
 export const MAX_READ_BYTES = 64 * 1024;
 export const MAX_LIST_ENTRIES = 200;
 export const REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
