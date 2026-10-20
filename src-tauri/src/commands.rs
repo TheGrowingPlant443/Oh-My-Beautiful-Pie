@@ -1326,12 +1326,49 @@ pub async fn query_graphify_graph(window: tauri::WebviewWindow, state: State<'_,
     knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.query_graphify_graph(&artifact_id, &query)).await
 }
 #[tauri::command]
-pub async fn configure_cognee_ui(window: tauri::WebviewWindow, state: State<'_, AppState>, url: Option<String>, installation_folder: Option<String>) -> Result<k::CogneeCapability> {
-    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.configure_cognee_ui(url.as_deref(), installation_folder.as_deref())).await
+pub async fn open_cognee_ui(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<k::CogneeOpenResult> {
+    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || Ok(s.open_cognee_ui())).await
 }
 #[tauri::command]
-pub async fn open_cognee_ui(window: tauri::WebviewWindow, state: State<'_, AppState>) -> Result<()> {
-    knowledge_only!(window); let s = state.knowledge.clone(); blocking(move || s.open_cognee_ui()).await
+pub async fn open_host_monitor(window: tauri::WebviewWindow, state: State<'_, AppState>, instance_id: String, expected_generation: u64) -> Result<crate::host_monitor::HostMonitorOpen> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let monitor = state.host_monitor.clone();
+    blocking(move || monitor.open(&instance_id, expected_generation)).await
+}
+#[tauri::command]
+pub async fn collect_host_monitor(window: tauri::WebviewWindow, state: State<'_, AppState>, view_id: String, displayed_snapshot_id: Option<String>) -> Result<crate::host_monitor::HostSnapshotSummary> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let monitor = state.host_monitor.clone();
+    blocking(move || monitor.collect(&view_id, displayed_snapshot_id.as_deref())).await
+}
+#[tauri::command]
+pub async fn read_host_monitor(window: tauri::WebviewWindow, state: State<'_, AppState>, snapshot_id: String, query: crate::host_monitor::HostMonitorQuery) -> Result<crate::host_monitor::HostMonitorPage> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let monitor = state.host_monitor.clone();
+    blocking(move || monitor.read(&snapshot_id, &query)).await
+}
+#[tauri::command]
+pub fn close_host_monitor(window: tauri::WebviewWindow, state: State<'_, AppState>, view_id: String) -> Result<()> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    state.host_monitor.close(&view_id);
+    Ok(())
+}
+#[tauri::command]
+pub async fn explain_host_monitor(window: tauri::WebviewWindow, state: State<'_, AppState>, snapshot_id: String) -> Result<crate::host_monitor::ExplainResult> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (monitor, registry) = (state.host_monitor.clone(), state.registry.clone());
+    blocking(move || Ok(monitor.explain_host_monitor(&registry, &snapshot_id))).await
+}
+#[tauri::command]
+pub async fn explain_host_monitor_after_srs_pause(window: tauri::WebviewWindow, state: State<'_, AppState>, snapshot_id: String, job_id: String, attempt_id: String) -> Result<crate::host_monitor::ExplainResult> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    let (monitor, registry) = (state.host_monitor.clone(), state.registry.clone());
+    blocking(move || Ok(monitor.explain_host_monitor_after_srs_pause(&registry, &snapshot_id, &job_id, &attempt_id))).await
+}
+#[tauri::command]
+pub fn cancel_host_monitor_explanation(window: tauri::WebviewWindow, state: State<'_, AppState>, snapshot_id: String) -> Result<bool> {
+    if window.label() != "main" { return Err("unauthorized window".into()); }
+    Ok(state.host_monitor.cancel_host_monitor_explanation(&snapshot_id))
 }
 #[tauri::command]
 pub async fn get_agent_markdown_status(window: tauri::WebviewWindow, state: State<'_, AppState>, target: crate::agent_markdown::KnowledgeAssetTarget) -> Result<crate::agent_markdown::MarkdownStatus> {

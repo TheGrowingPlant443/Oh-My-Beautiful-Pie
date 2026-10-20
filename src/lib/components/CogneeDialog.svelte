@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { open as pickFolderDialog } from "@tauri-apps/plugin-dialog";
   import { get } from "svelte/store";
-  import { knowledge, knowledgeApi, validateCogneeUrl } from "../knowledge";
+  import { knowledge, knowledgeApi, type CogneeOpenResult } from "../knowledge";
 
-  // Opens an already running Cognee UI in the system browser. It never starts Cognee, downloads anything, runs its CLI or touches its
-  // memory: installing and starting it stays manual. The address must be a loopback http(s) address; the backend checks it again.
+  // Opens the Cognee web interface. No address, folder or other configuration is asked for: an explicit click revalidates the installed
+  // interface and, when it can, starts this app's own frontend for the already running local Cognee backend and opens it in the system
+  // browser. It never installs or downloads anything, never starts Cognee's backend, MCP server or Docker and never changes its stores.
+  // Closing this popup only hides it: a start that was requested keeps going and its answer is shown when the popup is opened again.
   let { open, onClose }: { open: boolean; onClose: () => void } = $props();
 
   let dialog = $state<HTMLDialogElement>();
@@ -19,71 +20,49 @@
   $effect(() => knowledge.subscribe(value => { caps = value.capabilities; }));
   const cognee = $derived(caps?.cognee ?? null);
 
-  let url = $state("");
-  let installation = $state("");
-  let seeded = false;
-  $effect(() => {
-    if (!open) { seeded = false; return; }
-    if (seeded || !cognee) return;
-    seeded = true;
-    url = cognee.uiUrl ?? "";
-    installation = cognee.installationFolder ?? "";
-  });
+  // The in-flight request lives at component level (not tied to `open`), so closing and reopening the popup neither orphans nor repeats it.
   let busy = $state(false);
-  let error = $state<string | null>(null);
-  let note = $state<string | null>(null);
-  const checked = $derived(url.trim() === "" ? null : validateCogneeUrl(url));
+  let result = $state<CogneeOpenResult | null>(null);
+  let failure = $state<string | null>(null);
+  let launching: Promise<void> | null = null;
 
-  async function save(): Promise<void> {
-    const parsed = validateCogneeUrl(url);
-    if (!parsed.ok) { error = parsed.message; return; }
-    busy = true; error = null; note = null;
-    try {
-      await knowledgeApi.configureCognee(parsed.url, installation.trim() || null);
-      await knowledge.probe(get(knowledge).folder);
-      note = "Saved. Cognee itself was not started, probed or changed.";
-    } catch (failure) { error = String(failure); } finally { busy = false; }
+  function launch(): Promise<void> {
+    if (launching) return launching;
+    busy = true; result = null; failure = null;
+    launching = knowledgeApi.openCognee()
+      .then(answer => { result = answer; })
+      .catch(error => { failure = String(error); })
+      .finally(() => { busy = false; launching = null; });
+    return launching;
   }
-  async function browse(): Promise<void> {
-    try {
-      const picked = await pickFolderDialog({ directory: true, multiple: false, title: "Choose the Cognee installation folder" });
-      if (typeof picked === "string") installation = picked;
-    } catch (failure) { error = String(failure); }
-  }
-  async function launch(): Promise<void> {
-    busy = true; error = null;
-    try { await knowledgeApi.openCognee(); note = "Opened in your browser."; } catch (failure) { error = String(failure); } finally { busy = false; }
-  }
+
+  const status = $derived.by(() => {
+    if (!cognee) return "Cognee has not been looked for yet.";
+    if (cognee.state === "unreadable") return `Cognee could not be fully inspected${cognee.message ? `: ${cognee.message}` : "."} This is not proof it is absent.`;
+    if (cognee.state === "absent" || !cognee.installed) return "Cognee was not found on this computer.";
+    const version = cognee.version ? ` ${cognee.version}` : "";
+    if (cognee.ui.state === "ready") return `Cognee${version} is installed and its web interface can be started when you open it.`;
+    return `Cognee${version} is installed. ${cognee.ui.message ?? "Its web interface cannot be started from here."}`;
+  });
 </script>
 <dialog bind:this={dialog} aria-labelledby="cognee-title" onclose={() => { if (programmaticCloses) programmaticCloses--; else onClose(); }} oncancel={event => { event.preventDefault(); onClose(); }}>
   <section>
     <header><h3 id="cognee-title">Cognee</h3><button onclick={onClose}>Close</button></header>
     <div class="body">
-      {#if !cognee}
-        <p class="dim" role="status">Cognee has not been looked for yet.</p>
-      {:else if cognee.state === "unreadable"}
-        <p class="err" role="status"><strong>Cognee discovery could not be completed.</strong> {cognee.message ?? "The installation metadata could not be read."} This is not an absent-installation result. Check permissions or select the installation folder and check again.</p>
-      {:else if !cognee.installed}
-        <p role="status">Cognee was not found on this computer{cognee.message ? ` (${cognee.message})` : ""}. This is not proof it is absent; if it is installed elsewhere, give its folder below.</p>
-      {:else if !cognee.uiUrl}
-        <p role="status"><strong>Cognee is installed; its UI is not configured.</strong>{cognee.version ? ` (version ${cognee.version})` : ""}</p>
-        <p class="dim">OMP Manager does not start Cognee or its interface. Start the UI yourself, then enter the address it listens on (for example <code>http://127.0.0.1:3000</code>).</p>
-      {:else}
-        <p role="status">Cognee {cognee.version ?? ""} is installed. The saved UI address is <code>{cognee.uiUrl}</code>.</p>
+      <p role="status" class:err={cognee?.state === "unreadable"}>{status}</p>
+      {#if busy}
+        <p role="status">Starting the Cognee interface… the first start can take up to a minute. You can close this window; it keeps going.</p>
       {/if}
-      <label class="field">Address of the running Cognee UI
-        <input type="url" bind:value={url} placeholder="http://127.0.0.1:3000" autocomplete="off" spellcheck="false" />
-      </label>
-      {#if checked && !checked.ok}<p class="err" role="alert">{checked.message}</p>{/if}
-      <label class="field">Cognee installation folder (optional)
-        <span class="pick"><input type="text" bind:value={installation} placeholder="Found automatically when empty" spellcheck="false" /><button onclick={() => void browse()}>Browse…</button></span>
-      </label>
-      <p class="dim">Only the folder and address are stored, in this app's own settings. Cognee's configuration and memory are never read or changed here.</p>
-      {#if error}<p class="err" role="alert">{error}</p>{/if}
-      {#if note}<p role="status">{note}</p>{/if}
+      {#if result?.state === "opened"}
+        <p role="status">Opened {result.url ?? "the Cognee interface"} in your browser.</p>
+      {:else if result}
+        <p class="err" role="alert">{result.message ?? "The Cognee interface could not be opened."}</p>
+        {#if result.state === "openFailed" && result.url}<p class="dim">The interface is running at <code>{result.url}</code>; open that address in your browser yourself, or try again.</p>{/if}
+      {/if}
+      {#if failure}<p class="err" role="alert">{failure}</p>{/if}
+      <p class="dim">Your Cognee backend must already be running; OMP Manager never starts it. Starting the interface may let it compile and write its own cache files, but nothing is installed or downloaded and Cognee's data and settings are not changed.</p>
       <div class="actions">
-        <button disabled={busy || !(checked?.ok ?? false)} onclick={() => void save()}>Save</button>
-        <button disabled={busy || cognee?.state !== "installed" || !cognee.uiUrl} onclick={() => void launch()}>Open Cognee UI</button>
+        <button disabled={busy || !cognee || cognee.state === "absent"} onclick={() => void launch()}>Open Cognee UI</button>
       </div>
     </div>
   </section>
@@ -95,9 +74,6 @@
   header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
   h3, p { margin: 0; }
   .body { overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; overflow-wrap: anywhere; }
-  .field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
-  .pick { display: flex; gap: 6px; }
-  .pick input { flex: 1; }
   .actions { display: flex; gap: 8px; }
   .dim { color: var(--text-dim); }
   .err { color: var(--err); }

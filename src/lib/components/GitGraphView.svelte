@@ -8,12 +8,17 @@
   import { layoutGraph, legendOf, mergedPullRequests, prEdgeColor, INITIAL_FIT_NODES, NODE_W, NODE_H, LANE_W, ROW_H } from "../git-graph";
   import type { CommitFlowNode, PullRequestBranch } from "../git-graph";
   import { errorText, instancesById } from "../stores";
+  import { renderedHelperAgentId } from "../human-decisions";
   import { confirmDanger } from "../ui";
   import CommitNode from "./CommitNode.svelte";
   import CommitDiffView from "./CommitDiffView.svelte";
   import HelperPane from "./HelperPane.svelte";
 
-  let { instanceId, name, onBack }: { instanceId: string; name: string; onBack: () => void } = $props();
+  let { instanceId, name, onBack, onVisibleAgentChange }: {
+    instanceId: string; name: string; onBack: () => void;
+    /** Id of the helper conversation this page actually renders, or null. Cleanup reports null on that same callback. */
+    onVisibleAgentChange?: (id: string | null) => void;
+  } = $props();
   const nodeTypes: NodeTypes = { commit: CommitNode };
   let graph = $state<GitGraph | null>(null);
   let nodes = $state.raw<CommitFlowNode[]>([]);
@@ -40,6 +45,14 @@
   let helperOpen = $state(false);
   let opening = $state(false);
   const helper = $derived(agent ? $instancesById.get(agent.id) : undefined);
+  // Exactly the render predicate: !diffRequest && helperOpen && agent && helper && helper.generation > 0.
+  const visibleAgentId = $derived(!diffRequest && helperOpen && agent ? renderedHelperAgentId(true, helper) : null);
+  $effect(() => {
+    const report = onVisibleAgentChange;
+    if (!report) return;
+    report(visibleAgentId);
+    return () => report(null);
+  });
   const prByMerge = $derived(new Map(prs.map(pr => [pr.merge, pr] as const)));
   let explain = $state<{ title: string; x: number; y: number; status: "loading" | "done" | "error"; text: string } | null>(null);
   const explained = new Map<string, string>();

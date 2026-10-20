@@ -10,7 +10,10 @@
   import { helicopterDefaultExpanded, journeyRows, revealNodes } from "../helicopter-graph";
   import type { LayoutStatus } from "../overview-layout";
   import type { EvidenceRef, SourceFileRow, SourceSymbolRow } from "../api";
-  import type { GraphifyAvailability } from "../overview-types";
+  import type { ArchitectDescriptor } from "../overview-types";
+  import { knowledge, cogneeVisible, graphifyVisible, graphifyAction, capabilitiesFor } from "../knowledge";
+  import CogneeDialog from "./CogneeDialog.svelte";
+  import GraphifyAccessDialog from "./GraphifyAccessDialog.svelte";
   import OverviewFlow from "./OverviewFlow.svelte";
   import OverviewGraph from "./OverviewGraph.svelte";
   import OverviewInspector from "./OverviewInspector.svelte";
@@ -18,15 +21,14 @@
   import HelicopterPanel from "./HelicopterPanel.svelte";
   import StructureView from "./StructureView.svelte";
 
-  let { initialFolder, resume = false, onBack, onOpenArchitect, architect, onSrsDocumentation, onGraphify, graphify = null }: {
+  let { initialFolder, resume = false, onBack, onOpenArchitect, architect, onSrsDocumentation, onGraphify }: {
     initialFolder?: string; resume?: boolean; onBack: () => void;
     onOpenArchitect: (id: string, replayRequestId?: string) => Promise<boolean>;
-    architect: { id: string; generation: number; ready: boolean } | null;
+    architect: ArchitectDescriptor | null;
     /** Opens the SRS documentation start dialog for the shown project. The button is hidden when the parent gives no handler. */
     onSrsDocumentation?: (folder: string) => void;
-    /** Opens the Graphify view for the shown project. Needs `graphify.present`. */
+    /** Opens the Graphify view for the shown project. */
     onGraphify?: (folder: string) => void;
-    graphify?: GraphifyAvailability | null;
   } = $props();
 
   const TABS: { id: OverviewTab; label: string; hint: string }[] = [
@@ -167,6 +169,10 @@
   const discuss = (): void => { if (shown && architect) void onOpenArchitect(architect.id, shown.status.requestId); };
   const when = (ms: number | null): string => ms === null ? "" : new Date(ms).toLocaleString();
   const pictureName = (kind: string): string => kind === "helicopter" ? "Helicopter view" : "system diagram";
+  let cogneeOpen = $state(false);
+  let graphifyAccessOpen = $state(false);
+  const caps = $derived(capabilitiesFor($knowledge, s.folder));
+  $effect(() => { void s.folder; cogneeOpen = false; graphifyAccessOpen = false; });
 </script>
 
 <section class="overview">
@@ -189,8 +195,12 @@
     {#if indexing}<button onclick={() => void systemOverview.cancelIndex()}>Cancel indexing</button>{/if}
     <button disabled={!s.folder || indexing} title="Re-read the repository and rebuild the local source index. No agent is involved." onclick={() => void systemOverview.refreshIndex()}>Refresh index</button>
     <button class:active={s.area === "structure"} aria-pressed={s.area === "structure"} disabled={!s.folder} title="Current and target repository structure and naming" onclick={() => systemOverview.setArea(s.area === "structure" ? "diagram" : "structure")}>Repository structure</button>
-    {#if graphify?.present && onGraphify}
-      <button disabled={!s.folder} title={graphify.message ?? "Explore this project's existing Graphify knowledge graph"} onclick={() => onGraphify(s.folder)}>Graphify</button>
+    {#if cogneeVisible($knowledge.capabilities)}
+      <button title="Open the Cognee web interface for your already running local Cognee backend" onclick={() => cogneeOpen = true}>Open Cognee UI</button>
+    {/if}
+    {#if graphifyVisible(s.folder) && onGraphify}
+      <button disabled={!s.folder} title={caps?.graphify.message ?? "Explore this project's Graphify knowledge graph"}
+        onclick={() => graphifyAction(caps) === "view" ? onGraphify(s.folder) : graphifyAccessOpen = true}>Graphify</button>
     {/if}
     {#if onSrsDocumentation}
       <button disabled={!s.folder} title="Software Requirements Specification: what it is, what it costs, and how to start it. Nothing starts until you confirm." onclick={() => onSrsDocumentation(s.folder)}>SRS documentation</button>
@@ -371,6 +381,9 @@
     {/if}
     {#if tab !== "helicopter"}<OverviewCoverage {status} coverage={s.coverage} onLoad={more => void systemOverview.loadCoverage(more)} />{/if}
   {/if}
+  <CogneeDialog open={cogneeOpen} onClose={() => cogneeOpen = false} />
+  <GraphifyAccessDialog open={graphifyAccessOpen} folder={s.folder || null} capabilities={caps} loading={$knowledge.loading}
+    onClose={() => graphifyAccessOpen = false} onOpenGraph={folder => onGraphify?.(folder)} />
 </section>
 
 <style>
@@ -403,7 +416,8 @@
   .overlay { position: absolute; z-index: 5; left: 12px; right: 12px; top: 8px; margin: 0; padding: 6px 10px; font-size: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
   .empty { margin: 24px; color: var(--text-dim); }
   .empty p { margin: 0 0 8px; max-width: 70ch; }
-  .structure { flex: 1; min-height: 0; overflow: auto; }
+  .structure { flex: 1 1 auto; min-height: 0; overflow: auto; }
+  .bar, .strip, .notice { flex: 0 0 auto; }
   .legend { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; }
   .legend li { display: inline-flex; align-items: center; gap: 5px; }
   .dim { color: var(--text-dim); }

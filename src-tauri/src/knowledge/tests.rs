@@ -452,7 +452,7 @@ fn fake_obsidian(t: &Temp, registered: &Path) -> Environment {
     let exe = t.join("obsidian").join(if cfg!(windows) { "Obsidian.exe" } else { "obsidian" });
     write_notes(&t.join("obsidian"), &[("registry.json", &json!({"vaults": {"abc123": {"path": registered.to_string_lossy(), "ts": 1}, "gone": {"path": t.join("not-here").to_string_lossy()}}}).to_string())]);
     fs::write(&exe, b"not a real program").unwrap();
-    Environment { obsidian_exe: ExeSetting::Fixed(exe), obsidian_registry: Some(t.join("obsidian").join("registry.json")), cognee_home: None, protected: Vec::new() }
+    Environment { obsidian_exe: ExeSetting::Fixed(exe), obsidian_registry: Some(t.join("obsidian").join("registry.json")), cognee_home: None, cognee_node: None, protected: Vec::new() }
 }
 
 #[test]
@@ -544,7 +544,7 @@ fn cognee_urls_are_loopback_only_and_credential_free() {
 }
 
 #[test]
-fn cognee_is_found_by_files_alone_and_opens_only_a_configured_ui() {
+fn cognee_is_found_by_files_alone_and_its_ui_is_judged_without_running_anything() {
     let t = Temp::new();
     fake_cognee(&t.join("cognee"));
     fs::create_dir_all(t.join("empty")).unwrap();
@@ -553,22 +553,19 @@ fn cognee_is_found_by_files_alone_and_opens_only_a_configured_ui() {
     let probe = service.get_knowledge_capabilities(None).unwrap().cognee;
     assert_eq!(probe.installed, Some(true));
     assert_eq!(probe.version.as_deref(), Some("1.6.4"));
-    assert_eq!(probe.message.as_deref(), Some("Cognee is installed; its UI is not configured"));
-    assert!(probe.ui_url.is_none());
-    assert!(service.open_cognee_ui().unwrap_err().contains("not configured"));
-    assert!(service.configure_cognee_ui(Some("http://example.com"), None).is_err());
-    assert!(service.configure_cognee_ui(Some("http://127.0.0.1:3000"), Some(&t.join("empty").to_string_lossy())).is_err(), "an alternate folder must contain Cognee");
-    let configured = service.configure_cognee_ui(Some("http://127.0.0.1:3000"), None).unwrap();
-    assert_eq!(configured.ui_url.as_deref(), Some("http://127.0.0.1:3000/"));
-    assert!(configured.message.is_none());
-    let restarted = KnowledgeService::with_environment(t.join("config"), t.join("home"), Environment { cognee_home: Some(t.join("cognee")), ..Environment::isolated() });
-    assert_eq!(restarted.get_knowledge_capabilities(None).unwrap().cognee.ui_url.as_deref(), Some("http://127.0.0.1:3000/"));
-    let cleared = restarted.configure_cognee_ui(None, None).unwrap();
-    assert!(cleared.ui_url.is_none());
+    assert!(probe.message.is_none(), "nothing is \"not configured\" any more");
+    let expected = if cfg!(all(windows, target_arch = "x86_64")) { CogneeUiState::MissingFrontend } else { CogneeUiState::Unsupported };
+    assert_eq!(probe.ui.state, expected, "an installed SDK without a frontend is reported as such");
+    assert!(probe.ui.message.is_some());
+    let opened = service.open_cognee_ui();
+    assert_eq!((opened.state, opened.url), (if expected == CogneeUiState::Unsupported { CogneeOpenState::Unsupported } else { CogneeOpenState::MissingComponent }, None));
+    assert!(!t.join("config").exists() && !t.join("home").join(".cognee").exists(), "neither a probe nor a refused open writes anything or creates Cognee's cache folder");
     // Missing installation: not installed and nothing to open.
     let missing = service_with(&Temp::new(), Environment { cognee_home: Some(t.join("empty")), ..Environment::isolated() });
     assert_eq!(missing.get_knowledge_capabilities(None).unwrap().cognee.installed, Some(false));
-    assert!(missing.open_cognee_ui().is_err());
+    let refused = missing.open_cognee_ui();
+    assert_eq!(refused.state, CogneeOpenState::MissingComponent);
+    assert!(refused.message.unwrap().contains("not installed"));
 }
 
 // ---------- Graphify ----------
@@ -816,6 +813,38 @@ fn legacy_edges_are_parsed_explicitly_and_the_home_of_the_output_is_registered_b
     // A local output wins once it exists.
     write_graph(&repo, &sample_graph(), Some(&folder));
     assert_eq!(again.open_graphify_artifact(&folder).unwrap().output_kind, "local");
+}
+
+#[test]
+fn capabilities_carry_the_canonical_project_key_and_a_copied_workspace_is_never_adopted() {
+    let t = Temp::new();
+    let service = service(&t);
+    let repo = repository(&t);
+    let folder = repo.to_string_lossy().into_owned();
+    let capabilities = service.get_knowledge_capabilities(Some(folder.as_str())).unwrap();
+    assert_eq!(capabilities.folder.as_deref(), Some(folder.as_str()));
+    assert_eq!(capabilities.project_key, Some(fsio::norm(&repo)), "the same identity the Graphify store and vault scopes use");
+    let padded = service.get_knowledge_capabilities(Some(format!("  {folder}  ").as_str())).unwrap();
+    assert_eq!((padded.folder.as_deref(), padded.project_key.clone()), (Some(folder.as_str()), capabilities.project_key.clone()), "the echoed folder is the trimmed request");
+    let global = service.get_knowledge_capabilities(None).unwrap();
+    assert_eq!((global.folder, global.project_key), (None, None));
+    let unusable = service.get_knowledge_capabilities(Some(t.join("home").to_string_lossy().as_ref())).unwrap();
+    assert_eq!(unusable.project_key, None, "a folder that is not a project has no project identity");
+    assert_eq!(unusable.graphify.state, GraphifyState::Unavailable, "the picker dialog still has a diagnostic to show");
+    // A copy of the workspace in another folder with the same base name carries the original's marker: not this project.
+    let copy = t.join("copy").join("repo");
+    fs::create_dir_all(copy.join(".git")).unwrap();
+    let copy_folder = crate::setup::canonical(&copy).unwrap().to_string_lossy().into_owned();
+    let external = t.join("external").join("graphify-out");
+    fs::create_dir_all(&external).unwrap();
+    fs::write(external.join("graph.json"), serde_json::to_vec(&json!({"nodes": [{"id": "a"}], "links": []})).unwrap()).unwrap();
+    fs::write(external.join(".graphify_root"), &folder).unwrap();
+    let refused = service.register_graphify_output(&copy_folder, &external.to_string_lossy()).unwrap_err();
+    assert!(refused.contains("Foreign Graphify output") && refused.contains("repo"), "the claimed root is shown: {refused}");
+    assert_eq!(fs::read_to_string(external.join(".graphify_root")).unwrap(), folder, "the marker is never edited");
+    assert_eq!(service.get_knowledge_capabilities(Some(copy_folder.as_str())).unwrap().graphify.state, GraphifyState::Absent);
+    // The workspace the output was built for accepts it, so the human can view it truthfully as its own project.
+    assert_eq!(service.register_graphify_output(&folder, &external.to_string_lossy()).unwrap().graphify.state, GraphifyState::Present);
 }
 
 #[test]

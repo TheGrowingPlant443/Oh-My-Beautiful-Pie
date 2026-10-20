@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { get } from 'svelte/store';
-import { askResponse, canAnswer, createHumanDecisionStore, decisionKey, initialDecisionDraft, nativeOption, readDecisionImage, toggleQuestionOption } from './human-decisions.ts';
+import { askResponse, canAnswer, createHumanDecisionStore, decisionKey, hasDecisionAttention, initialDecisionDraft, nativeOption, readDecisionImage, renderedHelperAgentId, toggleQuestionOption } from './human-decisions.ts';
 
 function decision(overrides = {}) {
   return { target: { instanceId: 'agent', requestId: 'public-id', generation: 3, sessionId: 'session', ownershipEpoch: 4, workspaceEpoch: 5 }, createdAt: 100, instanceName: 'Worker', instanceKind: 'instance', agentOrigin: { kind: 'unattributed' }, repository: { folder: 'C:/repo', label: 'repo', scope: 'repository' }, method: 'input', payload: { title: 'Exact question', placeholder: 'Answer' }, answerable: true, humanOnly: false, ...overrides };
@@ -183,4 +183,23 @@ test('human answer union is sent unchanged with the exact fenced target', async 
     await h.store.submit(item.target, response);
     assert.deepEqual(h.answers, [{ target: item.target, response }]);
   }
+});
+
+test('attention lights only for pending decisions outside the actually visible conversation', () => {
+  const a = decision(), b = decision({ target: { ...decision().target, instanceId: 'other', requestId: 'r2' } });
+  assert.equal(hasDecisionAttention([], null), false);
+  assert.equal(hasDecisionAttention([], 'agent'), false);
+  assert.equal(hasDecisionAttention([a], 'agent'), false, 'only the visible agent is pending');
+  assert.equal(hasDecisionAttention([a, b], 'agent'), true, 'another agent is pending');
+  assert.equal(hasDecisionAttention([b], 'agent'), true);
+  assert.equal(hasDecisionAttention([a], null), true, 'no visible conversation: any pending decision counts');
+  assert.equal(hasDecisionAttention([a, { ...a, target: { ...a.target, requestId: 'second' } }], 'agent'), false, 'several for the visible agent stay quiet');
+});
+
+test('a helper conversation is visible only while shown and backed by a live generation', () => {
+  assert.equal(renderedHelperAgentId(true, { id: 'helper', generation: 2 }), 'helper');
+  assert.equal(renderedHelperAgentId(false, { id: 'helper', generation: 2 }), null);
+  assert.equal(renderedHelperAgentId(true, { id: 'helper', generation: 0 }), null);
+  assert.equal(renderedHelperAgentId(true, undefined), null);
+  assert.equal(renderedHelperAgentId(true, null), null);
 });

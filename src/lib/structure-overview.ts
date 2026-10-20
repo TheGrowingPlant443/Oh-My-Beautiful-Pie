@@ -1,6 +1,6 @@
 import { writable, type Readable } from "svelte/store";
 import type { api, ProjectInsightStatus, StructureApproval, StructureSourceRow } from "./api";
-import type { GenerateOutcome, GenerateRequest, StructureHost, VisualizationSink } from "./overview-types";
+import type { ArchitectDescriptor, GenerateOutcome, GenerateRequest, StructureHost, VisualizationSink } from "./overview-types";
 import { canApprove, type ApprovalCheck } from "./structure-view";
 
 // Parent-lived store of the repository-structure area. It never reaches the Architect or a model on its own:
@@ -25,7 +25,7 @@ export interface SourcePage {
 export interface StructureState {
   folder: string; snapshotId: string | null;
   sources: StructureSourceRow[]; sessionId: string | null;
-  /** `id:generation` of the Architect the list was read from. */
+  /** `id:generation:sessionId` of the Architect owner the list was read from. */
   sourcesKey: string | null; sourcesLoading: boolean; sourcesLoaded: boolean; sourcesError: string | null; selectingLast: boolean;
   /** The source the target preview is generated from. */
   selectedSourceId: string | null;
@@ -52,7 +52,8 @@ const initialState = (folder: string, snapshotId: string | null): StructureState
 });
 
 export const folderKey = (folder: string): string => folder.replace(/^\\\\\?\\/, "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-const architectKey = (architect: { id: string; generation: number } | null): string | null => architect ? `${architect.id}:${architect.generation}` : null;
+/** The owner whose captured messages may be shown: Architect id + generation + known session. Null while the session is unknown. */
+const architectKey = (architect: ArchitectDescriptor | null): string | null => architect && architect.sessionId ? `${architect.id}:${architect.generation}:${architect.sessionId}` : null;
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 const stateRank = (state: ProjectInsightStatus["state"]): number => state === "completed" ? 3 : state === "pending" ? 0 : state === "submitted" ? 1 : 2;
 
@@ -88,7 +89,7 @@ export function approveCheck(state: StructureState): ApprovalCheck {
   return check;
 }
 /** Why Analyze / Preview cannot be clicked right now, or null when they can. */
-export function generateBlock(state: StructureState, kind: StructureKind, architect: { id: string; generation: number } | null): string | null {
+export function generateBlock(state: StructureState, kind: StructureKind, architect: ArchitectDescriptor | null): string | null {
   if (!state.snapshotId) return "No complete source index snapshot is selected yet.";
   if (state.busy[kind]) return "Waiting for the Architect…";
   if (kind === "structureProposed") {
@@ -111,7 +112,8 @@ export interface StructureStore extends VisualizationSink {
   connect(host: StructureHost, api: StructureApi): void;
   /** A folder change resets everything; a snapshot change keeps sources and revisions (shown as stale) and drops in-flight results. Passively reads saved results. */
   setFolder(folder: string, snapshotId: string | null): void;
-  refreshSources(): Promise<void>;
+  /** Reads the Architect's captured Markdown list. `automatic` (a mount, owner or focus trigger) reads only a ready Architect with a known session. */
+  refreshSources(options?: { automatic?: boolean }): Promise<void>;
   /** Uses this Markdown for the target preview (and reads it). */
   selectSource(sourceId: string): Promise<void>;
   /** Reads the first page of a source, or with `more` the next page, into the viewer. Never changes the selection. */
@@ -145,12 +147,13 @@ export function createStructureStore(): StructureStore {
   const arrival = new Map<string, number>();
   let arrivalSeq = 0;
   let savedFlight: { epoch: number; promise: Promise<void> } | null = null;
-  let sourcesFlight: { scope: number; key: string | null; promise: Promise<void> | null } | null = null;
+  /** The newest source-list read: `key` is the owner and its readiness, so a not-ready read never stands in for the later ready one. */
+  let sourcesFlight: { scope: number; key: string; promise: Promise<void> | null } | null = null;
 
-  const architect = (): { id: string; generation: number; ready: boolean } | null => host?.architect() ?? null;
-  const sameArchitect = (a: { id: string; generation: number } | null, b: { id: string; generation: number } | null): boolean =>
-    a !== null && b !== null && a.id === b.id && a.generation === b.generation;
-  const sourceCurrent = (mine: number, arch: { id: string; generation: number }): boolean => mine === scope && sameArchitect(architect(), arch);
+  const architect = (): ArchitectDescriptor | null => host?.architect() ?? null;
+  const sameArchitect = (a: ArchitectDescriptor | null, b: ArchitectDescriptor | null): boolean =>
+    a !== null && b !== null && a.id === b.id && a.generation === b.generation && a.sessionId === b.sessionId;
+  const sourceCurrent = (mine: number, arch: ArchitectDescriptor): boolean => mine === scope && sameArchitect(architect(), arch);
 
   // ----- revisions -----
 
@@ -253,6 +256,7 @@ export function createStructureStore(): StructureStore {
     if (!api || !host) return;
     const arch = architect();
     if (!arch) { commit({ sourcesError: NEED_ARCHITECT }); return; }
+    if (state.sourcesKey === null || state.sourcesKey !== architectKey(arch)) { commit({ sourcesError: "The Markdown list belongs to another Architect session; refresh it." }); return; }
     const row = state.sources.find(candidate => candidate.sourceId === id);
     if (!row) { commit({ sourcesError: `Unknown Markdown source ${id}; refresh the list.` }); return; }
     const known = state.pages[id];
@@ -283,9 +287,11 @@ export function createStructureStore(): StructureStore {
     }
   }
 
-  function clearSources(message: string | null): void {
+  /** Drops the list, pages and selection and any read still running for them; `settled` marks the list as read (with `message`) instead of unknown. */
+  function clearSources(message: string | null, settled = true): void {
     sourcePinned = false;
-    commit({ sources: [], sessionId: null, sourcesKey: null, sourcesLoading: false, sourcesLoaded: true, sourcesError: message, selectedSourceId: null, previewId: null, pages: {} });
+    sourcesFlight = null;
+    commit({ sources: [], sessionId: null, sourcesKey: null, sourcesLoading: false, sourcesLoaded: settled, sourcesError: message, selectedSourceId: null, previewId: null, pages: {} });
     reselect("structureProposed");
   }
 
@@ -302,26 +308,36 @@ export function createStructureStore(): StructureStore {
     if (selectedId && !state.pages[selectedId]?.loaded) void readSource(selectedId);
   }
 
-  function refreshSources(): Promise<void> {
+  function refreshSources(options: { automatic?: boolean } = {}): Promise<void> {
     const api = backend;
     if (!api || !host) return Promise.resolve();
     const arch = architect();
+    if (!arch) { clearSources(NEED_ARCHITECT); return Promise.resolve(); }
     const key = architectKey(arch);
-    if (sourcesFlight && sourcesFlight.scope === scope && sourcesFlight.key === key && sourcesFlight.promise) return sourcesFlight.promise;
-    if (!arch || !key) { clearSources(NEED_ARCHITECT); return Promise.resolve(); }
+    // A list read from another owner or session is not authorized for this one, whatever is read next.
+    if (state.sourcesKey !== null && state.sourcesKey !== key) clearSources(null, false);
+    if (!key) {
+      if (!options.automatic) commit({ sourcesError: "The Architect's session is not known yet; wait until it is running." });
+      return Promise.resolve();
+    }
+    if (options.automatic && !arch.ready) return Promise.resolve();
+    const flightKey = `${key}:${arch.ready ? "ready" : "notReady"}`;
+    if (sourcesFlight && sourcesFlight.scope === scope && sourcesFlight.key === flightKey && sourcesFlight.promise) return sourcesFlight.promise;
     const mine = scope;
-    const flight: NonNullable<typeof sourcesFlight> = { scope: mine, key, promise: null };
+    const flight: NonNullable<typeof sourcesFlight> = { scope: mine, key: flightKey, promise: null };
     sourcesFlight = flight;
     flight.promise = (async () => {
       commit({ sourcesLoading: true, sourcesError: null });
       try {
         const list = await api.listStructureSources(arch.id, arch.generation);
-        if (sourceCurrent(mine, arch)) applyList(list.sources, list.sessionId, key);
+        if (sourcesFlight !== flight || !sourceCurrent(mine, arch)) return;
+        if (list.sessionId !== arch.sessionId) commit({ sourcesError: "The Architect returned captured messages from another session; refresh the list.", sourcesLoaded: true });
+        else applyList(list.sources, list.sessionId, key);
       } catch (error) {
-        if (sourceCurrent(mine, arch)) commit({ sourcesError: errorText(error), sourcesLoaded: true });
+        if (sourcesFlight === flight && sourceCurrent(mine, arch)) commit({ sourcesError: errorText(error), sourcesLoaded: true });
       } finally {
-        if (sourcesFlight === flight) sourcesFlight = null;
-        if (mine === scope) commit({ sourcesLoading: false });
+        // Only the read that still owns the loading state clears it; a superseded read must not hide the newer one's progress.
+        if (sourcesFlight === flight) { sourcesFlight = null; commit({ sourcesLoading: false }); }
       }
     })();
     return flight.promise;
@@ -343,6 +359,7 @@ export function createStructureStore(): StructureStore {
     const arch = architect();
     if (!arch) { commit({ sourcesError: NEED_ARCHITECT }); return; }
     const key = architectKey(arch);
+    if (!key) { commit({ sourcesError: "The Architect's session is not known yet; wait until it is running." }); return; }
     const mine = scope;
     commit({ selectingLast: true, sourcesError: null });
     try {
@@ -351,7 +368,7 @@ export function createStructureStore(): StructureStore {
       const sameSession = state.sourcesKey === key;
       const rows = sameSession ? [row, ...state.sources.filter(other => other.sourceId !== row.sourceId)] : [row];
       const sources = rows.sort((a, b) => b.capturedAt - a.capturedAt);
-      commit({ sources, sourcesKey: key, sourcesLoaded: true, sessionId: sameSession ? state.sessionId : null, pages: sameSession ? state.pages : {} });
+      commit({ sources, sourcesKey: key, sourcesLoaded: true, sessionId: arch.sessionId, pages: sameSession ? state.pages : {} });
       await selectSource(row.sourceId);
     } catch (error) {
       if (sourceCurrent(mine, arch)) commit({ sourcesError: errorText(error) });

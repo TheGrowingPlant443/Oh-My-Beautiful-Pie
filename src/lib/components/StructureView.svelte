@@ -1,8 +1,8 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import type { StructureSourceRow } from "../api";
-  import type { InventoryState } from "../overview-types";
-  import { approveCheck, generateBlock, inFlightRevision, selectedRevision, selectedSource, sourceViewed, supersededBy, type StructureStore } from "../structure-overview";
+  import type { ArchitectDescriptor, InventoryState } from "../overview-types";
+  import { approveCheck, folderKey, generateBlock, inFlightRevision, selectedRevision, selectedSource, sourceViewed, supersededBy, type StructureStore } from "../structure-overview";
   import {
     approvalNotice, buildCurrentTree, capturedText, conflictList, conventionRows, differentDocument, entryLookup, excerptLine, generalize,
     indexChanged, mappingIndex, proposedTree, shortHash, sizeText, sourceKindLabel,
@@ -12,7 +12,7 @@
   let { folder, snapshotId, inventory, store, onOpenArchitect, architect }: {
     folder: string; snapshotId: string | null; inventory: InventoryState; store: StructureStore;
     onOpenArchitect: (id: string, replayRequestId?: string) => Promise<boolean>;
-    architect: { id: string; generation: number; ready: boolean } | null;
+    architect: ArchitectDescriptor | null;
   } = $props();
 
   let approveDialog = $state<HTMLDialogElement>();
@@ -53,10 +53,13 @@
   const noLookup = entryLookup(null);
   const noMappings = mappingIndex(null);
 
-  // Passive refresh of the Architect's captured Markdown list; it never generates.
+  // Passive reads of the Architect's captured Markdown list; they never generate. The effect depends only on this scalar, so the freshly
+  // allocated Architect object App derives for every instance snapshot never causes another request; only a real folder, owner,
+  // session or readiness transition (and mount, the Refresh button and window focus) does.
+  const refreshKey = $derived(`${folderKey(folder)}|${architect ? `${architect.id}:${architect.generation}:${architect.sessionId ?? ""}:${architect.ready ? "ready" : "notReady"}` : ""}`);
   $effect(() => {
-    void folder; void architect?.id; void architect?.generation;
-    untrack(() => { void store.refreshSources(); });
+    void refreshKey;
+    untrack(() => { void store.refreshSources({ automatic: true }); });
   });
 
   const openArchitect = async (replay?: string): Promise<void> => { if (architect) await onOpenArchitect(architect.id, replay); };
@@ -68,6 +71,9 @@
     return `${shortHash(revision.requestId)} · ${revision.createdAt ? capturedText(revision.createdAt) : "time unknown"} · ${revision.state}`;
   }
 </script>
+
+<!-- Returning to this window after pasting the target Markdown in the Architect picks the new capture up; a read already running is joined. -->
+<svelte:window onfocus={() => void store.refreshSources({ automatic: true })} />
 
 <section class="structure" aria-label="Repository structure">
   <div class="toolbar" role="toolbar" aria-label="Structure actions">
@@ -93,7 +99,7 @@
     <summary><h3>Current structure</h3>
       <span class="meta">{tree.fileCount} files · {tree.dirCount} directories{#if inventory.total > inventory.files.length} (inventory {inventory.files.length} of {inventory.total} files loaded){/if}</span>
     </summary>
-    <div class="body scroll">
+    <div class="body">
       {#if inventory.snapshotId !== snapshotId && snapshotId}<p class="warn">The inventory belongs to another index snapshot; it is being refreshed.</p>{/if}
       {#if inventory.status === "loading"}<p class="dim" role="status">Loading the file inventory…</p>{/if}
       {#if inventory.status === "error"}<p class="alert" role="alert">{inventory.error ?? "The file inventory could not be loaded."}</p>{/if}
@@ -131,7 +137,7 @@
         <button onclick={() => store.regenerate("structureProposed")} disabled={!!previewBlock}>Re-run preview</button>
       {/if}
     </header>
-    <div class="body scroll">
+    <div class="body">
       <p class="dim">The pasted Markdown remains the source of truth; this diagram is a visualization aid only.</p>
       {#if waiting.structureProposed}<p class="dim" role="status">Waiting for the Architect…</p>{/if}
       {#if failedPreview}<p class="warn">The newest preview request is {failedPreview.state}: {failedPreview.message ?? "no details"}</p>{/if}
@@ -172,11 +178,11 @@
     <header><h3 id="source-title">Target Markdown source</h3>
       <button onclick={() => store.refreshSources()} disabled={s.sourcesLoading}>Refresh list</button>
       <button onclick={() => store.useLastSubmitted()} disabled={s.selectingLast || !architect}>Use last submitted message</button>
+      <span class="checking" role="status">{s.sourcesLoading ? (s.sourcesLoaded ? "Checking captured messages…" : "Reading the Architect's captured messages…") : ""}</span>
     </header>
-    <div class="body scroll">
+    <div class="body">
       {#if s.sourcesError}<p class="alert" role="alert">{s.sourcesError}</p>{/if}
-      {#if s.sourcesLoading}<p class="dim" role="status">Reading the Architect's captured messages…</p>{/if}
-      {#if s.sources.length === 0 && !s.sourcesLoading}
+      {#if s.sources.length === 0 && (s.sourcesLoaded || !s.sourcesLoading)}
         <p><strong>Paste the target Markdown in Architect chat first</strong></p>
         <button onclick={() => openArchitect()} disabled={!architect}>Open Architect</button>
       {/if}
@@ -229,6 +235,9 @@
 
 <style>
   .structure { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  /* Natural height: the page's .structure wrapper is the one scroller, so no panel is squeezed below its content or clipped at the bottom. */
+  .structure > * { flex: 0 0 auto; }
+  .panel > .body { flex: 0 0 auto; min-height: auto; overflow: visible; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 8px; }
   .reasons { margin: 0; padding: 0; list-style: none; font-size: 12px; color: var(--text-dim); }
   p.alert, p.warn, p.ok { margin: 0; padding: 8px 10px; border: 1px solid var(--err); border-radius: 8px; overflow-wrap: anywhere; white-space: pre-wrap; }
@@ -237,7 +246,7 @@
   .dim, .meta { color: var(--text-dim); font-size: 12px; margin: 4px 0; overflow-wrap: anywhere; }
   summary { display: flex; align-items: center; gap: 10px; padding: 8px 10px; cursor: pointer; background: #141b25; }
   summary h3, header h3 { margin: 0; font-size: 12px; letter-spacing: .07em; text-transform: uppercase; color: var(--text-dim); }
-  .scroll { max-height: 420px; overflow: auto; }
+  .checking { margin-left: auto; color: var(--text-dim); font-size: 12px; }
   .target { border: 2px solid var(--accent-2); }
   .pill { display: inline-block; font-size: 11px; padding: 0 6px; border: 1px solid var(--line); border-radius: 999px; font-weight: 400; text-transform: none; letter-spacing: 0; }
   .pill.warn { color: var(--warn); border-color: var(--warn); }

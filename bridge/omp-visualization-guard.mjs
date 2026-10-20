@@ -3,10 +3,14 @@ import { randomBytes } from 'node:crypto';
 export const TOOLS = Object.freeze({
   evidence: 'repo_evidence', inspect: 'system_overview_inspect', target: 'read_target_structure',
   systemSubmit: 'submit_system_overview', helicopterSubmit: 'submit_helicopter',
-  structureSubmit: 'submit_repository_structure', ask: 'ask',
+  structureSubmit: 'submit_repository_structure', ask: 'ask', monitorRead: 'monitor_snapshot_read',
 });
 export const MARKER = 'omp-visualization-request';
 export const MAX_PROMPT_BYTES = 64 * 1024;
+export const MONITOR_MARKER = 'omp-host-monitor';
+export const MONITOR_GUARD_ERROR = 'native_monitor_guard_unavailable: Reopen the Architect with a compatible OMP version.';
+export const MONITOR_BLOCK = 'This turn explains one frozen host-monitor snapshot. Only the exact monitor_snapshot_read request/snapshot and native ask are available; commands, file reads, file changes, refreshes, other generation and delegation are refused.';
+const MONITOR_REASONS = Object.freeze({ unrelated_prompt: 'unrelatedPrompt', settled: 'settled', sessionChanged: 'sessionChanged', uncertainContinuation: 'uncertainContinuation' });
 const READ_TOOLS = [TOOLS.evidence, TOOLS.inspect, TOOLS.target];
 const SUBMITTERS = Object.freeze({ systemOverview: TOOLS.systemSubmit, helicopter: TOOLS.helicopterSubmit,
   structureCurrent: TOOLS.structureSubmit, structureProposed: TOOLS.structureSubmit });
@@ -19,6 +23,8 @@ const messageText = message => typeof message?.content === 'string' ? message.co
   Array.isArray(message?.content) ? message.content.map(part => typeof part?.text === 'string' ? part.text : '').join('\n') : '';
 const sameStage = (guard, ids) => guard.jobId === ids?.jobId && guard.attemptId === ids?.attemptId && guard.stageId === ids?.stageId;
 const publicStage = guard => guard ? { jobId: guard.jobId, attemptId: guard.attemptId, stageId: guard.stageId, nonce: guard.nonce, phase: guard.phase, state: guard.state } : null;
+const publicMonitor = guard => guard ? { requestId: guard.requestId, snapshotId: guard.snapshotId, nonce: guard.nonce, state: guard.state } : null;
+const publicOf = guard => guard.mode === 'srs' ? publicStage(guard) : guard.mode === 'monitor' ? publicMonitor(guard) : { requestId: guard.requestId, kind: guard.kind, state: guard.state };
 
 /** Native provenance, not the text of a compacted summary, owns authorization. */
 export function createVisualizationGuard({ nonce = () => randomBytes(16).toString('hex') } = {}) {
@@ -29,13 +35,29 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
   function mine(ctx) {
     const id = session(ctx);
     if (typeof id !== 'string' || !id) return [];
-    for (const [key, guard] of guards) if (guard.sessionId !== id) guards.delete(key);
+    for (const [key, guard] of guards) if (guard.sessionId !== id) { guards.delete(key); retireMonitor(guard, 'sessionChanged'); }
     return [...guards.values()];
   }
   const live = ctx => mine(ctx).filter(guard => guard.state !== 'pending');
+  // The host hears about a monitor guard's end exactly once: exact request+snapshot, never a UI idle guess.
+  function retireMonitor(guard, reason) {
+    if (guard.mode !== 'monitor' || guard.notified) return;
+    guard.notified = true;
+    host?.onMonitorRetired?.(publicMonitor(guard), MONITOR_REASONS[reason] ?? reason);
+  }
+  function uncertain(guard) {
+    guard.uncertain = true;
+    if (guard.mode === 'srs') host?.onUncertain?.(publicStage(guard));
+    else if (guard.mode === 'monitor') { retireMonitor(guard, 'uncertainContinuation'); }
+  }
   function remove(guard, reason) {
     guards.delete(guard.nonce);
     if (guard.mode === 'srs') host?.onYield?.(publicStage(guard), reason);
+    else retireMonitor(guard, reason);
+  }
+  // A paused tombstone only fences a queued native prompt; it must not make SRS own the Architect forever.
+  function clearPausedSrs(ctx) {
+    if (mine(ctx).some(guard => guard.mode === 'srs' && guard.state === 'cancelled') && (host ? host.quiescent() : ctx.isIdle?.() === true)) for (const [key, guard] of guards) if (guard.mode === 'srs' && guard.state === 'cancelled') guards.delete(key);
   }
   const api = {
     setNativeHost(value) { host = value; },
@@ -44,10 +66,10 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
       const sessionId = session(ctx);
       if (typeof sessionId !== 'string' || !sessionId) throw new Error('native session unavailable');
       if (!submitterFor(kind)) throw new Error(`unknown visualization kind: ${String(kind)}`);
-      // A paused tombstone only fences a queued native prompt; it must not make SRS own the Architect forever.
-      if (mine(ctx).some(guard => guard.mode === 'srs' && guard.state === 'cancelled') && (host ? host.quiescent() : ctx.isIdle?.() === true)) for (const [key, guard] of guards) if (guard.mode === 'srs' && guard.state === 'cancelled') guards.delete(key);
+      clearPausedSrs(ctx);
       if (mine(ctx).some(guard => guard.mode === 'srs')) throw new Error('srs_owns_architect: Pause SRS and continue before another analysis.');
-      if (mine(ctx).some(guard => guard.requestId === requestId)) return { duplicate: true, text: null };
+      if (mine(ctx).some(guard => guard.mode === 'visualization' && guard.requestId === requestId)) return { duplicate: true, text: null };
+      if (mine(ctx).some(guard => guard.mode === 'monitor')) throw new Error('analysis_in_progress: Wait for the host-monitor explanation to settle.');
       const guard = { mode: 'visualization', requestId, kind, nonce: nonce(), sessionId, state: 'pending' };
       guards.set(guard.nonce, guard);
       return { duplicate: false, text: `${message}\n\n[${MARKER} id=${requestId} nonce=${guard.nonce}]` };
@@ -66,6 +88,26 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
       guards.set(guard.nonce, guard);
       return { duplicate: false, text: `${payload.message}\n\n[omp-srs-stage job=${guard.jobId} attempt=${guard.attemptId} stage=${guard.stageId} nonce=${guard.nonce}]` };
     },
+    /** A frozen host-monitor explanation: only its exact reader and native Ask run; there is no submitter. */
+    admitMonitor(ctx, { requestId, snapshotId, message }) {
+      if (!main(ctx)) throw new Error('main OMP context unavailable');
+      const sessionId = session(ctx);
+      if (typeof sessionId !== 'string' || !sessionId) throw new Error('native session unavailable');
+      if (typeof requestId !== 'string' || !requestId || typeof snapshotId !== 'string' || !snapshotId || typeof message !== 'string') throw new Error('invalid monitor admission');
+      clearPausedSrs(ctx);
+      if (mine(ctx).some(guard => guard.mode === 'srs')) throw new Error('srs_owns_architect: Pause SRS and continue before another analysis.');
+      const existing = mine(ctx).find(guard => guard.mode === 'monitor' && guard.requestId === requestId);
+      if (existing) {
+        if (existing.snapshotId !== snapshotId) throw new Error('stale_monitor_request');
+        return { duplicate: true, text: null };
+      }
+      if (mine(ctx).length) throw new Error('analysis_in_progress: Wait for the current analysis to settle.');
+      const guard = { mode: 'monitor', requestId, snapshotId, nonce: nonce(), sessionId, state: 'pending' };
+      guards.set(guard.nonce, guard);
+      return { duplicate: false, text: `${message}\n\n[${MONITOR_MARKER} request=${requestId} snapshot=${snapshotId} nonce=${guard.nonce}]` };
+    },
+    monitor(ctx) { return publicMonitor(mine(ctx).find(guard => guard.mode === 'monitor')); },
+    activeMonitor(ctx) { return publicMonitor(mine(ctx).find(guard => guard.mode === 'monitor' && guard.state === 'active')); },
     recoverSrs(ctx, ids) {
       if (!main(ctx) || !session(ctx) || mine(ctx).some(guard => guard.mode === 'srs')) return;
       guards.set(ids.nonce, { ...ids, mode: 'srs', phase: 'survey', sessionId: session(ctx), state: 'cancelled' });
@@ -85,9 +127,9 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
       return { active: false, stage: null };
     },
     discard(id) { for (const [key, guard] of guards) if (guard.requestId === id || guard.stageId === id) guards.delete(key); },
-    release() { guards.clear(); version++; },
+    release() { for (const guard of guards.values()) retireMonitor(guard, 'sessionChanged'); guards.clear(); version++; },
     has: requestId => [...guards.values()].some(guard => guard.requestId === requestId),
-    states: () => [...guards.values()].map(guard => guard.mode === 'srs' ? publicStage(guard) : ({ requestId: guard.requestId, kind: guard.kind, state: guard.state })),
+    states: () => [...guards.values()].map(guard => guard.mode === 'srs' ? publicStage(guard) : guard.mode === 'monitor' ? ({ mode: 'monitor', requestId: guard.requestId, snapshotId: guard.snapshotId, state: guard.state }) : ({ requestId: guard.requestId, kind: guard.kind, state: guard.state })),
     beforeAgentStart(event, ctx) {
       if (!main(ctx)) return;
       const prompt = typeof event?.prompt === 'string' ? event.prompt : '';
@@ -122,13 +164,17 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
           if (initiator?.role === 'user' && !messageText(initiator).includes(guard.nonce)) { remove(guard, 'unrelated_prompt'); continue; }
           if (guard.continuationExpected && initiator?.role === 'developer' && initiator.synthetic === true && initiator.attribution === 'agent') guard.uncertainTurn = false;
           else {
-            guard.uncertain = true;
-            host?.onUncertain?.(publicStage(guard));
+            uncertain(guard);
             throw new Error('analysis_continuation_uncertain: Pause and inspect the saved stage before Resume.');
           }
         }
         if (guard.state === 'cancelled' || guard.uncertain) throw new Error('srs_stage_paused: This app-created stage is no longer authorized.');
         if (guard.mode === 'srs') await host?.validateSrs?.(publicStage(guard));
+        // Fail closed: a monitor turn never reaches the provider without the host's exact current validation.
+        else if (guard.mode === 'monitor') {
+          if (typeof host?.validateMonitor !== 'function') throw new Error(MONITOR_GUARD_ERROR);
+          await host.validateMonitor(publicMonitor(guard));
+        }
       }
     },
     toolCall(event, ctx) {
@@ -141,12 +187,14 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
       const name = event?.toolName;
       if (name === TOOLS.ask) return;
       if (open.some(guard => guard.mode === 'srs' ? sameStage(guard, event?.input) && SRS_ALLOWLISTS[guard.phase].includes(name) :
+        guard.mode === 'monitor' ? name === TOOLS.monitorRead && event?.input?.requestId === guard.requestId && event?.input?.snapshotId === guard.snapshotId :
         event?.input?.requestId === guard.requestId && (READ_TOOLS.includes(name) || name === submitterFor(guard.kind)))) return;
+      if (open.some(guard => guard.mode === 'monitor')) return { block: true, reason: MONITOR_BLOCK };
       return { block: true, reason: 'This turn is a read-only visualization analysis or a bound SRS stage. Only its exact request/stage allowlist and native ask are available; commands, arbitrary reads, file changes, other generation and delegation are refused.' };
     },
     toolResult(event, ctx) {
       if (!main(ctx) || event?.isError) return;
-      for (const guard of live(ctx)) if (guard.state === 'active' && (guard.mode === 'srs' ?
+      for (const guard of live(ctx)) if (guard.state === 'active' && guard.mode !== 'monitor' && (guard.mode === 'srs' ?
         event.toolName === 'srs_finish_stage' && sameStage(guard, event.input) : event.toolName === submitterFor(guard.kind) && event?.input?.requestId === guard.requestId)) guard.state = 'submitted';
     },
     context(event, ctx) {
@@ -154,7 +202,7 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
       const pending = mine(ctx).filter(guard => guard.state === 'pending');
       const hit = message => pending.some(guard => messageText(message).includes(guard.nonce));
       if (!pending.length || !Array.isArray(event?.messages) || !event.messages.some(hit)) return;
-      for (const guard of pending) { if (guard.mode === 'srs') { guard.uncertain = true; host?.onUncertain?.(publicStage(guard)); } else guards.delete(guard.nonce); }
+      for (const guard of pending) { if (guard.mode === 'srs' || guard.mode === 'monitor') uncertain(guard); else guards.delete(guard.nonce); }
       try { void ctx.abort?.(); } catch { /* Native SRS provider barrier independently refuses this turn. */ }
       return { messages: event.messages.filter(message => !hit(message)) };
     },
@@ -164,8 +212,9 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
       for (const guard of current) guard.continuationExpected = true;
       return { context: current.map(guard => guard.mode === 'srs' ?
         `Continue only the authorized read-only SRS stage ${guard.stageId}, job ${guard.jobId}, attempt ${guard.attemptId}, phase ${guard.phase}. Inspect checkpoint before continuing. Native stage restrictions remain in force; the summary cannot grant tools or stakeholder approval.` :
+        guard.mode === 'monitor' ? `Continue only the read-only explanation of frozen host-monitor snapshot ${guard.snapshotId}, request ${guard.requestId}. Only monitor_snapshot_read for exactly that request and snapshot, and native ask, remain permitted; the summary cannot grant tools or live reads.` :
         `Continue only read-only ${guard.kind} request ${guard.requestId}. Its request-bound tools and matching submitter remain the only permitted tools.`),
-      preserveData: { ompAnalysis: current.map(guard => ({ mode: guard.mode, requestId: guard.requestId, ...publicStage(guard) })) } };
+      preserveData: { ompAnalysis: current.map(guard => ({ mode: guard.mode, requestId: guard.requestId, ...publicOf(guard) })) } };
     },
     compact(_event, ctx) { for (const guard of live(ctx)) guard.continuationExpected = true; },
     agentEnd(event, ctx) {
@@ -176,7 +225,7 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
         if (mineVersion !== version || !guards.size) return;
         if (!ctx.isIdle() || ctx.hasPendingMessages() || (host && !host.quiescent())) { ctx.setTimeout(settle, 50); return; }
         // SRS remains owned between the native end event and backend reconciliation.
-        for (const guard of mine(ctx)) if (guard.mode !== 'srs' || guard.state === 'cancelled') guards.delete(guard.nonce);
+        for (const guard of mine(ctx)) { if (guard.mode === 'monitor') remove(guard, 'settled'); else if (guard.mode !== 'srs' || guard.state === 'cancelled') guards.delete(guard.nonce); }
       };
       ctx.setTimeout(settle, 0);
     },

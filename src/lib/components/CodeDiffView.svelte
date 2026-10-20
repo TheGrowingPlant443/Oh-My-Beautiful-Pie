@@ -3,14 +3,17 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { api, type DiffContent, type DiffFile, type DiffFileAction, type DiffGroup, type DiffMode, type DiffOverview, type HelperAdmission } from "../api";
   import { errorText, instancesById, reportError } from "../stores";
+  import { renderedHelperAgentId } from "../human-decisions";
   import { confirmDanger } from "../ui";
   import CodeDiffEditor from "./CodeDiffEditor.svelte";
   import DiffFileTree from "./DiffFileTree.svelte";
   import HelperPane from "./HelperPane.svelte";
   type Choice = "save" | "discard" | "cancel";
   type Sel = { group: DiffGroup | null; path: string };
-  let { instanceId, name, onBack, onGitTree, onGuardChange }: {
+  let { instanceId, name, onBack, onGitTree, onGuardChange, onVisibleAgentChange }: {
     instanceId: string; name: string; onBack: () => void; onGitTree: () => void; onGuardChange: (guard: (() => Promise<boolean>) | null) => void;
+    /** Id of the helper conversation this page actually renders, or null. Cleanup reports null on that same callback. */
+    onVisibleAgentChange?: (id: string | null) => void;
   } = $props();
   const GROUPS: { group: DiffGroup; label: string }[] = [{ group: "staged", label: "Staged Changes" }, { group: "changes", label: "Changes" }];
   let mode = $state<DiffMode>("head");
@@ -49,6 +52,14 @@
   let opening = $state(false);
   let lastRequest: "explain" | "review" = "explain";
   const helper = $derived(agent ? $instancesById.get(agent.id) : undefined);
+  // Exactly the render predicate: agentOpen && agent && helper && helper.generation > 0.
+  const visibleAgentId = $derived(agentOpen && agent ? renderedHelperAgentId(true, helper) : null);
+  $effect(() => {
+    const report = onVisibleAgentChange;
+    if (!report) return;
+    report(visibleAgentId);
+    return () => report(null);
+  });
 
   function askLeave(): Promise<Choice> {
     return new Promise(resolve => { pending = resolve; leaveDialog?.showModal(); });

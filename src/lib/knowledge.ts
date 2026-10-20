@@ -34,9 +34,18 @@ export interface GraphifyCapability {
   artifactHash: string | null;
   message: string | null;
 }
-export interface CogneeCapability { state: "installed" | "absent" | "unreadable"; installed: boolean | null; version: string | null; uiUrl: string | null; installationFolder: string | null; message: string | null }
+export type CogneeUiState = "ready" | "missingFrontend" | "missingDependencies" | "unreadable" | "unsupported";
+/** Whether the installed Cognee web interface can be started by Open. Passive file metadata only; Open revalidates. */
+export interface CogneeUiCapability { state: CogneeUiState; message: string | null }
+export interface CogneeCapability { state: "installed" | "absent" | "unreadable"; installed: boolean | null; version: string | null; installationFolder: string | null; message: string | null; ui: CogneeUiCapability }
+export type CogneeOpenState = "opened" | "missingComponent" | "backendUnavailable" | "portBusy" | "unsupported" | "startingFailed" | "readinessTimeout" | "openFailed";
+/** The answer to one Open click; every state but `opened` explains why. `url` is set when a UI is ready (also for `openFailed`). */
+export interface CogneeOpenResult { state: CogneeOpenState; url: string | null; message: string | null }
 export interface KnowledgeCapabilities {
+  /** The folder as asked (trimmed); a late answer is fenced against the project now shown. */
   folder: string | null;
+  /** Canonical backend repository identity of `folder` (null for global probes and folders that are not projects). */
+  projectKey: string | null;
   obsidian: ObsidianCapability;
   graphify: GraphifyCapability;
   cognee: CogneeCapability;
@@ -234,8 +243,8 @@ export const knowledgeApi = {
   registerGraphifyOutput: (folder: string, directory: string) => invoke<KnowledgeCapabilities>("register_graphify_output", { folder, directory }),
   readGraphify: <T>(artifactId: string, section: GraphifySection, offset: number, limit: number) => invoke<GraphifyPage<T>>("read_graphify_graph", { artifactId, section, offset, limit }),
   queryGraphify: (artifactId: string, query: GraphifyQuery) => invoke<GraphifyQueryPage>("query_graphify_graph", { artifactId, query }),
-  configureCognee: (url: string | null, installationFolder: string | null) => invoke<CogneeCapability>("configure_cognee_ui", { url, installationFolder }),
-  openCognee: () => invoke<void>("open_cognee_ui"),
+  /** Explicit click only: revalidates the installed Cognee UI, starts this app's own frontend when needed and opens it. Always an answer. */
+  openCognee: () => invoke<CogneeOpenResult>("open_cognee_ui"),
 };
 export type KnowledgeApi = typeof knowledgeApi;
 
@@ -295,21 +304,24 @@ export const knowledge = createKnowledgeStore(knowledgeApi);
 /** Vault of the scope that applies to the shown folder: its project vault, otherwise the global one. */
 export const projectVaultOf = (state: KnowledgeState): VaultBinding | null => state.capabilities?.projectVault ?? null;
 export const obsidianInstalled = (capabilities: KnowledgeCapabilities | null): boolean => capabilities?.obsidian.state === "installed";
-/** Graphify button: only a project output that exists. Absent/unprobed hides it; malformed and foreign stay visible so the problem is shown. */
-export const graphifyVisible = (capabilities: KnowledgeCapabilities | null): boolean => !!capabilities && capabilities.graphify.state !== "absent" && capabilities.graphify.present;
+/** The folder as the backend echoes it (`folder.trim()`), or null when no project is shown. */
+export const projectFolder = (folder: string | null | undefined): string | null => folder?.trim() || null;
+/**
+ * The capabilities that were accepted for exactly this project. A retained answer for another project (while a probe for this
+ * one is in flight or after it failed) is never used: the echoed `folder` must match. A failed re-probe of the same project keeps
+ * its previous answer, which is the intended "an error never hides what was found" behavior.
+ */
+export const capabilitiesFor = (state: Pick<KnowledgeState, "capabilities">, folder: string | null | undefined): KnowledgeCapabilities | null => {
+  const wanted = projectFolder(folder);
+  return wanted !== null && state.capabilities?.folder === wanted ? state.capabilities : null;
+};
+/** Graphify is reachable from every shown project; what it opens depends on `graphifyAction`. */
+export const graphifyVisible = (folder: string | null | undefined): boolean => projectFolder(folder) !== null;
+/**
+ * What the Graphify button does: a valid admitted output (verified, or local and labelled unverified) opens the graph view; anything
+ * else (absent, foreign, malformed, unavailable, or not probed for this project yet) opens the access dialog with its diagnostic.
+ */
+export const graphifyAction = (capabilities: KnowledgeCapabilities | null): "view" | "access" =>
+  capabilities && capabilities.graphify.present && (capabilities.graphify.state === "present" || capabilities.graphify.state === "unverified") ? "view" : "access";
+/** Cognee button: positive installed evidence only (an unreadable installation is a diagnostic elsewhere, not proof). */
 export const cogneeVisible = (capabilities: KnowledgeCapabilities | null): boolean => capabilities?.cognee.installed === true;
-
-/** Loopback http(s) UI URL a human may configure: no user-info, query or fragment. Mirrors the backend rule; the backend revalidates. */
-export function validateCogneeUrl(text: string): { ok: true; url: string } | { ok: false; message: string } {
-  const value = text.trim();
-  if (!value) return { ok: false, message: "Enter the address of the Cognee UI that is already running." };
-  if (/[\s\u0000-\u001f]/.test(value)) return { ok: false, message: "The address must not contain spaces or control characters." };
-  let parsed: URL;
-  try { parsed = new URL(value); } catch { return { ok: false, message: "That is not a valid address." }; }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return { ok: false, message: "Only http or https addresses are accepted." };
-  if (parsed.username || parsed.password) return { ok: false, message: "The address must not contain a user name or password." };
-  if (parsed.search || parsed.hash) return { ok: false, message: "The address must not contain a query or fragment." };
-  const host = parsed.hostname.toLowerCase();
-  if (host !== "127.0.0.1" && host !== "[::1]" && host !== "::1" && host !== "localhost") return { ok: false, message: "Only a UI on this computer (127.0.0.1, ::1 or localhost) can be opened from here." };
-  return { ok: true, url: parsed.toString() };
-}

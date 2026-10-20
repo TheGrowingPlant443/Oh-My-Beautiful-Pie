@@ -2,9 +2,9 @@
 //!
 //! Probing only inspects files: nothing is launched, no CLI or Python is run, no Obsidian or Cognee setting, registry
 //! entry or store is written, and no note is copied. Obsidian is opened only through an `obsidian://` URI handed to its
-//! own executable; Cognee only through a loopback http(s) URL the human configured for an already running UI.
+//! own executable; the Cognee UI is started and opened by `cognee_ui` (explicit click only, loopback only).
 use super::dto::*;
-use super::fsio::{self, err, shown, validate_relative};
+use super::fsio::{self, err, validate_relative};
 use super::{KnowledgeService, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -24,12 +24,14 @@ pub(crate) enum ExeSetting {
 }
 
 /// Where discovery looks. [`Environment::from_process`] reads the optional `OMP_KNOWLEDGE_*` overrides used by isolated
-/// smoke runs (`OMP_KNOWLEDGE_OBSIDIAN_EXE` may be `none` to simulate an absent Obsidian).
+/// smoke runs (`OMP_KNOWLEDGE_OBSIDIAN_EXE` may be `none` to simulate an absent Obsidian; `OMP_KNOWLEDGE_COGNEE_NODE`
+/// names the Node.js executable for the Cognee UI instead of searching `PATH`).
 #[derive(Clone, Debug)]
 pub(crate) struct Environment {
     pub obsidian_exe: ExeSetting,
     pub obsidian_registry: Option<PathBuf>,
     pub cognee_home: Option<PathBuf>,
+    pub cognee_node: Option<PathBuf>,
     pub protected: Vec<PathBuf>,
 }
 
@@ -45,6 +47,7 @@ impl Environment {
             obsidian_exe,
             obsidian_registry: variable("OMP_KNOWLEDGE_OBSIDIAN_REGISTRY").map(PathBuf::from),
             cognee_home: variable("OMP_KNOWLEDGE_COGNEE_HOME").map(PathBuf::from),
+            cognee_node: variable("OMP_KNOWLEDGE_COGNEE_NODE").map(PathBuf::from),
             protected: Vec::new(),
         }
     }
@@ -52,21 +55,18 @@ impl Environment {
     /// Nothing is discovered anywhere (tests).
     #[cfg(test)]
     pub(crate) fn isolated() -> Self {
-        Self { obsidian_exe: ExeSetting::Disabled, obsidian_registry: None, cognee_home: None, protected: Vec::new() }
+        Self { obsidian_exe: ExeSetting::Disabled, obsidian_registry: None, cognee_home: None, cognee_node: None, protected: Vec::new() }
     }
 }
 
+/// Old versions saved a UI address and an installation folder here. Both are ignored when read (unknown fields are
+/// skipped by serde) and dropped on the next save: a saved address never authorizes a launch.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub(crate) struct CogneeSettings {
-    pub ui_url: Option<String>,
-    pub installation_folder: Option<String>,
-    /// Written only by explicit configuration, never by a passive probe.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub installation_evidence: Option<CogneeEvidence>,
     /// Positive observations survive subsequent inspection errors during this service's lifetime.
     #[serde(skip)]
-    observed_installation: Option<CogneeEvidence>,
+    pub(super) observed_installation: Option<CogneeEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,7 +122,7 @@ mod version {
 
 /// The file version resource of an executable (read-only metadata; the program is not run).
 #[cfg(windows)]
-fn executable_version(path: &Path) -> Option<String> {
+pub(crate) fn executable_version(path: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let mut handle = 0u32;
@@ -225,11 +225,12 @@ fn launch_detached(program: &Path, argument: &str) -> Result<()> {
     Ok(())
 }
 
-/// The Cognee UI URL rule: credential-free http(s) on a loopback host, no query or fragment.
+/// The loopback URL rule of the system opener: credential-free http(s) on a loopback host, no query or fragment.
+/// It is the last boundary before the browser is started; nothing user-supplied reaches it any more.
 pub(crate) fn validate_cognee_url(text: &str) -> Result<String> {
     let text = text.trim();
     if text.is_empty() || text.len() > 512 || text.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err("Enter the address of your running Cognee UI, for example http://127.0.0.1:3000".into());
+        return Err("The Cognee UI address is empty or contains whitespace".into());
     }
     let url = reqwest::Url::parse(text).map_err(|_| "That is not a valid address".to_string())?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -247,7 +248,7 @@ pub(crate) fn validate_cognee_url(text: &str) -> Result<String> {
     }
 }
 
-fn open_loopback_url(url: &str) -> Result<()> {
+pub(crate) fn open_loopback_url(url: &str) -> Result<()> {
     let url = validate_cognee_url(url)?;
     #[cfg(windows)]
     let mut command = {
@@ -444,35 +445,36 @@ impl KnowledgeService {
         self.probe_cognee_with(probe_cognee_folder)
     }
 
+    /// The one place the Cognee installation folder comes from: the isolated-run override, otherwise
+    /// `%LOCALAPPDATA%/Cognee` on Windows. There is no saved/configured location any more.
+    pub(crate) fn cognee_folder(&self) -> Option<PathBuf> {
+        self.env.cognee_home.clone().or_else(|| {
+            std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()).map(|base| PathBuf::from(base).join("Cognee")).filter(|_| cfg!(windows))
+        })
+    }
+
+    fn cognee_ui_for(&self, evidence: Option<&CogneeEvidence>, problem: bool) -> CogneeUiCapability {
+        match evidence {
+            Some(evidence) => super::cognee_ui::capability(Path::new(&evidence.folder), &self.home, self.env.cognee_node.as_deref()),
+            None if problem => CogneeUiCapability { state: CogneeUiState::Unreadable, message: Some("Cognee could not be inspected, so its web interface was not looked for.".into()) },
+            None => CogneeUiCapability { state: CogneeUiState::MissingFrontend, message: Some("Cognee is not installed.".into()) },
+        }
+    }
+
     /// The injectable file probe keeps error handling deterministic in regression tests.
     pub(crate) fn probe_cognee_with(&self, probe: impl FnOnce(&Path) -> Result<Option<CogneeEvidence>, CogneeProbeError>) -> CogneeCapability {
         let (settings, settings_error) = {
             let state = self.state.lock();
             (state.integrations.cognee.clone(), state.integrations_error.clone())
         };
-        let folder = self.env.cognee_home.clone().or_else(|| settings.installation_folder.as_deref().map(PathBuf::from)).or_else(|| {
-            std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()).map(|base| PathBuf::from(base).join("Cognee")).filter(|_| cfg!(windows))
-        });
+        let folder = self.cognee_folder();
         let mut problems = Vec::new();
         if let Some(error) = settings_error {
             problems.push(format!("Integration settings are unreadable: {error}"));
         }
-        let ui_url = match settings.ui_url.as_deref().map(validate_cognee_url).transpose() {
-            Ok(url) => url,
-            Err(error) => {
-                problems.push(format!("The saved Cognee UI address is invalid: {error}"));
-                None
-            }
-        };
-        let previous = folder.as_deref().and_then(|folder| {
-            settings.observed_installation.iter().chain(settings.installation_evidence.iter())
-                .find(|evidence| fsio::same_path(Path::new(&evidence.folder), folder)).cloned()
-                // Older settings saved a folder only after validating an installation.
-                .or_else(|| settings.installation_folder.as_deref().filter(|saved| fsio::same_path(Path::new(saved), folder))
-                    .map(|saved| CogneeEvidence { folder: saved.to_string(), version: None }))
-        });
+        let previous = folder.as_deref().and_then(|folder| settings.observed_installation.iter().find(|evidence| fsio::same_path(Path::new(&evidence.folder), folder)).cloned());
         let result = match folder.as_deref() {
-            Some(folder) if !folder.is_absolute() => Err(CogneeProbeError { message: "The saved Cognee installation folder is not absolute".into(), evidence: None }),
+            Some(folder) if !folder.is_absolute() => Err(CogneeProbeError { message: "The Cognee installation folder is not absolute".into(), evidence: None }),
             Some(folder) => probe(folder),
             None => Ok(None),
         };
@@ -493,77 +495,32 @@ impl KnowledgeService {
             if let Some(evidence) = &evidence {
                 self.state.lock().integrations.cognee.observed_installation = Some(evidence.clone());
             }
+            let ui = self.cognee_ui_for(evidence.as_ref(), true);
             return CogneeCapability {
                 state: CogneeState::Unreadable,
                 installed: evidence.as_ref().map(|_| true),
                 version: evidence.as_ref().and_then(|evidence| evidence.version.clone()),
-                ui_url,
                 message: Some(format!("Cognee could not be fully inspected: {}. No application was started or changed.", problems.join("; "))),
                 installation_folder: folder.map(|folder| folder.to_string_lossy().into_owned()),
+                ui,
             };
         }
         match found {
             Some(evidence) => {
                 // In-memory only: capability queries never write settings or any Cognee store.
                 self.state.lock().integrations.cognee.observed_installation = Some(evidence.clone());
-                let message = ui_url.is_none().then(|| "Cognee is installed; its UI is not configured".to_string());
-                CogneeCapability { state: CogneeState::Installed, installed: Some(true), version: evidence.version, ui_url, message, installation_folder: Some(evidence.folder) }
+                let ui = self.cognee_ui_for(Some(&evidence), false);
+                CogneeCapability { state: CogneeState::Installed, installed: Some(true), version: evidence.version, message: None, installation_folder: Some(evidence.folder), ui }
             }
-            None => CogneeCapability { state: CogneeState::Absent, installed: Some(false), version: None, ui_url, message: Some("Cognee was not found".into()), installation_folder: folder.map(|folder| folder.to_string_lossy().into_owned()) },
+            None => CogneeCapability {
+                state: CogneeState::Absent,
+                installed: Some(false),
+                version: None,
+                message: Some("Cognee was not found".into()),
+                installation_folder: folder.map(|folder| folder.to_string_lossy().into_owned()),
+                ui: self.cognee_ui_for(None, false),
+            },
         }
-    }
-
-    /// Saves (or, with `None`, clears) the address of an already running Cognee UI and an alternate installation
-    /// folder. Nothing is started, imported or contacted.
-    pub fn configure_cognee_ui(&self, url: Option<&str>, installation_folder: Option<&str>) -> Result<CogneeCapability> {
-        let url = url.map(str::trim).filter(|u| !u.is_empty()).map(validate_cognee_url).transpose()?;
-        let evidence = match installation_folder.map(str::trim).filter(|f| !f.is_empty()) {
-            None => None,
-            Some(folder) => {
-                let path = Path::new(folder);
-                if !path.is_absolute() {
-                    return Err("Choose an absolute Cognee installation folder".into());
-                }
-                let meta = fs::symlink_metadata(path).map_err(|e| err("Cannot inspect the Cognee folder", e))?;
-                if !meta.is_dir() || crate::code_quality::snapshot::is_link(&meta) {
-                    return Err("The Cognee installation folder must be a plain folder".into());
-                }
-                let canonical = crate::setup::canonical(path).map_err(|e| err("Cannot resolve the Cognee folder", e))?;
-                let evidence = probe_cognee_folder(&canonical).map_err(|error| format!("Cognee could not be inspected: {}", error.message))?
-                    .ok_or_else(|| format!("No Cognee installation was found in {}", shown(folder)))?;
-                Some(evidence)
-            }
-        };
-        {
-            let mut state = self.state.lock();
-            if let Some(error) = &state.integrations_error {
-                return Err(format!("Integration settings are unreadable: {error}"));
-            }
-            let mut settings = state.integrations.clone();
-            let previous = settings.cognee.observed_installation.clone();
-            let installation_evidence = evidence.clone().or_else(|| url.as_ref().and(previous.clone()));
-            settings.cognee = CogneeSettings {
-                ui_url: url,
-                installation_folder: evidence.as_ref().map(|evidence| evidence.folder.clone()),
-                installation_evidence,
-                observed_installation: previous,
-            };
-            self.save_integrations(&settings)?;
-            state.integrations = settings;
-        }
-        Ok(self.probe_cognee())
-    }
-
-    /// Opens the configured, already running Cognee UI externally. Never starts Cognee or any of its services.
-    pub fn open_cognee_ui(&self) -> Result<()> {
-        let capability = self.probe_cognee();
-        match capability.state {
-            CogneeState::Unreadable => return Err(capability.message.unwrap_or_else(|| "Cognee could not be inspected".into())),
-            CogneeState::Absent => return Err("Cognee is not installed".into()),
-            CogneeState::Installed => {}
-        }
-        let url = capability.ui_url.ok_or("Cognee is installed; its UI is not configured")?;
-        open_loopback_url(&url)
     }
 
     /// Records that the human declined Obsidian for this project, so Markdown mode is offered without asking again.

@@ -29,6 +29,7 @@ mod project_insight;
 mod project_requirements;
 mod session;
 mod setup;
+mod host_monitor;
 mod knowledge;
 mod srs;
 mod source_index;
@@ -64,6 +65,7 @@ pub struct AppState {
     pub source_index: Arc<source_index::SourceIndexService>,
     pub agent_markdown: Arc<agent_markdown::AgentMarkdownService>,
     pub srs: Arc<srs::SrsService>,
+    pub host_monitor: Arc<host_monitor::HostMonitorService>,
     pub inhouse: Arc<inhouse::InhouseService>,
     #[cfg(windows)]
     pub browser_host: Arc<browser_window::BrowserHost>,
@@ -162,6 +164,8 @@ fn main() {
             }
             srs.bind_registry(Arc::downgrade(&registry)).map_err(std::io::Error::other)?;
             hub.install_srs_service(Arc::downgrade(&srs)).map_err(std::io::Error::other)?;
+            let host_monitor = host_monitor::HostMonitorService::new(registry.clone());
+            hub.install_host_monitor_service(Arc::downgrade(&host_monitor)).map_err(std::io::Error::other)?;
             agent_markdown.install_boundary(Arc::new(manager::HubMarkdownBoundary(Arc::downgrade(&registry)))).map_err(std::io::Error::other)?;
             app.manage(AppState {
                 registry,
@@ -170,6 +174,7 @@ fn main() {
                 knowledge,
                 agent_markdown,
                 srs,
+                host_monitor,
                 browser: browser.clone(),
                 code_diff: Arc::new(code_diff::DiffService::new()),
                 code_quality,
@@ -343,8 +348,14 @@ fn main() {
             commands::register_graphify_output,
             commands::read_graphify_graph,
             commands::query_graphify_graph,
-            commands::configure_cognee_ui,
             commands::open_cognee_ui,
+            commands::open_host_monitor,
+            commands::collect_host_monitor,
+            commands::read_host_monitor,
+            commands::close_host_monitor,
+            commands::explain_host_monitor,
+            commands::explain_host_monitor_after_srs_pause,
+            commands::cancel_host_monitor_explanation,
             commands::get_agent_markdown_status,
             commands::prepare_agent_markdown_import,
             commands::confirm_agent_markdown_import,
@@ -376,11 +387,15 @@ fn main() {
                 let quality = state.code_quality.clone();
                 let srs = state.srs.clone();
                 let workspace = state.workspace.clone();
+                let monitor = state.host_monitor.clone();
+                let knowledge = state.knowledge.clone();
                 let handle = handle.clone();
                 std::thread::spawn(move || {
+                    monitor.shutdown();
                     srs.shutdown();
                     workspace.shutdown();
                     quality.shutdown();
+                    knowledge.shutdown();
                     registry.shutdown();
                     handle.exit(0);
                 });

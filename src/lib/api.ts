@@ -292,6 +292,46 @@ export interface StructureSourceRow { sourceId: string; capturedAt: number; kind
 export interface StructureSourceList { sessionId: string | null; sources: StructureSourceRow[] }
 export interface StructureSourcePage { sourceId: string; sha256: string; text: string; nextOffset: number | null }
 
+// ---- Outbound & Processes: whole-computer, read-only snapshots (camelCase wire contract of host_monitor.rs) ----
+export interface HostMonitorContext { instanceId: string; generation: number; projectPath: string }
+export interface HostMonitorOpen { viewId: string; context: HostMonitorContext }
+export type HostSectionStatus = "ok" | "partial" | "unavailable";
+export interface HostSectionState { status: HostSectionStatus; error: string | null }
+export interface HostSnapshotSections { processes: HostSectionState; tcp4: HostSectionState; tcp6: HostSectionState; udp4: HostSectionState; udp6: HostSectionState }
+/** Counts are null when their sections were unavailable; "partial" sections make them lower bounds. */
+export interface HostSnapshotSummary {
+  viewId: string; snapshotId: string; instanceId: string; generation: number; scope: "wholeComputer";
+  startedAt: number; completedAt: number; durationMs: number;
+  processCount: number | null; externalTcpCount: number | null; confirmedOutboundCount: number | null; unknownDirectionCount: number | null;
+  udpEndpointCount: number | null; limitedProcessCount: number | null; sections: HostSnapshotSections;
+}
+export type HostTcpView = "external" | "confirmedOutbound" | "unknownDirection" | "listeners" | "all";
+export type HostMonitorQuery =
+  | { kind: "processes"; text?: string; offset: number; limit: number }
+  | { kind: "tcp"; view: HostTcpView; text?: string; offset: number; limit: number }
+  | { kind: "udp"; text?: string; offset: number; limit: number };
+export type HostOwnerKind = "agentRoot" | "descendant" | "browserRoot" | "browserDescendant";
+export interface HostProcessRow {
+  key: string; pid: number; creationTime100ns: string | null; parentPid: number | null; name: string; threadCount: number;
+  availability: "available" | "limited" | "exited"; owner: { instanceId: string; generation: number; kind: HostOwnerKind } | null;
+}
+export interface HostEndpoint { address: string; port: number; scopeId: number | null }
+export interface HostSocketRow {
+  key: string; family: "ipv4" | "ipv6"; protocol: "tcp" | "udp"; pid: number | null; processKey: string | null; processName: string | null;
+  local: HostEndpoint; remote: HostEndpoint | null; state: string | null;
+  direction: "outbound" | "inbound" | "listener" | "unknown"; directionEvidence: "synSent" | "synReceived" | "listen" | "unavailable";
+  addressScope: "loopback" | "private" | "public" | "linkLocal" | "unspecified" | "other";
+}
+interface HostPageBase { snapshotId: string; total: number; offset: number; nextOffset: number | null }
+/** `offset` is the effective (clamped) offset and `total` the filtered total of the full snapshot. */
+export type HostMonitorPage =
+  | (HostPageBase & { section: "processes"; items: HostProcessRow[] })
+  | (HostPageBase & { section: "tcp" | "udp"; items: HostSocketRow[] });
+export interface HostExplainResult {
+  requestId: string; snapshotId: string; producer: InsightProducer | null; promptSent: boolean | null;
+  error: { code: string; message: string } | null; blockedBy: { jobId: string; attemptId: string } | null;
+}
+
 export const api = {
   getCodeQualityState: () => invoke<QualityState>("get_code_quality_state"),
   takeOverCodeQuality: (consent: boolean) => invoke<QualityState>("take_over_code_quality", { consent }),
@@ -428,4 +468,11 @@ export const api = {
   writeUserTerminal: (id: string, shellId: string, data: string) => invoke<void>("write_user_terminal", { id, shellId, data }),
   resizeUserTerminal: (id: string, shellId: string, cols: number, rows: number) => invoke<void>("resize_user_terminal", { id, shellId, cols, rows }),
   closeUserTerminal: (id: string, shellId: string) => invoke<void>("close_user_terminal", { id, shellId }),
+  openHostMonitor: (instanceId: string, expectedGeneration: number) => invoke<HostMonitorOpen>("open_host_monitor", { instanceId, expectedGeneration }),
+  collectHostMonitor: (viewId: string, displayedSnapshotId: string | null) => invoke<HostSnapshotSummary>("collect_host_monitor", { viewId, displayedSnapshotId }),
+  readHostMonitor: (snapshotId: string, query: HostMonitorQuery) => invoke<HostMonitorPage>("read_host_monitor", { snapshotId, query }),
+  closeHostMonitor: (viewId: string) => invoke<void>("close_host_monitor", { viewId }),
+  explainHostMonitor: (snapshotId: string) => invoke<HostExplainResult>("explain_host_monitor", { snapshotId }),
+  explainHostMonitorAfterSrsPause: (snapshotId: string, jobId: string, attemptId: string) => invoke<HostExplainResult>("explain_host_monitor_after_srs_pause", { snapshotId, jobId, attemptId }),
+  cancelHostMonitorExplanation: (snapshotId: string) => invoke<boolean>("cancel_host_monitor_explanation", { snapshotId }),
 };

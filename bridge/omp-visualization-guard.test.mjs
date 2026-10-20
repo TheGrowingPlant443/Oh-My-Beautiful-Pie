@@ -253,3 +253,146 @@ test('registration wires the native hooks and enforcement flows through them', a
   await handlers.get('session_switch')({}, ctx);
   assert.equal(guard.states().length, 0);
 });
+
+const MONITOR = '44444444-4444-4444-8444-444444444444';
+const SNAPSHOT = 'snap-A';
+const reader = (requestId = MONITOR, snapshotId = SNAPSHOT) => ({ requestId, snapshotId });
+function admitMonitor(guard, ctx, requestId = MONITOR, snapshotId = SNAPSHOT) {
+  const { text, duplicate } = guard.admitMonitor(ctx, { requestId, snapshotId, message: 'Explain this frozen snapshot.' });
+  assert.equal(duplicate, false);
+  return text;
+}
+function hosted(overrides = {}) {
+  const retired = [];
+  const guard = createVisualizationGuard();
+  guard.setNativeHost({ quiescent: () => true, validateMonitor: async () => {}, onMonitorRetired: (stage, reason) => retired.push([stage.requestId, stage.snapshotId, reason]), ...overrides });
+  return { guard, retired };
+}
+
+test('monitor admission carries a private nonce marker, never resends a known request and excludes every other analysis', () => {
+  const guard = createVisualizationGuard();
+  const { ctx } = fakeContext();
+  const text = admitMonitor(guard, ctx);
+  assert.match(text, new RegExp(`^Explain this frozen snapshot\\.\\n\\n\\[omp-host-monitor request=${MONITOR} snapshot=${SNAPSHOT} nonce=[0-9a-f]{32}\\]$`));
+  assert.notEqual(text, admitMonitor(createVisualizationGuard(), ctx));
+  assert.deepEqual(guard.admitMonitor(ctx, { requestId: MONITOR, snapshotId: SNAPSHOT, message: 'again' }), { duplicate: true, text: null });
+  assert.throws(() => guard.admitMonitor(ctx, { requestId: MONITOR, snapshotId: 'snap-B', message: 'x' }), /stale_monitor_request/);
+  assert.throws(() => guard.admitMonitor(ctx, { requestId: STRUCTURE, snapshotId: SNAPSHOT, message: 'x' }), /analysis_in_progress/);
+  assert.throws(() => guard.admit(ctx, { requestId: SYSTEM, kind: 'systemOverview', message: 'x' }), /analysis_in_progress/);
+  assert.throws(() => guard.admitSrs(ctx, { jobId: 'j', attemptId: 'a', stageId: 's', nonce: 'n', phase: 'survey', message: 'x' }), /analysis_in_progress/);
+  assert.throws(() => guard.admitMonitor({ ...ctx, agent: { kind: 'sub' } }, { requestId: STRUCTURE, snapshotId: SNAPSHOT, message: 'x' }), /main OMP context/);
+  assert.throws(() => guard.admitMonitor(ctx, { requestId: '', snapshotId: SNAPSHOT, message: 'x' }), /invalid monitor admission/);
+  // The reverse: an outstanding visualization or SRS stage refuses a monitor, but a visualization duplicate stays a duplicate.
+  const visual = createVisualizationGuard();
+  admit(visual, ctx);
+  assert.throws(() => visual.admitMonitor(ctx, { requestId: MONITOR, snapshotId: SNAPSHOT, message: 'x' }), /analysis_in_progress/);
+  assert.deepEqual(visual.admit(ctx, { requestId: SYSTEM, kind: 'systemOverview', message: 'again' }), { duplicate: true, text: null });
+  const srs = createVisualizationGuard();
+  srs.admitSrs(ctx, { jobId: 'j', attemptId: 'a', stageId: 's', nonce: 'n'.repeat(32), phase: 'survey', message: 'x' });
+  assert.throws(() => srs.admitMonitor(ctx, { requestId: MONITOR, snapshotId: SNAPSHOT, message: 'x' }), /srs_owns_architect/);
+});
+
+test('an active monitor turn allows only its exact reader and native Ask; no submitter, search, refresh or other snapshot exists', () => {
+  const { guard } = hosted();
+  const { ctx } = fakeContext();
+  assert.equal(call(guard, ctx, TOOLS.monitorRead, reader()), undefined, 'a pending guard restricts nothing');
+  guard.beforeAgentStart({ prompt: admitMonitor(guard, ctx) }, ctx);
+  assert.equal(guard.activeMonitor(ctx).requestId, MONITOR);
+  assert.equal(call(guard, ctx, TOOLS.monitorRead, { ...reader(), section: 'tcp', offset: 0, limit: 200 }), undefined);
+  assert.equal(call(guard, ctx, TOOLS.ask, { questions: [] }), undefined);
+  for (const [name, input] of [
+    [TOOLS.monitorRead, reader(STRUCTURE)], [TOOLS.monitorRead, reader(MONITOR, 'snap-B')], [TOOLS.monitorRead, {}],
+    [TOOLS.evidence, { requestId: MONITOR }], [TOOLS.inspect, { requestId: MONITOR }], [TOOLS.systemSubmit, { requestId: MONITOR }], [TOOLS.structureSubmit, { requestId: MONITOR }],
+    ['bash', { command: 'Get-NetTCPConnection' }], ['read', { path: 'C:/Windows' }], ['write', {}], ['edit', {}], ['task', {}], ['eval', {}], ['browser', {}],
+  ]) {
+    const result = call(guard, ctx, name, input);
+    assert.equal(result?.block, true, `${name} ${JSON.stringify(input)}`);
+    assert.match(result.reason, /frozen host-monitor snapshot/);
+  }
+  // Completing a read never "submits" the turn: the reader stays available until native quiescence.
+  guard.toolResult({ toolName: TOOLS.monitorRead, input: reader(), isError: false }, ctx);
+  assert.equal(guard.states()[0].state, 'active');
+  assert.equal(call(guard, ctx, TOOLS.monitorRead, reader()), undefined);
+});
+
+test('a monitor turn fails closed at the provider barrier without an exact host validation and never drops to unrestricted tools', async () => {
+  const none = createVisualizationGuard();
+  const { ctx } = fakeContext();
+  none.beforeAgentStart({ prompt: admitMonitor(none, ctx) }, ctx);
+  await assert.rejects(none.beforeModelCall(ctx, { messages: [{ role: 'user', content: 'x', timestamp: 1 }] }), /native_monitor_guard_unavailable/);
+  assert.equal(call(none, ctx, 'bash', {}).block, true);
+  const seen = [];
+  const { guard } = hosted({ validateMonitor: async stage => { seen.push([stage.requestId, stage.snapshotId]); } });
+  guard.beforeAgentStart({ prompt: admitMonitor(guard, ctx) }, ctx);
+  await guard.beforeModelCall(ctx, { messages: [{ role: 'user', content: 'x', timestamp: 1 }] });
+  assert.deepEqual(seen, [[MONITOR, SNAPSHOT]]);
+  const refused = hosted({ validateMonitor: async () => { throw new Error('monitor_not_authorized'); } });
+  const second = fakeContext();
+  refused.guard.beforeAgentStart({ prompt: admitMonitor(refused.guard, second.ctx) }, second.ctx);
+  await assert.rejects(refused.guard.beforeModelCall(second.ctx, { messages: [{ role: 'user', content: 'x', timestamp: 1 }] }), /monitor_not_authorized/);
+  assert.equal(call(refused.guard, second.ctx, 'bash', {}).block, true);
+});
+
+test('the host hears of a monitor guard exactly once with the precise reason, and a retired guard is gone', async () => {
+  const { ctx, state, flush } = fakeContext();
+  // Native quiescence, never agent_end alone.
+  const settled = hosted();
+  settled.guard.beforeAgentStart({ prompt: admitMonitor(settled.guard, ctx) }, ctx);
+  settled.guard.agentEnd({}, ctx);
+  state.idle = false;
+  flush();
+  assert.deepEqual(settled.retired, []);
+  state.idle = true;
+  flush();
+  assert.deepEqual(settled.retired, [[MONITOR, SNAPSHOT, 'settled']]);
+  assert.equal(settled.guard.monitor(ctx), null);
+  // A queued prompt the native queue dropped is retired at quiescence too.
+  const dropped = hosted();
+  admitMonitor(dropped.guard, ctx);
+  dropped.guard.agentEnd({}, ctx);
+  flush();
+  assert.deepEqual(dropped.retired, [[MONITOR, SNAPSHOT, 'settled']]);
+  // An unrelated human turn and a replaced session.
+  const unrelated = hosted();
+  unrelated.guard.beforeAgentStart({ prompt: admitMonitor(unrelated.guard, ctx) }, ctx);
+  unrelated.guard.beforeAgentStart({ prompt: 'something else' }, ctx);
+  await unrelated.guard.beforeModelCall(ctx, { messages: [{ role: 'user', content: 'something else', timestamp: 5 }] });
+  assert.deepEqual(unrelated.retired, [[MONITOR, SNAPSHOT, 'unrelatedPrompt']]);
+  const replaced = hosted();
+  admitMonitor(replaced.guard, ctx);
+  replaced.guard.sessionChanged(ctx);
+  assert.deepEqual(replaced.retired, [[MONITOR, SNAPSHOT, 'sessionChanged']]);
+  const other = hosted();
+  admitMonitor(other.guard, ctx);
+  assert.equal(other.guard.monitor(fakeContext('session-b').ctx), null);
+  assert.deepEqual(other.retired, [[MONITOR, SNAPSHOT, 'sessionChanged']]);
+  // An unlabelled continuation is retired as uncertain once, then settles silently.
+  const uncertain = hosted();
+  uncertain.guard.beforeAgentStart({ prompt: admitMonitor(uncertain.guard, ctx) }, ctx);
+  uncertain.guard.beforeAgentStart({ prompt: 'unattributed' }, ctx);
+  await assert.rejects(uncertain.guard.beforeModelCall(ctx, { messages: [{ role: 'assistant', content: 'x' }] }), /continuation_uncertain/);
+  uncertain.guard.agentEnd({}, ctx);
+  flush();
+  assert.deepEqual(uncertain.retired, [[MONITOR, SNAPSHOT, 'uncertainContinuation']]);
+});
+
+test('a native automatic compaction continuation keeps the monitor reader+Ask restriction and its summary context', async () => {
+  const { guard, retired } = hosted();
+  const { ctx } = fakeContext();
+  guard.beforeAgentStart({ prompt: admitMonitor(guard, ctx) }, ctx);
+  assert.match(guard.compacting({}, ctx).context[0], new RegExp(`frozen host-monitor snapshot ${SNAPSHOT}, request ${MONITOR}`));
+  guard.agentEnd({ willContinue: true }, ctx);
+  guard.beforeAgentStart({ prompt: 'Resume the user\'s latest intent.' }, ctx);
+  assert.equal(call(guard, ctx, 'bash', {}).block, true);
+  await guard.beforeModelCall(ctx, { messages: [{ role: 'user', content: 'summary', timestamp: 1 }, { role: 'developer', synthetic: true, attribution: 'agent', content: 'Resume' }] });
+  assert.equal(guard.activeMonitor(ctx).requestId, MONITOR);
+  assert.equal(call(guard, ctx, 'bash', {}).block, true, 'compaction did not release the guard');
+  assert.equal(call(guard, ctx, TOOLS.monitorRead, reader()), undefined);
+  assert.deepEqual(retired, []);
+  // An unknown continuation fails closed.
+  const unknown = hosted();
+  unknown.guard.beforeAgentStart({ prompt: admitMonitor(unknown.guard, ctx) }, ctx);
+  unknown.guard.beforeAgentStart({ prompt: 'something unattributed' }, ctx);
+  await assert.rejects(unknown.guard.beforeModelCall(ctx, { messages: [{ role: 'assistant', content: 'x' }] }), /continuation_uncertain/);
+  assert.equal(call(unknown.guard, ctx, TOOLS.monitorRead, reader()).block, true);
+});

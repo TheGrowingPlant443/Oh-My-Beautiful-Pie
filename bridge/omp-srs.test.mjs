@@ -238,7 +238,7 @@ test('pause aborts only the active app-created SRS stage and fences every furthe
 
 test('tools forward only to srs_tool for the active stage and enforce the per-phase allowlist', async () => {
   const h = harness();
-  assert.deepEqual([...h.tools.keys()], ['srs_inspect', 'srs_read_evidence', 'srs_write_document_chunk', 'srs_commit_document', 'srs_checkpoint', 'srs_finish_stage']);
+  assert.deepEqual([...h.tools.keys()], ['monitor_snapshot_read', 'srs_inspect', 'srs_read_evidence', 'srs_write_document_chunk', 'srs_commit_document', 'srs_checkpoint', 'srs_finish_stage']);
   const inspect = { ...ids, section: 'work', limit: 50 };
   assert.equal((await h.tools.get('srs_inspect').execute('1', inspect, undefined, undefined, h.ctx)).isError, true, 'no active stage');
   await h.admitActive();

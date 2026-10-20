@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {BrowserService} from '../omp-browser-service.mjs';
+import {TestNativeHost} from './native-host.mjs';
 import {mkdir,readFile} from 'node:fs/promises';
 function completedDownload(session) {
   return new Promise((resolve,reject)=>{
@@ -12,11 +13,12 @@ function completedDownload(session) {
 }
 
 const root=process.env.BROWSER_TEST_ROOT;
-process.env.USERPROFILE=root;
 process.env.HOME=root;
+process.env.PI_CONFIG_DIR='.omp';
 process.env.PI_CODING_AGENT_DIR=path.join(root,'agent');
 delete process.env.PI_COMPILED;
-const service=new BrowserService(root,process.env.OMP_SDK_DIR);
+const host=new TestNativeHost(root);
+const service=new BrowserService(root,process.env.OMP_SDK_DIR,undefined,{native:host.channel()});
 await service.start();
 try {
   const {loadPuppeteer}=await import(pathToFileURL(path.join(process.env.OMP_SDK_DIR,'src/tools/browser/launch.ts')).href);
@@ -33,9 +35,11 @@ try {
     await pages[0].goto(process.env.BROWSER_FIXTURE_URL);
     return pages[0];
   }));
-  await pages[0].evaluate(()=>{document.cookie='owner=a;path=/';localStorage.setItem('owner','a');});
+  await pages[0].evaluate(()=>{document.cookie='owner=a;path=/;max-age=3600';localStorage.setItem('owner','a');});
   assert.equal(await pages[2].evaluate(()=>localStorage.getItem('owner')),null,'same-origin storage must not cross terminal profiles');
   assert.equal(await pages[1].evaluate(()=>localStorage.getItem('owner')),'a','named pages in one terminal retain its shared login');
+  assert.equal(await pages[2].evaluate(()=>document.cookie),'','same-origin cookies must not cross terminal profiles');
+  assert.equal(await pages[1].evaluate(()=>document.cookie),'owner=a','named pages in one terminal share its cookie');
   await pages[1].type('#shared','second');
   assert.equal(await pages[0].$eval('#shared',e=>e.value),'');
   assert.equal(await pages[1].$eval('#shared',e=>e.value),'second');
@@ -67,14 +71,16 @@ try {
   await extra.close();
   const browserA=service.owner('a',1).browser;
   const browserB=service.owner('b',1).browser;
-  const pid=browserA.process().pid;
-  assert.notEqual(pid,browserB.process().pid);
+  // Chrome is owned natively (connected Puppeteer has no child process): the owned record carries the root pid.
+  const pid=service.owner('a',1).native.pid;
+  assert.notEqual(pid,service.owner('b',1).native.pid);
   await service.dispatch('configure',{headless:false,embedded:false});
-  assert.equal(service.owner('a',1).browser.process().pid,pid,'headless preference must not restart an active browser');
+  assert.equal(service.owner('a',1).native.pid,pid,'headless preference must not restart an active browser');
   assert.equal(service.owner('a',1).headless,true);
   for(const browser of connections)browser.disconnect();
   await browserA.close();
-  assert.notEqual(browserA.process().exitCode,null,'browser-only close must reap its root process');
+  await host.waitForExit(pid);
+  assert.equal(host.isAlive(pid),false,'browser-only close must reap its root process');
   assert.equal(browserB.connected,true,'closing A must not stop B');
   assert.equal((await fetch(a.cdpUrl+'/json/version',{method:'HEAD'})).status,403,'closed tabs must revoke their CDP discovery capability');
   await service.dispatch('configure',{headless:true,embedded:false});
@@ -84,6 +90,7 @@ try {
   const page=(await restored.pages())[0];
   await page.goto(process.env.BROWSER_FIXTURE_URL);
   assert.equal(await page.evaluate(()=>localStorage.getItem('owner')),'a','browser restart must retain the terminal profile');
+  assert.equal(await page.evaluate(()=>document.cookie),'owner=a','browser restart must retain persistent terminal cookies');
   restored.disconnect();
   await service.dispatch('revoke',{instanceId:'a',generation:1});
   await assert.rejects(service.dispatch('ensureTab',{instanceId:'a',generation:1,name:'main'}),/stale_generation/);
@@ -91,4 +98,5 @@ try {
   console.log('Real browser isolation and lifecycle assertions passed');
 } finally {
   await service.dispatch('shutdown');
+  await host.retireAll();
 }

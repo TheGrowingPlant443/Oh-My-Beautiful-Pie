@@ -146,6 +146,16 @@ pub(crate) enum UpdatePlanSendError {
     /// The prompt may have reached The Manager; it must never be resent automatically.
     Uncertain(String),
 }
+/// Why an app-created host-monitor explanation prompt did not reach the Architect's native session.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MonitorPromptError {
+    /// Provably not admitted: nothing ran in the native session, so a later explicit click may make one new request.
+    NotSent { code: String, message: String },
+    /// A persisted SRS job owns this Architect generation; only a human Pause SRS and continue may proceed.
+    SrsActive { job_id: String, attempt_id: String },
+    /// The prompt may have reached the native session; it is never resent automatically.
+    Uncertain(String),
+}
 pub struct ManagerHub {
     endpoint: String,
     extension_path: PathBuf,
@@ -155,6 +165,7 @@ pub struct ManagerHub {
     workspace: OnceLock<Weak<crate::workspace::WorkspaceService>>,
     code_quality: OnceLock<Weak<crate::code_quality::CodeQualityService>>,
     srs: OnceLock<Weak<crate::srs::SrsService>>,
+    host_monitor: OnceLock<Weak<crate::host_monitor::HostMonitorService>>,
     app: OnceLock<tauri::AppHandle>,
     decision_publication: Mutex<()>,
     ready_changed: Condvar,
@@ -212,6 +223,7 @@ impl ManagerHub {
             workspace: OnceLock::new(),
             code_quality: OnceLock::new(),
             srs: OnceLock::new(),
+            host_monitor: OnceLock::new(),
             app: OnceLock::new(),
             decision_publication: Mutex::new(()),
             ready_changed: Condvar::new(),
@@ -258,6 +270,14 @@ impl ManagerHub {
     }
     pub fn install_srs_service(&self, service: Weak<crate::srs::SrsService>) -> Result<()> {
         self.srs.set(service).map_err(|_| "SRS service already installed".into())
+    }
+    pub fn install_host_monitor_service(&self, service: Weak<crate::host_monitor::HostMonitorService>) -> Result<()> {
+        self.host_monitor.set(service).map_err(|_| "host monitor service already installed".into())
+    }
+    /// Separate from SRS: a session replacement, disconnect, process exit or hub shutdown retires exactly the frozen-snapshot
+    /// explanations bound to that Architect launch, never a UI idle guess.
+    fn monitor_lifecycle(&self, id: &str, generation: u64, kind: &str) {
+        if let Some(service) = self.host_monitor.get().and_then(Weak::upgrade) { service.on_architect_lifecycle(id, generation, kind); }
     }
     fn srs_lifecycle(&self, id: &str, generation: u64, kind: &str, payload: Value) {
         let Some(service) = self.srs.get().and_then(Weak::upgrade) else { return };
@@ -520,6 +540,7 @@ impl ManagerHub {
     }
     pub fn invalidate(&self, id: &str, generation: u64) {
         self.srs_lifecycle(id, generation, "disconnect", Value::Null);
+        self.monitor_lifecycle(id, generation, "disconnect");
         let stream = {
             let Ok(mut state) = self.state.lock() else {
                 return;
@@ -564,6 +585,7 @@ impl ManagerHub {
     }
     pub fn shutdown(&self) {
         if let Some(service) = self.srs.get().and_then(Weak::upgrade) { service.shutdown(); }
+        self.monitor_lifecycle("", 0, "shutdown");
         self.closing.store(true, Ordering::Relaxed);
         let streams = {
             let Ok(mut state) = self.state.lock() else {
@@ -746,6 +768,7 @@ impl ManagerHub {
         };
         if current {
             self.srs_lifecycle(&actor.id, actor.generation, "disconnect", Value::Null);
+            self.monitor_lifecycle(&actor.id, actor.generation, "disconnect");
             if let Ok(registry) = self.registry() {
                 registry.set_bridge_ready(&actor.id, actor.generation, false);
             }
@@ -978,6 +1001,7 @@ impl ManagerHub {
                 if payload["sessionId"].as_str() == old.as_deref() { "ready" } else { "session_changed" }
             } else { kind };
             self.srs_lifecycle(&actor.id, actor.generation, lifecycle, payload.clone());
+            self.monitor_lifecycle(&actor.id, actor.generation, lifecycle);
         }
         if registry.lease(&actor.id, Origin::Human, false)?.generation != actor.generation {
             return Err("stale_generation".into());
@@ -1276,6 +1300,43 @@ impl ManagerHub {
         }
         self.control(id, &lease, "project_visualization_prompt", json!({"requestId": request_id, "kind": kind, "message": message}), Origin::Human)
     }
+    /// Deliver the app-created frozen-snapshot explanation prompt through the human-only `monitor_explanation_prompt` control.
+    /// One lease binds the generation check and the frame. An SRS job on this Architect is reported structurally, never paused here.
+    pub(crate) fn prompt_monitor_explanation(&self, producer: &DependencyProducer, request_id: &str, snapshot_id: &str, snapshot_hash: &str, message: &str) -> std::result::Result<(), MonitorPromptError> {
+        use MonitorPromptError::{NotSent, SrsActive, Uncertain};
+        let unsent = |code: &str, message: String| NotSent { code: code.into(), message };
+        let registry = self.registry().map_err(|e| unsent("registry_unavailable", e))?;
+        let lease = registry.lease(&producer.instance_id, Origin::Human, true).map_err(|e| unsent(e.split(':').next().filter(|c| !c.contains(' ')).unwrap_or("architect_unavailable"), e.clone()))?;
+        if lease.generation != producer.generation { return Err(unsent("stale_generation", "The Architect was replaced; nothing was sent.".into())); }
+        if self.dependency_producer(&producer.instance_id, producer.generation).map_err(|e| unsent("architect_unavailable", e))? != *producer {
+            return Err(unsent("stale_generation", "The Architect session was replaced; nothing was sent.".into()));
+        }
+        if registry.inspect(&producer.instance_id, Origin::Human).map_err(|e| unsent("architect_unavailable", e))?.kind != InstanceKind::Architect {
+            return Err(unsent("architect_unavailable", "The Architect is no longer available".into()));
+        }
+        if let Some((job_id, attempt_id)) = self.srs_active_job(&producer.instance_id) { return Err(SrsActive { job_id, attempt_id }); }
+        let outcome = self.control(&producer.instance_id, &lease, "monitor_explanation_prompt",
+            json!({"requestId": request_id, "snapshotId": snapshot_id, "snapshotHash": snapshot_hash, "message": message}), Origin::Human);
+        match outcome {
+            Ok(receipt) if receipt["requestId"] == request_id && receipt["snapshotId"] == snapshot_id && receipt["admitted"] == true => Ok(()),
+            // An explicit refusal is provably unsent even when a malformed request could not echo its ids.
+            Ok(receipt) if receipt["admitted"] == false => Err(NotSent {
+                code: receipt["error"]["code"].as_str().unwrap_or("not_admitted").into(),
+                message: receipt["error"]["message"].as_str().unwrap_or("The Architect did not admit the explanation prompt.").into(),
+            }),
+            Ok(_) => Err(Uncertain("The Architect answered with an unrecognised receipt".into())),
+            Err(error) if ["bridge_not_ready", "stale_generation", "not_controlled"].contains(&error.as_str()) => Err(unsent(&error, error.clone())),
+            Err(error) => Err(Uncertain(error)),
+        }
+    }
+    /// Read-only: the persisted SRS job/attempt that currently owns this Architect generation.
+    pub(crate) fn srs_active_job(&self, instance_id: &str) -> Option<(String, String)> {
+        self.srs.get().and_then(Weak::upgrade).and_then(|service| service.active_job_for(instance_id))
+    }
+    /// Human "Pause SRS and continue": the job's own pause API; the native guard releases at its genuine quiescent boundary.
+    pub(crate) fn pause_srs_job(&self, job_id: &str) -> Result<()> {
+        self.srs.get().and_then(Weak::upgrade).ok_or("SRS service unavailable")?.pause_srs(job_id).map(|_| ())
+    }
     /// Human-only read of the Architect's captured structure-source Markdown (`structure_sources`,
     /// `structure_source_read`, `structure_source_select_last`). Never accepts a path.
     pub(crate) fn architect_control(&self, id: &str, generation: u64, action: &str, payload: Value) -> Result<Value> {
@@ -1409,6 +1470,13 @@ impl ManagerHub {
             if actor.role != InstanceKind::Architect { return Err("unauthorized".into()); }
             let producer = self.dependency_producer(&actor.id, actor.generation)?;
             let service = self.srs.get().and_then(Weak::upgrade).ok_or("SRS service unavailable")?;
+            return service.handle_bridge(&producer, action, p.clone());
+        }
+        if matches!(action, "monitor_snapshot_read" | "monitor_explanation_validate" | "monitor_explanation_retired") {
+            // Authenticated Architect only, before the Manager boundary; the producer derives from the actor, never the payload.
+            if actor.role != InstanceKind::Architect { return Err("unauthorized".into()); }
+            let producer = self.dependency_producer(&actor.id, actor.generation)?;
+            let service = self.host_monitor.get().and_then(Weak::upgrade).ok_or("host monitor service unavailable")?;
             return service.handle_bridge(&producer, action, p.clone());
         }
         if matches!(action, "workspace_begin" | "workspace_ready" | "workspace_complete" | "workspace_failed" | "workspace_reconcile") {
@@ -1923,6 +1991,33 @@ mod tests {
         assert!(browser.snapshot().is_empty());
         assert_eq!(hub.execute(&actor,&json!({"action":"browser_prepare","payload":{"name":"main"}})).unwrap_err(),"stale_generation");
         browser.shutdown();hub.shutdown();std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
+    fn host_monitor_bridge_actions_are_architect_only_and_a_refused_prompt_is_known_unsent() {
+        let folder = std::env::temp_dir().join(format!("omp-monitor-hub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let worker = registry.create(CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
+        hub.bind_registry(Arc::downgrade(&registry)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        hub.launch(&Definition { id: worker.id.clone(), input: CreateInput::default(), session_path: None, kind: InstanceKind::Instance, manager_id: None, plan_target: None, helper: None }, 0).unwrap();
+        let payload = json!({"requestId": "11111111-1111-4111-8111-111111111111", "snapshotId": "snap-A"});
+        for role in [InstanceKind::Instance, InstanceKind::Manager] {
+            let actor = Actor { id: worker.id.clone(), generation: 0, role, connection_id: String::new() };
+            for action in ["monitor_snapshot_read", "monitor_explanation_validate", "monitor_explanation_retired"] {
+                assert_eq!(hub.execute(&actor, &json!({"action": action, "payload": payload})).unwrap_err(), "unauthorized", "{role:?} {action}");
+            }
+        }
+        // Not an Architect session: the prompt is refused before any control frame, so it is provably unsent.
+        let producer = DependencyProducer { instance_id: worker.id.clone(), generation: 0, launch_id: "launch".into(), session_id: "session".into() };
+        let refused = hub.prompt_monitor_explanation(&producer, "11111111-1111-4111-8111-111111111111", "snap-A", &"ab".repeat(32), "Explain.");
+        assert!(matches!(refused, Err(MonitorPromptError::NotSent { .. })), "{refused:?}");
+        let missing = DependencyProducer { instance_id: "missing".into(), ..producer };
+        assert!(matches!(hub.prompt_monitor_explanation(&missing, "11111111-1111-4111-8111-111111111111", "snap-A", &"ab".repeat(32), "Explain."), Err(MonitorPromptError::NotSent { .. })));
+        assert_eq!(hub.srs_active_job(&worker.id), None, "no SRS service means no blocking job");
+        hub.shutdown();
+        std::fs::remove_dir_all(folder).unwrap();
     }
     #[test]
     fn workspace_acknowledgements_accept_ordinary_agents_but_not_helpers_or_plan_sessions() {

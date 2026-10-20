@@ -788,6 +788,28 @@ impl Registry {
             })
             .collect()
     }
+    /// Creation identities of the live PTY roots, for host-monitor ownership attribution only. Read-only: never
+    /// starts, stops or touches an agent; an agent whose root identity could not be captured is simply absent.
+    pub fn process_roots(&self) -> Vec<crate::host_monitor::ManagedRoot> {
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+            .filter_map(|record| {
+                let generation = record.generation;
+                let process = record.process.as_mut()?;
+                if !matches!(process.poll(), Ok(None)) {
+                    return None;
+                }
+                Some(crate::host_monitor::ManagedRoot {
+                    instance_id: record.definition.id.clone(),
+                    generation,
+                    kind: crate::host_monitor::RootKind::Agent,
+                    identity: process.root_identity()?,
+                })
+            })
+            .collect()
+    }
     fn save(&self, records: &[Record]) -> Result<(), String> {
         let saved = Saved {
             version: 1,

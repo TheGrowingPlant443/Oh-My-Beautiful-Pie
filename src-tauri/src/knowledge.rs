@@ -1,5 +1,5 @@
 //! Knowledge backend: human-registered Markdown vaults, a safe in-process vault reader/index, passive Obsidian,
-//! Graphify and Cognee discovery, and immutable Graphify admission.
+//! Graphify and Cognee discovery, immutable Graphify admission and the explicit, app-owned Cognee UI launcher.
 //!
 //! Only a human picker/configuration registers a vault root (`prepare_knowledge_vault` → `confirm_knowledge_vault`);
 //! no model or tool parameter can grant path access. Probes (`get_knowledge_capabilities`) never launch an
@@ -7,7 +7,9 @@
 //! private state (bindings, tokens, indexes, Graphify snapshots) lives under `<app-config>/knowledge/`.
 //!
 //! Layout: `fsio` (rooted, hardlink-safe IO), `markdown` (line scanner), `index` (link index/queries), `vault`
-//! (registration, listing, document pages, writers), `integrations` (Obsidian/Cognee), `graphify`, `dto`.
+//! (registration, listing, document pages, writers), `integrations` (Obsidian/Cognee discovery), `cognee_ui` (the
+//! explicit Cognee frontend launcher), `graphify`, `dto`.
+mod cognee_ui;
 mod dto;
 pub(crate) mod fsio;
 mod graphify;
@@ -23,6 +25,8 @@ mod publication_recovery_regression;
 mod tests;
 #[cfg(test)]
 mod graphify_regression;
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+mod cognee_ui_regression;
 #[cfg(test)]
 mod integration_regression;
 mod vault;
@@ -87,6 +91,7 @@ pub struct KnowledgeService {
     indexes: Mutex<HashMap<String, Arc<index::Slot>>>,
     graphify_cache: Mutex<HashMap<String, Arc<graphify::Loaded>>>,
     authorities: Mutex<HashMap<String, Arc<RwLock<u64>>>>,
+    cognee_ui: cognee_ui::CogneeUi,
 }
 
 fn load_file<T: serde::de::DeserializeOwned + Default>(path: &Path, version_of: impl Fn(&T) -> u32) -> (T, Option<String>) {
@@ -125,7 +130,14 @@ impl KnowledgeService {
             indexes: Mutex::new(HashMap::new()),
             graphify_cache: Mutex::new(HashMap::new()),
             authorities: Mutex::new(HashMap::new()),
+            cognee_ui: cognee_ui::CogneeUi::new(),
         })
+    }
+
+    /// Application shutdown: cancels a Cognee UI start that is still in progress (no browser is opened afterwards) and
+    /// retires the frontend this app started. A Cognee UI or backend started by anyone else is never touched.
+    pub fn shutdown(&self) {
+        self.cognee_ui.shutdown();
     }
 
     /// Adds folders a vault may never overlap (for example the native OMP agent folders from `setup::paths`).
@@ -188,6 +200,7 @@ impl KnowledgeService {
         };
         Ok(KnowledgeCapabilities {
             folder: folder.map(String::from),
+            project_key: repository_ref.map(|r| fsio::norm(r)),
             obsidian,
             graphify,
             cognee,

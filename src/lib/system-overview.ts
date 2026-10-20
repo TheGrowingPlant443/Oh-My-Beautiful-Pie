@@ -10,7 +10,7 @@ import type {
   SourceIndexSelection, SourceIndexStatus, SourceSiteRow, SourceSymbolRow, SystemOverviewPayload, HelicopterPayload,
 } from "./api";
 import type { api as backend } from "./api";
-import { EMPTY_INVENTORY, type GenerateOutcome, type GenerateRequest, type InventoryState, type StructureHost, type VisualizationSink } from "./overview-types";
+import { EMPTY_INVENTORY, type ArchitectDescriptor, type GenerateOutcome, type GenerateRequest, type InventoryState, type StructureHost, type VisualizationSink } from "./overview-types";
 import { modelFromHelicopter } from "./helicopter-graph";
 
 export type OverviewTab = "helicopter" | "system" | "files" | "functions";
@@ -130,7 +130,7 @@ export interface OverviewState {
 export interface OverviewHooks {
   architectId(): string | null;
   /** The live Architect session this page may show structure sources for. */
-  architectSession(): { id: string; generation: number; ready: boolean } | null;
+  architectSession(): ArchitectDescriptor | null;
   openArchitect(id: string, replayRequestId?: string): Promise<boolean>;
   following(ticket: VisualizationTicket): boolean;
   quiescent(ticket: VisualizationTicket): boolean;

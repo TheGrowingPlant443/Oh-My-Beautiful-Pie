@@ -23,7 +23,7 @@ const status = (id, kind, extra = {}) => ({
   sourceId: kind === "structureProposed" ? "A" : null, sourceHash: kind === "structureProposed" ? "sha-A" : null, producer: null, approval: null, ...extra,
 });
 
-function harness({ architect = { id: "arch", generation: 1, ready: true }, sources = [row("A", 10)], texts = { A: "target markdown" }, chunk = 1000 } = {}) {
+function harness({ architect = { id: "arch", generation: 1, sessionId: "s1", ready: true }, sources = [row("A", 10)], texts = { A: "target markdown" }, chunk = 1000 } = {}) {
   const calls = { generate: [], list: 0, read: [], saved: [], approve: [], open: [] };
   const state = { architect, folder: FOLDER, snapshotId: "snap" };
   const gates = { list: null, saved: null, approve: null, generate: null };
@@ -385,4 +385,103 @@ test("folder switch resets sources, revisions and selection", async () => {
   assert.deepEqual(state.revisions.structureProposed, []);
   assert.equal(state.selectedSourceId, null);
   assert.equal(state.folder, "C:/other");
+});
+
+test("automatic refresh reads only a ready Architect with a known session; an explicit refresh needs just the session", async () => {
+  const h = harness({ architect: { id: "arch", generation: 1, sessionId: null, ready: false } });
+  await h.store.refreshSources({ automatic: true });
+  assert.equal(h.calls.list, 0);
+  await h.store.refreshSources();
+  assert.equal(h.calls.list, 0);
+  assert.match(h.snap().sourcesError, /session is not known/);
+  h.state.architect = { id: "arch", generation: 1, sessionId: "s1", ready: false };
+  await h.store.refreshSources({ automatic: true });
+  assert.equal(h.calls.list, 0);
+  h.state.architect = { id: "arch", generation: 1, sessionId: "s1", ready: true };
+  await h.store.refreshSources({ automatic: true });
+  assert.equal(h.calls.list, 1);
+  assert.equal(h.snap().sourcesKey, "arch:1:s1");
+  assert.equal(h.snap().sessionId, "s1");
+});
+
+test("an equivalent refresh joins the running read; a not-ready read neither stands in for nor hides the later ready read", async () => {
+  const h = harness({ architect: { id: "arch", generation: 1, sessionId: "s1", ready: false } });
+  const pending = [];
+  h.api.listStructureSources = async () => { h.calls.list++; const gate = deferred(); pending.push(gate); await gate.promise; return { sessionId: "s1", sources: [row("A", 10)] }; };
+  const early = h.store.refreshSources();
+  assert.equal(h.store.refreshSources(), early);
+  assert.equal(h.calls.list, 1);
+  h.state.architect = { id: "arch", generation: 1, sessionId: "s1", ready: true };
+  const late = h.store.refreshSources({ automatic: true });
+  assert.notEqual(late, early);
+  assert.equal(h.store.refreshSources({ automatic: true }), late);
+  assert.equal(h.calls.list, 2);
+  pending[0].resolve();
+  await early;
+  assert.equal(h.snap().sourcesLoading, true);
+  assert.deepEqual(h.snap().sources, []);
+  pending[1].resolve();
+  await late;
+  assert.equal(h.snap().sourcesLoading, false);
+  assert.equal(h.snap().sourcesLoaded, true);
+  assert.equal(h.snap().sources.length, 1);
+  assert.equal(h.calls.list, 2);
+});
+
+test("a list returned for another session is rejected", async () => {
+  const h = harness();
+  h.state.architect = { id: "arch", generation: 1, sessionId: "other", ready: true };
+  await h.store.refreshSources({ automatic: true });
+  assert.deepEqual(h.snap().sources, []);
+  assert.match(h.snap().sourcesError, /another session/);
+  assert.equal(h.snap().sourcesKey, null);
+  assert.equal(h.snap().sourcesLoading, false);
+});
+
+test("an owner or session change drops the unauthorized list; a same-owner refresh keeps it and its empty guidance state", async () => {
+  const h = await ready(harness());
+  assert.equal(h.snap().pages.A.loaded, true);
+  h.gates.list = deferred();
+  const again = h.store.refreshSources();
+  assert.equal(h.snap().sources.length, 1);
+  assert.equal(h.snap().sourcesLoaded, true);
+  assert.equal(h.snap().sourcesLoading, true);
+  assert.equal(h.snap().pages.A.loaded, true);
+  h.gates.list.resolve();
+  await again;
+  assert.equal(h.snap().sources.length, 1);
+
+  h.gates.list = deferred();
+  h.state.architect = { id: "arch", generation: 2, sessionId: "s1", ready: true };
+  const next = h.store.refreshSources({ automatic: true });
+  assert.deepEqual(h.snap().sources, []);
+  assert.equal(h.snap().selectedSourceId, null);
+  assert.deepEqual(h.snap().pages, {});
+  assert.equal(h.snap().sourcesLoaded, false);
+  assert.equal(h.snap().sourcesLoading, true);
+  h.gates.list.resolve();
+  await next;
+  assert.equal(h.snap().sourcesKey, "arch:2:s1");
+
+  h.state.architect = { id: "arch", generation: 2, sessionId: null, ready: true };
+  await h.store.refreshSources({ automatic: true });
+  assert.deepEqual(h.snap().sources, []);
+  assert.equal(h.snap().sourcesKey, null);
+});
+
+test("a read that completes after the owner changed cannot replace the new owner's state or its loading flag", async () => {
+  const h = harness();
+  h.gates.list = deferred();
+  const stale = h.store.refreshSources();
+  h.state.architect = { id: "arch", generation: 2, sessionId: "s1", ready: true };
+  const fresh = h.store.refreshSources({ automatic: true });
+  h.gates.list.resolve();
+  await stale;
+  await fresh;
+  assert.equal(h.snap().sourcesKey, "arch:2:s1");
+  assert.equal(h.snap().sourcesLoading, false);
+  h.state.architect = null;
+  await h.store.refreshSources();
+  assert.equal(h.snap().sourcesError, NEED_ARCHITECT);
+  assert.deepEqual(h.snap().sources, []);
 });

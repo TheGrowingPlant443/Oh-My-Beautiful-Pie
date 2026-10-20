@@ -5,6 +5,7 @@ import {readFile} from 'node:fs/promises';
 import path from 'node:path';
 import {installTerminalBrowserBridge} from '../omp-browser.mjs';
 import {profileDirectory} from '../omp-browser-service.mjs';
+import {TestNativeHost} from './native-host.mjs';
 
 // Loaded as an explicit extension by the real OMP CLI. A tab opened by hand in the terminal's Chrome must be
 // attached to the agent session automatically, controllable, renameable, and must not break the AI's own tab.
@@ -14,7 +15,9 @@ export default async function tabsScenario(pi) {
   const originalInfos=pi.pi.AgentSession.prototype.getAllToolInfos;
   function captureInfos(...args){session=this;return originalInfos.apply(this,args);}
   pi.pi.AgentSession.prototype.getAllToolInfos=captureInfos;
+  const host=new TestNativeHost(root);
   const helper=spawn(process.env.BUN_BIN||'bun',[fileURLToPath(new URL('../omp-browser-service.mjs',import.meta.url)),root,process.env.OMP_SDK_DIR],{env:process.env,stdio:['pipe','pipe','inherit']});
+  host.attach(helper);
   let sequence=0,buffered='';
   const pending=new Map();
   const ready=new Promise((resolve,reject)=>{helper.once('error',reject);helper.once('exit',()=>reject(new Error('Browser helper exited')));helper.stdout.on('data',chunk=>{
@@ -22,6 +25,7 @@ export default async function tabsScenario(pi) {
     for(;;){
       const end=buffered.indexOf('\n');if(end<0)break;
       const frame=JSON.parse(buffered.slice(0,end));buffered=buffered.slice(end+1);
+      if(frame.type==='native_request')host.serve(helper,frame);
       if(frame.type==='ready')resolve();
       if(frame.type==='response'){const call=pending.get(frame.id);pending.delete(frame.id);if(frame.ok)call?.resolve(frame.data);else call?.reject(new Error(frame.error));}
     }

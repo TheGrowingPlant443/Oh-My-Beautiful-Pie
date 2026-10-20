@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { humanDecisions } from "./lib/human-decisions";
+  import { humanDecisions, hasDecisionAttention } from "./lib/human-decisions";
   import type { HumanDecisionSnapshot } from "./lib/api";
-  import { api, type SetupDraft, type SetupAdmission, type PlanSessionAdmission, type Instance } from "./lib/api";
+  import { api, type SetupDraft, type SetupAdmission, type PlanSessionAdmission, type Instance, type InsightProducer } from "./lib/api";
   import { connectInstances, instances, instancesById, previewsEnabled, toasts, dismissToast, reportError, managerInstance, architectInstance, appSettings, startInstance, errorText, refreshInstances } from "./lib/stores";
   import { initializeProjectHistory, visibleProjectHistory, computedFolders, rememberProjectFolder } from "./lib/stores";
   import { coordinatorTemporaryFolders } from "./lib/stores";
@@ -27,8 +27,11 @@
   import CodeQualityPage from "./lib/components/CodeQualityPage.svelte";
   import SystemOverviewPage from "./lib/components/SystemOverviewPage.svelte";
   import GraphifyView from "./lib/components/GraphifyView.svelte";
-  import CogneeDialog from "./lib/components/CogneeDialog.svelte";
-  import { knowledge, cogneeVisible, graphifyVisible } from "./lib/knowledge";
+  import { knowledge } from "./lib/knowledge";
+  import type { ArchitectDescriptor } from "./lib/overview-types";
+  import { terminalOwners, updateTerminalUi } from "./lib/stores";
+  import { GLOBAL_UI_KEY, DECISIONS_KEY } from "./lib/terminal";
+  import { monitorProducerCurrent } from "./lib/host-monitor";
   import SrsStartDialog from "./lib/components/SrsStartDialog.svelte";
   import SrsDocumentationPage from "./lib/components/SrsDocumentationPage.svelte";
   import { srs } from "./lib/srs";
@@ -79,7 +82,6 @@
     view = "srs_documentation";
   }
   let graphifyFolder = $state<string | null>(null);
-  let cogneeOpen = $state(false);
   // Passive, sequence-fenced capability probes: startup (global), the shown System overview project, and window focus.
   const overviewFolder = $derived(view === "system_overview" ? $systemOverview.folder || null : null);
   $effect(() => { const folder = overviewFolder; untrack(() => void knowledge.probe(folder)); });
@@ -88,9 +90,6 @@
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   });
-  const graphifyAvailability = $derived(graphifyVisible($knowledge.capabilities) && $knowledge.capabilities?.folder === overviewFolder
-    ? { present: true, state: $knowledge.capabilities.graphify.state, message: $knowledge.capabilities.graphify.message }
-    : null);
   let configOpen = $state(false);
   let configMode = $state<"save" | "import">("save");
   let setupDraft = $state<SetupDraft>({ scope: null, kinds: [], items: [], step: 0, instanceId: null, projectInstanceId: null });
@@ -126,7 +125,7 @@
   // Set by the mounted Code diff page; resolves false when the user keeps unsaved edits.
   let diffGuard: (() => Promise<boolean>) | null = null;
   let popoverOpen = $state(false);
-  const browserHidden = $derived(settingsOpen || dialogOpen || configOpen || cogneeOpen || srsStartFolder !== null || !!panel || popoverOpen);
+  const browserHidden = $derived(settingsOpen || dialogOpen || configOpen || srsStartFolder !== null || !!panel || popoverOpen);
   const focused = $derived(focusedId ? $instancesById.get(focusedId) : undefined);
   const panelOwner = $derived(panel ? $instancesById.get(panel.id) : undefined);
   const planTarget = $derived(planChange ? $instancesById.get(planChange.targetId) : undefined);
@@ -135,6 +134,53 @@
   const needsHuman = $derived(!!$managerInstance?.pendingDecisionCount || $instances.some(instance => !!instance.humanRequest));
   const fullscreen = $derived(view === "dashboard" && !!focused && !planChange);
   const setupProject = $derived(setupContextId ? $instancesById.get(setupContextId) ?? null : null);
+  // The Architect as the overview and structure views see it: the terminal session of exactly this generation.
+  const architectDescriptor = $derived.by((): ArchitectDescriptor | null => {
+    const architect = $architectInstance;
+    if (!architect) return null;
+    const owner = $terminalOwners.get(architect.id);
+    return {
+      id: architect.id, generation: architect.generation,
+      sessionId: owner && owner.generation === architect.generation ? owner.sessionId : null,
+      ready: architect.bridgeReady && architect.status === "running",
+    };
+  });
+  // Reported by the mounted Code diff / Git graph page; fenced by route and source so an old page's cleanup cannot erase a new identity.
+  let helperVisible = $state<{ view: "code_diff" | "git_graph"; instanceId: string; id: string } | null>(null);
+  function reportHelperVisible(routeView: "code_diff" | "git_graph", instanceId: string | null, id: string | null): void {
+    if (view !== routeView || diffInstanceId !== instanceId || !instanceId) return;
+    helperVisible = id ? { view: routeView, instanceId, id } : null;
+  }
+  // The conversation actually on screen: the planner (not its target), a valid embedded setup session, a rendered helper, or the focused session. Non-chat routes show none.
+  const visibleAgentId = $derived.by((): string | null => {
+    if (view === "git_graph" || view === "code_diff") return helperVisible && helperVisible.view === view && helperVisible.instanceId === diffInstanceId ? helperVisible.id : null;
+    if (view === "agent_setup") return setupDraft.instanceId && $instancesById.has(setupDraft.instanceId) ? setupDraft.instanceId : null;
+    if (view !== "dashboard") return null;
+    if (planChange && planTarget && planner) return planner.id;
+    return focused ? focused.id : null;
+  });
+  const attention = $derived(hasDecisionAttention($humanDecisions.items, visibleAgentId));
+  // Inside the guarded navigation: an attention click lands on the global Decisions tab without Follow; otherwise the remembered tab stays.
+  function openTerminalsFromButton(): void {
+    if (attention) updateTerminalUi(GLOBAL_UI_KEY, { tab: DECISIONS_KEY, follow: false });
+    openTerminals();
+  }
+  // Focus only: never starts, restarts or replays the Architect.
+  async function focusArchitectOnly(producer: InsightProducer, current: () => boolean): Promise<boolean> {
+    // Admission can start the existing Architect before its periodic UI snapshot arrives. Read authoritative identities;
+    // recheck the origin after these awaits so a late receipt can never navigate away from a newer user action.
+    try {
+      const [list, owners] = await Promise.all([api.listInstances(), api.listAllTerminals()]);
+      const architect = list.find(row => row.kind === "architect");
+      const owner = owners.find(row => row.instanceId === producer.instanceId);
+      if (!current() || !monitorProducerCurrent(producer, architect, owner)) return false;
+      focus(producer.instanceId);
+      return true;
+    } catch (error) {
+      reportError("Open Architect", error);
+      return false;
+    }
+  }
   function openAgentSetup(): void {
     if (view === "agent_setup") return;
     planChange = null;
@@ -428,7 +474,7 @@
     let disposed = false;
     systemOverview.attach({
       architectId: () => $architectInstance?.id ?? null,
-      architectSession: () => { const architect = $architectInstance; return architect ? { id: architect.id, generation: architect.generation, ready: architect.bridgeReady && architect.status === "running" } : null; },
+      architectSession: () => architectDescriptor,
       openArchitect: (id, replay) => onOpenArchitect(id, replay),
       following: ticket => view === "dashboard" && !planChange && !panel && focusedId === (ticket.producer?.instanceId ?? $architectInstance?.id ?? null),
       quiescent: ticket => { const architect = ticket.producer ? $instancesById.get(ticket.producer.instanceId) : $architectInstance; return !!architect && architect.activity === "idle" && architect.pendingDecisionCount === 0 && !architect.humanRequest; },
@@ -478,10 +524,7 @@
     {#if fullscreen}<button disabled={initializing} onclick={() => openConfig("save")}>Save as global config</button>{/if}
     <button disabled={initializing} onclick={() => openConfig("import")}>Import config</button>
     <button disabled={initializing} class:active={view === "agent_setup"} onclick={() => requestNavigation(openAgentSetup)}>Agent setup</button>
-    <button disabled={initializing} class:active={view === "terminals"} title="Every agent's history, human decisions and live commands" onclick={() => requestNavigation(openTerminals)}>Terminals{#if $humanDecisions.items.length}<span class="pill">{$humanDecisions.items.length}</span>{/if}</button>
-    {#if cogneeVisible($knowledge.capabilities)}
-      <button disabled={initializing} title="Open your existing Cognee interface. Nothing is installed, started or changed." onclick={() => cogneeOpen = true}>Cognee</button>
-    {/if}
+    <button disabled={initializing} class:active={view === "terminals"} class:attention={attention} title={attention ? "An agent is waiting for your decision" : "Every agent's history, human decisions and live commands"} aria-label={attention ? `Terminals - ${$humanDecisions.items.length} pending ${$humanDecisions.items.length === 1 ? "decision" : "decisions"}` : undefined} onclick={() => requestNavigation(openTerminalsFromButton)}>Terminals{#if $humanDecisions.items.length}<span class="pill">{$humanDecisions.items.length}</span>{/if}</button>
     {#each $systemOverview.tickets.filter(ticket => ticket.lateResult && ticket.state === "completed").slice(0, 1) as ticket (ticket.key)}
       <button class="primary" title="A requested diagram or structure preview was saved while you were elsewhere" onclick={() => systemOverview.openResult(ticket.key)}>Open System overview result</button>
     {/each}
@@ -512,8 +555,8 @@
     {:else if view === "dependency_tree"}
       <DependencyTreePage initialFolder={analyzerInitialFolder} onBack={() => focus($architectInstance?.id ?? null)} {onOpenArchitect} onOpenManager={openManager} onOpenCodeQuality={openCodeQualityFromDependency} />
     {:else if view === "system_overview"}
-      <SystemOverviewPage initialFolder={overviewEntry.folder} resume={overviewEntry.resume} onBack={() => requestNavigation(() => focus($architectInstance?.id ?? null))} {onOpenArchitect} onGraphify={openGraphify} graphify={graphifyAvailability} onSrsDocumentation={openSrsStart}
-        architect={$architectInstance ? { id: $architectInstance.id, generation: $architectInstance.generation, ready: $architectInstance.bridgeReady && $architectInstance.status === "running" } : null} />
+      <SystemOverviewPage initialFolder={overviewEntry.folder} resume={overviewEntry.resume} onBack={() => requestNavigation(() => focus($architectInstance?.id ?? null))} {onOpenArchitect} onGraphify={openGraphify} onSrsDocumentation={openSrsStart}
+        architect={architectDescriptor} />
     {:else if view === "graphify" && graphifyFolder}
       <GraphifyView folder={graphifyFolder} onBack={() => openSystemOverview(true)} />
     {:else if view === "srs_documentation" && srsPageFolder}
@@ -521,13 +564,13 @@
     {:else if view === "code_quality"}
       <CodeQualityPage initialFolder={analyzerInitialFolder} onBack={closeCodeQuality} backLabel={qualityBackLabel} />
     {:else if view === "git_graph" && diffInstanceId}
-      <GitGraphView instanceId={diffInstanceId} name={diffName} onBack={() => view = "code_diff"} />
+      <GitGraphView instanceId={diffInstanceId} name={diffName} onBack={() => view = "code_diff"} onVisibleAgentChange={id => reportHelperVisible("git_graph", diffInstanceId, id)} />
     {:else if view === "code_diff" && diffInstanceId}
-      <CodeDiffView instanceId={diffInstanceId} name={diffName} onBack={closeCodeDiff} onGitTree={() => view = "git_graph"} onGuardChange={guard => diffGuard = guard} />
+      <CodeDiffView instanceId={diffInstanceId} name={diffName} onBack={closeCodeDiff} onGitTree={() => view = "git_graph"} onGuardChange={guard => diffGuard = guard} onVisibleAgentChange={id => reportHelperVisible("code_diff", diffInstanceId, id)} />
     {:else if planChange && planTarget && planner}
       <PlanChangeView target={planTarget} {planner} admission={planChange.admission} onBack={() => planChange = null} onRetry={retryPlanContext} onCodeQuality={() => openCodeQuality(planner.id, { kind: "planChange" })} />
     {:else if focused}
-      <SessionView instance={focused} instances={$instances} onSwitch={id => void openProject(id)} onClose={() => focus(null)} {onPlan} onPlanChange={openPlanChange} {onSubagents} {focusRequest} {onTerminalReady} onCodeDiff={openCodeDiff} onDependencyTree={() => openDependencyTree()} onSystemOverview={() => openSystemOverview()} onCodeQuality={id => openCodeQuality(id)} showBrowser={!focused.helper} browserHidden={browserHidden} />
+      <SessionView instance={focused} instances={$instances} onSwitch={id => void openProject(id)} onClose={() => focus(null)} {onPlan} onPlanChange={openPlanChange} {onSubagents} {focusRequest} {onTerminalReady} onCodeDiff={openCodeDiff} onDependencyTree={() => openDependencyTree()} onSystemOverview={() => openSystemOverview()} onCodeQuality={id => openCodeQuality(id)} onFocusArchitect={focusArchitectOnly} showBrowser={!focused.helper} browserHidden={browserHidden} />
     {:else if $previewsEnabled}
       <Grid instances={overview} onSelect={focus} onOpen={openProject} {onPlan} onPlanChange={openPlanChange} {onSubagents} tileMin={$appSettings.previewSize} onCreate={newInstance} />
     {:else}
@@ -538,7 +581,6 @@
 <NewInstanceDialog open={dialogOpen} purpose={dialogPurpose} onclose={() => dialogOpen = false} oncreated={created} />
 <GlobalConfigDialog open={configOpen} mode={configMode} initialSourceId={focused?.id || $managerInstance?.id || null} onclose={() => configOpen = false} />
 <SettingsDialog open={settingsOpen} onclose={() => settingsOpen = false} />
-<CogneeDialog open={cogneeOpen} onClose={() => cogneeOpen = false} />
 <SrsStartDialog open={srsStartFolder !== null} folder={srsStartFolder ?? ""} architectModel={$architectInstance?.model ?? null}
   onClose={() => srsStartFolder = null} onExisting={folder => openSrsPage(folder)}
   onStarted={() => { srsStartFolder = null; }} onOpenArchitect={() => requestNavigation(openArchitect)} />
@@ -564,4 +606,7 @@
   .viewer { width: min(1100px, 96vw); height: 90vh; }
   .viewer > :global(section) { flex: 1; min-height: 0; border: none; }
   .settings-button { display: inline-flex; align-items: center; gap: 6px; }
+  .toolbar button.attention { border-color: var(--warn); color: var(--warn); box-shadow: 0 0 0 1px var(--warn), 0 0 10px color-mix(in srgb, var(--warn) 55%, transparent); animation: attention-glow 2.4s ease-in-out infinite; }
+  @keyframes attention-glow { 50% { box-shadow: 0 0 0 1px var(--warn), 0 0 2px color-mix(in srgb, var(--warn) 20%, transparent); } }
+  @media (prefers-reduced-motion: reduce) { .toolbar button.attention { animation: none; } }
 </style>

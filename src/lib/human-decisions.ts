@@ -7,6 +7,15 @@ export const decisionKey = (target: HumanDecisionTarget): string => JSON.stringi
 ]);
 export const nativeOption = (option: string | NativeDecisionOption): NativeDecisionOption => typeof option === "string" ? { label: option } : option;
 export const canAnswer = (item: HumanDecision): boolean => item.answerable && ["approve", "confirm", "select", "input", "editor", "askDialog"].includes(item.method);
+/**
+ * True iff an authoritative pending native decision belongs to an agent other than the conversation actually on screen,
+ * or no conversation is on screen. The total count badge is separate; this never fabricates decisions.
+ */
+export const hasDecisionAttention = (items: readonly HumanDecision[], visibleAgentId: string | null): boolean =>
+  items.some(item => visibleAgentId === null || item.target.instanceId !== visibleAgentId);
+/** Identity of the helper conversation a diff/git view actually renders: only while shown and backed by a live generation. */
+export const renderedHelperAgentId = (shown: boolean, helper: { id: string; generation: number } | null | undefined): string | null =>
+  shown && helper && helper.generation > 0 ? helper.id : null;
 export interface QuestionDraft {
   selectedOptions: string[]; customInput: string; note: string;
   customInputImages: NativeDecisionImage[]; noteImages: NativeDecisionImage[];

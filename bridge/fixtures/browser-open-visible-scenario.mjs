@@ -2,14 +2,16 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {BrowserService} from '../omp-browser-service.mjs';
+import {TestNativeHost} from './native-host.mjs';
 
 const root=process.env.BROWSER_TEST_ROOT;
-process.env.USERPROFILE=root;
 process.env.HOME=root;
+process.env.PI_CONFIG_DIR='.omp';
 process.env.PI_CODING_AGENT_DIR=path.join(root,'agent');
 delete process.env.PI_COMPILED;
 const frames=[];
-const service=new BrowserService(root,process.env.OMP_SDK_DIR,frame=>frames.push(frame));
+const host=new TestNativeHost(root);
+const service=new BrowserService(root,process.env.OMP_SDK_DIR,frame=>frames.push(frame),{native:host.channel()});
 await service.start();
 const global={headless:true,embedded:false};
 try {
@@ -26,14 +28,14 @@ try {
   const a=await open('a'), b=await open('b');
   await a.page.goto(process.env.BROWSER_FIXTURE_URL+'?a');
   await b.page.goto(process.env.BROWSER_FIXTURE_URL+'?b');
-  const headlessPid=service.owner('a',1).browser.process().pid;
-  const otherPid=service.owner('b',1).browser.process().pid;
+  const headlessPid=service.owner('a',1).native.pid;
+  const otherPid=service.owner('b',1).native.pid;
   assert.equal(service.owner('a',1).headless,true);
   assert.equal(service.embedded(service.owner('a',1)),false);
 
   // Without consent a running headless browser is never touched.
   await assert.rejects(service.dispatch('openVisible',{instanceId:'a',generation:1,restartHeadless:false}),/^Error: browser_headless_restart_required$/);
-  assert.equal(service.owner('a',1).browser.process().pid,headlessPid);
+  assert.equal(service.owner('a',1).native.pid,headlessPid);
   assert.equal(service.owner('a',1).forceVisible,false);
   assert.equal(a.page.url(),process.env.BROWSER_FIXTURE_URL+'?a','refusing must keep the headless tabs');
   await assert.rejects(service.dispatch('openVisible',{instanceId:'a',generation:1,restartHeadless:'yes'}),/invalid browser visibility request/);
@@ -42,14 +44,14 @@ try {
 
   // With consent only this owner restarts, headed and flagged for docking.
   const row=await service.dispatch('openVisible',{instanceId:'a',generation:1,restartHeadless:true});
-  const visiblePid=service.owner('a',1).browser.process().pid;
+  const visiblePid=service.owner('a',1).native.pid;
   assert.notEqual(visiblePid,headlessPid);
   assert.equal(row.pid,visiblePid);
   assert.equal(row.headless,false);
   assert.equal(row.embedded,true);
   assert.equal(row.state,'ready');
   assert.equal((await fetch(a.ticket.cdpUrl+'/json/version',{method:'HEAD'})).status,403,'old tab capabilities must be revoked by the restart');
-  assert.equal(service.owner('b',1).browser.process().pid,otherPid,'another owner must keep its browser');
+  assert.equal(service.owner('b',1).native.pid,otherPid,'another owner must keep its browser');
   assert.deepEqual(service.settings,global,'a per-session request must not change global browser settings');
   assert.equal(b.page.url(),process.env.BROWSER_FIXTURE_URL+'?b','another owner must keep its tabs');
   assert.equal(service.embedded(service.owner('b',1)),false,'other owners keep the global embedded preference');
@@ -68,7 +70,7 @@ try {
 
   // Changing global settings supersedes the override without restarting the running browser.
   await service.dispatch('configure',global);
-  assert.equal(service.owner('a',1).browser.process().pid,visiblePid);
+  assert.equal(service.owner('a',1).native.pid,visiblePid);
   assert.equal(service.owner('a',1).forceVisible,false);
   assert.equal((await service.dispatch('snapshot')).find(row=>row.instanceId==='a').embedded,false);
   // Closing and reopening through the normal path follows the global preference again.
@@ -97,7 +99,21 @@ try {
   assert.deepEqual(repeat.map(row=>[row.name,row.tabEpoch]).sort(),rows.map(row=>[row.name,row.tabEpoch]).sort(),'listing twice must not bind pages twice');
   await manualB.close();
   assert.equal((await service.dispatch('listTabs',{instanceId:'c',generation:1})).length,2,'a closed page leaves the list');
+  // A fresh human Browser click (no earlier model browser.open) leaves exactly one normal page, even when clicked twice at once.
+  await service.dispatch('register',{instanceId:'d',generation:1});
+  const [firstClick,secondClick]=await Promise.all([1,2].map(()=>service.dispatch('openVisible',{instanceId:'d',generation:1,restartHeadless:false})));
+  assert.equal(firstClick.state,'ready');assert.equal(secondClick.pid,firstClick.pid);
+  assert.deepEqual((await service.owner('d',1).browser.pages()).map(page=>page.url()),['about:blank'],'concurrent Browser clicks must not create duplicate pages');
+  // A profile still owned natively is reported as busy and the failed attempt never reaches the browser.
+  await service.dispatch('register',{instanceId:'e',generation:1});
+  const rival=new BrowserService(root,process.env.OMP_SDK_DIR,undefined,{native:host.channel(),helperSession:'rival'});
+  await service.dispatch('openVisible',{instanceId:'e',generation:1,restartHeadless:false});
+  await rival.dispatch('register',{instanceId:'e',generation:1});
+  await assert.rejects(rival.dispatch('openVisible',{instanceId:'e',generation:1,restartHeadless:false}),/browser_profile_busy/);
+  assert.equal(host.isAlive(service.owner('e',1).native.pid),true,'a rejected rival must not touch the owner\'s Chrome');
+  await rival.dispatch('shutdown');
   console.log('openVisible assertions passed');
 } finally {
   await service.dispatch('shutdown');
+  await host.retireAll();
 }

@@ -45,7 +45,7 @@ function setup(overrides = {}) {
   const store = createSystemOverviewStore({ api, clock, storage: { getItem: key => memory.get(key) ?? null, setItem: (key, value) => memory.set(key, value) } });
   const hooks = { opened: [], returned: [], following: true, quiescent: true };
   store.attach({
-    architectId: () => "arch", architectSession: () => ({ id: "arch", generation: 1, ready: true }),
+    architectId: () => "arch", architectSession: () => ({ id: "arch", generation: 1, sessionId: "s1", ready: true }),
     openArchitect: async id => { hooks.opened.push(id); return true; }, following: () => hooks.following, quiescent: () => hooks.quiescent,
     returnToOverview: ticket => hooks.returned.push(ticket.key),
   });

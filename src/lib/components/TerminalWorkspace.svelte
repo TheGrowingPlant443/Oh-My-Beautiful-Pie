@@ -1,17 +1,22 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { api } from "../api";
+  import { api, type InsightProducer } from "../api";
   import { allInstances, reportError, terminalOwners, terminalUi, updateTerminalUi } from "../stores";
   import { defaultTerminalUi, GLOBAL_UI_KEY, HISTORY_KEY, nextSelection, ownerStatus, terminalTabs } from "../terminal";
   import CommandHistory from "./CommandHistory.svelte";
   import CommandOutput from "./CommandOutput.svelte";
   import UserTerminal from "./UserTerminal.svelte";
+  import OutboundProcesses from "./OutboundProcesses.svelte";
   import HumanDecisionInbox from "./HumanDecisionInbox.svelte";
   import { humanDecisions } from "../human-decisions";
 
-  // instanceId: one agent's pane next to its terminal. null: every agent (the Dashboard's Terminals page).
-  let { instanceId, onOpenSession }: { instanceId: string | null; onOpenSession?: (id: string) => void } = $props();
+  // instanceId: one agent's pane next to its terminal (it also gets the Outbound & Processes monitor). null: every agent (the Dashboard's Terminals page).
+  // covered: a modal or popover is over the app, so the monitor must not sample. onFocusArchitect: focus-only, never starts an agent.
+  let { instanceId, onOpenSession, covered = false, onFocusArchitect }: {
+    instanceId: string | null; onOpenSession?: (id: string) => void; covered?: boolean; onFocusArchitect?: (producer: InsightProducer, current: () => boolean) => boolean | Promise<boolean>;
+  } = $props();
   const uiKey = $derived(instanceId ?? GLOBAL_UI_KEY);
+  const instance = $derived(instanceId === null ? undefined : $allInstances.find(row => row.id === instanceId));
   const ui = $derived($terminalUi.get(uiKey) ?? defaultTerminalUi());
   const owners = $derived(instanceId === null
     ? $allInstances.flatMap(row => $terminalOwners.get(row.id) ?? [])
@@ -57,6 +62,8 @@
         <CommandHistory {instanceId} />
       {:else if selected.kind === "decisions"}
         <HumanDecisionInbox {onOpenSession} />
+      {:else if selected.kind === "monitor"}
+        {#if instance}<OutboundProcesses instanceId={instance.id} generation={instance.generation} projectPath={instance.projectPath} {covered} {onFocusArchitect} />{/if}
       {:else if selected.kind === "shell"}
         {@const owner = ownerOf(selected.instanceId)}
         {#if owner?.userShell}<UserTerminal instanceId={owner.instanceId} shell={owner.userShell} />{/if}

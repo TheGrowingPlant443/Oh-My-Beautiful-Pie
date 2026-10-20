@@ -88,6 +88,24 @@ pub enum CogneeState {
     Unreadable,
 }
 
+/// Whether the installed Cognee web interface can be started by "Open Cognee UI". Passive file metadata only.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CogneeUiState {
+    Ready,
+    MissingFrontend,
+    MissingDependencies,
+    Unreadable,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CogneeUiCapability {
+    pub state: CogneeUiState,
+    pub message: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CogneeCapability {
@@ -95,16 +113,43 @@ pub struct CogneeCapability {
     /// `None` means inspection failed without evidence; `true` may be advisory when state is unreadable.
     pub installed: Option<bool>,
     pub version: Option<String>,
-    pub ui_url: Option<String>,
     pub message: Option<String>,
     /// The inspected folder, including advisory evidence when it could not be inspected again.
     pub installation_folder: Option<String>,
+    pub ui: CogneeUiCapability,
+}
+
+/// The outcome of one explicit "Open Cognee UI" click. Always an answer, never a thrown string: every state carries
+/// the exact reason and nothing was installed, downloaded, migrated or started unless `opened`/`openFailed`.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CogneeOpenState {
+    Opened,
+    MissingComponent,
+    BackendUnavailable,
+    PortBusy,
+    Unsupported,
+    StartingFailed,
+    ReadinessTimeout,
+    OpenFailed,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CogneeOpenResult {
+    pub state: CogneeOpenState,
+    pub url: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeCapabilities {
+    /// The folder as asked (trimmed), echoed so a late answer can be fenced against the project now shown.
     pub folder: Option<String>,
+    /// The canonical backend repository identity of `folder` (the Graphify/vault project key); `None` for global probes
+    /// and for a folder that is not a usable project.
+    pub project_key: Option<String>,
     pub obsidian: ObsidianCapability,
     pub graphify: GraphifyCapability,
     pub cognee: CogneeCapability,

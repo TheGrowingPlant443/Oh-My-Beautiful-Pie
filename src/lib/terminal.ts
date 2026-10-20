@@ -8,7 +8,7 @@ export const defaultTerminalUi = (): TerminalUi => ({ pane: null, tab: "", follo
 
 export interface TabDescriptor {
   key: string;
-  kind: "shell" | "history" | "decisions" | "command";
+  kind: "shell" | "history" | "decisions" | "command" | "monitor";
   label: string;
   title: string;
   instanceId: string | null;
@@ -17,6 +17,7 @@ export interface TabDescriptor {
 
 export const HISTORY_KEY = "history";
 export const DECISIONS_KEY = "decisions";
+export const MONITOR_KEY = "outbound-processes";
 export const shellKey = (instanceId: string): string => `shell:${instanceId}`;
 export const commandKey = (instanceId: string, executionId: string): string => `command:${instanceId}:${executionId}`;
 
@@ -24,7 +25,8 @@ export function commandLabel(command: CommandSummary): string {
   return command.description ?? command.preview;
 }
 
-// Session pane: 0 user shell, 1 history, 2.. live commands by slot. Aggregate: history, decisions, commands, then shells.
+// Session pane: 0 user shell, 1 history, the permanent Outbound & Processes monitor (unnumbered), then live commands by slot.
+// Aggregate: history, decisions, commands, then shells (never the monitor: it belongs to one agent).
 export function terminalTabs(instanceId: string | null, owners: readonly TerminalOwner[]): TabDescriptor[] {
   const history: TabDescriptor = {
     key: HISTORY_KEY, kind: "history", label: instanceId === null ? "History" : "1 · History",
@@ -47,7 +49,11 @@ export function terminalTabs(instanceId: string | null, owners: readonly Termina
   if (instanceId === null) return [history, {
     key: DECISIONS_KEY, kind: "decisions", label: "Decisions", title: "Human answers across all agents", instanceId: null,
   }, ...commands, ...shells];
-  return [...shells, history, ...commands];
+  const monitor: TabDescriptor = {
+    key: MONITOR_KEY, kind: "monitor", label: "Outbound & Processes", instanceId,
+    title: "Running processes and external network connections on this computer, sampled only while this tab is shown",
+  };
+  return [...shells, history, monitor, ...commands];
 }
 
 export function initialTab(tabs: readonly TabDescriptor[]): string {

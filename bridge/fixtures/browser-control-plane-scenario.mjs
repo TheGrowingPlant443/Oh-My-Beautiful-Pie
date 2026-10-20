@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {fileURLToPath} from 'node:url';
 import {spawn} from 'node:child_process';
 import {installTerminalBrowserBridge} from '../omp-browser.mjs';
+import {TestNativeHost} from './native-host.mjs';
 
 // Loaded as an explicit extension by the real OMP CLI, not a second source SDK.
 export default async function controlPlaneScenario(pi) {
@@ -10,7 +11,9 @@ export default async function controlPlaneScenario(pi) {
   const originalInfos=pi.pi.AgentSession.prototype.getAllToolInfos;
   function captureInfos(...args){session=this;return originalInfos.apply(this,args);}
   pi.pi.AgentSession.prototype.getAllToolInfos=captureInfos;
+  const host=new TestNativeHost(root);
   const helper=spawn(process.env.BUN_BIN||'bun',[fileURLToPath(new URL('../omp-browser-service.mjs',import.meta.url)),root,process.env.OMP_SDK_DIR],{env:process.env,stdio:['pipe','pipe','inherit']});
+  host.attach(helper);
   let sequence=0;
   let buffered='';
   const pending=new Map();
@@ -23,6 +26,7 @@ export default async function controlPlaneScenario(pi) {
     for(;;){
       const end=buffered.indexOf('\n');if(end<0)break;
       const frame=JSON.parse(buffered.slice(0,end));buffered=buffered.slice(end+1);
+      if(frame.type==='native_request')host.serve(helper,frame);
       if(frame.type==='ready')readyResolve();
       if(frame.type==='response'){
         const call=pending.get(frame.id);pending.delete(frame.id);

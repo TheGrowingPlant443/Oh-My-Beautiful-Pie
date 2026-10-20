@@ -39,13 +39,19 @@ export interface InventoryState {
 
 export const EMPTY_INVENTORY: InventoryState = { snapshotId: null, status: "idle", files: [], directories: [], total: 0, error: null };
 
+/**
+ * The one local description of the existing Architect shared by App's attach hook, SystemOverviewPage, StructureView and StructureHost.
+ * `sessionId` is read from the matching-generation terminal owner (null while unknown); it identifies the captured-message session.
+ */
+export interface ArchitectDescriptor { id: string; generation: number; sessionId: string | null; ready: boolean }
+
 /** What the parent gives the structure area; it never reaches for app stores, the Architect or the backend on its own. */
 export interface StructureHost {
   folder(): string;
   /** Selected complete index snapshot of the shown folder, or null while none exists. */
   snapshotId(): string | null;
   /** The existing Architect session, when one is known. */
-  architect(): { id: string; generation: number; ready: boolean } | null;
+  architect(): ArchitectDescriptor | null;
   generate(request: GenerateRequest): Promise<GenerateOutcome>;
   openArchitect(id: string, replayRequestId?: string): Promise<boolean>;
 }
@@ -54,9 +60,3 @@ export interface StructureHost {
 export interface VisualizationSink {
   receive(status: ProjectInsightStatus): void;
 }
-
-/**
- * What the parent knows about a project's Graphify output (a passive, sequence-fenced capability probe). The System overview shows its
- * Graphify button only when `present`; a present but unreadable artifact is reported by the Graphify view itself, never as "absent".
- */
-export interface GraphifyAvailability { present: boolean; state: string; message: string | null }

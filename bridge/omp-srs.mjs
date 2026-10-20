@@ -1,4 +1,5 @@
 import { SRS_ALLOWLISTS, registerVisualizationGuard } from './omp-visualization-guard.mjs';
+import { installHostMonitorBridge } from './omp-host-monitor.mjs';
 export { SRS_ALLOWLISTS };
 
 export const MAX_SRS_FRAME = 1024 * 1024;
@@ -76,10 +77,14 @@ export function installSrsBridge(pi, { request, workspace, currentContext }) {
     void request('srs_stage_yielded', { jobId: stage.jobId, attemptId: stage.attemptId, stageId: stage.stageId, reason }).catch(() => {});
   }
   const available = () => !disposed && workspace.nativeGuardAvailable() && workspace.nativeUiCapabilities().nativeDecisions === true;
+  // The monitor explanation shares this guard and the one native before-model gate below; it never installs its own host.
+  const monitor = installHostMonitorBridge(pi, { request, workspace, currentContext, guard });
   guard.setNativeHost({
     quiescent: () => workspace.quiescence().quiescent,
     onYield: stage => yielded(stage, 'unrelated_prompt'),
     onUncertain: stage => yielded(stage, 'continuation_uncertain'),
+    validateMonitor: stage => monitor.validate(stage),
+    onMonitorRetired: (stage, reason) => monitor.retired(stage, reason),
     async validateSrs(stage) {
       if (disposed || disconnected || !available()) throw new Error(SRS_GUARD_ERROR);
       if (admission && sameStage(admission, stage)) await admission.persisted;
@@ -167,6 +172,7 @@ export function installSrsBridge(pi, { request, workspace, currentContext }) {
   }
   return {
     guard,
+    monitor,
     attachContext(ctx) {
       const sessionId = ctx.sessionManager.getSessionId();
       if (sessionId === recoveredSessionId || !workspace.nativeGuardAvailable()) return;
@@ -234,8 +240,8 @@ export function installSrsBridge(pi, { request, workspace, currentContext }) {
       receipt: (invocationId, provenance, results) => request('srs_ask_receipt', bounded({ invocationId, provenance, results: results.map(({ id, selectedOptions, customInput, note }) => ({ id, selectedOptions, ...(customInput === undefined ? {} : { customInput }), ...(note === undefined ? {} : { note }) })) })),
       retired: (invocationId, reason) => request('srs_ask_retired', { invocationId, reason }),
     },
-    disconnected() { disconnected = true; yielded(guard.srs(currentContext()), 'disconnected'); },
-    reconnect() { disconnected = false; },
-    dispose() { disposed = true; detach(); guard.setNativeHost(null); },
+    disconnected() { disconnected = true; monitor.disconnected(); yielded(guard.srs(currentContext()), 'disconnected'); },
+    reconnect() { disconnected = false; monitor.reconnect(); },
+    dispose() { disposed = true; monitor.dispose(); detach(); guard.setNativeHost(null); },
   };
 }

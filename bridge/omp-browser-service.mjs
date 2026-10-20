@@ -1,44 +1,132 @@
-import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { mkdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { spawn } from 'node:child_process';
 
 export const MAX_FRAME = 64 * 1024 * 1024;
+// One budget for spawn -> debugging endpoint -> CDP connect -> initialization, inside the supervisor's 30 s request bound.
+export const LAUNCH_DEADLINE_MS = 20000;
 const closedTab = 'Browser tab is closed; reopen it with browser.open';
 const tabTimeout = 'Browser did not respond while opening the tab and was closed; run browser.open again';
 const timeout = (promise, ms, message) => {
   let timer;
   return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]).finally(() => clearTimeout(timer));
 };
+
+/** Failure with a stable machine-readable code; the message always starts with the code so it survives plain-text relays. */
+export class BrowserError extends Error {
+  constructor(code, message) {
+    super(message.startsWith(code) ? message : `${code}: ${message}`);
+    this.code = code;
+  }
+}
+
 export function profileDirectory(root, id) {
   return path.join(root, 'terminal-browsers', createHash('sha256').update(id, 'utf8').digest('hex'), 'profile');
 }
-// Cookies and logins stay in the terminal's profile, but open pages must not: a closed browser starts empty.
-// The supervisor also kills Chrome on app/terminal stop; avoid Chrome's crash-restore prompt for that expected exit.
-async function resetSession(userDataDir) {
-  const defaults = path.join(userDataDir, 'Default');
-  await Promise.all(['Sessions', 'Session Storage', 'Current Session', 'Current Tabs', 'Last Session', 'Last Tabs']
-    .map(name => rm(path.join(defaults, name), { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })));
-  const file = path.join(defaults, 'Preferences');
-  let preferences;
-  try { preferences = JSON.parse(await readFile(file, 'utf8')); } catch { return; }
-  if (!preferences || typeof preferences !== 'object' || Array.isArray(preferences)) return;
-  preferences.profile = { ...(preferences.profile ?? {}), exit_type: 'Normal', exited_cleanly: true };
-  await writeFile(file, JSON.stringify(preferences));
+
+/** The installed Windows locations the SDK probes, in its order. Nothing is downloaded or executed. */
+export function windowsChromiumCandidates(env = process.env) {
+  const programFiles = env.ProgramFiles ?? 'C:\\Program Files';
+  const programFilesX86 = env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)';
+  const local = env.LOCALAPPDATA;
+  const join = path.win32.join;
+  return [
+    join(programFiles, 'Google\\Chrome\\Application\\chrome.exe'),
+    join(programFilesX86, 'Google\\Chrome\\Application\\chrome.exe'),
+    ...(local ? [join(local, 'Google\\Chrome\\Application\\chrome.exe')] : []),
+    join(programFiles, 'Chromium\\Application\\chrome.exe'),
+    ...(local ? [join(local, 'Chromium\\Application\\chrome.exe')] : []),
+    join(programFiles, 'Microsoft\\Edge\\Application\\msedge.exe'),
+    join(programFilesX86, 'Microsoft\\Edge\\Application\\msedge.exe'),
+  ];
 }
-const killTree = process => process && process.exitCode === null && new Promise(resolve => {
-  if (globalThis.process.platform !== 'win32') { process.kill('SIGKILL'); resolve(); return; }
-  const killer = spawn('taskkill', ['/PID', String(process.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-  killer.once('error', resolve); killer.once('exit', resolve);
-});
+const isFile = async file => (await stat(file).catch(() => null))?.isFile() === true;
+
+/**
+ * Passive installed-only resolution: an explicit absolute PUPPETEER_EXECUTABLE_PATH, then the SDK's installed Windows
+ * candidates, then an already existing Puppeteer cache executable. It never installs, downloads or runs a browser.
+ */
+export async function resolveInstalledChromium({ env = process.env, platform = process.platform, exists = isFile, cached = async () => null } = {}) {
+  if (platform !== 'win32') throw new BrowserError('unsupported_platform', 'Owned terminal browsers are supported on Windows only');
+  const explicit = env.PUPPETEER_EXECUTABLE_PATH;
+  if (explicit) {
+    if (!path.win32.isAbsolute(explicit) || !await exists(explicit)) {
+      throw new BrowserError('browser_executable_missing', 'PUPPETEER_EXECUTABLE_PATH must be the absolute path of an installed Chrome, Chromium or Edge executable');
+    }
+    return explicit;
+  }
+  for (const candidate of windowsChromiumCandidates(env)) if (await exists(candidate)) return candidate;
+  const cache = await cached();
+  if (cache && await exists(cache)) return cache;
+  throw new BrowserError('browser_executable_missing', 'No installed Chrome, Chromium or Edge was found. Install one (nothing is downloaded automatically) or set PUPPETEER_EXECUTABLE_PATH to its absolute path.');
+}
+
+/** Request/response channel to the native supervisor over the private helper stdio frames. */
+export class NativeChannel {
+  constructor(send) { this.send = send; this.pending = new Map(); this.closed = false; }
+  request(action, payload) {
+    if (this.closed) return Promise.reject(new BrowserError('browser_native_unavailable', 'The native browser supervisor is not connected'));
+    const id = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new BrowserError('browser_native_timeout', `${action} timed out`)); }, 60000);
+      this.pending.set(id, { resolve, reject, timer });
+      try { this.send({ type: 'native_request', id, action, payload }); }
+      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
+    });
+  }
+  receive(frame) {
+    const call = this.pending.get(frame.id);
+    if (!call) return;
+    this.pending.delete(frame.id); clearTimeout(call.timer);
+    if (frame.error) call.reject(new BrowserError(String(frame.error.code ?? 'native_error'), String(frame.error.message ?? 'native browser action failed')));
+    else call.resolve(frame.result);
+  }
+  close() {
+    this.closed = true;
+    for (const call of this.pending.values()) { clearTimeout(call.timer); call.reject(new BrowserError('browser_native_unavailable', 'The native browser supervisor disconnected')); }
+    this.pending.clear();
+  }
+}
+
+// One browser start. It owns the shared deadline and cancellation for spawn -> connect -> initialization, and records
+// what native owns for it so exactly that job can be retired no matter where the start stops.
+class LaunchOperation {
+  constructor(owner, requestId, ms) {
+    this.id = randomUUID(); this.instanceId = owner.id; this.generation = owner.generation; this.requestId = requestId;
+    this.owned = null; this.browser = null; this.retiring = null; this.retired = false; this.gone = false; this.spawnSent = false;
+    this.cancelled = false; this.settled = false; this.reason = null;
+    this.aborted = new Promise((_, reject) => { this.reject = reject; });
+    this.aborted.catch(() => {});
+    this.timer = setTimeout(() => this.abort(new BrowserError('browser_launch_timeout', 'Chrome did not finish starting within 20 seconds and was closed; try Browser again.')), ms);
+  }
+  abort(error) {
+    if (this.settled || this.cancelled) return;
+    this.cancelled = true; this.reason = error; this.reject(error);
+  }
+  settle() { this.settled = true; clearTimeout(this.timer); }
+  /** Awaits `promise` unless the operation is cancelled or past its deadline first; a late result is never published. */
+  async run(promise) {
+    const value = await Promise.race([promise, this.aborted]);
+    if (this.cancelled) throw this.reason;
+    return value;
+  }
+}
+
 
 export class BrowserService {
-  constructor(root, sdkDir, emit = () => {}) {
+  constructor(root, sdkDir, emit = () => {}, options = {}) {
     this.root = root; this.sdkDir = sdkDir; this.emit = emit;
+    this.native = options.native ?? null;
+    this.log = options.log ?? (() => {});
+    this.helperSession = options.helperSession ?? randomBytes(16).toString('hex');
+    this.resolveExecutable = options.resolveExecutable ?? (() => resolveInstalledChromium({ cached: () => this.cachedChromium() }));
     this.settings = { headless: false, embedded: true };
     this.owners = new Map(); this.capabilities = new Map(); this.epoch = Date.now();
     this.server = null; this.stopping = false;
+    // Retirement state lives here, not on replaceable owner objects: a replacement generation must still wait for the
+    // previous generation's browser to be gone, and a blocked cleanup must be retried before any new launch.
+    this.turns = new Map(); this.exits = new Map(); this.blocked = new Map();
   }
   async start() {
     this.server = Bun.serve({ hostname: '::1', port: 0,
@@ -60,13 +148,26 @@ export class BrowserService {
   embedded(owner) { return owner.forceVisible || this.settings.embedded; }
   row(owner) {
     return { instanceId: owner.id, generation: owner.generation, epoch: owner.epoch, state: owner.state,
-      headless: owner.headless, embedded: this.embedded(owner), pid: owner.browser?.process()?.pid ?? null, error: owner.error ?? null };
+      headless: owner.headless, embedded: this.embedded(owner), pid: owner.native?.pid ?? null, error: owner.error ?? null };
   }
   state(owner, state, error = null) {
     owner.state = state; owner.error = error;
     this.emit(this.row(owner));
   }
-  async dispatch(action, p = {}) {
+  // Owner transitions (register / revoke / replacement) of one instance run one at a time; browser actions do not.
+  serial(id, work) {
+    const run = (this.turns.get(id) ?? Promise.resolve()).then(work);
+    const tail = run.catch(() => {});
+    this.turns.set(id, tail);
+    tail.then(() => { if (this.turns.get(id) === tail) this.turns.delete(id); });
+    return run;
+  }
+  live(owner, browser) { return owner.active && !owner.closing && !this.stopping && owner.browser === browser; }
+  nativeCall(action, payload, ms) {
+    if (!this.native) return Promise.reject(new BrowserError('browser_native_unavailable', 'Native browser ownership is unavailable'));
+    return timeout(this.native.request(action, { helperSession: this.helperSession, ...payload }), ms, `${action} timed out`);
+  }
+  async dispatch(action, p = {}, requestId = null) {
     if (this.stopping && action !== 'shutdown') throw new Error('browser service closed');
     if (action === 'configure') {
       if (typeof p.headless !== 'boolean' || typeof p.embedded !== 'boolean') throw new Error('invalid browser settings');
@@ -77,22 +178,33 @@ export class BrowserService {
     }
     if (action === 'register') {
       if (typeof p.instanceId !== 'string' || !p.instanceId || !Number.isSafeInteger(p.generation) || p.generation < 0) throw new Error('invalid browser owner');
-      const previous = this.owners.get(p.instanceId);
-      if (previous?.active && previous.generation === p.generation) return null;
-      if (previous) { previous.active = false; await this.closeOwner(previous); }
-      this.owners.set(p.instanceId, { id: p.instanceId, generation: p.generation, active: true, epoch: 0, forceVisible: false,
-        headless: this.settings.headless, state: 'closed', tabs: new Map(), pendingTabs: new Map(), browser: null, launching: null, closing: null });
-      return null;
+      return this.serial(p.instanceId, async () => {
+        if (this.stopping) throw new Error('browser service closed');
+        const previous = this.owners.get(p.instanceId);
+        if (previous?.active && previous.generation === p.generation) return null;
+        // The old generation's browser job must be verified gone before its replacement can exist.
+        if (previous) { previous.active = false; await this.closeOwner(previous); }
+        if (this.stopping) throw new Error('browser service closed');
+        this.owners.set(p.instanceId, { id: p.instanceId, generation: p.generation, active: true, epoch: 0, forceVisible: false,
+          headless: this.settings.headless, state: 'closed', tabs: new Map(), pendingTabs: new Map(), browser: null, native: null, op: null, launching: null, closing: null });
+        return null;
+      });
     }
     if (action === 'snapshot') return [...this.owners.values()].filter(o => o.active).map(o => this.row(o));
     if (action === 'shutdown') {
       this.stopping = true;
       const owners = [...this.owners.values()]; for (const owner of owners) owner.active = false;
-      await Promise.all(owners.map(o => this.closeOwner(o)));
-      this.server?.stop(true); return null;
+      await Promise.allSettled([...this.turns.values()]);
+      const results = await Promise.allSettled(owners.map(o => this.closeOwner(o)));
+      this.server?.stop(true);
+      const failed = results.find(result => result.status === 'rejected');
+      if (failed) throw failed.reason;
+      return null;
+    }
+    if (action === 'revoke') {
+      return this.serial(p.instanceId, async () => { const owner = this.owner(p.instanceId, p.generation); owner.active = false; await this.closeOwner(owner); return null; });
     }
     const owner = this.owner(p.instanceId, p.generation);
-    if (action === 'revoke') { owner.active = false; await this.closeOwner(owner); return null; }
     if (action === 'closeTab') {
       const tabs = p.name === null ? [...owner.tabs.values()] : [owner.tabs.get(p.name)].filter(Boolean);
       await Promise.all(tabs.map(async tab => { this.invalidateTab(owner, tab); await tab.page.close().catch(() => {}); }));
@@ -111,7 +223,7 @@ export class BrowserService {
       }
       const previous = owner.forceVisible;
       owner.forceVisible = true;
-      try { await this.ensureBrowser(owner); this.owner(owner.id, owner.generation); }
+      try { await this.ensureBrowser(owner, requestId); this.owner(owner.id, owner.generation); await this.ensureVisiblePage(owner); this.owner(owner.id, owner.generation); }
       catch (error) { owner.forceVisible = previous; throw error; }
       this.state(owner, owner.state, owner.error ?? null);
       return this.row(owner);
@@ -120,13 +232,14 @@ export class BrowserService {
     if (typeof p.name !== 'string' || !p.name) throw new Error('browser tab name is required');
     if (action !== 'ensureTab') throw new Error('unknown browser service action');
     if (owner.closing) throw new Error('Browser is closing; reopen it with browser.open');
-    await this.ensureBrowser(owner);
+    await this.ensureBrowser(owner, requestId);
     this.owner(owner.id, owner.generation);
     let tab = owner.tabs.get(p.name);
     if (!tab || tab.page.isClosed()) {
       let pending = owner.pendingTabs.get(p.name);
       if (!pending) {
         const browser = owner.browser;
+        const op = owner.op;
         pending = timeout(this.exclusive(owner, async () => {
           let page;
           if (p.target !== undefined) {
@@ -143,7 +256,7 @@ export class BrowserService {
           if (!owner.active || owner.browser !== browser || owner.closing) { if (p.target === undefined) await page.close(); throw new Error('stale_generation'); }
           return this.bindPage(owner, p.name, page, false);
         }), 20000, tabTimeout).catch(async error => {
-          if (error.message === tabTimeout) await this.terminate(browser);
+          if (error.message === tabTimeout && op) await this.terminateOp(op).catch(blocked => this.log('tab-timeout retirement blocked', owner.id, String(blocked.message ?? blocked)));
           throw error;
         }).finally(() => owner.pendingTabs.delete(p.name));
         owner.pendingTabs.set(p.name, pending);
@@ -209,71 +322,173 @@ export class BrowserService {
       ...row, name: tab.name, auto: tab.auto, epoch: owner.epoch, tabEpoch: tab.epoch, cdpUrl: `http://${tab.capability}.localhost:${this.server.port}`,
     }));
   }
-  async ensureBrowser(owner) {
-    if (owner.browser?.connected) return;
-    if (!owner.launching) owner.launching = (async () => {
-      owner.headless = owner.forceVisible ? false : this.settings.headless; owner.epoch = ++this.epoch; this.state(owner, 'opening');
-      let browser;
-      try {
-        this.helpers ??= import(pathToFileURL(path.join(this.sdkDir, 'src/tools/browser/launch.ts')).href);
-        const {loadPuppeteer, ensureChromiumExecutable} = await this.helpers;
-        const puppeteer = await loadPuppeteer();
-        const executablePath = await ensureChromiumExecutable();
-        // A browser the user just closed may still be flushing its profile; a new Chrome would hand off to it and exit.
-        await owner.exiting;
-        const userDataDir = profileDirectory(this.root, owner.id); await mkdir(userDataDir, { recursive:true }); await resetSession(userDataDir);
-        browser = await puppeteer.launch({ executablePath, userDataDir, headless:owner.headless,
-          defaultViewport:null, timeout:20000, protocolTimeout:8000,
-          handleSIGINT:false, handleSIGTERM:false, handleSIGHUP:false,
-          args:['--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--no-first-run',
-            ...(this.embedded(owner) && !owner.headless ? ['--window-position=-32000,-32000'] : [])],
-        });
-        if (!owner.active || owner.closing || this.stopping) { await this.terminate(browser); throw new Error('stale_generation'); }
-        owner.browser = browser;
-        owner.adoptedBlank = false;
-        owner.control = await browser.target().createCDPSession();
-        owner.version = await owner.control.send('Browser.getVersion');
-        owner.browserTargetId = (await owner.control.send('Target.getTargetInfo')).targetInfo.targetId;
-        browser.once('disconnected', () => {
-          if (owner.browser !== browser) return;
-          for (const tab of [...owner.tabs.values()]) this.invalidateTab(owner, tab);
-          owner.browser = null;
-          owner.exiting = this.reap(browser);
-          this.state(owner, 'closed');
-        });
-        this.state(owner, 'ready');
-      } catch (error) {
-        if (browser && owner.browser !== browser) await this.terminate(browser);
-        this.state(owner, 'error', String(error.message ?? error).replace(/(?:ws|http):\/\/127\.0\.0\.1:[^\s]+/g, '[browser endpoint]'));
-        throw new Error(owner.error);
-      }
-    })().finally(() => { owner.launching = null; });
+  // Puppeteer's cache layout for an already present browser, computed without installing anything.
+  async cachedChromium() {
+    try {
+      const load = async specifier => import(pathToFileURL(Bun.resolveSync(specifier, this.sdkDir)).href);
+      const [browsers, utils, revisions] = await Promise.all([load('@oh-my-pi/pi-utils/browsers'), load('@oh-my-pi/pi-utils'), load('puppeteer-core/internal/revisions.js')]);
+      const platform = browsers.detectBrowserPlatform();
+      return platform ? browsers.computeExecutablePath({ buildId: revisions.PUPPETEER_REVISIONS.chrome, cacheDir: utils.getPuppeteerDir(), platform }) : null;
+    } catch { return null; }
+  }
+  async browserArguments(puppeteer, owner, userDataDir) {
+    // Puppeteer's own defaults (async in puppeteer-core 25), minus its startup URL and anything native admission refuses.
+    const defaults = (await puppeteer.defaultArgs({ browser: 'chrome', headless: owner.headless, userDataDir, args: [] }))
+      .filter(arg => arg.startsWith('--') && arg !== '--no-sandbox' && !/^--(?:remote-debugging-|user-data-dir=|no-startup-window)/.test(arg));
+    return [...defaults, `--user-data-dir=${userDataDir}`, '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0',
+      '--no-startup-window', '--hide-crash-restore-bubble',
+      ...(this.embedded(owner) && !owner.headless ? ['--window-position=-32000,-32000'] : [])];
+  }
+  // One launch per owner: concurrent callers share it. A caller timing out never releases the browser or starts another.
+  async ensureBrowser(owner, requestId = null) {
+    if (owner.browser?.connected && owner.native) return;
+    if (!owner.launching) {
+      const op = new LaunchOperation(owner, requestId, LAUNCH_DEADLINE_MS);
+      owner.op = op;
+      owner.launching = this.launch(owner, op).finally(() => { op.settle(); owner.launching = null; });
+    }
     return owner.launching;
+  }
+  async launch(owner, op) {
+    owner.headless = owner.forceVisible ? false : this.settings.headless; owner.epoch = ++this.epoch; this.state(owner, 'opening');
+    try {
+      // A previous browser of this instance (any generation) must be gone, and a blocked cleanup retried, first.
+      await op.run(this.settlePrevious(owner));
+      this.helpers ??= import(pathToFileURL(path.join(this.sdkDir, 'src/tools/browser/launch.ts')).href);
+      const { loadPuppeteer } = await op.run(this.helpers);
+      const puppeteer = await op.run(loadPuppeteer());
+      const executable = await op.run(this.resolveExecutable());
+      const userDataDir = profileDirectory(this.root, owner.id);
+      this.log('launch', owner.id, 'phase=spawn', path.basename(executable));
+      const args = await op.run(this.browserArguments(puppeteer, owner, userDataDir));
+      op.spawnSent = true;
+      const spawned = this.nativeCall('browser_spawn', { sourceRequestId: op.requestId, operationId: op.id, instanceId: owner.id, generation: owner.generation,
+        executable, args, profilePath: userDataDir }, LAUNCH_DEADLINE_MS + 5000);
+      spawned.catch(() => {});
+      op.owned = await op.run(spawned);
+      this.log('launch', owner.id, 'phase=spawned', `pid=${op.owned.pid}`, `creation=${op.owned.creationTime100ns}`);
+      const connecting = puppeteer.connect({ browserWSEndpoint: op.owned.webSocketUrl, defaultViewport: null, protocolTimeout: 8000 });
+      // A connection finishing after the operation ended is disconnected, never published.
+      connecting.then(late => { if (op.cancelled && op.browser !== late) Promise.resolve(late.disconnect()).catch(() => {}); }, () => {});
+      const browser = await op.run(connecting);
+      op.browser = browser;
+      browser.once('disconnected', () => this.browserGone(owner, op, browser));
+      const control = await op.run(browser.target().createCDPSession());
+      const version = await op.run(control.send('Browser.getVersion'));
+      const browserTargetId = (await op.run(control.send('Target.getTargetInfo'))).targetInfo.targetId;
+      // Pages the profile restored at startup are closed through this owned connection before any tab is bound.
+      for (const page of await op.run(browser.pages())) if (!page.isClosed()) await op.run(page.close()).catch(error => { if (op.cancelled) throw error; });
+      await op.run(this.nativeCall('browser_ready', { operationId: op.id, instanceId: owner.id, generation: owner.generation, leaseId: op.owned.leaseId }, 10000));
+      if (!owner.active || owner.closing || this.stopping || op.cancelled) throw new Error('stale_generation');
+      owner.browser = browser;
+      owner.native = { pid: op.owned.pid, creationTime100ns: op.owned.creationTime100ns, leaseId: op.owned.leaseId, operationId: op.id };
+      owner.adoptedBlank = false; owner.control = control; owner.version = version; owner.browserTargetId = browserTargetId;
+      // --no-startup-window may keep Chrome's background root alive after the human closes its last frame.
+      // Serialize this check with page creation so a concurrent Browser/open request cannot lose its new page.
+      browser.on?.('targetdestroyed', target => {
+        if (target.type() !== 'page') return;
+        this.exclusive(owner, async () => {
+          if (owner.browser !== browser || owner.op !== op || owner.closing || !op.settled) return;
+          const pages = await browser.pages();
+          if (pages.some(page => !page.isClosed() && !page.url().startsWith('devtools://'))) return;
+          await this.terminateOp(op);
+        }).catch(error => this.log('last window retirement', owner.id, String(error.message ?? error)));
+      });
+      op.settle();
+      this.log('launch', owner.id, 'phase=ready', String(version.product));
+      this.state(owner, 'ready');
+    } catch (error) {
+      let message = String(error.message ?? error).replace(/(?:wss?|https?):\/\/(?:127\.0\.0\.1|\[::1\]|localhost)[^\s]*/g, '[browser endpoint]');
+      op.abort(error);
+      try { await this.terminateOp(op); }
+      catch (blocked) { message += ` (cleanup is blocked and will be retried: ${String(blocked.message ?? blocked)})`; }
+      this.log('launch', owner.id, 'phase=failed', message);
+      if (message !== 'stale_generation') this.state(owner, 'error', message);
+      else if (owner.active && !owner.closing) this.state(owner, 'closed');
+      throw new Error(message);
+    }
+  }
+  async settlePrevious(owner) {
+    await this.exits.get(owner.id);
+    const blocked = this.blocked.get(owner.id);
+    if (blocked) await this.terminateOp(blocked);
+  }
+  // The browser's connection ended (user closed it, crash, or our own close): publish closed state and retire the
+  // job, waiting briefly for a clean root exit so the profile is flushed.
+  browserGone(owner, op, browser) {
+    if (op.browser !== browser) return;
+    op.gone = true;
+    if (!op.settled) op.abort(new BrowserError('browser_disconnected', 'Chrome closed while it was starting'));
+    if (owner.op === op && owner.browser === browser) {
+      for (const tab of [...owner.tabs.values()]) this.invalidateTab(owner, tab);
+      owner.browser = null; owner.native = null;
+      this.state(owner, 'closed');
+    }
+    this.trackExit(op.instanceId, this.terminateOp(op));
   }
   invalidateTab(owner, tab) {
     if (owner.tabs.get(tab.name) === tab) owner.tabs.delete(tab.name);
     this.capabilities.delete(tab.capability);
     for (const proxy of [...tab.sockets]) proxy.close();
   }
-  async reap(browser) {
-    const process = browser.process();
-    if (!process || process.exitCode !== null) return;
-    await timeout(new Promise(resolve => process.once('exit', resolve)), 5000, 'browser exit timed out').catch(() => killTree(process));
+  trackExit(id, promise) {
+    const settled = promise.then(() => {}, error => this.log('retirement blocked', id, String(error.message ?? error)));
+    this.exits.set(id, settled);
+    settled.then(() => { if (this.exits.get(id) === settled) this.exits.delete(id); });
   }
-  async terminate(browser) {
-    try { await timeout(browser.close(), 5000, 'browser close timed out'); }
-    catch { await killTree(browser.process()); }
+  // Idempotent and single-flight per operation; waits only for that operation's native job, never for launching/closing.
+  terminateOp(op) {
+    if (op.retired) return Promise.resolve();
+    // Nothing was ever asked of native for this operation: there is no job or lease to retire.
+    if (!op.spawnSent && !op.browser) { op.retired = true; return Promise.resolve(); }
+    if (op.retiring) return op.retiring;
+    // Deferred one microtask: a synchronous `disconnected` emitted by browser.close() re-enters here and must join this promise.
+    const run = Promise.resolve().then(async () => {
+      let graceful = op.gone;
+      const browser = op.browser;
+      if (browser) {
+        try { await timeout(browser.close(), 3000, 'browser close timed out'); graceful = true; } catch { /* the job is terminated below */ }
+        try { await browser.disconnect(); } catch { /* already gone */ }
+        op.browser = null;
+      }
+      await this.nativeCall('browser_retire', { operationId: op.id, instanceId: op.instanceId, generation: op.generation,
+        leaseId: op.owned?.leaseId ?? null, graceMs: graceful ? 5000 : 0 }, 25000);
+      op.retired = true;
+      if (this.blocked.get(op.instanceId) === op) this.blocked.delete(op.instanceId);
+    });
+    op.retiring = run.catch(error => { op.retiring = null; this.blocked.set(op.instanceId, op); throw error; });
+    return op.retiring;
   }
-  async closeOwner(owner) {
+  // Admissions are invalidated, launch and pending tabs joined, then the owned job and any exit in flight are retired.
+  closeOwner(owner) {
     if (owner.closing) return owner.closing;
     owner.closing = (async () => {
       for (const tab of [...owner.tabs.values()]) this.invalidateTab(owner, tab);
+      owner.op?.abort(new Error('stale_generation'));
       await owner.launching?.catch(() => {});
       await Promise.allSettled([...owner.pendingTabs.values()]);
-      if (owner.browser) await this.terminate(owner.browser);
-      owner.browser = null; this.state(owner, 'closed');
+      await this.exits.get(owner.id);
+      try {
+        for (const op of new Set([owner.op, this.blocked.get(owner.id)])) if (op) await this.terminateOp(op);
+      } catch (error) {
+        owner.browser = null; owner.native = null;
+        this.state(owner, 'error', `Browser cleanup is blocked: ${String(error.message ?? error)}`);
+        throw error;
+      }
+      owner.browser = null; owner.native = null; this.state(owner, 'closed');
     })().finally(() => { owner.closing = null; });
     return owner.closing;
+  }
+  // A human "Browser" request must end with a normal page to show: none left after initialization means one blank page.
+  ensureVisiblePage(owner) {
+    const browser = owner.browser;
+    return this.exclusive(owner, async () => {
+      if (!this.live(owner, browser)) throw new Error('stale_generation');
+      const pages = (await browser.pages()).filter(page => !page.isClosed() && !page.url().startsWith('devtools://'));
+      if (pages.length) return;
+      const page = await browser.newPage();
+      if (!this.live(owner, browser)) { await page.close().catch(() => {}); throw new Error('stale_generation'); }
+    });
   }
   fetch(req, server) {
     const remote = server.requestIP(req)?.address;
@@ -427,7 +642,7 @@ class ScopedCdpProxy {
 }
 
 if (import.meta.main) {
-  const [root,sdkDir]=process.argv.slice(2);
+  const [root,sdkDir,session]=process.argv.slice(2);
   if(!root||!sdkDir)throw new Error('browser service requires app root and SDK directory');
   // SDK cache initialization is private to this helper, not the real ~/.omp.
   const runtime=path.join(root,'terminal-browsers','runtime');await mkdir(runtime,{recursive:true});
@@ -436,8 +651,11 @@ if (import.meta.main) {
   const output=value=>process.stdout.write(JSON.stringify(value)+'\n');
   // The supervisor keeps this stream in terminal-browsers/browser-service.log for post-mortems.
   const log=(...parts)=>process.stderr.write(`${new Date().toISOString()} ${parts.join(' ')}\n`);
-  const service=new BrowserService(root,sdkDir,state=>{log('state',state.instanceId,state.state,`pid=${state.pid}`,state.error??'');output({type:'state',data:state});});
-  await service.start();output({type:'ready'});
+  // Each helper run has its own session; every native request carries it and old runs' frames are ignored natively.
+  const helperSession=session||randomBytes(16).toString('hex');
+  const native=new NativeChannel(output);
+  const service=new BrowserService(root,sdkDir,state=>{log('state',state.instanceId,state.state,`pid=${state.pid}`,state.error??'');output({type:'state',data:state});},{native,log,helperSession});
+  await service.start();output({type:'ready',helperSession});
   let chunks=[];let bytes=0;
   try {
     for await (const chunk of process.stdin) {
@@ -447,12 +665,15 @@ if (import.meta.main) {
         const part=chunk.subarray(offset,end);bytes+=part.length;if(bytes>MAX_FRAME)throw new Error('browser frame exceeds transport limit');chunks.push(part);offset=end+1;
         if(newline<0)break;
         const frame=JSON.parse(Buffer.concat(chunks,bytes).toString('utf8'));chunks=[];bytes=0;
+        // Native answers to this helper's own requests are demultiplexed from the supervisor's actions.
+        if(frame.type==='native_response'){if(typeof frame.id==='string')native.receive(frame);continue;}
         if(typeof frame.id!=='string'||typeof frame.action!=='string')throw new Error('invalid browser frame');
         const started=Date.now();
-        void service.dispatch(frame.action,frame.payload).then(data=>{log(frame.action,'ok',`${Date.now()-started}ms`);output({type:'response',id:frame.id,ok:true,data});},error=>{log(frame.action,'failed',`${Date.now()-started}ms`,String(error.message??error));output({type:'response',id:frame.id,ok:false,error:String(error.message??error)});});
+        void service.dispatch(frame.action,frame.payload,frame.id).then(data=>{log(frame.action,'ok',`${Date.now()-started}ms`);output({type:'response',id:frame.id,ok:true,data});},error=>{log(frame.action,'failed',`${Date.now()-started}ms`,String(error.message??error));output({type:'response',id:frame.id,ok:false,error:String(error.message??error)});});
       }
     }
   } catch (error) { log('stdin loop failed',String(error?.stack??error)); process.exitCode=1; }
   log('shutting down');
+  native.close();
   await service.dispatch('shutdown').catch(()=>{});
 }

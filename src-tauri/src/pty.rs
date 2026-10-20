@@ -84,6 +84,8 @@ pub struct Pty {
     pub cols: u16,
     pub rows: u16,
     exit: Option<u32>,
+    /// PID plus creation time captured while the PTY owns the child handle; read-only attribution for the host monitor.
+    root: Option<crate::host_monitor::ProcessIdentity>,
 }
 
 impl Pty {
@@ -208,6 +210,7 @@ impl Pty {
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+        let root = child.process_id().and_then(crate::host_monitor::capture_identity);
         let writer: Writer = Arc::new(Mutex::new(
             pair.master.take_writer().map_err(|e| e.to_string())?,
         ));
@@ -226,10 +229,15 @@ impl Pty {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             exit: None,
+            root,
         })
     }
     pub fn process_id(&self) -> Option<u32> {
         self.child.process_id()
+    }
+    /// Creation identity of the launched root, captured at launch; `None` when it could not be read.
+    pub fn root_identity(&self) -> Option<crate::host_monitor::ProcessIdentity> {
+        self.root
     }
     /// Immediate termination for a shell the user closed; OMP uses `stop` for a graceful Ctrl-C first.
     pub fn kill(&mut self) -> Result<(), String> {

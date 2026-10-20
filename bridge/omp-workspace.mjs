@@ -6,6 +6,8 @@ import { NATIVE_UI_CAPTURE_ERROR } from './omp-native-ui.mjs';
 
 const PATCH = Symbol.for('omp-manager.workspace-host');
 export const WORKSPACE_COMPATIBILITY_ERROR = 'OMP workspace integration requires native move, rollback, BTW and removable pre-model hooks';
+/** Every app-created native prompt: no template or slash-command expansion, a dropped prompt throws, agent attribution. */
+export const NATIVE_PROMPT_OPTIONS = Object.freeze({ expandPromptTemplates: false, runCommands: false, throwOnDrop: true, attribution: 'agent' });
 const descriptor = (prototype, name) => {
   const value = prototype && Object.getOwnPropertyDescriptor(prototype, name);
   return value?.writable && typeof value.value === 'function' ? value : null;
@@ -300,7 +302,7 @@ export function installWorkspaceChanges(pi, options) {
       try {
         const admitted = Promise.withResolvers();
         const running = mode.session.prompt(payload.message, {
-          expandPromptTemplates: false, runCommands: false, streamingBehavior: 'steer', throwOnDrop: true, attribution: 'agent',
+          ...NATIVE_PROMPT_OPTIONS, streamingBehavior: 'steer',
           onPromptAdmitted() {
             accepted = true;
             if (before.sessionId !== identity().sessionId || before.workspaceEpoch !== epoch) {
@@ -443,7 +445,7 @@ export function installWorkspaceChanges(pi, options) {
       if (disposed || context?.agent?.kind !== 'main' || mode?.sessionManager !== context.sessionManager || mode.isInitialized !== true || typeof mode.session?.prompt !== 'function') {
         throw new Error('native_prompt_unavailable: Reopen this session with a compatible OMP version.');
       }
-      return mode.session.prompt(message, { expandPromptTemplates: false, runCommands: false, streamingBehavior: 'followUp', throwOnDrop: true, attribution: 'agent', onPromptAdmitted });
+      return mode.session.prompt(message, { ...NATIVE_PROMPT_OPTIONS, streamingBehavior: 'followUp', onPromptAdmitted });
     },
     attachContext(ctx) {
       if (ctx.agent?.kind !== 'main') return;

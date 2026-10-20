@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, type BrowserInfo, type Instance } from "../api";
+  import { api, type BrowserInfo, type Instance, type InsightProducer } from "../api";
   import { agentName, confirmDanger } from "../ui";
   import Term from "./Term.svelte";
   import BrowserPane from "./BrowserPane.svelte";
@@ -12,11 +12,13 @@
   import { sameRepoAgents } from "../repo-agents";
   import TerminalWorkspace from "./TerminalWorkspace.svelte";
   import { nativeHubDisabled } from "../native-agent-hub";
-  let { instance, instances, onSwitch, onClose, onPlan, onPlanChange, onSubagents, onCodeDiff, onDependencyTree, onSystemOverview, onCodeQuality, showBrowser = false, browserHidden = false, focusRequest = 0, onTerminalReady }: {
+  let { instance, instances, onSwitch, onClose, onPlan, onPlanChange, onSubagents, onCodeDiff, onDependencyTree, onSystemOverview, onCodeQuality, showBrowser = false, browserHidden = false, focusRequest = 0, onTerminalReady, onFocusArchitect }: {
     instance: Instance; instances: Instance[]; onSwitch: (id: string) => void;
     onClose: () => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void; onSubagents: (id: string) => void;
     onCodeDiff: (id: string) => void; onDependencyTree?: (id: string) => void; onSystemOverview?: (id: string) => void; onCodeQuality?: (id: string) => void; showBrowser?: boolean; browserHidden?: boolean;
     focusRequest?: number; onTerminalReady?: (id: string, generation: number, ready: boolean) => void;
+    /** Focus-only: show the existing Architect after the monitor's explanation was admitted. The parent guards the origin. */
+    onFocusArchitect?: (producer: InsightProducer, current: () => boolean) => boolean | Promise<boolean>;
   } = $props();
   const contextPending = $derived($workspaceChanges.some(change => change.coordinatorId === instance.id && workspacePending(change)));
   const TERMINAL_MIN = 160;
@@ -146,7 +148,7 @@
     {#if rightPane}
       <div class="divider" role="slider" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(ratio * 100)} aria-label={rightPane === "terminal" ? "Agent and terminal pane width" : "Terminal and browser width"} tabindex="0" onpointerdown={dragStart} onpointermove={dragMove} onpointerup={dragEnd} onpointercancel={dragEnd} onkeydown={dividerKey}></div>
       {#if rightPane === "terminal"}
-        <div class="terminal-column"><TerminalWorkspace instanceId={instance.id} /></div>
+        <div class="terminal-column"><TerminalWorkspace instanceId={instance.id} covered={browserHidden} {onFocusArchitect} /></div>
       {:else if paneBrowser}
         <div class="browser-column"><BrowserPane instanceId={instance.id} generation={instance.generation} info={paneBrowser} hidden={browserHidden || dragging} /></div>
       {/if}

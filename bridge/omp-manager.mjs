@@ -124,7 +124,7 @@ export async function confirmedPlanHandoff(request, ctx, payload, signal) {
 // including The Manager and unowned workers. Manager-originated control still needs an owned instance.
 // Killing a terminal command also interrupts the agent, so it is never available to a model or a Manager.
 export function controlAllowed({ role, owner, action, source }) {
-  if (['agent_hub','terminal_kill','dependency_result','workspace_change','cancel_workspace_change','workspace_plan_prompt','project_visualization_prompt','structure_sources','structure_source_read','structure_source_select_last','srs_stage_prompt','srs_stage_status','srs_pause','setup_markdown_hold','setup_markdown_release'].includes(action)) return source === 'human';
+  if (['agent_hub','terminal_kill','dependency_result','workspace_change','cancel_workspace_change','workspace_plan_prompt','project_visualization_prompt','structure_sources','structure_source_read','structure_source_select_last','srs_stage_prompt','srs_stage_status','srs_pause','monitor_explanation_prompt','setup_markdown_hold','setup_markdown_release'].includes(action)) return source === 'human';
   if (source === 'human') return action === 'prompt' || action === 'abort' || action === 'reply_ui';
   return role === 'instance' && !!owner;
 }
@@ -316,6 +316,11 @@ export default function managerBridge(pi) {
     if (['srs_stage_prompt', 'srs_stage_status', 'srs_pause'].includes(frame.action)) {
       if (!srs || !architectTools) throw new Error('not_controlled');
       return srs.control(frame.action, payload, context);
+    }
+    if (frame.action === 'monitor_explanation_prompt') {
+      // Human-only and Architect-only: the app's frozen-snapshot explanation prompt; the shared guard, not this text, restricts the turn.
+      if (!srs || !architectTools) throw new Error('not_controlled');
+      return srs.monitor.control(context, payload);
     }
     if (frame.action === 'setup_markdown_hold') return workspace.holdMarkdown(payload.transactionId);
     if (frame.action === 'setup_markdown_release') return workspace.releaseMarkdown(payload.transactionId);

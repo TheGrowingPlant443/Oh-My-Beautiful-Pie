@@ -32,9 +32,11 @@ async function runNativeScenario(name, prefix) {
   try {
     await promisify(execFile)(process.env.OMP_BIN || 'omp',[
       '--mode','rpc','--no-ui','--no-session','--no-title','--no-extensions','--no-skills','--no-rules','--no-lsp','--auto-approve','--cwd',root,
+      '--model','browser-offline/fixture',
+      '--extension',fileURLToPath(new URL('./fixtures/browser-offline-provider.mjs',import.meta.url)),
       '--extension',fileURLToPath(new URL(`./fixtures/${name}`,import.meta.url)),
     ],{
-      env:{...process.env,BROWSER_TEST_ROOT:root,USERPROFILE:root,HOME:root,PI_CODING_AGENT_DIR:path.join(root,'agent'),PI_NATIVES_DIR:process.env.PI_NATIVES_DIR||path.join(os.homedir(),'.omp','natives')},timeout:170000,maxBuffer:1024*1024,
+      env:{...process.env,BROWSER_TEST_ROOT:root,HOME:root,PI_CONFIG_DIR:'.omp',PI_CODING_AGENT_DIR:path.join(root,'agent'),PI_NATIVES_DIR:process.env.PI_NATIVES_DIR||path.join(os.homedir(),'.omp','natives')},timeout:170000,maxBuffer:1024*1024,
     });
   } finally {
     await rm(root,{recursive:true,force:true,maxRetries:10,retryDelay:100});

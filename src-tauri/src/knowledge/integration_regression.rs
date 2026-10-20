@@ -89,30 +89,10 @@ fn cognee_package_enumeration_errors_are_not_absence_even_with_cli_evidence() {
     let unreadable = service.probe_cognee();
     assert_eq!(unreadable.state, CogneeState::Unreadable);
     assert_eq!(unreadable.installed, Some(true));
-    assert!(service.configure_cognee_ui(Some("http://127.0.0.1:3000"), Some(fixture.folder().to_string_lossy().as_ref())).is_err());
-    assert!(!fixture.settings().exists(), "failed validation must not save settings");
-    assert!(service.open_cognee_ui().unwrap_err().contains("could not be fully inspected"));
-}
-
-#[test]
-fn cognee_explicit_configuration_saves_evidence_for_unreadable_restart() {
-    let fixture = Fixture::new();
-    fixture.install();
-    let service = fixture.service();
-    service.configure_cognee_ui(Some("http://127.0.0.1:3000"), Some(fixture.folder().to_string_lossy().as_ref())).unwrap();
-    let saved = fs::read(fixture.settings()).unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&saved).unwrap();
-    assert_eq!(json["cognee"]["installationEvidence"]["version"], "1.6.4");
-    fs::remove_dir_all(fixture.packages()).unwrap();
-    fs::write(fixture.packages(), b"not a directory").unwrap();
-    let restarted = fixture.service();
-    let unreadable = restarted.probe_cognee();
-    assert_eq!(unreadable.state, CogneeState::Unreadable);
-    assert_eq!(unreadable.installed, Some(true));
-    assert_eq!(unreadable.version.as_deref(), Some("1.6.4"));
-    assert_eq!(unreadable.ui_url.as_deref(), Some("http://127.0.0.1:3000/"));
-    assert_eq!(fs::read(fixture.settings()).unwrap(), saved, "passive reinspection must not rewrite saved evidence");
-    assert!(restarted.open_cognee_ui().is_err());
+    let opened = service.open_cognee_ui();
+    assert_eq!(opened.state, CogneeOpenState::MissingComponent);
+    assert!(opened.message.unwrap().contains("could not be fully inspected"));
+    assert!(!fixture.config().exists(), "an uninspectable installation writes nothing");
 }
 
 #[test]
@@ -125,38 +105,53 @@ fn cognee_settings_load_failure_is_unknown_not_absent_and_is_not_overwritten() {
     assert_eq!(unreadable.state, CogneeState::Unreadable);
     assert_eq!(unreadable.installed, None);
     assert!(unreadable.message.unwrap().contains("Integration settings are unreadable"));
-    assert!(service.configure_cognee_ui(Some("http://127.0.0.1:3000"), None).unwrap_err().contains("settings are unreadable"));
+    let opened = service.open_cognee_ui();
+    assert_eq!(opened.state, CogneeOpenState::MissingComponent);
+    assert!(opened.message.unwrap().contains("settings are unreadable"));
     assert_eq!(fs::read(fixture.settings()).unwrap(), b"invalid JSON");
-    assert!(service.open_cognee_ui().unwrap_err().contains("settings are unreadable"));
 }
 
 #[test]
-fn cognee_settings_failure_preserves_known_installation_and_safe_url() {
+fn cognee_settings_failure_preserves_known_installation() {
     let fixture = Fixture::new();
     fixture.install();
     let service = fixture.service();
-    service.configure_cognee_ui(Some("http://localhost:3000"), Some(fixture.folder().to_string_lossy().as_ref())).unwrap();
+    assert_eq!(service.probe_cognee().installed, Some(true));
     service.state.lock().integrations_error = Some("injected settings read failure".into());
-    let unreadable = service.probe_cognee_with(permission_failure);
-    assert_eq!(unreadable.state, CogneeState::Unreadable);
-    assert_eq!(unreadable.installed, Some(true));
-    assert_eq!(unreadable.version.as_deref(), Some("1.6.4"));
-    assert_eq!(unreadable.ui_url.as_deref(), Some("http://localhost:3000/"));
-    assert!(unreadable.message.unwrap().contains("injected settings read failure"));
-    assert!(service.open_cognee_ui().is_err());
-}
-
-#[test]
-fn cognee_invalid_saved_ui_url_is_diagnostic_and_never_opened() {
-    let fixture = Fixture::new();
-    fixture.install();
-    let service = fixture.service();
-    service.state.lock().integrations.cognee.ui_url = Some("https://example.com".into());
     let unreadable = service.probe_cognee();
     assert_eq!(unreadable.state, CogneeState::Unreadable);
     assert_eq!(unreadable.installed, Some(true));
-    assert!(unreadable.ui_url.is_none());
-    assert!(unreadable.message.unwrap().contains("saved Cognee UI address is invalid"));
-    assert!(service.open_cognee_ui().is_err());
-    assert!(!fixture.config().exists());
+    assert_eq!(unreadable.version.as_deref(), Some("1.6.4"));
+    assert!(unreadable.message.unwrap().contains("injected settings read failure"));
+    assert_eq!(service.open_cognee_ui().state, CogneeOpenState::MissingComponent);
+}
+
+#[test]
+fn cognee_old_saved_ui_address_and_folder_are_ignored_and_dropped_without_touching_other_settings() {
+    let fixture = Fixture::new();
+    fixture.install();
+    fs::create_dir_all(fixture.settings().parent().unwrap()).unwrap();
+    let elsewhere = fixture.0.join("elsewhere");
+    let old = serde_json::json!({
+        "version": 1,
+        "cognee": { "uiUrl": "http://127.0.0.1:3000/", "installationFolder": elsewhere, "installationEvidence": { "folder": elsewhere, "version": "9.9.9" } },
+        "obsidian": { "declinedProjects": ["c:/kept"] },
+        "graphifyOutputs": { "c:/project": "c:/out" }
+    });
+    fs::write(fixture.settings(), serde_json::to_vec(&old).unwrap()).unwrap();
+    let service = fixture.service();
+    let probe = service.probe_cognee();
+    assert_eq!(probe.state, CogneeState::Installed, "a saved folder never replaces the discovered installation");
+    assert_eq!(probe.version.as_deref(), Some("1.6.4"));
+    assert_eq!(probe.installation_folder.as_deref(), Some(fixture.folder().to_string_lossy().as_ref()));
+    let wire = serde_json::to_value(&probe).unwrap();
+    assert!(wire.get("uiUrl").is_none(), "no configured address is reported any more");
+    // The next unrelated save drops the obsolete fields and keeps everything else.
+    let repository = fixture.0.join("repo");
+    fs::create_dir_all(repository.join(".git")).unwrap();
+    service.record_obsidian_decline(repository.to_string_lossy().as_ref()).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(fixture.settings()).unwrap()).unwrap();
+    assert_eq!(saved["cognee"], serde_json::json!({}));
+    assert_eq!(saved["obsidian"]["declinedProjects"][0], "c:/kept");
+    assert_eq!(saved["graphifyOutputs"]["c:/project"], "c:/out");
 }
