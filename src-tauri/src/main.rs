@@ -35,6 +35,7 @@ mod srs;
 mod source_index;
 mod system_overview;
 mod terminal;
+mod toolchain;
 mod workspace;
 mod workspace_native;
 #[cfg(windows)]
@@ -72,6 +73,9 @@ pub struct AppState {
 }
 
 fn main() {
+    // A desktop-launched app inherits a PATH that can lack `~/.local/bin`, `~/.nix-profile/bin` or Homebrew.
+    #[cfg(unix)]
+    toolchain::extend_path_for_desktop_launch();
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::LibraryLoader::{

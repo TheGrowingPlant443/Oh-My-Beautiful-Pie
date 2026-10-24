@@ -583,7 +583,7 @@ pub fn render_transcript_file(
     path: &Path,
     input: &crate::instance::CreateInput,
 ) -> Result<String, String> {
-    let program = std::env::var_os("OMP_BIN").unwrap_or_else(|| "omp".into());
+    let program = crate::toolchain::omp_program();
     let mut command = std::process::Command::new(program);
     command
         .arg("render")

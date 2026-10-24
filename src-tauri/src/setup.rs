@@ -504,6 +504,26 @@ pub fn open_folder(registry: &Registry, scope: SetupScope, project_instance_id: 
     open_editor_folder(&folder)
 }
 
+/// `code` from `PATH` or the usual per-user locations, else (macOS) the CLI inside the VS Code app bundle.
+#[cfg(not(windows))]
+fn vscode_executable() -> Option<PathBuf> {
+    if let Some(found) = crate::toolchain::find_program("code") {
+        return Some(found);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        const BUNDLE_CLI: &str = "Visual Studio Code.app/Contents/Resources/app/bin/code";
+        let home_apps = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Applications"));
+        return [Some(PathBuf::from("/Applications")), home_apps]
+            .into_iter()
+            .flatten()
+            .map(|dir| dir.join(BUNDLE_CLI))
+            .find(|path| path.is_file());
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
 pub(crate) fn open_editor_folder(folder: &Path) -> Result<()> {
     if !folder.is_dir() {
         return Err(format!(
@@ -535,7 +555,8 @@ pub(crate) fn open_editor_folder(folder: &Path) -> Result<()> {
             .ok_or("VS Code not found. Install VS Code or add its bin directory to PATH.")?
     };
     #[cfg(not(windows))]
-    let executable = PathBuf::from("code");
+    let executable = vscode_executable()
+        .ok_or("VS Code not found. Install VS Code (`code`) or add its bin directory to PATH.")?;
     let mut command = std::process::Command::new(executable);
     command
         .arg("--new-window")

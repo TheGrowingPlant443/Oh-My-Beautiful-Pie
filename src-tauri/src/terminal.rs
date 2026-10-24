@@ -1087,8 +1087,15 @@ mod tests {
                 }
             }
         }
-        #[cfg(not(windows))]
-        let _ = pid;
+        #[cfg(unix)]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // SAFETY: signal 0 only probes for existence of the (already reaped) shell pid.
+            while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+                assert!(std::time::Instant::now() < deadline, "closing Tab 0 ends the shell process");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         let second = service.open_shell_in("a", folder.to_str().unwrap()).unwrap();
         assert_ne!(second.shell_id, first.shell_id, "a recreated shell gets a new id");
         service.close_instance("a");
