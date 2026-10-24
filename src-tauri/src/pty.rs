@@ -92,7 +92,7 @@ impl Pty {
     pub fn spawn(definition: &Definition, bridge: &BridgeLaunch) -> Result<Self, String> {
         let input = &definition.input;
 
-        let program = std::env::var_os("OMP_BIN").unwrap_or_else(|| "omp".into());
+        let program = crate::toolchain::omp_program();
         let mut cmd = CommandBuilder::new(program);
         cmd.cwd(&input.project_path);
         cmd.args(["--cwd", &input.project_path]);
@@ -244,8 +244,18 @@ impl Pty {
         if self.poll()?.is_some() {
             return Ok(());
         }
+        let session = self.kill_process_group();
+        // Reap the root even when a session member (e.g. after sudo) could not be signalled.
         self.child.kill().map_err(|e| e.to_string())?;
         self.exit = Some(self.child.wait().map_err(|e| e.to_string())?.exit_code());
+        session
+    }
+    /// portable-pty creates a session. Shell job-control groups must also be retired before the leader is reaped.
+    fn kill_process_group(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        if let Some(pid) = self.child.process_id() {
+            crate::process_tree::kill_session(pid)?;
+        }
         Ok(())
     }
     pub fn last_output(&self) -> u64 {
@@ -334,14 +344,16 @@ impl Pty {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        let session = self.kill_process_group();
         self.child.kill().map_err(|e| e.to_string())?;
         self.exit = Some(self.child.wait().map_err(|e| e.to_string())?.exit_code());
-        Ok(())
+        session
     }
 }
 impl Drop for Pty {
     fn drop(&mut self) {
         if self.exit.is_none() {
+            let _ = self.kill_process_group();
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
@@ -408,5 +420,46 @@ mod tests {
         assert_eq!(parser.callbacks().bytes, b"\x1b[?1;5R");
         parser.screen_mut().set_size(40, 100);
         assert_eq!(parser.screen().size(), (40, 100));
+    }
+
+    /// Everything the shell started that stayed in its process group ends with it (the Windows job's Unix counterpart).
+    #[cfg(unix)]
+    #[test]
+    fn killing_a_shell_ends_the_background_processes_it_started() {
+        let folder = std::env::temp_dir();
+        let mut shell = Pty::spawn_shell(folder.to_str().unwrap()).unwrap();
+        shell.write("sh -c 'sleep 600 & echo CHILD_PID=$!; wait'\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let child: libc::pid_t = loop {
+            let text = shell.screen().unwrap().text;
+            let found = text.lines().filter_map(|line| line.rsplit_once("CHILD_PID=").map(|(_, pid)| pid)).find_map(|pid| pid.trim().parse().ok());
+            if let Some(pid) = found {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the shell never printed the child pid: {text:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // SAFETY: signal 0 only probes for existence.
+        assert_eq!(unsafe { libc::kill(child, 0) }, 0, "the background process is alive before the kill");
+        shell.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // The orphaned sleep is reparented and reaped by init/subreaper; wait for it to disappear.
+        while unsafe { libc::kill(child, 0) } == 0 && !is_zombie(child) {
+            assert!(Instant::now() < deadline, "the background process survived the shell's kill");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_zombie(pid: libc::pid_t) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z')))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_zombie(pid: libc::pid_t) -> bool {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+        read == size && unsafe { info.assume_init() }.pbi_status == 5
     }
 }

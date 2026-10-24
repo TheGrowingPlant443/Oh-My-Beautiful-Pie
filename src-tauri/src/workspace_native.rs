@@ -47,7 +47,7 @@ pub(crate) fn relocate<T>(
     let package: Value = serde_json::from_slice(&fs::read(sdk.join("package.json")).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
     let version = package["version"].as_str().ok_or("OMP SDK has no version")?;
-    let output = command(std::env::var_os("OMP_BIN").unwrap_or_else(|| "omp".into()))
+    let output = command(crate::toolchain::omp_program())
         .arg("--version").output().map_err(|error| format!("Read OMP version: {error}"))?;
     if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != format!("omp/{version}") {
         return Err(format!("OMP SDK {version} does not match the executable; set OMP_SDK_DIR to its installed SDK"));
@@ -56,7 +56,7 @@ pub(crate) fn relocate<T>(
     let cwd = request["cwd"].as_str().map(std::path::PathBuf::from).unwrap_or_else(|| home.to_path_buf());
     let encoded = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     if encoded.len() as u64 > FRAME_LIMIT { return Err("Workspace helper request exceeds transport limit".into()); }
-    let mut child = command(std::env::var_os("BUN_BIN").unwrap_or_else(|| "bun".into()))
+    let mut child = command(crate::toolchain::bun_program())
         .arg(root.join("omp-workspace.mjs")).current_dir(cwd).env("PI_COMPILED", "false")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().map_err(|error| format!("Start native workspace helper: {error}"))?;

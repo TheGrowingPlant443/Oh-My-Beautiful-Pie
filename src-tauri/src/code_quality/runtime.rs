@@ -7,6 +7,9 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+#[cfg(unix)]
+pub(crate) mod native;
+
 pub const OWNER_LABEL: &str = "dev.udvikler.omp-manager.owner";
 pub const ROLE_LABEL: &str = "dev.udvikler.omp-manager.role";
 pub const ROLE_SONAR: &str = "quality-sonar";
@@ -88,6 +91,8 @@ pub struct EngineProbe {
     pub memory_bytes: u64,
     pub max_map_count: Option<u64>,
     pub file_max: Option<u64>,
+    #[cfg(unix)]
+    pub cpu_limits_unsupported: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -413,9 +418,11 @@ pub(crate) fn discover_program(name: &str, standard: &[PathBuf]) -> Option<PathB
         .map(|p| p.join(name)).chain(standard.iter().cloned()).find(|p| p.is_file())
 }
 
+#[cfg(windows)]
 pub(crate) fn docker_program() -> Option<PathBuf> {
     discover_program("docker.exe", &[program_files().join("Docker/Docker/resources/bin/docker.exe")])
 }
+#[cfg(windows)]
 pub(crate) fn podman_program() -> Option<PathBuf> {
     discover_program("podman.exe", &[
         program_files().join("RedHat/Podman/podman.exe"),
@@ -423,6 +430,10 @@ pub(crate) fn podman_program() -> Option<PathBuf> {
         std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_default().join("Programs/Podman/podman.exe"),
     ])
 }
+#[cfg(unix)]
+pub(crate) fn docker_program() -> Option<PathBuf> { native::docker_program() }
+#[cfg(unix)]
+pub(crate) fn podman_program() -> Option<PathBuf> { native::podman_program() }
 pub(crate) fn program_files() -> PathBuf {
     std::env::var_os("PROGRAMFILES").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:/Program Files"))
 }
@@ -471,6 +482,8 @@ pub(crate) fn wsl_command(distro: &str, program: &str, args: &[&str]) -> Result<
 
 fn runtime_prefix(runtime: &QualityRuntime) -> Result<Vec<String>> {
     match runtime {
+        #[cfg(unix)]
+        QualityRuntime::DockerNative => Ok(Vec::new()),
         QualityRuntime::DockerDesktop => Ok(vec!["--context".into(), "desktop-linux".into()]),
         QualityRuntime::DockerWsl { distro } => {
             validate_selector(distro, "WSL distribution")?;
@@ -490,10 +503,15 @@ pub struct CliEngine {
     program: PathBuf,
     prefix: Vec<String>,
     config_root: PathBuf,
+    #[cfg(unix)]
+    cpu_limits: Arc<std::sync::OnceLock<Option<String>>>,
 }
 
 impl CliEngine {
     pub fn new(runtime: QualityRuntime, config_root: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        let (runtime, program, prefix) = native::resolve(runtime)?;
+        #[cfg(windows)]
         let (runtime, program, prefix) = match runtime {
             QualityRuntime::DockerDesktop => (QualityRuntime::DockerDesktop,
                 docker_program().ok_or("Docker Desktop is not installed. Choose Install runtime (https://www.docker.com/products/docker-desktop/).")?,
@@ -517,7 +535,10 @@ impl CliEngine {
                     runtime_prefix(&QualityRuntime::Podman { connection })?)
             }
         };
-        Ok(Self { runtime, program, prefix, config_root: config_root.to_owned() })
+        Ok(Self { runtime, program, prefix, config_root: config_root.to_owned(),
+            #[cfg(unix)]
+            cpu_limits: Arc::new(std::sync::OnceLock::new()),
+        })
     }
 
     fn command(&self, args: &[String]) -> Command {
@@ -631,6 +652,9 @@ fn container_info(v: &serde_json::Value) -> Result<ContainerInfo> {
 
 impl Engine for CliEngine {
     fn runtime(&self) -> &QualityRuntime { &self.runtime }
+    #[cfg(unix)]
+    fn probe(&self, ctl: &Ctl) -> Result<EngineProbe> { native::probe(self, ctl) }
+    #[cfg(windows)]
     fn probe(&self, ctl: &Ctl) -> Result<EngineProbe> {
         if let QualityRuntime::DockerWsl { distro } = &self.runtime {
             if !wsl_running_distros(ctl)?.contains(distro) {
@@ -714,6 +738,9 @@ impl Engine for CliEngine {
         }
         Ok(EngineProbe { fingerprint, os: os.into(), memory_bytes, max_map_count, file_max })
     }
+    #[cfg(unix)]
+    fn ensure_started(&self, ctl: &Ctl) -> Result<()> { native::ensure_started(self, ctl) }
+    #[cfg(windows)]
     fn ensure_started(&self, ctl: &Ctl) -> Result<()> {
         if self.probe(ctl).is_ok() { return Ok(()); }
         match &self.runtime {
@@ -793,6 +820,19 @@ impl Engine for CliEngine {
             ctl.say(&format!("Downloading {} (first use only)", spec.image));
             self.pull(&spec.image, ctl)?;
         }
+        #[cfg(unix)]
+        let adjusted = {
+            let mut copy = spec.clone();
+            if copy.cpus.is_some() {
+                if let Some(reason) = native::cpu_limit_problem(self, ctl) {
+                    ctl.say(&format!("CPU limit unavailable: {reason}. Memory limit retained."));
+                    copy.cpus = None;
+                }
+            }
+            copy
+        };
+        #[cfg(unix)]
+        let spec = &adjusted;
         let result = run_bounded(self.create_command(spec)?, None, PROBE_TIMEOUT, ctl).and_then(|out| {
             out.require_success(&format!("Create analysis container '{}'", spec.name))?;
             let id = out.text();
@@ -934,7 +974,10 @@ mod tests {
 
     fn fixture(runtime: QualityRuntime) -> CliEngine {
         CliEngine { prefix: runtime_prefix(&runtime).unwrap(), runtime,
-            program: PathBuf::from("explicit-runtime.exe"), config_root: PathBuf::from("isolated-config") }
+            program: PathBuf::from("explicit-runtime.exe"), config_root: PathBuf::from("isolated-config"),
+            #[cfg(unix)]
+            cpu_limits: Arc::new(std::sync::OnceLock::new()),
+        }
     }
     fn args(cmd: &Command) -> Vec<String> {
         cmd.get_args().map(|s| s.to_string_lossy().into_owned()).collect()

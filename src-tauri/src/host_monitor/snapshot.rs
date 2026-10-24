@@ -14,7 +14,7 @@ pub struct RawProcess {
     pub parent_pid: u32,
     pub threads: u32,
     pub name: String,
-    /// FILETIME creation time; `None` when the process could not be opened for a limited query.
+    /// Creation time (see `ProcessIdentity`); `None` when the process could not be opened for a limited query.
     pub creation: Option<u64>,
     pub availability: Availability,
 }

@@ -1,9 +1,11 @@
 //! Code quality service: one authoritative configuration, one operation gate, one scan at a time.
-//! Module map: `types` (wire DTOs), `store` (versioned state), `secrets` (Credential Manager),
-//! `runtime`/`install`/`job` (container engines), `sonar`/`scanners`/`snapshot` (SonarQube path),
+//! Module map: `types` (wire DTOs), `store` (versioned state), `secrets`/`secrets_unix` (OS credential
+//! store), `runtime`/`install`/`job` (container engines; `runtime/native` is the Linux/macOS adapter), `sonar`/`scanners`/`snapshot` (SonarQube path),
 //! `alternate`/`reports` (MegaLinter + Opengrep + Semgrep CE path), `lifecycle` (configuration and
 //! Community server transitions), `scan` (scan jobs).
 pub mod alternate;
+#[cfg(unix)]
+pub(crate) mod cli;
 pub mod install;
 pub mod job;
 pub mod credentials;
@@ -16,6 +18,8 @@ pub mod runtime;
 mod scan;
 pub mod scanners;
 pub mod secrets;
+#[cfg(unix)]
+pub mod secrets_unix;
 pub mod snapshot;
 pub mod sonar;
 pub mod store;
@@ -127,8 +131,14 @@ impl Drop for Gate {
     }
 }
 
+/// `windows`, `linux` or `macos` (the only platforms this module supports).
+pub(crate) fn platform_name() -> &'static str {
+    if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" }
+}
+
 /// What "Install and setup" still has to do, derived only from cached probes and state (never probes).
-pub(crate) fn setup_state(inner: &Inner) -> SetupState {
+/// On Linux/macOS nothing is ever installed: the runtime step only asks whether the engine is usable.
+pub(crate) fn setup_state(inner: &Inner, credential_store_ok: bool) -> SetupState {
     let config = &inner.file.config;
     let probed = !inner.prerequisites.is_empty();
     let prerequisite = inner
@@ -146,14 +156,20 @@ pub(crate) fn setup_state(inner: &Inner) -> SetupState {
         };
         steps.push(SetupStep { id: id.to_string(), label, state });
     };
-    let wsl_runtime = matches!(config.runtime, QualityRuntime::Podman { .. } | QualityRuntime::DockerWsl { .. });
+    let windows = cfg!(windows);
+    let wsl_runtime = windows && matches!(config.runtime, QualityRuntime::Podman { .. } | QualityRuntime::DockerWsl { .. });
     if wsl_runtime {
         let restart = prerequisite.is_some_and(|p| p.needs_restart);
         push("windowsFeatures", "Enable Windows features for WSL (needs one restart)".into(), probed && !restart && !inner.options.wsl_features_missing, restart);
     }
     let installed = prerequisite.is_some_and(|p| p.installed);
-    push("runtime", format!("Install {}", config.runtime.label()), installed, false);
-    if let QualityRuntime::Podman { connection } = &config.runtime {
+    if windows {
+        push("runtime", format!("Install {}", config.runtime.label()), installed, false);
+    } else {
+        push("runtime", format!("{} is installed and reachable (detected, never installed by this app)", config.runtime.label()), prerequisite.is_some_and(|p| p.ready), false);
+        push("credentials", "Credential store (Secret Service / Keychain) is usable".into(), credential_store_ok, false);
+    }
+    if let (true, QualityRuntime::Podman { connection }) = (windows, &config.runtime) {
         push("machine", "Create the app's Podman machine".into(), probed && prerequisite.is_some_and(|p| p.installed) && (inner.options.podman_app_connection.is_some() || !connection.is_empty()), false);
     }
     push("server", "Start the analyzer".into(), inner.effective == Some(config.mode), false);
@@ -161,7 +177,7 @@ pub(crate) fn setup_state(inner: &Inner) -> SetupState {
         push("token", "Create the scan token".into(), inner.credentials.community, false);
     }
     let needed = steps.iter().any(|s| s.state != SetupStepState::Done);
-    let install_required = steps.iter().any(|s| matches!(s.id.as_str(), "windowsFeatures" | "runtime" | "machine") && s.state != SetupStepState::Done);
+    let install_required = windows && steps.iter().any(|s| matches!(s.id.as_str(), "windowsFeatures" | "runtime" | "machine") && s.state != SetupStepState::Done);
     SetupState { needed, install_required, resume: inner.setup_resume, steps }
 }
 
@@ -189,13 +205,15 @@ pub fn materialize_bridge(folder: &std::path::Path) -> Result<()> {
 }
 
 impl CodeQualityService {
-    /// Production constructor: real engines, Windows Credential Manager, cross-process lock.
+    /// Production constructor: real engines, the OS credential store, cross-process lock.
     pub fn new(config_root: PathBuf) -> Arc<Self> {
         let factory: Arc<dyn EngineFactory> = Arc::new(runtime::RuntimeFactory { config_root: config_root.clone() });
         #[cfg(windows)]
         let secrets: Arc<dyn SecretStore> = Arc::new(secrets::WindowsSecrets);
-        #[cfg(not(windows))]
-        let secrets: Arc<dyn SecretStore> = Arc::new(secrets::MemorySecrets::default());
+        #[cfg(unix)]
+        let secrets: Arc<dyn SecretStore> = Arc::new(secrets_unix::ExternalSecrets::system());
+        #[cfg(not(any(windows, unix)))]
+        compile_error!("code quality has no credential store for this platform");
         let root = config_root.join("code-quality");
         let name = process_lock::name_for(&root);
         let lock = process_lock::ProcessLock::acquire(&name);
@@ -290,6 +308,8 @@ impl CodeQualityService {
     }
 
     pub fn state(&self) -> QualityState {
+        // Before the ownership/inner locks: the credential store answers from a cache and never blocks.
+        let credential_store = self.secrets.status();
         let ownership = self.ownership.lock();
         let ownership_state = ownership.snapshot(&self.paths);
         let inner = self.inner.lock();
@@ -314,8 +334,10 @@ impl CodeQualityService {
             active_scan_id: inner.active_scan.as_ref().map(|s| s.id.clone()),
             diagnostics: inner.diagnostics.iter().cloned().collect(),
             unresolved: inner.unresolved.clone(),
-            setup: setup_state(&inner),
+            setup: setup_state(&inner, credential_store.available),
             start_at_launch: inner.file.start_at_launch,
+            platform: platform_name().to_string(),
+            credential_store,
         }
     }
 

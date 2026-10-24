@@ -165,7 +165,7 @@ pub fn explain(registry: &Registry, id: &str, kind: &str, base: Option<&str>, ta
     let row = registry.inspect(id, Origin::Human)?;
     let root = repository_root(Path::new(&row.project_path))?;
     let material = material(&root, kind, base, target)?;
-    let program = std::env::var_os("OMP_BIN").unwrap_or_else(|| "omp".into());
+    let program = crate::toolchain::omp_program();
     let folder = registry.config_root().join("git-explain");
     explain_with(&program, &folder, &row.profile, &row.configs, &row.model, kind, &material, Duration::from_secs(MODEL_SECS))
 }

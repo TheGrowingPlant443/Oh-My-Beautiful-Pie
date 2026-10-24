@@ -816,9 +816,295 @@ fn native_snapshot_smoke() {
     drop(listener6);
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 #[test]
 fn native_snapshot_smoke() {
     assert_eq!(super::native::collect(&AtomicBool::new(false)).err().as_deref(), Some("unsupported_platform"));
     assert!(capture_identity(1).is_none());
+}
+
+// ---------------------------------------------------------------- Linux /proc decoding (pure, runs on any host)
+
+// Captured from a live Linux host (little-endian: the kernel prints each address word in host byte order).
+const PROC_TCP4: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:22B8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 2252060 2 0000000000000000 100 0 0 10 0
+   1: 3600007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   974        0 15736 1 0000000000000000 100 0 0 10 5
+   2: BE08A8C0:A2C3 1D12AE03:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 2236367 2 0000000000000000 92 4 28 10 -1
+   3: BE08A8C0:A2C4 0101A8C0:0050 02 00000000:00000000 00:00000000 00000000  1000        0 2236368 2 0000000000000000 92 4 28 10 -1
+   4: 0100007F:1F90 0100007F:C350 03 00000000:00000000 00:00000000 00000000  1000        0 2236369 2 0000000000000000 92 4 28 10 -1
+   5: BE08A8C0:A2C5 7797FB8E:01BB 06 00000000:00000000 03:000001A2 00000000     0        0 0 3 0000000000000000
+";
+const PROC_TCP6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:14EB 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000   974        0 15727 1 0000000000000000 100 0 0 10 5
+   1: 00000000000000000000000001000000:0277 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 40560 1 0000000000000000 100 0 0 10 0
+   2: C80601209D4F09FFF5AA25E203001DA7:DCAA 5014002A06080F400000000016200000:01BB 08 00000000:00000082 00:00000000 00000000  1000        0 1034553 1 0000000000000000 92 4 28 10 -1
+   3: 0000000000000000FFFF00000100007F:1F90 0000000000000000FFFF00000200A8C0:C351 01 00000000:00000000 00:00000000 00000000  1000        0 77 1 0000000000000000 92 4 28 10 -1
+";
+const PROC_UDP4: &str = "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+ 7407: BE08A8C0:A2C3 1D12AE03:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 2236367 2 0000000000000000 0
+31329: 3600007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   974        0 15735 2 0000000000000000 0
+";
+const PROC_UDP6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+ 2214: 00000000000000000000000000000000:8E7A 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 1294348 2 0000000000000000 0
+31822: 000080FE00000000848D8FDE1F70569D:0222 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 17023 2 0000000000000000 0
+";
+
+fn proc_rows(text: &str, family: Family, protocol: Protocol) -> tables::ParsedProcTable {
+    tables::parse_proc_net(text.as_bytes(), family, protocol).unwrap()
+}
+
+#[cfg(target_endian = "little")]
+#[test]
+fn proc_net_tcp4_decodes_host_order_addresses_ports_states_and_inodes() {
+    let parsed = proc_rows(PROC_TCP4, Family::Ipv4, Protocol::Tcp);
+    assert_eq!((parsed.rows.len(), parsed.truncated, parsed.malformed), (6, false, 0));
+    let row = |index: usize| &parsed.rows[index];
+    let listener = row(0);
+    assert_eq!(listener.socket.local, Endpoint { address: "127.0.0.1".into(), port: 0x22B8, scope_id: None });
+    assert_eq!((listener.socket.remote.clone(), listener.socket.tcp_state, listener.inode), (None, Some(tables::TCP_LISTEN), 2252060), "a listener has no peer");
+    assert_eq!(row(1).socket.local.address, "127.0.0.54", "the byte order is host order: 3600007F is 127.0.0.54");
+    let established = row(2);
+    assert_eq!(established.socket.local.address, "192.168.8.190");
+    assert_eq!(established.socket.remote, Some(Endpoint { address: "3.174.18.29".into(), port: 443, scope_id: None }));
+    assert_eq!(established.socket.tcp_state.map(tables::tcp_state_name).as_deref(), Some("ESTABLISHED"));
+    assert_eq!(row(3).socket.tcp_state, Some(3), "SYN_SENT keeps the Windows number so the shared direction rules apply");
+    assert_eq!(row(4).socket.tcp_state, Some(4), "SYN_RECV");
+    let waiting = row(5);
+    assert_eq!((waiting.inode, waiting.socket.tcp_state.map(tables::tcp_state_name).as_deref()), (0, Some("TIME_WAIT")), "TIME_WAIT sockets have no owner inode");
+    assert!(parsed.rows.iter().all(|row| row.socket.pid == 0 && row.socket.family == Family::Ipv4 && row.socket.protocol == Protocol::Tcp));
+}
+
+#[cfg(target_endian = "little")]
+#[test]
+fn proc_net_tcp6_decodes_word_swapped_addresses_including_mapped_and_link_local() {
+    let parsed = proc_rows(PROC_TCP6, Family::Ipv6, Protocol::Tcp);
+    assert_eq!((parsed.rows.len(), parsed.malformed), (4, 0));
+    assert_eq!(parsed.rows[0].socket.local.address, "::");
+    assert_eq!(parsed.rows[0].socket.remote, None, "a wildcard peer with port 0 is no peer");
+    assert_eq!(parsed.rows[1].socket.local, Endpoint { address: "::1".into(), port: 0x0277, scope_id: None });
+    let global = &parsed.rows[2].socket;
+    assert_eq!(global.local.address, "2001:6c8:ff09:4f9d:e225:aaf5:a71d:3", "each 32-bit word is byte-swapped on its own, the words keep their order");
+    assert_eq!(global.remote.as_ref().map(|peer| (peer.address.as_str(), peer.port)), Some(("2a00:1450:400f:806::2016", 443)));
+    let mapped = &parsed.rows[3].socket;
+    assert_eq!((mapped.local.address.as_str(), mapped.remote.as_ref().map(|p| p.address.as_str())), ("::ffff:127.0.0.1", Some("::ffff:192.168.0.2")));
+    assert!(tables::is_external(mapped.remote.as_ref()), "a mapped private LAN peer is external");
+    assert!(!tables::is_external(Some(&Endpoint { address: "::ffff:127.0.0.1".into(), port: 1, scope_id: None })), "a mapped loopback peer is not");
+}
+
+#[cfg(target_endian = "little")]
+#[test]
+fn proc_net_udp_rows_have_no_peer_or_state_and_link_local_is_classified() {
+    let udp4 = proc_rows(PROC_UDP4, Family::Ipv4, Protocol::Udp);
+    assert_eq!(udp4.rows.len(), 2);
+    assert!(udp4.rows.iter().all(|row| row.socket.remote.is_none() && row.socket.tcp_state.is_none()), "a connected UDP socket still lists only its local side, like the Windows table");
+    assert_eq!((udp4.rows[1].socket.local.port, udp4.rows[1].inode), (53, 15735));
+    let udp6 = proc_rows(PROC_UDP6, Family::Ipv6, Protocol::Udp);
+    assert_eq!(udp6.rows[1].socket.local.address, "fe80::de8f:8d84:9d56:701f");
+    assert_eq!(tables::address_scope(&udp6.rows[1].socket.local.address), AddressScope::LinkLocal);
+}
+
+#[test]
+fn proc_net_rejects_foreign_headers_and_counts_unreadable_lines_without_guessing() {
+    assert!(tables::parse_proc_net(&b""[..], Family::Ipv4, Protocol::Tcp).is_err());
+    assert!(tables::parse_proc_net(&b"not a table\n   0: 0100007F:22B8 00000000:0000 0A 0 0 0 0 0 0 1\n"[..], Family::Ipv4, Protocol::Tcp).is_err());
+    let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+    let good = "   0: 0100007F:22B8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 5 2\n";
+    for bad in [
+        "   1: 0100007F:22B8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0\n", // missing inode
+        "   1: 0100007F:22B8 00000000:0000 0A 0 0 0 0 0 abc\n",                                        // inode not a number
+        "   1: 0100007:22B8 00000000:0000 0A 0 0 0 0 0 0 1\n",                                         // 7-digit address
+        "   1: 0100007F:22B 00000000:0000 0A 0 0 0 0 0 0 1\n",                                         // 3-digit port
+        "   1: 0100007F:22B8 00000000:0000 0 0 0 0 0 0 0 1\n",                                         // 1-digit state
+        "   1: 0100007G:22B8 00000000:0000 0A 0 0 0 0 0 0 1\n",                                         // not hex
+        "   1: 0100007F22B8 00000000:0000 0A 0 0 0 0 0 0 1\n",                                         // no colon
+        "   1: ünïcödé:22B8 00000000:0000 0A 0 0 0 0 0 0 1\n",
+    ] {
+        let parsed = proc_rows(&format!("{header}{good}{bad}{good}"), Family::Ipv4, Protocol::Tcp);
+        assert_eq!((parsed.rows.len(), parsed.malformed), (2, 1), "{bad}");
+    }
+    // Blank lines are not rows and not damage; a missing final newline still yields the last row.
+    let parsed = proc_rows(&format!("{header}{good}\n\n{}", good.trim_end()), Family::Ipv4, Protocol::Tcp);
+    assert_eq!((parsed.rows.len(), parsed.malformed), (2, 0));
+    // A line longer than any socket row is skipped whole; the next row is still read.
+    let parsed = proc_rows(&format!("{header}{}\n{good}", "9".repeat(5_000)), Family::Ipv4, Protocol::Tcp);
+    assert_eq!((parsed.rows.len(), parsed.malformed), (1, 1));
+    // The same long line at the very end of the input must not loop or panic.
+    let parsed = proc_rows(&format!("{header}{good}{}", "9".repeat(5_000)), Family::Ipv4, Protocol::Tcp);
+    assert_eq!((parsed.rows.len(), parsed.malformed), (1, 1));
+}
+
+#[test]
+fn proc_net_tables_are_capped_and_say_so() {
+    let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+    let row = "   0: 0100007F:22B8 00000000:0000 06 00000000:00000000 00:00000000 00000000  1000        0 0 2\n";
+    let text = format!("{header}{}", row.repeat(tables::PROC_ROW_LIMIT + 7));
+    let parsed = proc_rows(&text, Family::Ipv4, Protocol::Tcp);
+    assert_eq!((parsed.rows.len(), parsed.truncated), (tables::PROC_ROW_LIMIT, true));
+    let exact = proc_rows(&format!("{header}{}", row.repeat(tables::PROC_ROW_LIMIT)), Family::Ipv4, Protocol::Tcp);
+    assert_eq!((exact.rows.len(), exact.truncated), (tables::PROC_ROW_LIMIT, false), "exactly the limit is not truncation");
+}
+
+#[test]
+fn linux_tcp_states_map_onto_the_shared_direction_rules() {
+    let direction = |state: u8| tables::direction_of(tables::tcp_state_from_linux(state));
+    assert_eq!(direction(0x0a), (Direction::Listener, DirectionEvidence::Listen));
+    assert_eq!(direction(0x02), (Direction::Outbound, DirectionEvidence::SynSent));
+    assert_eq!(direction(0x03), (Direction::Inbound, DirectionEvidence::SynReceived));
+    assert_eq!(direction(0x0c), (Direction::Inbound, DirectionEvidence::SynReceived), "a request socket is still in the handshake");
+    for established_or_closing in [0x01, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0b] {
+        assert_eq!(direction(established_or_closing), (Direction::Unknown, DirectionEvidence::Unavailable), "{established_or_closing:#x}");
+    }
+    let names: Vec<String> = (1..=0x0b).map(|state| tables::tcp_state_name(tables::tcp_state_from_linux(state))).collect();
+    assert_eq!(names, ["ESTABLISHED", "SYN_SENT", "SYN_RCVD", "FIN_WAIT1", "FIN_WAIT2", "TIME_WAIT", "CLOSED", "CLOSE_WAIT", "LAST_ACK", "LISTEN", "CLOSING"]);
+    assert_eq!(tables::tcp_state_name(tables::tcp_state_from_linux(0x7f)), "UNKNOWN(0)");
+}
+
+#[test]
+fn proc_stat_names_may_contain_spaces_and_parentheses_and_the_fields_are_positional() {
+    let stat = tables::parse_proc_stat("1727 (omp) R 1691 1727 1727 34816 1727 4194304 10544891 183077658 163541 40082 129617 9238 1193824 284183 20 0 151 0 1869 84651192320 140084 18446744073709551615 25435648").unwrap();
+    assert_eq!(stat, tables::ProcStat { name: "omp".into(), state: 'R', parent_pid: 1691, threads: 151, start_ticks: 1869 });
+    let tricky = tables::parse_proc_stat("42 (a) b (c)) S 7 42 42 0 -1 4194560 1 1 1 1 1 1 1 1 20 0 3 0 99 1 1").unwrap();
+    assert_eq!((tricky.name.as_str(), tricky.state, tricky.parent_pid, tricky.threads, tricky.start_ticks), ("a) b (c)", 'S', 7, 3, 99));
+    assert_eq!(tables::parse_proc_stat("42 (zombie) Z 7 42 42 0 -1 0 1 1 1 1 1 1 1 1 20 0 1 0 5 0").unwrap().state, 'Z');
+    for broken in ["", "42", "42 (x", "42 )x(", "42 (x) S", "42 (x) S 7 42 42 0 -1 4194560 1 1 1 1 1 1 1 1 20 0 3 0", "42 (x) S notapid 42 42 0 -1 4194560 1 1 1 1 1 1 1 1 20 0 3 0 99"] {
+        assert_eq!(tables::parse_proc_stat(broken), None, "{broken:?}");
+    }
+    assert_eq!(tables::ticks_to_100ns(1869, 100), 186_900_000);
+    assert_eq!(tables::ticks_to_100ns(u64::MAX, 1), u64::MAX, "no overflow");
+    assert_eq!(tables::ticks_to_100ns(5, 0), 50_000_000, "a bogus zero clock rate cannot divide by zero");
+}
+
+#[test]
+fn linux_rows_flow_through_the_shared_snapshot_rules() {
+    // A decoded private-LAN peer is external; loopback and wildcard are not; TIME_WAIT (no owner) has no pid.
+    let mut sockets: Vec<RawSocket> = proc_rows(PROC_TCP4, Family::Ipv4, Protocol::Tcp).rows.into_iter().map(|row| row.socket).collect();
+    sockets[2].pid = 200;
+    sockets[3].pid = 200;
+    let raw = collection(
+        vec![process(200, 1, "curl", Some(5))],
+        sockets,
+        vec![],
+        &[(200, Recheck::Creation(5))],
+    );
+    let snapshot = build(raw, &[]);
+    let external = all_tcp(&snapshot, TcpView::External);
+    let peers: Vec<&str> = external.iter().map(|row| row["remote"]["address"].as_str().unwrap()).collect();
+    assert_eq!(peers.len(), 3, "{peers:?}");
+    assert!(peers.contains(&"192.168.1.1") && peers.contains(&"3.174.18.29"), "{peers:?}");
+    let outbound = all_tcp(&snapshot, TcpView::ConfirmedOutbound);
+    assert_eq!(outbound.len(), 1);
+    assert_eq!((outbound[0]["pid"].clone(), outbound[0]["processName"].clone()), (json!(200), json!("curl")));
+    let waiting = all_tcp(&snapshot, TcpView::All).into_iter().find(|row| row["state"] == "TIME_WAIT").unwrap();
+    assert_eq!((waiting["pid"].clone(), waiting["processKey"].clone()), (Value::Null, Value::Null));
+}
+
+// ---------------------------------------------------------------- real Linux native pass
+
+/// The Linux twin of the Windows smoke test, against the live `/proc`. Read-only; it creates loopback endpoints and
+/// one scratch `sleep` child of its own.
+#[cfg(target_os = "linux")]
+#[test]
+fn native_snapshot_smoke() {
+    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::process::{Command, Stdio};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen_port = listener.local_addr().unwrap().port();
+    let client = TcpStream::connect(("127.0.0.1", listen_port)).unwrap();
+    let client_port = client.local_addr().unwrap().port();
+    let (_server, _) = listener.accept().unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_port = udp.local_addr().unwrap().port();
+    let listener6 = TcpListener::bind("[::1]:0").ok();
+    let client6 = listener6.as_ref().and_then(|l| TcpStream::connect(l.local_addr().unwrap()).ok());
+    let mut child = Command::new("sleep").arg("30").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+
+    let own = capture_identity(std::process::id()).expect("own process identity");
+    let child_identity = capture_identity(child.id()).expect("scratch child identity");
+    assert_ne!(own.creation_time_100ns, 0);
+    assert!(child_identity.creation_time_100ns >= own.creation_time_100ns, "the child started after its parent");
+    let roots = [ManagedRoot { instance_id: "smoke".into(), generation: 1, kind: RootKind::Agent, identity: own }];
+    let cancel = AtomicBool::new(false);
+    let raw = super::native::collect(&cancel).expect("native collection");
+    let snapshot = HostSnapshot::build("s".into(), "v".into(), "smoke".into(), 1, raw, &roots);
+    let summary = snapshot.summary();
+    assert_eq!(summary.sections.processes.status, SectionStatus::Ok);
+    assert_eq!(summary.sections.tcp4.status, SectionStatus::Ok);
+    assert_eq!(summary.sections.udp4.status, SectionStatus::Ok);
+    assert!(summary.process_count.unwrap() > 2);
+    assert!(summary.duration_ms < 30_000);
+
+    let process_rows = snapshot.query(&HostMonitorQuery::Processes { text: String::new(), offset: 0, limit: 250 });
+    let mut every_process = process_rows.items;
+    let mut offset = process_rows.next_offset;
+    while let Some(next) = offset {
+        let more = snapshot.query(&HostMonitorQuery::Processes { text: String::new(), offset: next, limit: 250 });
+        every_process.extend(more.items);
+        offset = more.next_offset;
+    }
+    let find = |pid: u32| every_process.iter().find(|row| row["pid"] == pid).cloned().unwrap_or_else(|| panic!("pid {pid} listed"));
+    let me = find(std::process::id());
+    assert_eq!(me["key"], format!("{}:{}", own.pid, own.creation_time_100ns).as_str());
+    assert_eq!(me["owner"]["kind"], "agentRoot");
+    assert_eq!(me["availability"], "available");
+    let scratch = find(child.id());
+    assert_eq!(scratch["creationTime100ns"], child_identity.creation_time_100ns.to_string().as_str());
+    assert_eq!(scratch["name"], "sleep");
+    assert_eq!(scratch["owner"]["kind"], "descendant", "the scratch child is attributed through verified ancestry");
+    assert_eq!(scratch["parentPid"], std::process::id());
+    assert!(me["threadCount"].as_u64().unwrap() >= 1);
+
+    let tcp = snapshot.query(&HostMonitorQuery::Tcp { view: TcpView::All, text: format!("{}", std::process::id()), offset: 0, limit: 250 }).items;
+    let on = |port: u16| -> Vec<&Value> { tcp.iter().filter(|row| row["local"]["port"] == port).collect() };
+    let listening = on(listen_port).into_iter().find(|row| row["state"] == "LISTEN").expect("listener row");
+    assert_eq!((listening["direction"].clone(), listening["pid"].clone(), listening["remote"].clone()), (json!("listener"), json!(std::process::id()), Value::Null));
+    assert_eq!(listening["processKey"], me["key"], "attributed through the socket inode and creation identity");
+    let established = on(client_port).into_iter().find(|row| row["state"] == "ESTABLISHED").expect("client row");
+    assert_eq!(established["remote"]["port"], listen_port, "literal ports, not byte-swapped");
+    assert_eq!(established["remote"]["address"], "127.0.0.1", "literal addresses, not byte-swapped");
+    assert_eq!((established["direction"].clone(), established["directionEvidence"].clone()), (json!("unknown"), json!("unavailable")));
+    assert!(on(listen_port).iter().any(|row| row["state"] == "ESTABLISHED" && row["remote"]["port"] == client_port), "the accepted side is listed too");
+
+    let udp_rows = snapshot.query(&HostMonitorQuery::Udp { text: udp_port.to_string(), offset: 0, limit: 50 }).items;
+    let udp_row = udp_rows.iter().find(|row| row["local"]["port"] == udp_port).expect("udp row");
+    assert_eq!((udp_row["pid"].clone(), udp_row["remote"].clone(), udp_row["direction"].clone()), (json!(std::process::id()), Value::Null, json!("unknown")));
+
+    if let (Some(listener6), Some(_client6)) = (&listener6, &client6) {
+        assert_eq!(summary.sections.tcp6.status, SectionStatus::Ok);
+        let port6 = listener6.local_addr().unwrap().port();
+        let rows6 = snapshot.query(&HostMonitorQuery::Tcp { view: TcpView::Listeners, text: port6.to_string(), offset: 0, limit: 50 }).items;
+        let row6 = rows6.iter().find(|row| row["local"]["port"] == port6).expect("IPv6 listener");
+        assert_eq!((row6["family"].clone(), row6["local"]["address"].clone(), row6["addressScope"].clone()), (json!("ipv6"), json!("::1"), json!("loopback")));
+        assert_eq!(row6["pid"], std::process::id());
+    }
+
+    // Cancellation before the pass starts is honoured without reading anything.
+    let stopped = AtomicBool::new(true);
+    assert_eq!(super::native::collect(&stopped).err().as_deref(), Some("monitor_cancelled"));
+
+    child.kill().ok();
+    child.wait().ok();
+    drop(listener6);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_zombie_is_reported_as_exited_and_has_no_capturable_identity() {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("true").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let pid = child.id();
+    // The child is not waited for, so once it has run it stays a zombie.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.contains(") Z ")) {
+        assert!(std::time::Instant::now() < deadline, "the child never became a zombie");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(capture_identity(pid), None);
+    let raw = super::native::collect(&AtomicBool::new(false)).unwrap();
+    let row = raw.processes.iter().find(|process| process.pid == pid).expect("zombie is still listed");
+    assert_eq!((row.availability, row.parent_pid), (Availability::Exited, std::process::id()));
+    child.wait().unwrap();
+    assert_eq!(capture_identity(pid), None, "a reaped pid is gone");
+    assert_eq!(capture_identity(0), None);
+    assert_eq!(capture_identity(u32::MAX), None, "a pid beyond pid_max never existed");
 }

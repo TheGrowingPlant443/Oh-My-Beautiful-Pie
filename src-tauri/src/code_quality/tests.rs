@@ -54,7 +54,10 @@ impl Engine for FakeEngine {
         if !self.reachable.load(Ordering::Relaxed) {
             return Err("engine is not running".into());
         }
-        Ok(EngineProbe { fingerprint: format!("fp-{}", self.runtime.key()), os: "linux".into(), memory_bytes: 8 << 30, max_map_count: Some(1 << 20), file_max: Some(1 << 20) })
+        Ok(EngineProbe { fingerprint: format!("fp-{}", self.runtime.key()), os: "linux".into(), memory_bytes: 8 << 30, max_map_count: Some(1 << 20), file_max: Some(1 << 20),
+            #[cfg(unix)]
+            cpu_limits_unsupported: None,
+        })
     }
     fn ensure_started(&self, ctl: &Ctl) -> Result<()> {
         self.probe(ctl).map(|_| ())
@@ -683,6 +686,7 @@ fn setup_needs_the_consent_checkbox_before_anything_is_touched() {
     assert!(h.desktop.ops().is_empty() && h.podman.ops().is_empty());
 }
 
+#[cfg(windows)]
 #[test]
 fn setup_steps_follow_what_is_installed_started_and_saved() {
     let h = harness();
@@ -793,6 +797,7 @@ fn enter_decisions_cover_every_branch() {
     assert_eq!(enter_decision(true, None, false), EnterDecision::Start);
 }
 
+#[cfg(windows)]
 #[test]
 fn installed_prerequisites_do_not_require_installation_when_only_analyzer_and_token_are_missing() {
     let h = harness();

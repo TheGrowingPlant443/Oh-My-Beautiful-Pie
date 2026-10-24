@@ -825,7 +825,8 @@ const GH_DEADLINE: Duration = Duration::from_secs(5);
 const GH_NOT_INSTALLED: &str = "GitHub CLI (gh) was not found. Install it (https://cli.github.com), run `gh auth login`, then press Recheck.";
 fn gh_not_logged_in(program: &str) -> String {
     let wsl = if cfg!(windows) { " (a login made inside WSL is not shared with this app)" } else { "" };
-    format!("GitHub CLI ({program}) is installed but not logged in to github.com. Run `gh auth login` in a normal Windows terminal as this user{wsl}, then press Recheck.")
+    let terminal = if cfg!(windows) { "normal Windows terminal" } else { "normal terminal" };
+    format!("GitHub CLI ({program}) is installed but not logged in to github.com. Run `gh auth login` in a {terminal} as this user{wsl}, then press Recheck.")
 }
 const REJECTED_TOKEN: &str = "GitHub rejected the saved token (401). Run `gh auth login` again or replace GITHUB_TOKEN/GH_TOKEN, then press Recheck.";
 
@@ -932,8 +933,12 @@ fn gh_programs(env: &dyn Fn(&str) -> Option<String>) -> Vec<OsString> {
     }
     #[cfg(not(windows))]
     {
-        let _ = env;
         programs.extend(["/usr/local/bin/gh", "/opt/homebrew/bin/gh", "/usr/bin/gh"].map(OsString::from));
+        // Nix: per-user profile (`nix profile add nixpkgs#gh`), the default profile, NixOS.
+        if let Some(home) = env("HOME").filter(|home| !home.is_empty()) {
+            programs.push(PathBuf::from(home).join(".nix-profile/bin/gh").into_os_string());
+        }
+        programs.extend(["/nix/var/nix/profiles/default/bin/gh", "/run/current-system/sw/bin/gh"].map(OsString::from));
     }
     programs
 }
@@ -2114,7 +2119,18 @@ mod tests {
             PathBuf::from(r"C:\Users\fixture\AppData\Local").join(r"Microsoft\WinGet\Links\gh.exe").into_os_string(),
         ]);
         #[cfg(not(windows))]
-        assert_eq!(programs, ["gh","/usr/local/bin/gh","/opt/homebrew/bin/gh","/usr/bin/gh"].map(OsString::from).to_vec());
+        assert_eq!(programs, ["gh","/usr/local/bin/gh","/opt/homebrew/bin/gh","/usr/bin/gh","/nix/var/nix/profiles/default/bin/gh","/run/current-system/sw/bin/gh"].map(OsString::from).to_vec());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_gh_candidates_include_the_users_nix_profile() {
+        let env = |name: &str| (name == "HOME").then(|| "/home/fixture".to_string());
+        let programs = gh_programs(&env);
+        assert_eq!(programs[0], OsString::from("gh"));
+        assert!(programs.contains(&OsString::from("/home/fixture/.nix-profile/bin/gh")));
+        let blank = |name: &str| (name == "HOME").then(String::new);
+        assert!(gh_programs(&blank).iter().all(|p| p != "/.nix-profile/bin/gh"));
     }
 
     #[test]

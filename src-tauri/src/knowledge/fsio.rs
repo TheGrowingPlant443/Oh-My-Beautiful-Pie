@@ -158,11 +158,18 @@ pub(crate) fn handle_identity(file: &File) -> Result<Identity> {
     })
 }
 
+/// Unix: `nlink` plus `dev:ino`, extended by the birth time where the filesystem reports one. Inode numbers are
+/// reused quickly (a removed and recreated folder may get the same number); the birth time tells them apart.
 #[cfg(unix)]
 pub(crate) fn handle_identity(file: &File) -> Result<Identity> {
     use std::os::unix::fs::MetadataExt;
     let meta = file.metadata().map_err(|e| err("Cannot inspect the opened file", e))?;
-    Ok(Identity { links: meta.nlink(), id: Some(format!("{:x}:{:x}", meta.dev(), meta.ino())) })
+    let born = meta.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos());
+    let id = match born {
+        Some(born) => format!("{:x}:{:x}:{born:x}", meta.dev(), meta.ino()),
+        None => format!("{:x}:{:x}", meta.dev(), meta.ino()),
+    };
+    Ok(Identity { links: meta.nlink(), id: Some(id) })
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -179,6 +186,12 @@ pub(crate) fn dir_identity(path: &Path) -> Option<String> {
         use std::os::windows::fs::OpenOptionsExt;
         // FILE_FLAG_BACKUP_SEMANTICS (open a directory) | FILE_FLAG_OPEN_REPARSE_POINT (never follow a link).
         options.custom_flags(0x0200_0000 | 0x0020_0000);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Never follow a link at the root, and only a directory has a directory identity.
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
     }
     let file = options.open(path).ok()?;
     handle_identity(&file).ok().and_then(|i| i.id)

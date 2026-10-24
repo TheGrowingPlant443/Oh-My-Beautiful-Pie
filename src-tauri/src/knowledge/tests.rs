@@ -553,8 +553,7 @@ fn cognee_is_found_by_files_alone_and_its_ui_is_judged_without_running_anything(
     let probe = service.get_knowledge_capabilities(None).unwrap().cognee;
     assert_eq!(probe.installed, Some(true));
     assert_eq!(probe.version.as_deref(), Some("1.6.4"));
-    assert!(probe.message.is_none(), "nothing is \"not configured\" any more");
-    let expected = if cfg!(all(windows, target_arch = "x86_64")) { CogneeUiState::MissingFrontend } else { CogneeUiState::Unsupported };
+    let expected = if cfg!(any(all(windows, target_arch = "x86_64"), all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))) { CogneeUiState::MissingFrontend } else { CogneeUiState::Unsupported };
     assert_eq!(probe.ui.state, expected, "an installed SDK without a frontend is reported as such");
     assert!(probe.ui.message.is_some());
     let opened = service.open_cognee_ui();
@@ -929,6 +928,56 @@ fn an_external_writer_holding_the_note_open_conflicts_instead_of_being_overwritt
     root.write_markdown("n.md", "# ours\n", WritePrecondition::Replace { expected_hash: base.hash }).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn an_external_writer_holding_the_note_open_cannot_alter_the_published_note() {
+    use std::io::Write;
+    // Unix has no sharing locks: an editor that has the note open stays able to write, but it holds the superseded
+    // original and can never reach the published replacement.
+    let t = Temp::new();
+    let service = service(&t);
+    let vault = bind_global(&service, &t.join("v"));
+    let root = service.vault_root(&vault.vault_id).unwrap();
+    let base = root.write_markdown("n.md", "# base\n", WritePrecondition::Create).unwrap();
+    let external = fs::OpenOptions::new().write(true).open(t.join("v").join("n.md")).unwrap();
+    root.write_markdown("n.md", "# ours\n", WritePrecondition::Replace { expected_hash: base.hash }).unwrap();
+    (&external).write_all(b"late external edit").unwrap();
+    assert_eq!(fs::read_to_string(t.join("v").join("n.md")).unwrap(), "# ours\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn links_and_special_files_inside_the_vault_are_never_followed_by_readers_or_writers() {
+    use std::os::unix::fs::symlink;
+    let t = Temp::new();
+    let service = service(&t);
+    let vault = bind_global(&service, &t.join("v"));
+    let root = service.vault_root(&vault.vault_id).unwrap();
+    let outside = t.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.md"), "secret").unwrap();
+    symlink(&outside, t.join("v").join("link")).unwrap();
+    assert!(root.write_markdown("link/new.md", "x", WritePrecondition::Create).is_err());
+    assert!(!outside.join("new.md").exists(), "nothing is written through a linked folder");
+    assert!(root.read_markdown("link/secret.md").is_err());
+    symlink(outside.join("secret.md"), t.join("v").join("alias.md")).unwrap();
+    assert!(root.read_markdown("alias.md").is_err());
+    assert!(root.write_markdown("alias.md", "x", WritePrecondition::Replace { expected_hash: sha256_hex(b"secret") }).is_err());
+    assert!(root.write_markdown("alias.md", "x", WritePrecondition::Create).is_err());
+    assert_eq!(fs::read_to_string(outside.join("secret.md")).unwrap(), "secret");
+    // A FIFO named like a note must be refused without blocking.
+    let fifo = std::ffi::CString::new(t.join("v").join("pipe.md").to_string_lossy().as_bytes()).unwrap();
+    // SAFETY: `fifo` is a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(root.read_markdown("pipe.md").is_err());
+    // An ancestor link is refused too, however the root is spelled.
+    let real = t.join("real");
+    fs::create_dir_all(real.join("vault")).unwrap();
+    symlink(&real, t.join("via")).unwrap();
+    assert!(fsio::pin_directory(&t.join("via").join("vault")).is_err());
+    assert!(fsio::pin_directory(&real.join("vault")).is_ok());
+}
+
 #[test]
 fn a_document_page_always_carries_the_hash_of_the_bytes_it_returns() {
     let t = Temp::new();
@@ -941,11 +990,13 @@ fn a_document_page_always_carries_the_hash_of_the_bytes_it_returns() {
     assert_eq!(page.text.as_bytes(), &bytes[..page.length as usize]);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 mod publication_race {
     use super::super::note_publication::{HookAction, Stage, HOOKS};
     use super::*;
+    #[cfg(windows)]
     use parking_lot::Mutex;
+    #[cfg(windows)]
     use std::sync::Arc;
 
     fn names(dir: &Path) -> Vec<String> {
@@ -997,6 +1048,7 @@ mod publication_race {
         assert!(names(&f.journal).is_empty(), "a successful replacement keeps no journal and no backup");
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_foreign_process_cannot_write_rename_or_delete_the_note_between_the_hash_check_and_publication() {
         let f = Fixture::new();
@@ -1017,6 +1069,53 @@ mod publication_race {
         assert_eq!(*outcomes.lock(), vec![false, false, false, false], "every external mutation is refused while the note is locked");
         assert_eq!(fs::read_to_string(f.root.join("n.md")).unwrap(), "ours");
         assert_eq!(names(&f.root), vec!["n.md".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_in_place_between_the_hash_check_and_the_move_is_detected_and_kept() {
+        let f = Fixture::new();
+        f.hook(|stage, parent, name| {
+            if stage == Stage::Locked { fs::write(parent.join(name), "foreign edit").unwrap(); }
+            HookAction::Continue
+        });
+        assert!(f.write("ours").is_err());
+        assert_eq!(fs::read_to_string(f.root.join("n.md")).unwrap(), "foreign edit", "the external edit is never overwritten");
+        assert_eq!(names(&f.root), vec!["n.md".to_string()], "no staged or reserved file is left behind");
+        assert!(names(&f.journal).is_empty(), "a refused replacement keeps neither journal nor backup");
+        assert!(!fsio::publications_need_recovery(&f.journal).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_note_swapped_for_another_file_between_the_hash_check_and_the_move_is_put_back() {
+        let f = Fixture::new();
+        f.hook(|stage, parent, name| {
+            if stage == Stage::Locked {
+                fs::write(parent.join("swap.tmp"), "swapped in").unwrap();
+                fs::rename(parent.join("swap.tmp"), parent.join(name)).unwrap();
+            }
+            HookAction::Continue
+        });
+        let error = f.write("ours").unwrap_err();
+        assert!(error.contains("put back untouched"), "{error}");
+        assert_eq!(fs::read_to_string(f.root.join("n.md")).unwrap(), "swapped in", "the foreign file keeps the name");
+        assert_eq!(names(&f.root), vec!["n.md".to_string()]);
+        assert!(names(&f.journal).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_note_deleted_between_the_hash_check_and_the_move_is_not_resurrected() {
+        let f = Fixture::new();
+        f.hook(|stage, parent, name| {
+            if stage == Stage::Locked { fs::remove_file(parent.join(name)).unwrap(); }
+            HookAction::Continue
+        });
+        let error = f.write("ours").unwrap_err();
+        assert!(error.contains("could not be reserved"), "{error}");
+        assert!(names(&f.root).is_empty(), "{:?}", names(&f.root));
+        assert!(names(&f.journal).is_empty());
     }
 
     #[test]

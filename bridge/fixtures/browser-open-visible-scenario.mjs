@@ -13,6 +13,7 @@ const frames=[];
 const host=new TestNativeHost(root);
 const service=new BrowserService(root,process.env.OMP_SDK_DIR,frame=>frames.push(frame),{native:host.channel()});
 await service.start();
+const docks=process.platform==='win32'; // Win32 docking exists only on Windows; Linux and macOS use an external window.
 const global={headless:true,embedded:false};
 try {
   const {loadPuppeteer}=await import(pathToFileURL(path.join(process.env.OMP_SDK_DIR,'src/tools/browser/launch.ts')).href);
@@ -48,7 +49,7 @@ try {
   assert.notEqual(visiblePid,headlessPid);
   assert.equal(row.pid,visiblePid);
   assert.equal(row.headless,false);
-  assert.equal(row.embedded,true);
+  assert.equal(row.embedded,docks);
   assert.equal(row.state,'ready');
   assert.equal((await fetch(a.ticket.cdpUrl+'/json/version',{method:'HEAD'})).status,403,'old tab capabilities must be revoked by the restart');
   assert.equal(service.owner('b',1).native.pid,otherPid,'another owner must keep its browser');
@@ -62,10 +63,10 @@ try {
   await headed.page.goto(process.env.BROWSER_FIXTURE_URL+'?visible');
   const again=await service.dispatch('openVisible',{instanceId:'a',generation:1,restartHeadless:false});
   assert.equal(again.pid,visiblePid,'headed browsers must not be restarted');
-  assert.equal(again.embedded,true);
+  assert.equal(again.embedded,docks);
   assert.equal(headed.page.url(),process.env.BROWSER_FIXTURE_URL+'?visible');
   assert.equal((await headed.browser.pages()).length,1,'reuse must not create or navigate tabs');
-  assert.equal(frames.at(-1).embedded,true,'the forced presentation must be published to the supervisor');
+  assert.equal(frames.at(-1).embedded,docks,'the forced presentation must be published to the supervisor');
   assert.equal(frames.at(-1).instanceId,'a');
 
   // Changing global settings supersedes the override without restarting the running browser.

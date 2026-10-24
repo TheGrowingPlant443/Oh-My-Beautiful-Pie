@@ -37,18 +37,57 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
-pub(crate) fn sdk_dir(home: &Path) -> Result<PathBuf> {
-    let mut candidates = vec![];
-    if let Some(path) = std::env::var_os("OMP_SDK_DIR") {
-        candidates.push(PathBuf::from(path));
-    } else {
-        if let Some(root) = std::env::var_os("BUN_INSTALL") {
-            candidates.push(
-                PathBuf::from(root).join("install/global/node_modules/@oh-my-pi/pi-coding-agent"),
-            );
-        }
-        candidates.push(home.join(".bun/install/global/node_modules/@oh-my-pi/pi-coding-agent"));
+#[cfg(unix)]
+const SDK_PACKAGE: &str = "node_modules/@oh-my-pi/pi-coding-agent";
+
+/// Where the installed OMP SDK (`@oh-my-pi/pi-coding-agent`) may be, most specific first. `OMP_SDK_DIR` is exclusive.
+fn sdk_candidates(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>, omp: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(path) = env("OMP_SDK_DIR") {
+        return vec![PathBuf::from(path)];
     }
+    let mut candidates = vec![];
+    if let Some(root) = env("BUN_INSTALL") {
+        candidates.push(
+            PathBuf::from(root).join("install/global/node_modules/@oh-my-pi/pi-coding-agent"),
+        );
+    }
+    candidates.push(home.join(".bun/install/global/node_modules/@oh-my-pi/pi-coding-agent"));
+    #[cfg(unix)]
+    {
+        // The app's user-owned Nix SDK directory; see the README "Linux and macOS" setup.
+        for data in app_data_dirs(home, env) {
+            candidates.push(data.join("omp-manager/sdk").join(SDK_PACKAGE));
+        }
+        // A package-manager install: `omp` is (a link into) `<prefix>/node_modules/@oh-my-pi/pi-coding-agent/...`.
+        if let Some(real) = omp.filter(|path| path.is_absolute()).and_then(|path| fs::canonicalize(path).ok()) {
+            for ancestor in real.ancestors().skip(1).filter(|a| a.parent().is_some()) {
+                if ancestor.ends_with("@oh-my-pi/pi-coding-agent") {
+                    candidates.push(ancestor.to_path_buf());
+                }
+                candidates.push(ancestor.join(SDK_PACKAGE));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = omp;
+    candidates
+}
+
+#[cfg(unix)]
+fn app_data_dirs(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let mut dirs = vec![];
+    if let Some(data) = env("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()) {
+        dirs.push(data);
+    }
+    dirs.push(home.join(".local/share"));
+    #[cfg(target_os = "macos")]
+    dirs.push(home.join("Library/Application Support"));
+    dirs
+}
+
+pub(crate) fn sdk_dir(home: &Path) -> Result<PathBuf> {
+    let omp = crate::toolchain::omp_program();
+    let candidates = sdk_candidates(home, &|name| std::env::var_os(name), Some(Path::new(&omp)));
     for candidate in candidates {
         let package = fs::read(candidate.join("package.json"))
             .ok()
@@ -66,7 +105,8 @@ pub(crate) fn sdk_dir(home: &Path) -> Result<PathBuf> {
             ));
         }
     }
-    Err("Portable config requires Bun and the installed OMP SDK. Set BUN_BIN / OMP_SDK_DIR if they are not discoverable.".into())
+    let hint = if cfg!(unix) { " On Linux/macOS build the matching SDK with Nix as described in the README section \"Linux and macOS\", then set OMP_SDK_DIR to its @oh-my-pi/pi-coding-agent directory." } else { "" };
+    Err(format!("Portable config requires Bun and the installed OMP SDK. Set BUN_BIN / OMP_SDK_DIR if they are not discoverable.{hint}"))
 }
 
 pub fn native_request(root: &Path, home: &Path, mut request: Value) -> Result<Value> {
@@ -77,7 +117,7 @@ pub fn native_request(root: &Path, home: &Path, mut request: Value) -> Result<Va
     let sdk_version = package["version"]
         .as_str()
         .ok_or("OMP SDK has no version")?;
-    let omp = std::env::var_os("OMP_BIN").unwrap_or_else(|| "omp".into());
+    let omp = crate::toolchain::omp_program();
     let version = command(omp)
         .arg("--version")
         .output()
@@ -91,7 +131,7 @@ pub fn native_request(root: &Path, home: &Path, mut request: Value) -> Result<Va
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| home.to_path_buf());
-    let bun = std::env::var_os("BUN_BIN").unwrap_or_else(|| "bun".into());
+    let bun = crate::toolchain::bun_program();
     let mut child = command(bun)
         .arg(root.join("omp-config.mjs"))
         .current_dir(cwd)
@@ -383,5 +423,36 @@ mod tests {
         assert!(store.activate(&outside).is_err());
         assert_eq!(store.current_path().unwrap(), Some(a));
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn explicit_sdk_dir_is_exclusive_and_defaults_cover_bun_global() {
+        let env = |name: &str| (name == "OMP_SDK_DIR").then(|| std::ffi::OsString::from("/explicit/sdk"));
+        assert_eq!(sdk_candidates(Path::new("/home/u"), &env, None), vec![PathBuf::from("/explicit/sdk")]);
+        let none = |_: &str| None;
+        let defaults = sdk_candidates(Path::new("/home/u"), &none, None);
+        assert_eq!(defaults[0], PathBuf::from("/home/u/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unix_defaults_include_the_app_sdk_dir_and_the_package_around_omp() {
+        let env = |name: &str| (name == "XDG_DATA_HOME").then(|| std::ffi::OsString::from("/xdg"));
+        let home = Path::new("/home/u");
+        let candidates = sdk_candidates(home, &env, None);
+        assert!(candidates.contains(&PathBuf::from("/xdg/omp-manager/sdk/node_modules/@oh-my-pi/pi-coding-agent")));
+        assert!(candidates.contains(&PathBuf::from("/home/u/.local/share/omp-manager/sdk/node_modules/@oh-my-pi/pi-coding-agent")));
+        // A relative XDG_DATA_HOME is ignored per the XDG specification.
+        let relative = |name: &str| (name == "XDG_DATA_HOME").then(|| std::ffi::OsString::from("relative"));
+        assert!(sdk_candidates(home, &relative, None).iter().all(|c| c.is_absolute()));
+
+        let prefix = std::env::temp_dir().join(format!("omp-sdk-prefix-{}", uuid::Uuid::new_v4()));
+        let package = prefix.join("lib/node_modules/@oh-my-pi/pi-coding-agent");
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::write(package.join("src/cli.ts"), "").unwrap();
+        std::os::unix::fs::symlink(package.join("src/cli.ts"), prefix.join("bin/omp")).unwrap();
+        let canonical = fs::canonicalize(&package).unwrap();
+        assert!(sdk_candidates(home, &|_| None, Some(&prefix.join("bin/omp"))).contains(&canonical));
+        assert!(sdk_candidates(home, &|_| None, Some(Path::new("omp"))).iter().all(|c| c.is_absolute()));
+        fs::remove_dir_all(prefix).unwrap();
     }
 }

@@ -1,8 +1,10 @@
 # OMP Manager
 
-A local-first Windows desktop dashboard for independent Oh My Pi processes. Rust + Tauri, plain Svelte/TypeScript, and xterm.js. Herdr is not a dependency.
+A local-first desktop dashboard for independent Oh My Pi processes, with the existing Windows path and additive native Linux/macOS builds. Rust + Tauri, plain Svelte/TypeScript, and xterm.js. Herdr is not a dependency.
 
 ## Run
+
+### Windows
 
 Prerequisites: Rust/MSVC with the Windows SDK, Node.js compatible with Vite 8, the system WebView2 runtime, and an installed `omp` on `PATH`. Windows 11 x64 is the exercised platform; other platforms are not verified.
 
@@ -21,6 +23,107 @@ cargo tauri build --no-bundle -- --locked
 ```
 
 Output: `src-tauri/target/release/omp-manager.exe`. It embeds the UI; no Vite server is needed for the release executable.
+
+### Linux and macOS
+
+The flake exposes native `x86_64-linux`, `aarch64-linux`, `x86_64-darwin` and `aarch64-darwin` packages. Build on the target OS/architecture (or use a matching Nix remote builder); Linux cannot runtime-test the macOS app. macOS builds, Finder launch, Keychain prompts and Podman-machine integration require verification on a real Mac; they are not claimed tested by a Linux build.
+
+Prerequisites are a working Nix installation with `nix-command` and `flakes` enabled, a graphical user session, and an existing **OMP 18.12.6** executable. The app does not install or replace your OMP executable, model configuration, credentials or sessions. The first Nix build can download a substantial Rust/WebKit/Node closure and compile Rust dependencies; all npm dependency materialization and frontend compilation happen inside Nix derivations, not in your checkout.
+
+From the repository root:
+
+```sh
+# Build the frontend and release Rust binary; no Tauri CLI or Vite server is needed.
+nix build .#omp-manager
+
+# Omit this when the matching omp is already discoverable.
+export OMP_BIN="$HOME/.local/bin/omp"
+./result/bin/omp-manager
+
+# Equivalent build-and-run entry point:
+nix run .
+```
+
+`packages.default` is `omp-manager`; `packages.frontend` contains the generated UI, and `packages.sdk` contains the pinned bridge SDK. The Rust package builds with `tauri/custom-protocol` so the UI, bridge modules, source-index scripts, scanner assets and SRS templates are embedded. Source filtering excludes `target`, `node_modules`, `dist`, worktrees and unrelated root files. Linux uses GTK 3/WebKitGTK 4.1 and bundled GIO/schema paths; macOS uses native WebKit/frameworks from the Nix stdenv's Apple SDK. This is a Nix package, not an AppImage, DMG, signed/notarized installer or cross-platform executable.
+
+#### OMP executable and SDK
+
+The package wrapper supplies Bun, Node.js, Git, the existing Tree-sitter Python environment, and an immutable **`@oh-my-pi/pi-coding-agent` 18.12.6** SDK. The SDK is built from `nix/omp-sdk/package.json` plus its integrity-pinned, hydrated `registry-lock.json`. Lifecycle scripts are disabled, including optional native/ONNX download hooks; no package is installed at app startup. The bridge consumes the SDK's source, not an SDK-installed replacement `omp`.
+
+To build/use the SDK separately:
+
+```sh
+nix build .#sdk --out-link result-sdk
+export OMP_SDK_DIR="$PWD/result-sdk/node_modules/@oh-my-pi/pi-coding-agent"
+export OMP_BIN="$HOME/.local/bin/omp"
+nix run .
+```
+
+Normally omit `OMP_SDK_DIR`: the packaged launcher and `nix develop` set its default to the pinned SDK. An explicit `OMP_SDK_DIR` wins and is exclusive: point it at the package directory containing `package.json`, `src/config/settings.ts` and `src/config/registry.ts`, **not** at the enclosing `node_modules`. The app checks the executable's `omp/<version>` against the SDK version and refuses a mismatch. When updating OMP, update the SDK version and its complete integrity-bearing registry lock together and recheck the bridge against that exact executable; changing only the manifest is insufficient.
+
+For an unwrapped binary, discovery also covers Bun's existing global SDK (`BUN_INSTALL` or `~/.bun/install/global/node_modules/...`), `${XDG_DATA_HOME:-$HOME/.local/share}/omp-manager/sdk/node_modules/...`, `~/.local/share/omp-manager/sdk/node_modules/...`, macOS `~/Library/Application Support/omp-manager/sdk/node_modules/...`, and an SDK beside/in the resolved OMP installation. These are discovery locations, not instructions to run a non-Nix installer. `OMP_BIN` and `BUN_BIN` override executable discovery. Unix desktop launch also searches existing `~/.local/bin`, `~/.bun/bin`, `~/.nix-profile/bin`, `~/.cargo/bin` and conventional system locations after inherited `PATH`.
+
+#### Desktop installation and development environment
+
+```sh
+# Persistent per-user application installation; no sudo:
+nix profile add .#omp-manager
+omp-manager
+```
+
+On Linux, the package includes `share/applications/omp-manager.desktop` with an absolute store-path launcher. If your desktop does not discover Nix profile desktop entries, after `nix build .#omp-manager` install the entry explicitly:
+
+```sh
+install -Dm644 result/share/applications/omp-manager.desktop \
+  "$HOME/.local/share/applications/omp-manager.desktop"
+```
+
+Reinstall that entry after rebuilding/updating; keep the Nix profile installation or `result` GC root so the referenced store path remains live. Do not launch as root: the app needs your session bus, keyring and rootless container store.
+
+On macOS the package also contains `result/Applications/OMP Manager.app`. The direct terminal command above is the primary smoke path. For Finder registration after building:
+
+```sh
+mkdir -p "$HOME/Applications"
+ln -sfn "$PWD/result/Applications/OMP Manager.app" "$HOME/Applications/OMP Manager.app"
+open "$HOME/Applications/OMP Manager.app"
+```
+
+Keep `result` or install the Nix profile to retain the store path. Finder does not inherit shell-local overrides; make the matching `omp` discoverable in a documented location, or launch from a terminal with `OMP_BIN`/`OMP_SDK_DIR` exported. The bundle is unsigned and unnotarized; organization/Gatekeeper policy may require local approval.
+
+`nix develop` supplies the existing Rust/Node/Bun/parser development environment and native libraries, plus the pinned SDK. It does not mutate `node_modules`; use `nix build .#frontend` for a reproducible frontend build instead of installing npm dependencies outside Nix. The Windows workflow above is unchanged.
+
+#### Native runtime prerequisites and platform differences
+
+- **Linux Code quality:** uses an existing local Podman installation and the current user's native/rootless container store; there is no WSL and no app-created Linux VM. Install a missing CLI through Nix, for example `nix profile add --inputs-from . nixpkgs#podman`. A working host setup still needs subordinate UID/GID mappings, networking/storage helpers, and the appropriate cgroup delegation; installing a CLI does not configure these host services. Docker is an explicit alternative, never a silent fallback. Unsupported resource controllers are reported rather than treated as enforced limits.
+- **macOS Code quality:** uses an existing Podman machine/connection or an existing Docker Desktop installation. Podman needs a real configured VM and its provider; merely adding its CLI is not enough. Nix can supply the CLI (`nix profile add --inputs-from . nixpkgs#podman`), but this flake does not install/configure a hypervisor, Podman VM or Docker Desktop. Those are separate host prerequisites. macOS has no WSL path.
+- **Consent and limits:** Unix has no automatic runtime/Windows-feature installer. Starting configured quality services and pulling their pinned images is explicit. SonarQube needs approximately 5 GiB engine memory and Linux-kernel limits `vm.max_map_count >= 524288` and `fs.file-max >= 131072`; for macOS these are VM limits, not macOS host sysctls. The app's consented limit action uses the existing host authorization mechanism on Linux or the selected Podman machine on macOS; an unavailable action reports manual steps rather than pretending it succeeded.
+- **Credentials:** Code quality tokens/database passwords use Linux Secret Service through `secret-tool` (the Nix package includes the libsecret client), macOS login Keychain through `/usr/bin/security`, or Windows Credential Manager on Windows. Linux still needs a running, unlocked Secret Service provider such as GNOME Keyring or KWallet and the user's D-Bus session. Nix does not replace or configure the host desktop/keyring. A missing/locked store is an actionable error, not a plaintext fallback.
+- **Browser:** Win32 Chrome docking/embedded-window behavior remains Windows-only. Linux/macOS use external browser windows; they do not embed a foreign Chrome window in the terminal pane. A compatible browser/Chrome installation is separate from this package and may need `PUPPETEER_EXECUTABLE_PATH`.
+- **Process containment:** Unix has no Windows Job Object equivalent that outlives the manager. Chrome and the Cognee UI run in their own session and are retired on normal exit, but if the manager is killed or crashes they keep running (a leftover Chrome blocks that terminal's profile; a leftover Next server keeps the Cognee UI port). Stop them yourself after a crash. A `--code-quality scan` that is interrupted can likewise leave its scanner container until `down`.
+- **Cognee UI:** Linux and macOS start the frontend (Next.js 16.3.4 only) from an installed cognee-frontend with Node.js on `PATH`; the backend must already be running and is recognized only by its own venv interpreter and loopback listener. On macOS process discovery parses `ps` and `lsof`, so a home folder containing spaces can hide the backend. Nothing here downloads or installs the frontend or backend.
+- **Keyring prompts:** Credential reads wait up to two minutes for an unlock prompt, and the first read happens during app start. Unlock the Secret Service/Keychain before launching.
+- **Flake sources:** A flake only sees files tracked by git. After adding new files to a working tree, `git add` them before `nix build .#…`, or build with `path:.#…`.
+- **macOS case sensitivity:** project and credential identities are case-sensitive on Unix, so one folder opened with different letter case on a default (case-insensitive) macOS volume is treated as two projects.
+- **Independent tools:** Ponytail, optional flow tooling and standalone search/Searx services remain independent of OMP Manager. This package does not make them application features or mandatory setup dependencies.
+
+#### Native Code quality CLI
+
+The Unix executable can use the same real service, OS credential store, process lock and saved reports without opening a Tauri window. For an isolated native smoke run, use one persistent state directory and a free port; `9001` avoids an independent service already using `9000`:
+
+```sh
+nix build .#omp-manager
+./result/bin/omp-manager --code-quality --help
+./result/bin/omp-manager --code-quality up --port 9001 --state-dir /tmp/omp-quality
+./result/bin/omp-manager --code-quality status --state-dir /tmp/omp-quality
+./result/bin/omp-manager --code-quality scan /absolute/path/to/project --state-dir /tmp/omp-quality
+./result/bin/omp-manager --code-quality down --state-dir /tmp/omp-quality
+```
+
+Keep the same `--state-dir` for every call; it is the app-config root and contains `code-quality/`. Without the flag, the CLI shares the normal GUI configuration/ownership root. `up` saves the port, so later commands can omit `--port`; `status`/`down` reject a different override. `up` and `scan` leave services running. `down` stops only app-owned quality resources, retains data/reports, and does not shut down the container engine or VM.
+
+`up` explicitly consents to starting configured services/pulling images, never installing a Unix runtime. `scan` explicitly approves the detected recipe and uses the normal disposable snapshot; build-based recipes can execute project build code. Ambiguous build families or .NET entry points require a saved GUI selection first. Run it only on a project you trust. The one-hour service watchdog remains in effect. Linux Secret Service/macOS Keychain and native runtime prerequisites above still apply; “headless” does not mean an unlocked credential store is unnecessary.
+
+The CLI writes allowlisted JSON to stdout and errors to stderr; secrets, logs, build arguments and finding messages are omitted from that JSON. Exit codes: `0` success, `1` infrastructure/incomplete run or unknown gate, `2` a completed scan with findings or a failed gate, `64` invalid arguments. A `2` is not a service startup failure and must not be reported as a clean scan.
 
 ## Use
 
@@ -107,7 +210,7 @@ Example: “Use manage_sessions to create a worker named API in C:/projects/api,
 - **Vault viewer.** One in-app split view (file menu, rendered Markdown, note graph) serves Agent setup and SRS results. Markdown is rendered with raw HTML disabled and sanitized output; wiki links, aliases, heading/block references and transclusions are supported, scripts/HTML/Mermaid/Dataview/plugins never run and remote images are not fetched. Documents page in 64 KiB exact-UTF-8 pieces with no total size limit. Note relationships are drawn undirected; only Source/System/Helicopter/Graphify directed records have arrowheads.
 - **Agent setup vault.** Enabling a target (Global, Manager, Architect, repository, named profile) is a reviewed **Import Markdown** of native instruction/rule/skill/workflow Markdown only. Edits in the vault are inactive until a reviewed **Apply to OMP** (diff, ten-minute single-use token, native drift needs re-import, explicit deletions, journaled atomic per-file renames with immutable backups under `<app-config>/knowledge/deployments/`, held native sessions, recovery before any app-managed instruction load). Tools, scripts, plugin modules, package/config files, credentials and sessions stay native and are never copied. A deployed batch is recoverable but not externally atomic: standalone OMP can observe an intermediate batch.
 - **Graphify** is reachable from System overview for any selected project. A valid local output (`graphify-out/graph.json` with a matching `.graphify_root`, or labelled **Unverified** without one) or a human-registered external output whose `.graphify_root` names the project opens an immutable app-owned snapshot (full hash) in a read-only graph with provenance (EXTRACTED/INFERRED/AMBIGUOUS), multigraph edges, self-loops, communities and hyperedges. Otherwise a dialog shows what was found (absent, foreign with the claimed root, malformed, unreadable) and offers **Choose existing Graphify output…** (native folder picker; accepted only when its marker names this project; cancel changes nothing). Copies of a workspace are never adopted by name and markers are never edited; Graphify is never run and repository `graph.html` is never opened. A replaced live output shows **New Graphify output available — Refresh** while the old snapshot stays readable.
-- **Cognee** appears in the System overview header only when an installation is found passively; there is no global Cognee button and nothing to configure. **Open Cognee UI** revalidates the installed `cognee-frontend` (exact Next.js 16.3.4 development layout, Node.js, TypeScript/React/Node typings, matching Windows x64 SWC binding) and an already running local Cognee backend (installed-venv `python -m uvicorn cognee.api.client:app` owning a loopback listener; port 8000 preferred), then starts this app's own job-contained `node next dev --turbopack --hostname localhost --port 3000`, checks that `/api/runtime-config` names that backend and opens `http://localhost:3000`. It never installs or downloads a frontend or dependencies, starts the backend, MCP or Docker, runs migrations or touches Cognee's stores; a missing component is reported with nothing spawned, a foreign listener on port 3000 is left alone, and only the frontend this app started is stopped (also at app exit). A missing frontend (this PC's current state) shows a diagnostic naming what is missing.
+- **Cognee** appears in the System overview header only when an installation is found passively; there is no global Cognee button and nothing to configure. Passive discovery reads installation metadata without executing Node; Node's version is checked only on explicit **Open Cognee UI**. Open revalidates the installed `cognee-frontend` (exact Next.js 16.3.4 development layout, Node.js, TypeScript/React/Node typings, and the matching installed native SWC binding: Windows x64/arm64, Linux GNU x64/arm64, or Darwin x64/arm64) and an already running local Cognee backend (installed-venv `python -m uvicorn cognee.api.client:app`, including `venv/bin/python` on Unix, owning a loopback listener with matching process-creation identity; port 8000 preferred). It starts only this app's frontend, `node next dev --turbopack --hostname localhost --port 3000`, checks that `/api/runtime-config` names that backend and opens `http://localhost:3000`. The frontend is owned by a Windows Job Object or a dedicated Unix process session retired on stop/exit; process ownership is not a sandbox. The app never installs or downloads a frontend or dependencies, starts the backend, MCP or Docker, runs migrations or touches Cognee's stores; a missing component is reported with nothing spawned, a foreign listener on port 3000 is left alone, and only the frontend this app started is stopped. Cognee/backend/frontend installation remains separate from the OMP Manager package. macOS runtime behavior still requires verification on a real Mac.
 - **SRS documentation** (System overview header) opens an explanation of the Software Requirements Specification, the modernization purpose (not a 1:1 technology/UI/structure port) and a prominent cost warning: no app-imposed total token, time, document or iteration limit, potentially days of continuous model use, very large provider charges unless the configured Architect model is local. **Create SRS** confirms source scope (optional human-picked evidence folders and exclusions), the vault/Markdown destination and cost understanding; nothing starts a model before explicit Start/Resume. The template is the pinned `jam01/SRS-Template` revision `3965e951fa5ea1c1dd1bbc7a66b7f35f7e85c006` (CC0) in `resources/srs-template/`.
 - **How SRS runs.** A durable job under `<app-config>/srs/<job id>/` drives the same native Architect through persisted stages (survey, specify, gap review, verify) with strict evidence/document/checkpoint tools, immutable evidence receipts, stable `REQ-` ids and a questions ledger answered only by authenticated human receipts. While a stage runs the Architect may use only those tools and native Ask (a native before-model-call gate enforces this, also across compaction). Completion requires the backend ledger to validate (every admitted area read or explicitly excluded, every obligation traced, template sections populated, no unresolved material question); the result is labelled **SRS complete for the recorded evidence scope**. Output is Markdown under `SRS/<job id>/` in the vault with no source paths, symbols or excerpts; internal citations stay in app-owned audit records. The job runs while OMP Manager is open (including minimized); closing checkpoints and pauses it and reopening offers an explicit **Resume** (no daemon). Provider, storage or unsupported-evidence failures pause with a diagnostic and never complete a job.
 
@@ -116,14 +219,14 @@ Example: “Use manage_sessions to create a worker named API in C:/projects/api,
 - **Code quality** (every agent's toolbar: ordinary agents, The Manager, The Architect, helpers and plan agents, and the Change-plan view) opens an in-app scan page for that agent's repository (its working directory; a helper's or plan agent's target project; for the Manager and Architect their working directory, or your last real project when that is a temporary or computed shared folder). **Back** returns to the agent or view that opened it. It never starts an agent or sends a prompt. Dependency tree stays on The Architect's toolbar. Settings are the same component in **Settings → Code quality** and in the page's collapsible settings. Changes apply only with **Apply changes**; while any operation runs every control in every surface stays locked, a second change is rejected immediately (never queued), and **Apply** returns only after the server has really stopped/started.
 - **Shared folder history:** Code quality and Dependency tree retain successfully opened folders across sessions and app restarts, alongside saved-session folders. Both retain **Browse…**. Previous analyzer preferences and saved Code quality project metadata are merged without starting an engine or running a scan. Missing historical folders remain selectable and report the existing unavailable-folder error; malformed history or failed browser-storage writes produce a persistence diagnostic without replacing the original stored value. Advanced settings scroll below the fixed page header, keeping Back reachable.
 - **Analyzer** is exactly one of: **SonarQube — Community, managed locally** (default; official `sonarqube` + PostgreSQL 17 containers, named volumes, published only on `127.0.0.1:<port>`, ~5 GiB engine memory), **SonarQube — Enterprise, existing SSO server** (never started, stopped or modified by the app; log in through SSO in your browser, create a *user token* under My Account → Security with Browse + Execute Analysis, paste it), or **MegaLinter + Opengrep + Semgrep CE** (frozen high-signal profile; no fixes, no cloud, analyzers run with `--network none`). Changing runtime or analyzer first stops the app-owned Community containers on the old runtime (Sonar, then PostgreSQL) and verifies it; if that cannot be confirmed no new server starts and **Start / retry** reconciles by exact container id/label. Each runtime keeps its own Sonar history (volumes are never deleted or migrated).
-- **Container runtime**: Podman (default; the app provisions its own WSL machine `omp-manager-quality`), Docker Desktop, or Docker in WSL (explicit distro, Ubuntu/Debian can be installed automatically). There is no silent fallback between them. **Install runtime**, **Enable required Windows features** (restart is manual; the app never reboots) and raising the VM limits SonarQube's search engine needs (`vm.max_map_count`, `fs.file-max`) are separate consented actions; opening Settings never installs or pulls anything.
+- **Container runtime on Windows**: Podman (default; the app provisions its own WSL machine `omp-manager-quality`), Docker Desktop, or Docker in WSL (explicit distro, Ubuntu/Debian can be installed automatically). There is no silent fallback between them. **Install runtime**, **Enable required Windows features** (restart is manual; the app never reboots) and raising the VM limits SonarQube's search engine needs (`vm.max_map_count`, `fs.file-max`) are separate consented actions; opening Settings never installs or pulls anything. Linux/macOS use the native runtime prerequisites described under **Run → Linux and macOS**, without WSL or automatic runtime installation.
 - **One-click setup and scanning:** select a repository; project/scanner options are detected and the recipe is prepared automatically. **Install and setup** appears only while Windows features, the runtime or the app machine need installation, with explicit installation approval. Once those prerequisites are installed, **Start and scan** starts the analyzer, bootstraps its token and runs the scan without an installation checkbox or installer. Maven/Gradle/.NET and optional dependency preparation retain their separate build-recipe approval. Node.js/TypeScript projects use SonarScanner CLI without a build.
 - **Lazy startup:** opening Code quality starts an already configured analyzer and shows a waiting screen until readiness is verified. App startup does not start quality containers or Podman by default; **Settings → Code quality → Start code quality when OMP Manager starts** opts in. Settings, polling and credential viewing never start an engine.
 - **Multiple windows/processes:** one process holds the OS ownership mutex. A waiting window recovers automatically when the owner exits. **Take control here** asks for confirmation, cancels any active scan, verifies managed containers stopped, then transfers ownership without deleting the machine, volumes, reports or Architect sessions. Installers/lifecycle operations must finish first. Legacy or unresponsive owners must be closed; there is no forced takeover.
 - **Shutdown the Podman server** stops exact app-owned quality containers and then the receipt-verified app VM only when both its rootless and rootful stores have no running workloads. External/replaced/unverifiable machines and unrelated containers are left running with an explanation. Docker selections stop only managed quality containers, not Docker Desktop or the WSL distro. Shutdown keeps reports readable and stays stopped across navigation until explicit **Start and scan**; it does not change the startup preference.
 - **Show SonarQube login and scan token** explicitly reads the committed connection's saved credentials into a local, initially masked dialog. Community shows `admin` only when its generated password was stored; Enterprise shows its token, never an SSO password. Missing values are labelled not stored. Closing, Escape, navigation, window blur or 60 seconds clears the dialog; revealed values are never put in shared frontend state, localStorage or report exports.
 - Scans run on a disposable snapshot of the folder (honours `.gitignore`, skips `.git`, `node_modules`, build output and links/junctions; limit 100,000 files / 1 GiB), one at a time, with a 60 minute limit. Build-based Sonar scans (Maven, Gradle, .NET) and optional `npm ci --ignore-scripts` preparation need per-project approval of the displayed recipe; test execution is skipped. Source analysis is sent only to the selected Sonar server. Results (latest 20 per folder) show tool outcomes, quality gate and findings; `partial`, `interrupted`, `cancelled` and failed runs are never shown as clean.
-- Sonar tokens and the generated database password live in Windows Credential Manager, never in localStorage, config files, exports or logs. The Opengrep rule pack is LGPL-2.1 + Commons Clause: the alternate analyzer asks you to acknowledge that license (shipped manifest + hash) before downloading the pinned rules. State lives under `<app-config>/code-quality/` (`config.json`, `resources.json`, `jobs/<id>/`).
+- Sonar tokens and the generated database password live in Windows Credential Manager, Linux Secret Service or macOS Keychain, never in localStorage, config files, exports or logs. The Opengrep rule pack is LGPL-2.1 + Commons Clause: the alternate analyzer asks you to acknowledge that license (shipped manifest + hash) before downloading the pinned rules. State lives under `<app-config>/code-quality/` (`config.json`, `resources.json`, `jobs/<id>/`).
 - **Agents can read saved Code quality results.** Every agent (The Manager, The Architect, workers, plan agents and helpers) has a read-only `code_quality_report` tool for the repository it works in: its own working directory, a helper's or plan agent's target project. Sections `scans` (latest 20 summaries), `summary` (counts by severity and tool), `findings` (paged: offset, limit 1–100, optional `tool`/`severity`; output capped at 256 KiB, nextOffset continues) and `artifact` (a report name that scan's tools declared; offset is a byte offset, at most 64 KiB per call, UTF-8 safe, nextOffset continues). There is no folder, instance, path or export argument: a `scanId` that is not one of the caller's repository's saved scans is refused, and a working-directory change during the read fails it. The tool reads saved files only; it never opens the Code quality page, starts or probes a container engine, scans, installs or exports, and works while another operation is running. Analyzer text is untrusted data. The human `read_code_quality_report` preview is unchanged.
 
 ### Global config
