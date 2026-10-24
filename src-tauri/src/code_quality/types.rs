@@ -1,5 +1,6 @@
 //! Serializable contract shared with `src/lib/code-quality.ts`. Every DTO is camelCase on the wire.
-//! Secrets never appear here: tokens/passwords live in Windows Credential Manager (`secrets.rs`).
+//! Secrets never appear here: tokens/passwords live in the OS credential store (`secrets.rs`):
+//! Windows Credential Manager, the freedesktop Secret Service on Linux, the Keychain on macOS.
 use serde::{Deserialize, Serialize};
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
@@ -17,6 +18,8 @@ pub enum QualityMode {
 pub enum QualityRuntime {
     DockerDesktop,
     DockerWsl { distro: String },
+    /// Docker Engine running natively on this (Linux) host. Never available on Windows or macOS.
+    DockerNative,
     Podman { connection: String },
 }
 
@@ -26,6 +29,7 @@ impl QualityRuntime {
         match self {
             QualityRuntime::DockerDesktop => "dockerDesktop".into(),
             QualityRuntime::DockerWsl { distro } => format!("dockerWsl:{distro}"),
+            QualityRuntime::DockerNative => "dockerNative".into(),
             QualityRuntime::Podman { connection } => format!("podman:{connection}"),
         }
     }
@@ -33,6 +37,7 @@ impl QualityRuntime {
         match self {
             QualityRuntime::DockerDesktop => "Docker Desktop",
             QualityRuntime::DockerWsl { .. } => "Docker in WSL",
+            QualityRuntime::DockerNative => "Docker",
             QualityRuntime::Podman { .. } => "Podman",
         }
     }
@@ -229,6 +234,20 @@ pub struct QualityState {
     pub setup: SetupState,
     /// Whether the managed analyzer is started when OMP Manager starts (default false).
     pub start_at_launch: bool,
+    /// `windows`, `linux` or `macos`: decides which runtimes and setup actions the UI offers.
+    pub platform: String,
+    /// Where Sonar tokens and generated passwords are kept and whether that store works right now.
+    pub credential_store: CredentialStoreStatus,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialStoreStatus {
+    /// Human-readable backend name, e.g. "Windows Credential Manager" or "Secret Service (secret-tool)".
+    pub name: String,
+    pub available: bool,
+    /// Why it is unavailable and what to do about it; `None` while available.
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

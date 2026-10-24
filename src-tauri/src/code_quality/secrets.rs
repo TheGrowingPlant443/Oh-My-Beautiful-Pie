@@ -1,7 +1,9 @@
 //! Secret storage for Sonar tokens and generated database passwords.
-//! Production uses Windows Credential Manager generic credentials; tests use `MemorySecrets`.
+//! Production uses Windows Credential Manager generic credentials on Windows, the freedesktop Secret
+//! Service (`secret-tool`) on Linux and the login Keychain (`security`) on macOS (see `secrets_unix`);
+//! tests use `MemorySecrets`. There is never a plaintext fallback.
 //! Secret values never appear in serializable state, logs, argv or `Debug` output.
-use super::types::Result;
+use super::types::{CredentialStoreStatus, Result};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -10,6 +12,14 @@ pub trait SecretStore: Send + Sync {
     fn read(&self, target: &str) -> Result<Option<String>>;
     /// Deleting a missing credential is not an error.
     fn delete(&self, target: &str) -> Result<()>;
+    /// Cheap, non-blocking view of whether the backing store works (may be a cached result).
+    fn status(&self) -> CredentialStoreStatus {
+        CredentialStoreStatus { name: "credential store".into(), available: true, message: None }
+    }
+    /// Blocking, fresh check run before anything is stored. `Err` names the missing prerequisite.
+    fn verify(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub fn sha256_hex(text: &str) -> String {
@@ -53,13 +63,13 @@ pub fn random_sonar_password() -> String {
     format!("Omp-{}-{}-Aa1!", group(), group())
 }
 
-#[cfg(any(test, not(windows)))]
+#[cfg(test)]
 #[derive(Default)]
 pub struct MemorySecrets {
     values: parking_lot::Mutex<std::collections::HashMap<String, String>>,
 }
 
-#[cfg(any(test, not(windows)))]
+#[cfg(test)]
 impl SecretStore for MemorySecrets {
     fn write(&self, target: &str, secret: &str) -> Result<()> {
         self.values.lock().insert(target.to_string(), secret.to_string());
@@ -93,6 +103,9 @@ mod windows_store {
     }
 
     impl SecretStore for WindowsSecrets {
+        fn status(&self) -> super::CredentialStoreStatus {
+            super::CredentialStoreStatus { name: "Windows Credential Manager".into(), available: true, message: None }
+        }
         fn write(&self, target: &str, secret: &str) -> Result<()> {
             let mut name = wide(target);
             let mut user = wide("omp-manager");
