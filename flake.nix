@@ -25,10 +25,10 @@
             packages = [
               pkgs.rustc pkgs.cargo pkgs.clippy pkgs.rustfmt pkgs.pkg-config pkgs.cmake
               pkgs.nodejs_24 pkgs.bun pkgs.git sourceIndexPython
-            ] ++ lib.optionals stdenv.isLinux (linuxLibs ++ [ pkgs.patchelf pkgs.xdg-utils ]);
+            ] ++ lib.optionals stdenv.hostPlatform.isLinux (linuxLibs ++ [ pkgs.patchelf pkgs.xdg-utils ]);
 
             OMP_SYSTEM_OVERVIEW_PYTHON = "${sourceIndexPython}/bin/python3";
-          } // lib.optionalAttrs stdenv.isLinux {
+          } // lib.optionalAttrs stdenv.hostPlatform.isLinux {
             LD_LIBRARY_PATH = lib.makeLibraryPath linuxLibs;
             GIO_MODULE_DIR = "${pkgs.glib-networking}/lib/gio/modules";
             XDG_DATA_DIRS = lib.concatStringsSep ":" [
