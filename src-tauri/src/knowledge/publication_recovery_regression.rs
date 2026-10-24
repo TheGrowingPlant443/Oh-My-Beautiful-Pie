@@ -146,17 +146,18 @@ fn needs_recovery_reads_only_and_skips_in_flight_ids() {
     assert!(needs_recovery(&f.journal).unwrap());
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 #[test]
-fn non_windows_refuses_pending_records_but_accepts_an_empty_journal() {
+fn unsupported_platform_refuses_pending_records_but_accepts_an_empty_journal() {
     let f = fixture(&[]);
     let error = recover_publications(&f.journal).unwrap_err();
-    assert!(error.contains("requires Windows"), "{error}");
+    assert!(error.contains("this platform lacks"), "{error}");
     finish(&f.journal, &f.record.id).unwrap();
     recover_publications(&f.journal).unwrap();
 }
 
-#[cfg(windows)]
+// The on-disk recovery table is identical on Windows, Linux and macOS (only the way objects are held differs).
+#[cfg(any(windows, unix))]
 mod windows {
     use super::*;
 

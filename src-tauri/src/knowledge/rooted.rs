@@ -1,10 +1,17 @@
 //! Opened-handle containment and directory pins. On Windows every ancestor is held without write/delete sharing
 //! from the volume root through the destination. A directory cannot be replaced, renamed or converted to a reparse
 //! point during traversal/publication. Final files are validated by their handles, never by re-resolving a pathname.
-use super::fsio::{self, err, handle_identity, same_path};
+use super::fsio::handle_identity;
+#[cfg(windows)]
+use super::fsio::{self, err, same_path};
 use super::Result;
+#[cfg(windows)]
 use crate::code_quality::snapshot::is_link;
+#[cfg(windows)]
 use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(windows)]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -54,17 +61,6 @@ pub(crate) fn handle_path(file: &File) -> Result<PathBuf> {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn handle_path(file: &File) -> Result<PathBuf> {
-    use std::os::fd::AsRawFd;
-    fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|e| err("Cannot resolve opened handle", e))
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-pub(crate) fn handle_path(_file: &File) -> Result<PathBuf> {
-    Err("Opened-handle containment is unavailable on this platform".into())
-}
-
 /// Pins an absolute directory and all ancestors; checks both the handle metadata and its kernel-resolved path.
 /// The caller keeps this guard alive until its path-based operation has finished.
 pub(crate) fn pin_directory(path: &Path) -> Result<DirectoryPins> {
@@ -74,6 +70,7 @@ pub(crate) fn pin_directory(path: &Path) -> Result<DirectoryPins> {
 /// `writable_leaf` additionally shares FILE_SHARE_WRITE on the deepest directory only. Windows opens the rename target
 /// directory for write when publishing; every ancestor still denies write/delete sharing, so the directory itself can
 /// not be renamed, deleted or replaced, and it is never empty at that point (the staged note lives in it).
+#[cfg(windows)]
 pub(crate) fn pin_directory_leaf(path: &Path, writable_leaf: bool) -> Result<DirectoryPins> {
     if !path.is_absolute() { return Err("A rooted operation requires an absolute directory".into()); }
     let mut files = Vec::new();
@@ -88,11 +85,6 @@ pub(crate) fn pin_directory_leaf(path: &Path, writable_leaf: bool) -> Result<Dir
             let leaf = writable_leaf && ancestor == path;
             options.share_mode(if leaf { 1 | 2 } else { 1 }).custom_flags(0x0200_0000 | 0x0020_0000);
         }
-        #[cfg(target_os = "linux")] {
-            use std::os::unix::fs::OpenOptionsExt;
-            // O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC; handle location is checked before descendants are opened.
-            options.custom_flags(0x20000 | 0x10000 | 0x80000);
-        }
         let file = options.open(ancestor).map_err(|e| err("Cannot pin directory safely", e))?;
         let meta = file.metadata().map_err(|e| err("Cannot inspect pinned directory", e))?;
         if !meta.is_dir() || is_link(&meta) { return Err("Refusing linked/reparse-point directory".into()); }
@@ -103,6 +95,7 @@ pub(crate) fn pin_directory_leaf(path: &Path, writable_leaf: bool) -> Result<Dir
 }
 
 /// Pins a root and descendants (creating missing directories without adopting existing links).
+#[cfg(windows)]
 pub(crate) fn pin_descendants(root: &Path, components: &[String], create: bool, writable_leaf: bool) -> Result<DirectoryPins> {
     let mut pins = pin_directory_leaf(root, writable_leaf && components.is_empty())?;
     for (i, component) in components.iter().enumerate() {
@@ -123,6 +116,7 @@ pub(crate) fn pin_descendants(root: &Path, components: &[String], create: bool, 
 }
 
 /// Opens a single-linked regular file while the complete directory chain is pinned.
+#[cfg(windows)]
 pub(crate) fn open_file(root: &Path, components: &[String]) -> Result<(File, PathBuf)> {
     let (name, parents) = components.split_last().ok_or("A file path is required")?;
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', ':', '\0']) { return Err("Unsafe file component".into()); }
@@ -134,15 +128,12 @@ pub(crate) fn open_file(root: &Path, components: &[String]) -> Result<(File, Pat
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(0x0020_0000);
     }
-    #[cfg(target_os = "linux")] {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(0x20000 | 0x80000);
-    }
     let file = options.open(&path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { format!("Not found: {}", components.join("/")) } else { err("Cannot safely open file", e) })?;
     validate_file(&file, &path)?;
     Ok((file, path))
 }
 
+#[cfg(windows)]
 fn validate_file(file: &File, path: &Path) -> Result<()> {
     let meta = file.metadata().map_err(|e| err("Cannot inspect opened file", e))?;
     if !meta.is_file() || is_link(&meta) { return Err("Not a plain regular file".into()); }
@@ -206,17 +197,31 @@ pub(crate) fn rename_handle(file: &File, parent: &DirectoryPins, name: &str, rep
     Ok(())
 }
 
+/// Moves the locked original to its reservation name. Windows: the locked handle cannot change, so this is the
+/// create-only handle rename.
+#[cfg(windows)]
+pub(crate) fn reserve_handle(file: &File, parent: &DirectoryPins, name: &str) -> Result<()> {
+    rename_handle(file, parent, name, false)
+}
+
+/// What the locked destination is called in the shared publication code.
+#[cfg(windows)]
+pub(crate) type Handle = File;
+
 /// Checked removal by the locked destination handle, never by a re-resolved path. The name stays locked (no other
 /// process can rename, delete or write it) from the hash check until this handle's own deletion completes.
 pub(crate) fn remove_checked(parent: &DirectoryPins, name: &str, expected_hash: &str) -> Result<()> {
-    #[cfg(not(windows))] {
+    #[cfg(not(any(windows, unix)))] {
         let _ = (parent, name, expected_hash);
-        return Err("Conflict-safe Markdown deletion requires Windows handle support on this platform".into());
+        return Err("Conflict-safe Markdown deletion requires handle support that this platform lacks".into());
     }
     #[cfg(windows)] {
         let mut locked = lock_destination(&parent.path.join(name))?;
         if hash_handle(&mut locked)? != expected_hash { return Err("The note changed since it was reviewed; deletion refused".into()); }
         delete_handle(&locked)
+    }
+    #[cfg(unix)] {
+        unix_impl::remove_checked(parent, name, expected_hash)
     }
 }
 
@@ -278,3 +283,11 @@ pub(crate) fn stage(parent: &DirectoryPins, text: &[u8], name: &str) -> Result<S
 fn shown_path(path: &Path) -> String {
     path.to_string_lossy().chars().filter(|c| !c.is_control()).take(200).collect()
 }
+
+#[cfg(unix)]
+#[path = "rooted_unix.rs"]
+mod unix_impl;
+#[cfg(unix)]
+pub(crate) use unix_impl::{
+    delete_handle, hash_handle, lock_destination, open_file, pin_descendants, pin_directory_leaf, rename_handle, reserve_handle, stage, Handle, Staged,
+};

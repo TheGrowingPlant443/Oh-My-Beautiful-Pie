@@ -1,4 +1,4 @@
-//! Private, durable journal for the Windows "reserve, then publish" note replacement.
+//! Private, durable journal for the "reserve, then publish" note replacement (Windows, Linux and macOS).
 //!
 //! The vault never contains journal state: records and the immutable original-bytes backup live in an explicit,
 //! app-private `journal_dir` (`<id>.json`, `<id>.base.md`). A record is written (and fsynced) *before* the locked
@@ -260,11 +260,11 @@ pub(crate) fn conflicted(journal_dir: &Path) -> Result<Vec<PublicationJournal>> 
 /// returned error. Unusable records are renamed to `<id>.rejected` (evidence kept) and reported once.
 pub(crate) fn recover_publications(journal_dir: &Path) -> Result<()> {
     let _serialized = RECOVERY.lock();
-    #[cfg(not(windows))] {
-        if needs_recovery(journal_dir)? { return Err("Publication journal recovery requires Windows handle-sharing/rename support on this platform".into()); }
+    #[cfg(not(any(windows, unix)))] {
+        if needs_recovery(journal_dir)? { return Err("Publication journal recovery requires handle-based rename support that this platform lacks".into()); }
         return Ok(());
     }
-    #[cfg(windows)] {
+    #[cfg(any(windows, unix))] {
         let mut problems = Vec::new();
         for id in record_ids(journal_dir)? {
             if in_flight(&id) { continue; }
@@ -284,7 +284,7 @@ pub(crate) fn recover_publications(journal_dir: &Path) -> Result<()> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn quarantine(journal_dir: &Path, id: &str) -> String {
     let from = record_path(journal_dir, id);
     let mut to = journal_dir.join(format!("{id}.rejected"));
@@ -295,15 +295,15 @@ fn quarantine(journal_dir: &Path, id: &str) -> String {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 enum Object {
     Absent,
     /// Present but not a plain regular file (directory, link): never opened, never touched.
     Foreign,
-    File { file: std::fs::File, hash: String },
+    File { file: super::rooted::Handle, hash: String },
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 impl Object {
     fn hash(&self) -> Option<&str> {
         match self { Object::File { hash, .. } => Some(hash), _ => None }
@@ -318,7 +318,7 @@ impl Object {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn probe(pins: &super::rooted::DirectoryPins, name: &str) -> Result<Object> {
     use crate::code_quality::snapshot::is_link;
     let path = pins.path().join(name);
@@ -339,7 +339,7 @@ fn probe(pins: &super::rooted::DirectoryPins, name: &str) -> Result<Object> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn recover_record(journal_dir: &Path, record: &PublicationJournal) -> Result<()> {
     use super::rooted;
     // Pin the whole chain once (the deepest folder shares write so the OS may open it for the rename). A second,
