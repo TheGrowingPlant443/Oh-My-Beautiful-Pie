@@ -53,7 +53,7 @@ struct SystemEnvironment {
 
 impl Environment for SystemEnvironment {
     fn supported(&self) -> bool {
-        cfg!(windows)
+        cfg!(any(windows, target_os = "linux"))
     }
 
     fn instance(&self, instance_id: &str) -> Option<InstanceContext> {
@@ -67,7 +67,7 @@ impl Environment for SystemEnvironment {
     fn roots(&self) -> Vec<ManagedRoot> {
         #[allow(unused_mut)]
         let mut roots = self.registry.process_roots();
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         {
             if let Some(browser) = self.registry.browser_supervisor() {
                 roots.extend(browser.owned_roots().into_iter().map(|root| ManagedRoot {

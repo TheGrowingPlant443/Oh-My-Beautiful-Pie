@@ -8,7 +8,8 @@ pub const MAX_PAGE: usize = 250;
 pub const MAX_PAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_SEARCH_CHARS: usize = 256;
 
-/// PID plus creation time (FILETIME ticks of 100 ns). A PID alone never identifies a process.
+/// PID plus creation time (FILETIME ticks of 100 ns; on Linux the process start time in the same unit, counted from
+/// boot). A PID alone never identifies a process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -100,7 +101,7 @@ pub struct Owner {
 pub struct ProcessRow {
     pub key: String,
     pub pid: u32,
-    /// FILETIME ticks as a decimal string: the value exceeds a JavaScript safe integer.
+    /// Creation ticks (see `ProcessIdentity`) as a decimal string: the value exceeds a JavaScript safe integer.
     pub creation_time_100ns: Option<String>,
     pub parent_pid: Option<u32>,
     pub name: String,
