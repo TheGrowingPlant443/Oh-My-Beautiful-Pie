@@ -41,6 +41,19 @@ export function windowsChromiumCandidates(env = process.env) {
     join(programFilesX86, 'Microsoft\\Edge\\Application\\msedge.exe'),
   ];
 }
+
+export function unixChromiumCandidates(env = process.env, platform = process.platform) {
+  const home = env.HOME ?? '';
+  const dirs = [...(env.PATH ?? '').split(':'), ...(home ? [path.join(home, '.nix-profile/bin'), path.join(home, '.local/bin')] : []), '/usr/bin', '/usr/local/bin', '/opt/homebrew/bin'];
+  const names = ['google-chrome-stable', 'google-chrome', 'chromium', 'chromium-browser', 'chrome', 'brave-browser'];
+  return [
+    ...dirs.filter(dir => path.posix.isAbsolute(dir)).flatMap(dir => names.map(name => path.posix.join(dir, name))),
+    '/opt/google/chrome/chrome',
+    ...(platform === 'darwin' ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium', '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+      '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'] : []),
+  ];
+}
 const isFile = async file => (await stat(file).catch(() => null))?.isFile() === true;
 
 /**
@@ -48,15 +61,16 @@ const isFile = async file => (await stat(file).catch(() => null))?.isFile() === 
  * candidates, then an already existing Puppeteer cache executable. It never installs, downloads or runs a browser.
  */
 export async function resolveInstalledChromium({ env = process.env, platform = process.platform, exists = isFile, cached = async () => null } = {}) {
-  if (platform !== 'win32') throw new BrowserError('unsupported_platform', 'Owned terminal browsers are supported on Windows only');
+  if (!['win32', 'linux', 'darwin'].includes(platform)) throw new BrowserError('unsupported_platform', 'Owned terminal browsers require Windows, Linux or macOS');
   const explicit = env.PUPPETEER_EXECUTABLE_PATH;
   if (explicit) {
-    if (!path.win32.isAbsolute(explicit) || !await exists(explicit)) {
+    if (!(platform === 'win32' ? path.win32 : path.posix).isAbsolute(explicit) || !await exists(explicit)) {
       throw new BrowserError('browser_executable_missing', 'PUPPETEER_EXECUTABLE_PATH must be the absolute path of an installed Chrome, Chromium or Edge executable');
     }
     return explicit;
   }
-  for (const candidate of windowsChromiumCandidates(env)) if (await exists(candidate)) return candidate;
+  const candidates = platform === 'win32' ? windowsChromiumCandidates(env) : unixChromiumCandidates(env, platform);
+  for (const candidate of candidates) if (await exists(candidate)) return candidate;
   const cache = await cached();
   if (cache && await exists(cache)) return cache;
   throw new BrowserError('browser_executable_missing', 'No installed Chrome, Chromium or Edge was found. Install one (nothing is downloaded automatically) or set PUPPETEER_EXECUTABLE_PATH to its absolute path.');
@@ -145,7 +159,7 @@ export class BrowserService {
     return owner;
   }
   // A human "Browser" request docks one session's browser without touching the global Embedded preference.
-  embedded(owner) { return owner.forceVisible || this.settings.embedded; }
+  embedded(owner) { return process.platform === 'win32' && (owner.forceVisible || this.settings.embedded); }
   row(owner) {
     return { instanceId: owner.id, generation: owner.generation, epoch: owner.epoch, state: owner.state,
       headless: owner.headless, embedded: this.embedded(owner), pid: owner.native?.pid ?? null, error: owner.error ?? null };

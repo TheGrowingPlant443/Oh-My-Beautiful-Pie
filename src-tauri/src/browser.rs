@@ -29,7 +29,7 @@ impl Default for BrowserSettings {
     fn default() -> Self {
         Self {
             headless: false,
-            embedded: true,
+            embedded: cfg!(windows),
         }
     }
 }
@@ -98,7 +98,7 @@ pub struct BrowserSupervisor {
     helper: Mutex<Option<Arc<Helper>>>,
     /// One turn per instance for owner transitions (register / revoke); never held across a browser action.
     transitions: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     natives: native::Natives,
     dirty: AtomicBool,
 }
@@ -137,7 +137,10 @@ pub(crate) fn profile_layout(root: &Path, instance_id: &str) -> (PathBuf, PathBu
 }
 
 fn normalized_path_text(text: &str) -> String {
-    text.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+    #[cfg(windows)]
+    { text.replace('/', "\\").trim_end_matches('\\').to_lowercase() }
+    #[cfg(unix)]
+    { text.trim_end_matches('/').to_string() }
 }
 pub(crate) fn same_path_text(a: &str, b: &str) -> bool {
     normalized_path_text(a) == normalized_path_text(b)
@@ -300,12 +303,25 @@ pub(crate) fn executable_allowed(
     if let Some(local) = local {
         allowed.extend([local.join("Google\\Chrome\\Application\\chrome.exe"), local.join("Chromium\\Application\\chrome.exe")]);
     }
+    #[cfg(unix)]
+    {
+        for name in ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome", "brave-browser"] {
+            if let Some(path) = crate::toolchain::find_program(name) { allowed.push(path); }
+        }
+        for path in ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/opt/google/chrome/chrome"] {
+            allowed.push(path.into());
+        }
+    }
     if allowed.iter().any(|candidate| fs::canonicalize(candidate).is_ok_and(|candidate| candidate == canonical)) {
         return Ok(());
     }
     let cached = fs::canonicalize(root.join("terminal-browsers").join("runtime")).is_ok_and(|runtime| canonical.starts_with(runtime));
     let name = canonical.file_name().map(|name| name.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    if cached && matches!(name.as_str(), "chrome.exe" | "chromium.exe" | "msedge.exe") {
+    if cached && matches!(name.as_str(), "chrome.exe" | "chromium.exe" | "msedge.exe" | "chrome" | "chromium") {
         return Ok(());
     }
     Err(refused("browser executable is not an installed Chrome/Chromium/Edge or an existing Puppeteer cache"))
@@ -332,21 +348,25 @@ fn native_generation(payload: &Value) -> std::result::Result<u64, NativeError> {
 // Native browser ownership: per-profile OS lease + contained Chrome process tree.
 // ---------------------------------------------------------------------------------------------------------------------
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 mod native {
     use super::*;
     use crate::process_tree::{ContainedChild, ContainedSpec, StdioMode};
     use parking_lot::Mutex;
     use std::collections::VecDeque;
     use std::ffi::OsString;
+    #[cfg(windows)]
     use std::os::windows::fs::OpenOptionsExt;
     use std::sync::atomic::AtomicBool;
     use std::sync::OnceLock;
+    #[cfg(windows)]
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
     pub(super) const ENDPOINT_DEADLINE: Duration = Duration::from_secs(20);
     const TOMBSTONES: usize = 512;
+    #[cfg(windows)]
     const ERROR_SHARING_VIOLATION: i32 = 32;
+    #[cfg(windows)]
     const ERROR_LOCK_VIOLATION: i32 = 33;
 
     type NativeResult<T> = std::result::Result<T, NativeError>;
@@ -363,6 +383,16 @@ mod native {
     pub(super) struct Lease {
         _file: fs::File,
     }
+    #[cfg(unix)]
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            use std::os::fd::AsRawFd;
+            // A concurrent fork can briefly inherit the open-file description before exec closes it.
+            // Explicit unlock releases our lease now, not when that unrelated child eventually execs.
+            unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN); }
+        }
+    }
+    #[cfg(windows)]
     pub(super) fn acquire_lease(path: &Path) -> NativeResult<Lease> {
         let opened = fs::OpenOptions::new()
             .read(true)
@@ -384,6 +414,24 @@ mod native {
             }
             Err(error) => Err(NativeError::new("browser_lease_failed", format!("profile lease: {error}"))),
         }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn acquire_lease(path: &Path) -> NativeResult<Lease> {
+        use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
+        use std::os::fd::AsRawFd;
+        let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)
+            .map_err(|e| NativeError::new("browser_lease_failed", e.to_string()))?;
+        let meta = file.metadata().map_err(|e| NativeError::new("browser_lease_failed", e.to_string()))?;
+        if !meta.is_file() || meta.nlink() != 1 {
+            return Err(NativeError::new("browser_lease_failed", "Profile lock must be a single-linked regular file"));
+        }
+        // SAFETY: file is an owned descriptor. flock is released when the last descriptor closes.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(busy("another process owns this terminal's browser profile"));
+        }
+        Ok(Lease { _file: file })
     }
 
     pub(super) struct SlotInner {
@@ -657,7 +705,7 @@ mod native {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 mod native {
     use super::*;
     #[derive(Default)]
@@ -748,7 +796,7 @@ impl BrowserSupervisor {
             }),
             helper: Mutex::new(None),
             transitions: Mutex::new(HashMap::new()),
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             natives: native::Natives::default(),
             dirty: AtomicBool::new(true),
         })
@@ -772,6 +820,8 @@ impl BrowserSupervisor {
         Ok(())
     }
     pub fn configure(&self, settings: BrowserSettings) -> Result<()> {
+        #[cfg(unix)]
+        let settings = BrowserSettings { embedded: false, ..settings };
         let helper = self.helper.lock().clone();
         if let Some(helper) = helper {
             helper.request(
@@ -810,11 +860,11 @@ impl BrowserSupervisor {
     /// Live Chrome roots this supervisor owns, each verified against its recorded creation time. Takes short locks
     /// only and never talks to the helper, so a monitor can call it on every snapshot.
     pub fn owned_roots(&self) -> Vec<BrowserRoot> {
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         {
             self.natives.roots()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, unix)))]
         {
             Vec::new()
         }
@@ -883,7 +933,7 @@ impl BrowserSupervisor {
         }
         helper.launches.lock().clear();
         helper.stop_process()?;
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         self.natives.retire_session(&helper.session).map_err(|e| e.to_string())?;
         *retired = true;
         Ok(())
@@ -906,7 +956,7 @@ impl BrowserSupervisor {
         }
         let sdk = crate::config::sdk_dir(&self.home)?;
         let session = uuid::Uuid::new_v4().simple().to_string();
-        let mut cmd = Command::new(std::env::var_os("BUN_BIN").unwrap_or_else(|| "bun".into()));
+        let mut cmd = Command::new(crate::toolchain::bun_program());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -1110,12 +1160,12 @@ impl BrowserSupervisor {
     }
     /// Private helper→native actions: `browser_spawn`, `browser_ready`, `browser_retire`.
     fn native_action(self: &Arc<Self>, helper: &Arc<Helper>, action: &str, payload: &Value) -> std::result::Result<Value, NativeError> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, unix)))]
         {
             let _ = (helper, action, payload);
             Err(NativeError::new("unsupported_platform", "Owned browsers require Windows"))
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         {
             let result = match action {
                 "browser_spawn" => self.browser_spawn(helper, payload),
@@ -1129,7 +1179,7 @@ impl BrowserSupervisor {
             result
         }
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn browser_spawn(self: &Arc<Self>, helper: &Arc<Helper>, p: &Value) -> std::result::Result<Value, NativeError> {
         let operation = native_identifier(p, "operationId")?;
         let source = native_text(p, "sourceRequestId", 128)?;
@@ -1164,7 +1214,7 @@ impl BrowserSupervisor {
             native::SpawnRequest { root: &self.root, instance_id: instance, executable, args, log: &log },
         )
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn browser_ready(self: &Arc<Self>, helper: &Arc<Helper>, p: &Value) -> std::result::Result<Value, NativeError> {
         let (operation, lease) = (native_identifier(p, "operationId")?, native_text(p, "leaseId", 128)?);
         let (instance, generation) = (native_text(p, "instanceId", 1024)?, native_generation(p)?);
@@ -1183,7 +1233,7 @@ impl BrowserSupervisor {
         }
         Ok(json!({"ready": true}))
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn browser_retire(self: &Arc<Self>, helper: &Arc<Helper>, p: &Value) -> std::result::Result<Value, NativeError> {
         let operation = native_identifier(p, "operationId")?;
         let instance = native_text(p, "instanceId", 1024)?;
@@ -1328,7 +1378,7 @@ impl BrowserSupervisor {
                 }
             }
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         self.natives.retire_instance(id, Some(generation)).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -1354,7 +1404,7 @@ impl BrowserSupervisor {
                 self.native_log(&format!("shutdown helper retirement blocked: {error}"));
             }
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         if let Err(error) = self.natives.retire_all() {
             self.native_log(&format!("shutdown browser retirement blocked: {error}"));
         }
@@ -1414,7 +1464,7 @@ mod tests {
         assert_eq!(profile, instance.join("profile"));
         assert_ne!(profile_layout(Path::new(r"C:\cfg"), "terminal-b").2, profile);
         assert_ne!(profile_layout(Path::new(r"C:\cfg"), "../terminal-a").2, profile);
-        assert!(same_path_text(&profile.to_string_lossy().replace('\\', "/"), &profile.to_string_lossy().to_uppercase()));
+        assert_eq!(same_path_text(&profile.to_string_lossy().replace('\\', "/"), &profile.to_string_lossy().to_uppercase()), cfg!(windows));
         assert!(!same_path_text(r"C:\cfg\terminal-browsers\x\profile", &profile.to_string_lossy()));
     }
 
@@ -1475,8 +1525,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(windows)]
-    mod windows {
+    #[cfg(any(windows, unix))]
+    mod native_tests {
         use super::*;
         use crate::process_tree::{process_creation_time, ContainedChild, ContainedSpec, StdioMode};
         use std::ffi::OsString;
@@ -1500,12 +1550,50 @@ mod tests {
             let _ = fs::remove_dir_all(root);
         }
 
+        #[cfg(unix)]
+        #[test]
+        fn releasing_a_profile_lease_does_not_wait_for_an_unrelated_fork_to_exec() {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::net::UnixStream;
+            let root = scratch();
+            let path = root.join("owner.lock");
+            let lease = native::acquire_lease(&path).unwrap();
+            let (reader, writer) = UnixStream::pair().unwrap();
+            // SAFETY: the forked child calls only async-signal-safe syscalls, never Rust allocation or locks.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                unsafe {
+                    libc::close(writer.as_raw_fd());
+                    let mut byte = 0u8;
+                    libc::read(reader.as_raw_fd(), (&mut byte as *mut u8).cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            assert!(pid > 0);
+            drop(reader);
+            drop(lease);
+            let replacement = native::acquire_lease(&path);
+            drop(writer);
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0); }
+            assert!(replacement.is_ok(), "the unrelated child must not extend the retired profile lease");
+            drop(replacement);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        fn shell_command(seconds: u32) -> (PathBuf, Vec<OsString>) {
+            #[cfg(windows)]
+            return (PathBuf::from(std::env::var_os("COMSPEC").unwrap()), vec!["/s".into(), "/c".into(), format!("ping -n {seconds} 127.0.0.1 >nul").into()]);
+            #[cfg(unix)]
+            (PathBuf::from("/bin/sh"), vec!["-c".into(), format!("sleep {seconds}").into()])
+        }
+
         fn scratch_child() -> Arc<ContainedChild> {
+            let (program, args) = shell_command(60);
             Arc::new(
                 ContainedChild::spawn(ContainedSpec {
                     subject: "browser slot probe".into(),
-                    program: PathBuf::from(std::env::var_os("COMSPEC").unwrap()),
-                    args: ["/s", "/c", "ping -n 60 127.0.0.1 >nul"].map(OsString::from).to_vec(),
+                    program,
+                    args,
                     cwd: None,
                     env_set: vec![],
                     env_remove: vec![],
@@ -1558,7 +1646,7 @@ mod tests {
                 return;
             }
             let root = scratch();
-            let home = std::env::var_os("USERPROFILE").map(PathBuf::from).expect("USERPROFILE");
+            let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).expect("home directory");
             let chrome = PathBuf::from(std::env::var_os("PUPPETEER_EXECUTABLE_PATH").expect("PUPPETEER_EXECUTABLE_PATH"));
             fs::create_dir_all(root.join("terminal-browsers")).unwrap();
             let supervisor = BrowserSupervisor::new(root.clone(), home.clone());
@@ -1577,10 +1665,11 @@ mod tests {
             };
 
             // Two terminals each own their own browser; the unrelated scratch process is never touched.
+            let (program, args) = shell_command(120);
             let bystander = ContainedChild::spawn(ContainedSpec {
                 subject: "bystander".into(),
-                program: PathBuf::from(std::env::var_os("COMSPEC").unwrap()),
-                args: ["/s", "/c", "ping -n 120 127.0.0.1 >nul"].map(OsString::from).to_vec(),
+                program,
+                args,
                 cwd: None,
                 env_set: vec![],
                 env_remove: vec![],
@@ -1670,7 +1759,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, unix)))]
 impl BrowserSupervisor {
     /// Kills only the helper process (no retirement), as a crash would; its EOF reader must retire the browsers.
     fn kill_helper_process_for_test(&self) {

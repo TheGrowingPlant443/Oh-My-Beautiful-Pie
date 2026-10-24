@@ -13,7 +13,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 mod explanation;
-mod native;
+pub(crate) mod native;
 mod snapshot;
 mod tables;
 #[cfg(test)]
@@ -53,7 +53,7 @@ struct SystemEnvironment {
 
 impl Environment for SystemEnvironment {
     fn supported(&self) -> bool {
-        cfg!(any(windows, target_os = "linux"))
+        cfg!(any(windows, target_os = "linux", target_os = "macos"))
     }
 
     fn instance(&self, instance_id: &str) -> Option<InstanceContext> {

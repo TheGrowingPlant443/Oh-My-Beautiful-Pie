@@ -27,7 +27,7 @@ fn standard_dirs() -> Vec<PathBuf> {
 }
 
 fn program(name: &str) -> Option<PathBuf> {
-    discover_program(name, &standard_dirs())
+    discover_program(name, &standard_dirs().iter().map(|dir| dir.join(name)).collect::<Vec<_>>())
 }
 
 pub(super) fn podman_program() -> Option<PathBuf> { program("podman") }
@@ -312,7 +312,7 @@ pub(crate) fn runtime_notes(runtime: &QualityRuntime, probe: &EngineProbe) -> Op
         });
     }
     if let Some(reason) = &probe.cpu_limits_unsupported {
-        notes.push(format!("CPU limits are not applied on {}: {reason}. Memory limits still apply.", runtime.label()));
+        notes.push(format!("CPU limits are not applied on {}: {reason}.", runtime.label()));
     }
     (!notes.is_empty()).then(|| notes.join("\n"))
 }
@@ -485,7 +485,7 @@ mod tests {
         assert_eq!(runtime_notes(&runtime, &healthy), None);
         let degraded = EngineProbe { cpu_limits_unsupported: Some("no cpu controller".into()), ..healthy.clone() };
         let note = runtime_notes(&runtime, &degraded).unwrap();
-        assert!(note.contains("CPU limits are not applied on Podman") && note.contains("Memory limits still apply"), "{note}");
+        assert!(note.contains("CPU limits are not applied on Podman"), "{note}");
         let low = EngineProbe { max_map_count: Some(65_530), ..healthy };
         let note = runtime_notes(&runtime, &low).unwrap();
         assert!(note.contains("65530") && (note.contains("polkit") || macos()), "{note}");

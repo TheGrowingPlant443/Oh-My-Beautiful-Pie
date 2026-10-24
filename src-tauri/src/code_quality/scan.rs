@@ -66,7 +66,7 @@ pub(crate) fn validate_project(project: &QualityProject, folder: &Path) -> Resul
     }
     if let Some(entry) = &project.entry_file {
         let path = Path::new(entry);
-        if entry.is_empty() || path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) || !clean(entry) {
+        if entry.is_empty() || path.is_absolute() || entry.split(['/', '\\']).any(|c| c == "..") || !clean(entry) {
             return Err("The entry file must be a relative path inside the project.".into());
         }
     }

@@ -10,6 +10,11 @@
   const uid = $props.id();
   const quality = $derived($service.state);
   const locked = $derived(qualityLocked($service));
+  const platform = $derived(quality?.platform ?? "windows");
+  const runtimeChoices = $derived(platform === "windows"
+    ? [{ kind: "podman", label: "Podman" }, { kind: "dockerDesktop", label: "Docker Desktop" }, { kind: "dockerWsl", label: "Docker in WSL" }]
+    : [{ kind: "podman", label: platform === "macos" ? "Podman machine" : "Podman (rootless)" },
+       { kind: platform === "macos" ? "dockerDesktop" : "dockerNative", label: platform === "macos" ? "Docker Desktop" : "Docker Engine" }]);
   let draft = $state<QualityConfig>(defaultQualityConfig());
   let analyzer = $state<"sonarqube" | "alternate">("sonarqube");
   let connection = $state<"community" | "enterprise">("community");
@@ -92,7 +97,7 @@
   <fieldset disabled={locked}>
     <legend>Container runtime</legend>
     <div class="quality-actions">
-      {#each [{ kind: "podman", label: "Podman" }, { kind: "dockerDesktop", label: "Docker Desktop" }, { kind: "dockerWsl", label: "Docker in WSL" }] as option}
+      {#each runtimeChoices as option}
         <label class="quality-check"><input type="radio" name={`quality-runtime-${uid}`} checked={draft.runtime.kind === option.kind} onchange={() => chooseRuntime(option.kind as QualityRuntime["kind"])} />{option.label}</label>
       {/each}
     </div>
@@ -100,13 +105,18 @@
       <label>WSL distro<select value={draft.runtime.distro} onchange={e => { draft.runtime = { kind: "dockerWsl", distro: e.currentTarget.value }; dirty = true; }}><option value="">Select a distro</option>{#each quality?.options.wslDistros ?? [] as distro}<option value={distro}>{distro}</option>{/each}</select></label>
       <small class="dim">Docker runs in the exact selected distro as root using its own Linux socket, not a Desktop integration shim.</small>
     {:else if draft.runtime.kind === "podman"}
-      <label>Podman connection<select value={draft.runtime.connection} onchange={e => { draft.runtime = { kind: "podman", connection: e.currentTarget.value }; dirty = true; }}><option value="">App machine · omp-manager-quality (WSL)</option>{#each quality?.options.podmanConnections ?? [] as item}<option value={item}>{item}</option>{/each}</select></label>
-      <small class="dim">App connection: {quality?.options.podmanAppConnection ?? "not provisioned — created by Install and setup"}. No ambient default connection is used.</small>
+      <label>Podman connection<select value={draft.runtime.connection} onchange={e => { draft.runtime = { kind: "podman", connection: e.currentTarget.value }; dirty = true; }}><option value="">{platform === "windows" ? "App machine · omp-manager-quality (WSL)" : "Local default connection"}</option>{#each quality?.options.podmanConnections ?? [] as item}<option value={item}>{item}</option>{/each}</select></label>
+      {#if platform === "windows"}
+        <small class="dim">App connection: {quality?.options.podmanAppConnection ?? "not provisioned — created by Install and setup"}. No ambient default connection is used.</small>
+      {:else}
+        <small class="dim">Uses the explicitly selected local engine. OMP Manager never installs it or creates a VM; on macOS start your Podman machine before scanning.</small>
+      {/if}
     {/if}
     <p class="warn">SonarQube history is separate per runtime. Switching retains existing named volumes and saved findings; it does not migrate or delete databases, stop shared engines or modify their global defaults.</p>
     {#each quality?.prerequisites ?? [] as prerequisite}
       <p><strong>{runtimeLabel(prerequisite.runtime)}</strong>: {prerequisite.ready ? "ready" : prerequisite.installed ? "installed, not ready" : "not installed"}{prerequisite.needsRestart ? " · restart required" : ""}<br />{prerequisite.message ?? ""}</p>
     {/each}
+      {#if quality?.credentialStore}<p class:err={!quality.credentialStore.available}>{quality.credentialStore.name}: {quality.credentialStore.message ?? "available"}</p>{/if}
   </fieldset>
   {#if dirty && quality && revision !== quality.revision}<p class="warn">Settings changed in another surface. Your draft is preserved; reload it before applying.</p><button disabled={locked} onclick={() => { if (quality) { draft = structuredClone(quality.config); revision = quality.revision; ({ analyzer, connection } = modeSelectors(quality.config.mode)); dirty = false; token = ""; tokenAction = "keep"; } }}>Reload committed settings</button>{/if}
   {#if mode === "alternate" && quality && !quality.rules.acknowledged}<p class="warn">Acknowledge the rules license under Advanced / manual setup before applying.</p>{/if}

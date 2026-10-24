@@ -1,6 +1,6 @@
 //! Versioned on-disk state under `<app-config>/code-quality/`. Nonsecret only.
 //! Corrupt or unknown-version files are reported, never silently reset (ownership records must survive).
-use super::secrets::sha256_hex;
+use super::secrets::{path_identity, sha256_hex};
 use super::types::*;
 use crate::dependency_security::{atomic_json, bounded_json};
 use serde::{Deserialize, Serialize};
@@ -153,7 +153,7 @@ impl Paths {
 }
 
 pub fn folder_hash(folder: &str) -> String {
-    sha256_hex(&folder.to_lowercase())[..32].to_string()
+    sha256_hex(&path_identity(folder))[..32].to_string()
 }
 
 pub fn valid_job_id(id: &str) -> bool {
@@ -352,6 +352,30 @@ mod tests {
         let (paths, dir) = temp_paths();
         assert!(load_scan(&paths, "..\\..\\x").is_err());
         assert_eq!(load_scan(&paths, &uuid::Uuid::new_v4().to_string()).unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_folders_differing_only_in_case_keep_separate_settings_and_consents() {
+        let (paths, dir) = temp_paths();
+        let (upper, lower) = ("/repo/A", "/repo/a");
+        let saved = |name: &str| ProjectFile { version: 1, project: None, recent: vec![name.into()] };
+        save_project(&paths, upper, &saved("upper")).unwrap();
+        assert!(load_project(&paths, lower).unwrap().recent.is_empty());
+        save_project(&paths, lower, &saved("lower")).unwrap();
+        assert_eq!(load_project(&paths, upper).unwrap().recent, ["upper"]);
+        assert_eq!(load_project(&paths, lower).unwrap().recent, ["lower"]);
+        assert_ne!(consent_key(upper, "recipe"), consent_key(lower, "recipe"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_folder_case_keeps_one_project_file() {
+        let (paths, dir) = temp_paths();
+        save_project(&paths, "C:/Repo", &ProjectFile { version: 1, project: None, recent: vec!["saved".into()] }).unwrap();
+        assert_eq!(load_project(&paths, "c:/repo").unwrap().recent, ["saved"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

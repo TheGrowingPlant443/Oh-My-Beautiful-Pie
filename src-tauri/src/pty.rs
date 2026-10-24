@@ -244,20 +244,19 @@ impl Pty {
         if self.poll()?.is_some() {
             return Ok(());
         }
-        self.kill_process_group();
+        let session = self.kill_process_group();
+        // Reap the root even when a session member (e.g. after sudo) could not be signalled.
         self.child.kill().map_err(|e| e.to_string())?;
         self.exit = Some(self.child.wait().map_err(|e| e.to_string())?.exit_code());
-        Ok(())
+        session
     }
-    /// The child is a session and process-group leader (portable-pty calls `setsid`), so one `killpg` ends everything it
-    /// started that stayed in the group, the Unix counterpart of the Windows job. Only called while the leader is still
-    /// unreaped, so its pid cannot have been recycled.
-    fn kill_process_group(&self) {
+    /// portable-pty creates a session. Shell job-control groups must also be retired before the leader is reaped.
+    fn kill_process_group(&self) -> Result<(), String> {
         #[cfg(unix)]
-        if let Some(pid) = self.child.process_id().and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|pid| *pid > 1) {
-            // SAFETY: plain signal delivery to a process group id this PTY created; failure (ESRCH) means it is already gone.
-            unsafe { libc::killpg(pid, libc::SIGKILL) };
+        if let Some(pid) = self.child.process_id() {
+            crate::process_tree::kill_session(pid)?;
         }
+        Ok(())
     }
     pub fn last_output(&self) -> u64 {
         self.shared.last_output.load(Ordering::Relaxed)
@@ -345,16 +344,16 @@ impl Pty {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        self.kill_process_group();
+        let session = self.kill_process_group();
         self.child.kill().map_err(|e| e.to_string())?;
         self.exit = Some(self.child.wait().map_err(|e| e.to_string())?.exit_code());
-        Ok(())
+        session
     }
 }
 impl Drop for Pty {
     fn drop(&mut self) {
         if self.exit.is_none() {
-            self.kill_process_group();
+            let _ = self.kill_process_group();
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
@@ -433,7 +432,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         let child: libc::pid_t = loop {
             let text = shell.screen().unwrap().text;
-            let found = text.lines().filter_map(|line| line.strip_prefix("CHILD_PID=")).find_map(|pid| pid.trim().parse().ok());
+            let found = text.lines().filter_map(|line| line.rsplit_once("CHILD_PID=").map(|(_, pid)| pid)).find_map(|pid| pid.trim().parse().ok());
             if let Some(pid) = found {
                 break pid;
             }
@@ -451,8 +450,16 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn is_zombie(pid: libc::pid_t) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z')))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_zombie(pid: libc::pid_t) -> bool {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+        read == size && unsafe { info.assume_init() }.pbi_status == 5
     }
 }

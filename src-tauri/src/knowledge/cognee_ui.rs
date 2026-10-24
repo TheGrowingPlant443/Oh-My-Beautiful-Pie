@@ -128,25 +128,32 @@ fn find_node(node_override: Option<&Path>) -> Result<Option<PathBuf>, Blocked> {
     Ok(None)
 }
 
+#[cfg(windows)]
 fn node_version(path: &Path) -> Option<(u32, u32, u32)> {
-    #[cfg(windows)]
-    {
-        super::integrations::executable_version(path).as_deref().and_then(parse_version)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        None
-    }
+    super::integrations::executable_version(path).as_deref().and_then(parse_version)
 }
 
 /// Inspects the installed frontend, its Node packages and Node.js. Reads metadata only; never runs, imports or writes.
 pub(crate) fn inspect_components(cognee_folder: &Path, home: &Path, node_override: Option<&Path>) -> Result<Components, Blocked> {
-    if !cfg!(all(windows, target_arch = "x86_64")) {
-        return Err(blocked(CogneeUiState::Unsupported, "OMP Manager can start the Cognee UI only on Windows (x64)."));
+    if !cfg!(any(all(windows, target_arch = "x86_64"), all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))) {
+        return Err(blocked(CogneeUiState::Unsupported, "This platform has no supported Next.js native binding."));
     }
     let venv = cognee_folder.join("venv");
+    #[cfg(windows)]
     let site = venv.join("Lib").join("site-packages");
+    #[cfg(unix)]
+    let site = {
+        let lib = venv.join("lib");
+        let mut sites = match fs::read_dir(&lib) {
+            Ok(entries) => entries.filter_map(|entry| entry.ok()).map(|entry| entry.path())
+                .filter(|path| path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("python")))
+                .map(|path| path.join("site-packages")).collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(unreadable(&lib, error)),
+        };
+        sites.sort();
+        sites.into_iter().find(|path| path.join("cognee").is_dir()).unwrap_or_else(|| lib.join("site-packages"))
+    };
     // The same candidates, in the same order, as Cognee's own frontend lookup: three development locations next to the
     // package, then the download cache. Looking is read-only; the cache folder is never created.
     let candidates = [
@@ -198,15 +205,20 @@ pub(crate) fn inspect_components(cognee_folder: &Path, home: &Path, node_overrid
         ));
     }
     let next_entry = modules.join("next").join("dist").join("bin").join("next");
-    let swc_package = modules.join("@next").join("swc-win32-x64-msvc");
-    let swc_binding = swc_package.join("next-swc.win32-x64-msvc.node");
+    let binding = if cfg!(windows) { "win32-x64-msvc" }
+        else if cfg!(all(target_os = "macos", target_arch = "aarch64")) { "darwin-arm64" }
+        else if cfg!(target_os = "macos") { "darwin-x64" }
+        else if cfg!(target_arch = "aarch64") { "linux-arm64-gnu" }
+        else { "linux-x64-gnu" };
+    let swc_package = modules.join("@next").join(format!("swc-{binding}"));
+    let swc_binding = swc_package.join(format!("next-swc.{binding}.node"));
     let mut missing = Vec::new();
     for (path, label) in [
         (&next_entry, "next/dist/bin/next"),
         (&modules.join("typescript").join("lib").join("typescript.js"), "typescript"),
         (&modules.join("@types").join("react").join("index.d.ts"), "@types/react"),
         (&modules.join("@types").join("node").join("index.d.ts"), "@types/node"),
-        (&swc_binding, "@next/swc-win32-x64-msvc (Windows x64 native binding)"),
+        (&swc_binding, "the platform-specific @next/swc native binding"),
     ] {
         if !is_file(path)? {
             missing.push(label);
@@ -226,6 +238,8 @@ pub(crate) fn inspect_components(cognee_folder: &Path, home: &Path, node_overrid
         None => return Err(blocked(CogneeUiState::MissingDependencies, "The installed Next.js native binding has no readable package.json.")),
     }
     let node = find_node(node_override)?.ok_or_else(|| blocked(CogneeUiState::MissingDependencies, "Node.js was not found on this computer's PATH; the Cognee web interface needs it. OMP Manager never installs it."))?;
+    #[cfg(windows)]
+    {
     let floor = node_floor(next_json);
     match node_version(&node) {
         Some(found) if found >= floor => {}
@@ -237,7 +251,8 @@ pub(crate) fn inspect_components(cognee_folder: &Path, home: &Path, node_overrid
         }
         None => return Err(blocked(CogneeUiState::Unreadable, format!("The version of Node.js at {} could not be read.", forward(&node)))),
     }
-    Ok(Components { frontend, node, next_entry, swc_binding, venv_python: venv.join("Scripts").join("python.exe") })
+    }
+    Ok(Components { frontend, node, next_entry, swc_binding, venv_python: if cfg!(windows) { venv.join("Scripts").join("python.exe") } else { venv.join("bin").join("python") } })
 }
 
 /// The passive capability shown on page entry: the same inspection as a click, nothing more.
@@ -389,6 +404,23 @@ fn result(state: CogneeOpenState, url: Option<String>, message: impl Into<String
     CogneeOpenResult { state, url, message: Some(message.into()) }
 }
 
+/// Unix has no Windows executable-version resource. Only an explicit Open executes Node; passive discovery remains read-only.
+#[cfg(unix)]
+fn verify_unix_node(components: &Components) -> Result<(), String> {
+    let next = read_json(&components.frontend.join("node_modules/next/package.json")).map_err(|e| e.message)?
+        .ok_or_else(|| "The installed Next.js package disappeared.".to_string())?;
+    let floor = node_floor(&next);
+    let mut command = std::process::Command::new(&components.node);
+    command.arg("--version");
+    let output = crate::code_diff::run_timed(command, None, Duration::from_secs(15), "Node.js version inspection timed out.")?;
+    let version = output.status.success().then(|| parse_version(&String::from_utf8_lossy(&output.stdout))).flatten()
+        .ok_or_else(|| "The installed Node.js version could not be read.".to_string())?;
+    if version < floor {
+        return Err(format!("Node.js {}.{}.{} is too old; this Next.js requires {}.{}.{}.", version.0, version.1, version.2, floor.0, floor.1, floor.2));
+    }
+    Ok(())
+}
+
 impl KnowledgeService {
     /// Explicit click: revalidates the installation and opens (starting this app's own frontend if needed) the Cognee UI
     /// for an already running local backend. Always an answer; see the module documentation for what is never done.
@@ -402,21 +434,27 @@ impl KnowledgeService {
         }
         let Some(folder) = capability.installation_folder else { return missing("The Cognee installation folder is unknown.".into()) };
         match inspect_components(Path::new(&folder), &self.home, self.env.cognee_node.as_deref()) {
-            Ok(components) => self.cognee_ui.open(&components),
+            Ok(components) => {
+                #[cfg(unix)]
+                if let Err(message) = verify_unix_node(&components) {
+                    return result(CogneeOpenState::MissingComponent, None, message);
+                }
+                self.cognee_ui.open(&components)
+            },
             Err(blocked) => result(if blocked.state == CogneeUiState::Unsupported { CogneeOpenState::Unsupported } else { CogneeOpenState::MissingComponent }, None, blocked.message),
         }
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 pub(crate) use live::CogneeUi;
 #[cfg(all(windows, test))]
 pub(crate) use live::{native, verify_backends, Hooks, Listener, Row};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 pub(crate) struct CogneeUi;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 impl CogneeUi {
     pub(crate) fn new() -> Self {
         Self
@@ -429,7 +467,7 @@ impl CogneeUi {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 mod live {
     use super::*;
     use crate::process_tree::{ContainedChild, ContainedSpec, StdioMode};
@@ -894,6 +932,9 @@ mod live {
         pub cmd: String,
     }
 
+    #[cfg(unix)]
+    fn query_processes() -> Result<Vec<Row>, String> { native::query_processes() }
+    #[cfg(windows)]
     /// One fixed, read-only query of Python/Node processes (id, creation time, path, command line), bounded to 15 seconds.
     fn query_processes() -> Result<Vec<Row>, String> {
         let shell = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| "C:/Windows".into()).join("System32/WindowsPowerShell/v1.0/powershell.exe");
@@ -932,6 +973,22 @@ mod live {
             .collect())
     }
 
+    /// Whether this process was started from the installed environment's interpreter. Windows compares the interpreter
+    /// path itself. A Unix venv (and a Nix environment) is a directory of links, so the process reports a sibling such as
+    /// `python3.13` in the same real `bin` directory: the comparison is on that directory, never on the shared base interpreter.
+    fn launched_from_venv(program: &str, exe: &str, venv_python: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            let _ = exe;
+            let bin = |path: &Path| path.parent().and_then(|dir| fs::canonicalize(dir).ok());
+            matches!((bin(Path::new(program)), bin(venv_python)), (Some(a), Some(b)) if a == b)
+        }
+        #[cfg(not(unix))]
+        {
+            fsio::same_path(Path::new(program), venv_python) || (!exe.is_empty() && fsio::same_path(Path::new(exe), venv_python))
+        }
+    }
+
     /// Backends among `rows` whose command line is exactly the installed Cognee uvicorn app and whose process, still
     /// the same (`creation` is read after the listener table), owns a numeric loopback listener on its port. WMI
     /// creation times have microsecond resolution, hence the tick comparison at that granularity.
@@ -940,7 +997,7 @@ mod live {
         for row in rows {
             let tokens = split_command_line(&row.cmd);
             let Some(program) = tokens.first() else { continue };
-            let installed = fsio::same_path(Path::new(program), venv_python) || (!row.exe.is_empty() && fsio::same_path(Path::new(&row.exe), venv_python));
+            let installed = launched_from_venv(program, &row.exe, venv_python);
             let Some(port) = installed.then(|| uvicorn_port(&tokens)).flatten() else { continue };
             for listener in listeners.iter().filter(|listener| listener.pid == row.pid && listener.port == port && listener.address.is_loopback()) {
                 if creation(row.pid).is_some_and(|created| created / 10 == row.created / 10) {
@@ -961,6 +1018,9 @@ mod live {
     }
 
 
+    #[cfg(unix)]
+    pub(crate) mod native { include!("cognee_ui_unix.rs"); }
+    #[cfg(windows)]
     pub(crate) mod native {
         use super::Listener;
         use std::collections::HashMap;

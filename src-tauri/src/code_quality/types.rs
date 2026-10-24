@@ -19,6 +19,7 @@ pub enum QualityRuntime {
     DockerDesktop,
     DockerWsl { distro: String },
     /// Docker Engine running natively on this (Linux) host. Never available on Windows or macOS.
+    #[cfg(unix)]
     DockerNative,
     Podman { connection: String },
 }
@@ -29,6 +30,7 @@ impl QualityRuntime {
         match self {
             QualityRuntime::DockerDesktop => "dockerDesktop".into(),
             QualityRuntime::DockerWsl { distro } => format!("dockerWsl:{distro}"),
+            #[cfg(unix)]
             QualityRuntime::DockerNative => "dockerNative".into(),
             QualityRuntime::Podman { connection } => format!("podman:{connection}"),
         }
@@ -37,6 +39,7 @@ impl QualityRuntime {
         match self {
             QualityRuntime::DockerDesktop => "Docker Desktop",
             QualityRuntime::DockerWsl { .. } => "Docker in WSL",
+            #[cfg(unix)]
             QualityRuntime::DockerNative => "Docker",
             QualityRuntime::Podman { .. } => "Podman",
         }

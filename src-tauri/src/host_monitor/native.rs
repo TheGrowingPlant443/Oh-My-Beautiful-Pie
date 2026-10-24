@@ -1,23 +1,27 @@
-//! Native collection. Windows: ToolHelp process enumeration, limited-query process times, and the IPv4/IPv6 TCP and
-//! UDP owner-PID tables. Linux: `/proc/<pid>/stat`, `/proc/net/{tcp,tcp6,udp,udp6}` and the socket inodes found under
-//! `/proc/<pid>/fd`. Read-only: no privileges are requested, nothing is opened for write or termination, no
-//! subprocess runs, and no DNS or network traffic is generated. Other platforms report `unsupported_platform`.
-#[cfg(not(any(windows, target_os = "linux")))]
+//! Native read-only collection. Windows uses ToolHelp and owner-PID socket tables; Linux reads `/proc`.
+//! macOS uses libproc process metadata and a bounded `/usr/sbin/lsof -nP` descriptor scan. No privileges are
+//! requested, no DNS/network traffic is generated, and inaccessible evidence is reported as partial/unavailable.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 use super::snapshot::RawCollection;
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 use super::types::ProcessIdentity;
 
 #[cfg(windows)]
 pub use imp::{capture_identity, collect};
 #[cfg(target_os = "linux")]
 pub use linux::{capture_identity, collect};
+#[cfg(any(target_os = "macos", test))]
+#[path = "native_macos.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::{capture_identity, collect};
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn capture_identity(_pid: u32) -> Option<ProcessIdentity> {
     None
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn collect(_cancel: &std::sync::atomic::AtomicBool) -> Result<RawCollection, String> {
     Err("unsupported_platform".into())
 }

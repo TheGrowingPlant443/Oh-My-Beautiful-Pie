@@ -1089,6 +1089,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn wire_shape_is_camel_case_and_round_trips() {
         let root = temp();

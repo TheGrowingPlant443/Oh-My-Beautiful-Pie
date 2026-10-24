@@ -28,13 +28,18 @@ pub fn sha256_hex(text: &str) -> String {
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Windows paths are case-insensitive; Unix paths are exact (`/repo/A` and `/repo/a` are different folders).
+pub fn path_identity(path: &str) -> String {
+    if cfg!(windows) { path.to_lowercase() } else { path.to_string() }
+}
+
 /// `OMPManager.CodeQuality/<SHA256(config-root)>/<SHA256(identity)>/<kind>`.
 /// `identity` distinguishes the server: the Community resource-set id, or the normalized
 /// Enterprise origin plus context path, so one server's token is never reused for another.
 pub fn target_name(config_root: &Path, identity: &str, kind: &str) -> String {
     format!(
         "OMPManager.CodeQuality/{}/{}/{}",
-        sha256_hex(&config_root.to_string_lossy().to_lowercase()),
+        sha256_hex(&path_identity(&config_root.to_string_lossy())),
         sha256_hex(identity),
         kind
     )
@@ -198,6 +203,20 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert!(a.starts_with("OMPManager.CodeQuality/") && a.ends_with("/token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_config_roots_differing_only_in_case_never_share_credential_names() {
+        let (upper, lower) = (Path::new("/cfg/A"), Path::new("/cfg/a"));
+        assert_ne!(target_name(upper, "community:set", "token"), target_name(lower, "community:set", "token"));
+        assert_eq!(target_name(upper, "community:set", "token"), target_name(Path::new("/cfg/A"), "community:set", "token"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_roots_keep_case_insensitive_credential_names() {
+        assert_eq!(target_name(Path::new("C:/Cfg"), "community:set", "token"), target_name(Path::new("c:/cfg"), "community:set", "token"));
     }
 
     #[test]

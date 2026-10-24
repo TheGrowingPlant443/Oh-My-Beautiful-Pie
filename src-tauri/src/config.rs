@@ -54,7 +54,7 @@ fn sdk_candidates(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     candidates.push(home.join(".bun/install/global/node_modules/@oh-my-pi/pi-coding-agent"));
     #[cfg(unix)]
     {
-        // The app's own user-owned SDK directory (README "Linux and macOS"): `bun add @oh-my-pi/pi-coding-agent@<omp version>` there.
+        // The app's user-owned Nix SDK directory; see the README "Linux and macOS" setup.
         for data in app_data_dirs(home, env) {
             candidates.push(data.join("omp-manager/sdk").join(SDK_PACKAGE));
         }
@@ -105,7 +105,7 @@ pub(crate) fn sdk_dir(home: &Path) -> Result<PathBuf> {
             ));
         }
     }
-    let hint = if cfg!(unix) { " On Linux/macOS install it with `bun add @oh-my-pi/pi-coding-agent@<omp version>` as described in the README section \"Linux and macOS\"." } else { "" };
+    let hint = if cfg!(unix) { " On Linux/macOS build the matching SDK with Nix as described in the README section \"Linux and macOS\", then set OMP_SDK_DIR to its @oh-my-pi/pi-coding-agent directory." } else { "" };
     Err(format!("Portable config requires Bun and the installed OMP SDK. Set BUN_BIN / OMP_SDK_DIR if they are not discoverable.{hint}"))
 }
 

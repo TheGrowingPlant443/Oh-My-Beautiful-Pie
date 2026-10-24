@@ -5,11 +5,15 @@ import path from 'node:path';
 // TEST HARNESS ONLY. Stands in for the Rust supervisor's private browser_spawn / browser_ready / browser_retire
 // actions so the Bun helper can be exercised with real Chrome outside the Tauri app. It mirrors the native contract
 // (one slot per instance, operation tombstones, helperSession scoping, loopback-only endpoint, contained retirement via
-// taskkill /T), but it is NOT the proof of native containment: src-tauri's browser::tests::native_owned_browser_lifecycle
-// is, with real Job Objects and per-profile OS leases.
+// taskkill /T on Windows and dedicated process groups on Unix), but it is NOT the proof of native retirement:
+// src-tauri's browser::tests::native_tests::native_owned_browser_lifecycle is, with real leases and owned children.
 const ENDPOINT = /DevTools listening on (ws:\/\/127\.0\.0\.1:[1-9]\d{0,4}\/devtools\/browser\/[0-9A-Za-z-]+)/;
 const fail = (code, message) => Object.assign(new Error(message.startsWith(code) ? message : `${code}: ${message}`), { code });
-const taskkill = pid => new Promise(resolve => execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve()));
+const retireProcessTree = pid => {
+  if (process.platform === 'win32') return new Promise(resolve => execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve()));
+  try { process.kill(-pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') return Promise.reject(error); }
+  return Promise.resolve();
+};
 const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 export class TestNativeHost {
@@ -53,13 +57,14 @@ export class TestNativeHost {
   async spawn(p) {
     if (this.tombstones.has(p.operationId)) throw fail('operation_cancelled', 'operation_cancelled');
     if (this.slots.has(p.instanceId)) throw fail('browser_profile_busy', 'a previous browser of this terminal has not finished closing');
-    if (path.win32.normalize(p.profilePath).toLowerCase() !== path.win32.normalize(this.profile(p.instanceId)).toLowerCase()) throw fail('browser_arguments_refused', 'profile path is not this terminal\'s profile');
+    const normalize = value => process.platform === 'win32' ? path.win32.normalize(value).toLowerCase() : path.resolve(value);
+    if (normalize(p.profilePath) !== normalize(this.profile(p.instanceId))) throw fail('browser_arguments_refused', 'profile path is not this terminal\'s profile');
     if (!Array.isArray(p.args) || p.args.some(arg => typeof arg !== 'string' || !arg.startsWith('--'))) throw fail('browser_arguments_refused', 'startup URLs and bare arguments are not permitted');
     for (const required of ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--no-startup-window']) if (!p.args.includes(required)) throw fail('browser_arguments_refused', `missing ${required}`);
     const slot = { instanceId: p.instanceId, generation: p.generation, operationId: p.operationId, session: p.helperSession, leaseId: crypto.randomUUID(), cancelled: false, ready: false, pid: 0, exited: false };
     this.slots.set(p.instanceId, slot);
     try {
-      const child = spawn(p.executable, p.args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false });
+      const child = spawn(p.executable, p.args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false, detached: process.platform !== 'win32' });
       slot.child = child; slot.pid = child.pid;
       slot.exit = new Promise(resolve => child.once('exit', () => { slot.exited = true; resolve(); }));
       let stderr = '';
@@ -90,7 +95,7 @@ export class TestNativeHost {
     slot.cancelled = true;
     if (slot.pid) {
       if (graceMs && !slot.exited) await Promise.race([slot.exit, new Promise(resolve => setTimeout(resolve, graceMs))]);
-      await taskkill(slot.pid);
+      await retireProcessTree(slot.pid);
       await slot.exit;
     }
     if (this.slots.get(slot.instanceId) === slot) this.slots.delete(slot.instanceId);

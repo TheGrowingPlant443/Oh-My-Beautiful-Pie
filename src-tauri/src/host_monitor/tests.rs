@@ -911,7 +911,7 @@ fn proc_net_rejects_foreign_headers_and_counts_unreadable_lines_without_guessing
     let good = "   0: 0100007F:22B8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 5 2\n";
     for bad in [
         "   1: 0100007F:22B8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0\n", // missing inode
-        "   1: 0100007F:22B8 00000000:0000 0A 0 0 0 0 0 0 abc\n",                                      // inode not a number
+        "   1: 0100007F:22B8 00000000:0000 0A 0 0 0 0 0 abc\n",                                        // inode not a number
         "   1: 0100007:22B8 00000000:0000 0A 0 0 0 0 0 0 1\n",                                         // 7-digit address
         "   1: 0100007F:22B 00000000:0000 0A 0 0 0 0 0 0 1\n",                                         // 3-digit port
         "   1: 0100007F:22B8 00000000:0000 0 0 0 0 0 0 0 1\n",                                         // 1-digit state

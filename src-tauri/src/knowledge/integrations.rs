@@ -302,9 +302,13 @@ pub(crate) fn cognee_version(folder: &Path) -> Result<Option<String>> {
             let Some(name) = name.to_str() else { continue };
             let Some(version) = name.strip_prefix("cognee-").and_then(|name| name.strip_suffix(".dist-info")) else { continue };
             if version.starts_with(|c: char| c.is_ascii_digit()) && version.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '!' | '_' | '-')) {
-                let kind = entry.file_type().map_err(|error| err("Cannot inspect Cognee package metadata entry", error))?;
-                if !kind.is_dir() {
-                    return Err("Cognee package metadata is not a plain folder".into());
+                #[cfg(windows)]
+                let directory = entry.file_type().map_err(|error| err("Cannot inspect Cognee package metadata entry", error))?.is_dir();
+                // Nix virtual environments link each installed dist-info directory to the immutable store.
+                #[cfg(unix)]
+                let directory = fs::metadata(entry.path()).map_err(|error| err("Cannot inspect Cognee package metadata entry", error))?.is_dir();
+                if !directory {
+                    return Err("Cognee package metadata is not a folder".into());
                 }
                 versions.insert(version.to_string());
             }

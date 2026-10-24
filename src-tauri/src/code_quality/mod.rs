@@ -4,6 +4,8 @@
 //! `alternate`/`reports` (MegaLinter + Opengrep + Semgrep CE path), `lifecycle` (configuration and
 //! Community server transitions), `scan` (scan jobs).
 pub mod alternate;
+#[cfg(unix)]
+pub(crate) mod cli;
 pub mod install;
 pub mod job;
 pub mod credentials;
