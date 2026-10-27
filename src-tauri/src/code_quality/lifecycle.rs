@@ -68,6 +68,8 @@ pub(crate) fn validate_config(config: &QualityConfig) -> Result<QualityConfig> {
             }
         }
         QualityRuntime::DockerDesktop => {}
+        #[cfg(unix)]
+        QualityRuntime::DockerNative => {}
     }
     if config.mode == QualityMode::SonarqubeEnterprise || !config.enterprise_url.trim().is_empty() {
         config.enterprise_url = sonar::normalize_enterprise_url(config.enterprise_url.trim())?;
@@ -842,7 +844,7 @@ impl CodeQualityService {
     }
 
     /// Fresh app-owned server only: change the default admin password to a random one and create a scan
-    /// token, both kept in Windows Credential Manager. Never fails the start; problems become log lines.
+    /// token, both kept in the operating system credential store. Never fails the start; problems become log lines.
     fn bootstrap_sonar_token(&self, gate: &Gate, runtime: &QualityRuntime, url: &str, set: &str) {
         let Some(token_target) = self.community_token_target(runtime) else { return };
         if matches!(self.secrets.read(&token_target), Ok(Some(_))) {
@@ -892,7 +894,7 @@ impl CodeQualityService {
             Ok(token) => match self.secrets.write(&token_target, &token) {
                 Ok(()) => {
                     self.refresh_credentials();
-                    gate.say("Created the SonarQube scan token and saved it in Windows Credential Manager.");
+                    gate.say("Created the SonarQube scan token and saved it in the operating system credential store.");
                 }
                 Err(error) => gate.say(&format!("Could not save the SonarQube scan token: {error}")),
             },

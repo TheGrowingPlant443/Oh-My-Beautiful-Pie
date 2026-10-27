@@ -1,7 +1,9 @@
 //! Secret storage for Sonar tokens and generated database passwords.
-//! Production uses Windows Credential Manager generic credentials; tests use `MemorySecrets`.
+//! Production uses Windows Credential Manager generic credentials on Windows, the freedesktop Secret
+//! Service (`secret-tool`) on Linux and the login Keychain (`security`) on macOS (see `secrets_unix`);
+//! tests use `MemorySecrets`. There is never a plaintext fallback.
 //! Secret values never appear in serializable state, logs, argv or `Debug` output.
-use super::types::Result;
+use super::types::{CredentialStoreStatus, Result};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -10,6 +12,14 @@ pub trait SecretStore: Send + Sync {
     fn read(&self, target: &str) -> Result<Option<String>>;
     /// Deleting a missing credential is not an error.
     fn delete(&self, target: &str) -> Result<()>;
+    /// Cheap, non-blocking view of whether the backing store works (may be a cached result).
+    fn status(&self) -> CredentialStoreStatus {
+        CredentialStoreStatus { name: "credential store".into(), available: true, message: None }
+    }
+    /// Blocking, fresh check run before anything is stored. `Err` names the missing prerequisite.
+    fn verify(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub fn sha256_hex(text: &str) -> String {
@@ -18,13 +28,18 @@ pub fn sha256_hex(text: &str) -> String {
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Windows paths are case-insensitive; Unix paths are exact (`/repo/A` and `/repo/a` are different folders).
+pub fn path_identity(path: &str) -> String {
+    if cfg!(windows) { path.to_lowercase() } else { path.to_string() }
+}
+
 /// `OMPManager.CodeQuality/<SHA256(config-root)>/<SHA256(identity)>/<kind>`.
 /// `identity` distinguishes the server: the Community resource-set id, or the normalized
 /// Enterprise origin plus context path, so one server's token is never reused for another.
 pub fn target_name(config_root: &Path, identity: &str, kind: &str) -> String {
     format!(
         "OMPManager.CodeQuality/{}/{}/{}",
-        sha256_hex(&config_root.to_string_lossy().to_lowercase()),
+        sha256_hex(&path_identity(&config_root.to_string_lossy())),
         sha256_hex(identity),
         kind
     )
@@ -53,13 +68,13 @@ pub fn random_sonar_password() -> String {
     format!("Omp-{}-{}-Aa1!", group(), group())
 }
 
-#[cfg(any(test, not(windows)))]
+#[cfg(test)]
 #[derive(Default)]
 pub struct MemorySecrets {
     values: parking_lot::Mutex<std::collections::HashMap<String, String>>,
 }
 
-#[cfg(any(test, not(windows)))]
+#[cfg(test)]
 impl SecretStore for MemorySecrets {
     fn write(&self, target: &str, secret: &str) -> Result<()> {
         self.values.lock().insert(target.to_string(), secret.to_string());
@@ -93,6 +108,9 @@ mod windows_store {
     }
 
     impl SecretStore for WindowsSecrets {
+        fn status(&self) -> super::CredentialStoreStatus {
+            super::CredentialStoreStatus { name: "Windows Credential Manager".into(), available: true, message: None }
+        }
         fn write(&self, target: &str, secret: &str) -> Result<()> {
             let mut name = wide(target);
             let mut user = wide("omp-manager");
@@ -185,6 +203,20 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert!(a.starts_with("OMPManager.CodeQuality/") && a.ends_with("/token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_config_roots_differing_only_in_case_never_share_credential_names() {
+        let (upper, lower) = (Path::new("/cfg/A"), Path::new("/cfg/a"));
+        assert_ne!(target_name(upper, "community:set", "token"), target_name(lower, "community:set", "token"));
+        assert_eq!(target_name(upper, "community:set", "token"), target_name(Path::new("/cfg/A"), "community:set", "token"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_roots_keep_case_insensitive_credential_names() {
+        assert_eq!(target_name(Path::new("C:/Cfg"), "community:set", "token"), target_name(Path::new("c:/cfg"), "community:set", "token"));
     }
 
     #[test]

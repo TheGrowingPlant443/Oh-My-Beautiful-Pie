@@ -1,5 +1,5 @@
 export type QualityMode = "sonarqubeCommunity" | "sonarqubeEnterprise" | "alternate";
-export type QualityRuntime = { kind: "dockerDesktop" } | { kind: "dockerWsl"; distro: string } | { kind: "podman"; connection: string };
+export type QualityRuntime = { kind: "dockerDesktop" } | { kind: "dockerWsl"; distro: string } | { kind: "dockerNative" } | { kind: "podman"; connection: string };
 export interface QualityConfig { version: 1; mode: QualityMode; runtime: QualityRuntime; communityPort: number; enterpriseUrl: string }
 export type QualityPhase = "idle" | "checking" | "installing" | "pulling" | "stopping" | "starting" | "waitingForReady" | "validating" | "scanning" | "cancelling" | "needsSetup" | "needsRestart" | "error";
 export interface QualityCredentialUpdate { target: "community" | "enterprise"; action: "replace" | "clear"; token?: string }
@@ -18,6 +18,8 @@ export interface QualityState {
   options: { wslDistros: string[]; podmanConnections: string[]; wingetAvailable: boolean; podmanAppConnection: string | null; wslFeaturesMissing: boolean };
   diagnostics: string[]; unresolved: string[]; activeScanId: string | null;
   setup: QualitySetup; startAtLaunch: boolean;
+  platform?: "windows" | "linux" | "macos";
+  credentialStore?: { name: string; available: boolean; message: string | null };
 }
 export interface QualityProject {
   folder: string; projectKey: string; scanner: "cli" | "maven" | "gradle" | "dotnet"; entryFile: string | null; image: string | null;
@@ -42,8 +44,12 @@ export function defaultQualityConfig(): QualityConfig { return { version: 1, mod
 export function modeSelectors(mode: QualityMode): { analyzer: "sonarqube" | "alternate"; connection: "community" | "enterprise" } { return { analyzer: mode === "alternate" ? "alternate" : "sonarqube", connection: mode === "sonarqubeEnterprise" ? "enterprise" : "community" }; }
 export function selectorMode(analyzer: "sonarqube" | "alternate", connection: "community" | "enterprise"): QualityMode { return analyzer === "alternate" ? "alternate" : connection === "enterprise" ? "sonarqubeEnterprise" : "sonarqubeCommunity"; }
 export function modeLabel(mode: QualityMode | null): string { return mode === null ? "Not active" : mode === "alternate" ? "MegaLinter + Opengrep + Semgrep CE" : mode === "sonarqubeEnterprise" ? "SonarQube Enterprise" : "SonarQube Community"; }
-export function runtimeLabel(runtime: QualityRuntime): string { return runtime.kind === "podman" ? `Podman · ${runtime.connection || "app-managed machine (not resolved)"}` : runtime.kind === "dockerWsl" ? `Docker in WSL · ${runtime.distro || "select a distro"}` : "Docker Desktop"; }
-export const qualityFolderKey = (folder: string): string => folder.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+export function runtimeLabel(runtime: QualityRuntime): string {
+  const unix = typeof navigator !== "undefined" && !/Win/i.test(navigator.platform);
+  return runtime.kind === "podman" ? `Podman · ${runtime.connection || (unix ? "local default" : "app-managed machine (not resolved)")}` : runtime.kind === "dockerWsl" ? `Docker in WSL · ${runtime.distro || "select a distro"}` : runtime.kind === "dockerNative" ? "Docker Engine (native)" : "Docker Desktop";
+}
+/** Drive-letter and UNC folders are Windows paths (case-insensitive, either separator); any other folder is an exact Unix path. */
+export const qualityFolderKey = (folder: string): string => /^([a-zA-Z]:([\\/]|$)|\\\\)/.test(folder) ? folder.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() : folder.replace(/\/+$/, "");
 /** An async result belongs to both a folder and the generation that requested it. */
 export class QualityGeneration {
   private value = 0;
@@ -100,8 +106,8 @@ export function scanAction(input: ScanActionInput): { label: string; kind: "scan
   return { label: input.requiresConsent ? "Approve recipe and scan" : "Scan project", kind: "scan", reason: null };
 }
 /** The runtime installer is offered only after a probe proved the selected runtime missing. */
-export function installVisible(q: QualityState): boolean { return q.prerequisites.length > 0 && q.prerequisites.find(item => item.runtime.kind === q.config.runtime.kind)?.installed === false; }
-export function featuresVisible(q: QualityState): boolean { return q.prerequisites.length > 0 && q.options.wslFeaturesMissing && q.config.runtime.kind !== "dockerDesktop"; }
+export function installVisible(q: QualityState): boolean { return (q.platform ?? "windows") === "windows" && q.prerequisites.length > 0 && q.prerequisites.find(item => item.runtime.kind === q.config.runtime.kind)?.installed === false; }
+export function featuresVisible(q: QualityState): boolean { return (q.platform ?? "windows") === "windows" && q.prerequisites.length > 0 && q.options.wslFeaturesMissing && q.config.runtime.kind !== "dockerDesktop"; }
 export function countBySeverity(findings: readonly QualityFinding[]): Record<"critical" | "high" | "medium" | "low" | "info", number> {
   const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
   for (const item of findings) if (item.severity in counts) counts[item.severity]++;

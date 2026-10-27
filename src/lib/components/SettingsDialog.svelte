@@ -112,8 +112,12 @@
           <option value={420}>Compact tiles</option><option value={640}>Readable tiles</option><option value={1000}>Large previews</option>
         </select>
       </label>
-      <label class="check"><input type="checkbox" checked={$appSettings.browserEmbedded} onchange={e => update("browserEmbedded", e.currentTarget.checked)} />Show browser inside app</label>
-      <small class="dim">Browsers appear on the right of fullscreen terminals. Off opens the same isolated browser in an external window.</small>
+      {#if typeof navigator !== "undefined" && /Win/i.test(navigator.platform)}
+        <label class="check"><input type="checkbox" checked={$appSettings.browserEmbedded} onchange={e => update("browserEmbedded", e.currentTarget.checked)} />Show browser inside app</label>
+        <small class="dim">Browsers appear on the right of fullscreen terminals. Off opens the same isolated browser in an external window.</small>
+      {:else}
+        <small class="dim">On Linux and macOS, isolated terminal browsers open in their own native window; Win32 docking is not used.</small>
+      {/if}
       <label class="check"><input type="checkbox" checked={$appSettings.browserHeadless} onchange={e => update("browserHeadless", e.currentTarget.checked)} />Headless browser</label>
       <small class="dim">No browser window or split screen. Applies to the next browser launch; existing browsers keep their mode until closed.</small>
       <label class="check"><input type="checkbox" checked={$appSettings.terminalAutoOpen} onchange={e => update("terminalAutoOpen", e.currentTarget.checked)} />Automatically show terminal view for AI commands</label>

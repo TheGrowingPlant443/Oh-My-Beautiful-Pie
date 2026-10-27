@@ -185,13 +185,17 @@ fn locate(name: &str) -> Option<PathBuf> {
             _ => {}
         }
     }
-    let files: Vec<String> = if cfg!(windows) { ["exe", "cmd", "bat"].iter().map(|ext| format!("{name}.{ext}")).collect() } else { vec![name.to_string()] };
+    let files: Vec<String> = if cfg!(windows) { ["exe", "cmd", "bat"].iter().map(|ext| format!("{name}.{ext}")).collect() } else { unix_names(name) };
     let mut dirs: Vec<PathBuf> = Vec::new();
     match name {
         "cargo" | "rustc" => dirs.extend(home_dir().map(|home| home.join(".cargo/bin"))),
-        "node" | "npm" | "pnpm" | "yarn" => dirs.push(program_files().join("nodejs")),
-        "dotnet" => dirs.push(program_files().join("dotnet")),
-        "git" => dirs.push(program_files().join("Git/cmd")),
+        "node" | "npm" | "pnpm" | "yarn" if cfg!(windows) => dirs.push(program_files().join("nodejs")),
+        "dotnet" if cfg!(windows) => dirs.push(program_files().join("dotnet")),
+        "dotnet" => {
+            dirs.extend(home_dir().map(|home| home.join(".dotnet")));
+            dirs.extend(["/usr/share/dotnet", "/usr/local/share/dotnet", "/usr/lib/dotnet"].map(PathBuf::from));
+        }
+        "git" if cfg!(windows) => dirs.push(program_files().join("Git/cmd")),
         "java" => dirs.extend(std::env::var_os("JAVA_HOME").map(|home| PathBuf::from(home).join("bin"))),
         _ => {}
     }
@@ -202,8 +206,19 @@ fn locate(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Executable names tried on Unix, in order: distributions and Homebrew ship `python3`/`pip3` and often no bare `python`/`pip`.
+fn unix_names(name: &str) -> Vec<String> {
+    match name {
+        "python" => vec!["python3".into(), "python".into()],
+        "pip" => vec!["pip3".into(), "pip".into()],
+        other => vec![other.into()],
+    }
+}
+
 fn probe_tool(name: &str) -> ToolProbe {
     if !ALLOWED_TOOLS.contains(&name) { return ToolProbe::Unknown { path: None }; }
+    // WSL is a Windows feature: on other platforms its absence says nothing about the project, so it is never "not found".
+    if name == "wsl" && !cfg!(windows) { return ToolProbe::Unknown { path: None }; }
     let Some(program) = locate(name) else { return ToolProbe::Missing; };
     let shown = display_folder(&program);
     let mut command = Command::new(&program);
@@ -760,6 +775,19 @@ fn detect_mentions(repo: &Repo, d: &mut Drafts) {
 
 fn install_for(id: &str) -> (Install, Option<SetupLink>) {
     let setup = |note: &str| (Install { availability: Availability::Automatic, via: Some(SETUP_VIA.into()), note: note.into() }, Some(SetupLink::CodeQuality));
+    #[cfg(not(windows))]
+    {
+        // The installers, WSL features and the app-managed Podman machine exist only on Windows; nothing is offered here.
+        let manual = |note: &str| (Install { availability: Availability::Manual, via: None, note: note.into() }, None);
+        match id {
+            "containerEngine:podman" | "containerEngine:docker" | "containerEngine:engine" =>
+                return manual("OMP Manager does not install a container engine on this platform; install Podman or Docker with your package manager (for example `nix profile add nixpkgs#podman`)."),
+            "osFeature:wsl" => return manual("Windows only; there is nothing to enable on this platform."),
+            _ if id.starts_with("systemSetting:") =>
+                return manual("A host kernel setting of the container engine's machine; OMP Manager never changes it on this platform. Raise it yourself with `sysctl` if your analyzer needs it."),
+            _ => {}
+        }
+    }
     match id {
         "containerEngine:podman" => setup("Windows only: Code quality setup installs Podman with winget (RedHat.Podman) after you confirm and creates the app's own WSL-backed Podman machine. Windows asks for administrator approval."),
         "containerEngine:docker" => setup("Windows only: Code quality setup can install Docker Desktop with winget (Docker.DockerDesktop; you accept its license interactively) or Docker Engine inside an explicitly chosen Ubuntu/Debian WSL distribution."),
@@ -962,13 +990,14 @@ mod tests {
         let podman = item(&result, "containerEngine:podman");
         assert_eq!(podman.need, Need::Unknown);
         assert!(podman.evidence.iter().any(|e| e.path == "README.md" && e.line == Some(2)));
-        assert_eq!((podman.install.availability, podman.setup_link), (Availability::Automatic, Some(SetupLink::CodeQuality)));
+        let installable = if cfg!(windows) { (Availability::Automatic, Some(SetupLink::CodeQuality)) } else { (Availability::Manual, None) };
+        assert_eq!((podman.install.availability, podman.setup_link), installable);
         assert_eq!(podman.detected.state, DetectedState::Missing);
         assert!(has(&result, "osFeature:wsl"));
         assert!(!has(&result, "packageManager:winget"));
         let setting = item(&result, "systemSetting:vm.max_map_count");
         assert!(setting.explanation.starts_with("Required by Code quality analysis, not by the project"));
-        assert_eq!((setting.install.availability, setting.setup_link), (Availability::Automatic, Some(SetupLink::CodeQuality)));
+        assert_eq!((setting.install.availability, setting.setup_link), installable);
         // Secret-looking files are never read or cited.
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("supersecret"));
@@ -1060,6 +1089,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn wire_shape_is_camel_case_and_round_trips() {
         let root = temp();
@@ -1113,6 +1143,18 @@ mod tests {
     fn unlisted_programs_are_never_launched() {
         assert_eq!(probe_tool("powershell"), ToolProbe::Unknown { path: None });
         assert_eq!(probe_tool("definitely-not-allowlisted"), ToolProbe::Unknown { path: None });
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_probes_know_python3_and_never_report_wsl_as_missing() {
+        assert_eq!(unix_names("python"), ["python3", "python"]);
+        assert_eq!(unix_names("pip"), ["pip3", "pip"]);
+        assert_eq!(unix_names("node"), ["node"]);
+        assert_eq!(probe_tool("wsl"), ToolProbe::Unknown { path: None });
+        let (install, link) = install_for("containerEngine:podman");
+        assert_eq!((install.availability, link), (Availability::Manual, None));
+        assert!(install.note.contains("package manager"));
     }
 
     #[test]

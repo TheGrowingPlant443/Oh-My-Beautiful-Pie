@@ -29,7 +29,7 @@ pub fn read_admission() -> Result<ReadAdmission> {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag="kind", rename_all="camelCase", rename_all_fields="camelCase", deny_unknown_fields)]
-pub enum KnowledgeAssetTarget { Global, Manager, Architect, Repository { project_instance_id: String }, Profile { profile_name: String } }
+pub enum KnowledgeAssetTarget { Global, Manager, Architect, #[serde(rename="local_ai")] LocalAi, Repository { project_instance_id: String }, Profile { profile_name: String } }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all="camelCase")]
 pub struct MarkdownItem {
@@ -73,6 +73,7 @@ pub struct AgentMarkdownService {
 
 fn target_name(target: &KnowledgeAssetTarget) -> Result<String> { Ok(match target {
     KnowledgeAssetTarget::Global => "Global".into(), KnowledgeAssetTarget::Manager => "Manager".into(), KnowledgeAssetTarget::Architect => "Architect".into(),
+    KnowledgeAssetTarget::LocalAi => "Local AI models".into(),
     KnowledgeAssetTarget::Repository { .. } => "Repository".into(),
     KnowledgeAssetTarget::Profile { profile_name } => { if profile_name == "default" || !setup::valid_profile_name(profile_name) { return Err("Invalid named OMP profile".into()); } format!("Profiles/{profile_name}") }
 }) }
@@ -168,6 +169,7 @@ impl AgentMarkdownService {
             KnowledgeAssetTarget::Global=>(paths.global_agent_folder.clone(),KnowledgeScope::Global),
             KnowledgeAssetTarget::Manager=>(paths.manager_folder.clone(),KnowledgeScope::Global),
             KnowledgeAssetTarget::Architect=>(paths.architect_folder.clone(),KnowledgeScope::Global),
+            KnowledgeAssetTarget::LocalAi=>(paths.local_ai_folder.clone(),KnowledgeScope::Global),
             KnowledgeAssetTarget::Profile{profile_name}=>(paths.global_omp_folder.join("profiles").join(profile_name).join("agent"),KnowledgeScope::Global),
             KnowledgeAssetTarget::Repository{project_instance_id}=>{let root=repository(project_instance_id)?;(root.join(".omp"),KnowledgeScope::Project{repository_root:root.to_string_lossy().into_owned()})},
         };
@@ -297,7 +299,7 @@ impl AgentMarkdownService {
     pub fn recover(&self)->Result<()> {let _serial=self.serial.lock();let _admission=ADMISSION.write();self.recover_locked()}
     pub fn routes(&self,registry:&Registry,request:&SetupRequest)->Result<MarkdownRoutes>{
         self.recover()?;let _serial=self.serial.lock();
-        let target=match request.scope{SetupScope::Global=>KnowledgeAssetTarget::Global,SetupScope::Manager=>KnowledgeAssetTarget::Manager,SetupScope::Architect=>KnowledgeAssetTarget::Architect,SetupScope::Repository=>KnowledgeAssetTarget::Repository{project_instance_id:request.project_instance_id.clone().ok_or("Repository requires a project")?}};
+        let target=match request.scope{SetupScope::Global=>KnowledgeAssetTarget::Global,SetupScope::Manager=>KnowledgeAssetTarget::Manager,SetupScope::Architect=>KnowledgeAssetTarget::Architect,SetupScope::LocalAi=>KnowledgeAssetTarget::LocalAi,SetupScope::Repository=>KnowledgeAssetTarget::Repository{project_instance_id:request.project_instance_id.clone().ok_or("Repository requires a project")?}};
         let mut profiles=BTreeMap::new();
         for item in &request.items {if item.kind==setup::SetupKind::Profile {if let Some(r)=self.reserve_route(self.resolve(registry,KnowledgeAssetTarget::Profile{profile_name:item.name.clone()})?,std::slice::from_ref(item),true)?{profiles.insert(item.name.clone(),r);}}}
         Ok(MarkdownRoutes{scope:self.reserve_route(self.resolve(registry,target)?,&request.items,false)?,profiles})

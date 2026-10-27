@@ -19,6 +19,7 @@
     { value: "global", label: "Global — default profile", target: { kind: "global" } },
     { value: "manager", label: "Manager", target: { kind: "manager" } },
     { value: "architect", label: "Architect", target: { kind: "architect" } },
+    { value: "local_ai", label: "Local AI models", target: { kind: "local_ai" } },
     ...(projectContext?.kind === "instance" ? [{ value: "repository", label: `Repository — ${projectContext.name}`, target: { kind: "repository" as const, projectInstanceId: projectContext.id } }] : setupTarget?.kind === "repository" ? [{ value: "repository", label: "Repository — active setup", target: setupTarget }] : []),
     ...profiles.filter(profile => profile.name !== "default").map(profile => ({ value: `profile:${profile.name}`, label: `Profile — ${profile.name}`, target: { kind: "profile" as const, profileName: profile.name } })),
   ]);
@@ -28,7 +29,7 @@
   const scope = $derived<ScopeRequest>(active.target.kind === "repository" ? { kind: "project" } : { kind: "global" });
   const folder = $derived(active.target.kind === "repository" ? projectContext?.projectPath ?? repositoryRoot : null);
   const pending = $derived(status ? unappliedMarkdown(status) : []);
-  const locations = $derived(targets.filter(target => (target.target.kind === "repository") === (active.target.kind === "repository")).map(target => ({ label: target.label, path: target.target.kind === "profile" ? `Agent setup/Profiles/${target.target.profileName}` : `Agent setup/${target.target.kind === "global" ? "Global" : target.target.kind === "manager" ? "Manager" : target.target.kind === "architect" ? "Architect" : "Repository"}` })));
+  const locations = $derived(targets.filter(target => (target.target.kind === "repository") === (active.target.kind === "repository")).map(target => ({ label: target.label, path: target.target.kind === "profile" ? `Agent setup/Profiles/${target.target.profileName}` : `Agent setup/${target.target.kind === "global" ? "Global" : target.target.kind === "manager" ? "Manager" : target.target.kind === "architect" ? "Architect" : target.target.kind === "local_ai" ? "Local AI models" : "Repository"}` })));
 
   let lastSetup = "";
   $effect(() => {

@@ -1,5 +1,6 @@
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
+import { isLocalModel } from './local-ai-models.mjs';
 
 const excludedRoots = new Set(['extensions', 'hooks', 'customtools', 'mcp', 'telemetry', 'auth', 'shellpath']);
 const secretKeys = new Set(['apikey', 'api_key', 'password', 'secret', 'token', 'accesstoken', 'refreshtoken', 'authorization', 'cookie', 'credentials', 'headers', 'env']);
@@ -74,6 +75,40 @@ export async function runConfig(request) {
   dirs.setProfile(request.profile || 'default');
   if (request.action === 'paths') return { globalOmpFolder: dirs.getBaseConfigRoot(), globalAgentFolder: dirs.getAgentDir() };
   const { Settings } = await import(pathToFileURL(path.join(sdk, 'src/config/settings.ts')).href);
+  if (request.action === 'local_setup') {
+    const settings = await Settings.loadReadOnly({ cwd: request.cwd, agentDir: dirs.getAgentDir(), configFiles: request.configFiles ?? [] });
+    const { discoverAuthStorage } = await import(pathToFileURL(path.join(sdk, 'src/sdk.ts')).href);
+    const { ModelRegistry } = await import(pathToFileURL(path.join(sdk, 'src/config/model-registry.ts')).href);
+    const { resolveCliModel, resolveSessionModelSelector } = await import(pathToFileURL(path.join(sdk, 'src/config/model-resolver.ts')).href);
+    const auth = await discoverAuthStorage(dirs.getAgentDir(), { settings, cwd: request.cwd });
+    try {
+      // Static/cached metadata only: admission never probes a model or performs inference.
+      const models = new ModelRegistry(auth, path.join(dirs.getAgentDir(), 'models.yml'), { settings, fetch: () => Promise.reject(new Error('Local setup admission does not discover models online')) });
+      await models.hydrateCredentialScopedModelCaches();
+      let resolved;
+      if (request.model) resolved = resolveCliModel({ cliModel: request.model, modelRegistry: models, settings });
+      else if (request.sessionPath) {
+        const { SessionManager } = await import(pathToFileURL(path.join(sdk, 'src/session/session-manager.ts')).href);
+        const { getRestorableSessionModels } = await import(pathToFileURL(path.join(sdk, 'src/session/session-context.ts')).href);
+        const session = await SessionManager.open(request.sessionPath, undefined, undefined, { suppressBreadcrumb: true, throwIfMissing: true });
+        try {
+          const context = session.buildSessionContext();
+          for (const selector of getRestorableSessionModels(context.models, session.getLastModelChangeRole())) {
+            const saved = resolveSessionModelSelector(models, selector);
+            if (saved) {
+              const hasThinkingEntry = session.getBranch().some(entry => entry.type === 'thinking_level_change');
+              const thinkingLevel = hasThinkingEntry ? context.configuredThinkingLevel ?? context.thinkingLevel : saved.thinkingLevel;
+              resolved = { ...saved, thinkingLevel };
+              break;
+            }
+          }
+        } finally { await session.close(); }
+      }
+      resolved ??= resolveCliModel({ cliModel: '@default', modelRegistry: models, settings });
+      if (!isLocalModel(resolved.model)) return { local: false };
+      return { local: true, selector: `${resolved.model.provider}/${resolved.model.id}`, thinkingLevel: resolved.thinkingLevel ?? null };
+    } finally { auth.close(); }
+  }
   const registry = await import(pathToFileURL(path.join(sdk, 'src/config/registry.ts')).href);
   const definitions = registry.all();
   if (!definitions.length) throw new Error('OMP compatibility: native setting registry is empty');

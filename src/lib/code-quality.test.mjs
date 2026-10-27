@@ -104,6 +104,10 @@ test("folder generations reject stale results after navigation, revisits and unm
   const second = guard.begin("C:/Repo/Two"); assert.equal(guard.accepts(first, "C:/Repo/One"), false);
   guard.begin("C:/Repo/One"); assert.equal(guard.accepts(first, "C:/Repo/One"), false); assert.equal(guard.accepts(second, "C:/Repo/Two"), false);
   const active = guard.begin("C:/Repo/One"); guard.invalidate(); assert.equal(guard.accepts(active, "C:/Repo/One"), false);
+  const unix = new QualityGeneration(), upper = unix.begin("/repo/A/");
+  assert.equal(unix.accepts(upper, "/repo/A"), true);
+  assert.equal(unix.accepts(upper, "/repo/a"), false);
+  assert.equal(unix.accepts(unix.begin("/repo/a\\b"), "/repo/a/b"), false);
 });
 
 test("only nonsecret folder and filter preferences are restored", () => {

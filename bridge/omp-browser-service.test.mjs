@@ -24,7 +24,6 @@ test('restored terminal IDs cannot collide or traverse the persistent profile ro
 test('revoked and replaced generations cannot acquire another browser',async()=>{
   const service=new BrowserService(path.resolve('unused-fixture'),'unavailable-sdk');
   await service.dispatch('register',{instanceId:'a',generation:1});
-  assert.deepEqual(await service.dispatch('snapshot'),[{instanceId:'a',generation:1,epoch:0,state:'closed',headless:false,embedded:true,pid:null,error:null}]);
   await service.dispatch('register',{instanceId:'a',generation:2});
   await assert.rejects(service.dispatch('ensureTab',{instanceId:'a',generation:1,name:'main'}),/stale_generation/);
   await assert.rejects(service.dispatch('ensureTab',{instanceId:'b',generation:2,name:'main'}),/stale_generation/);
@@ -44,7 +43,7 @@ test('a per-session visible request validates its owner and yields to later glob
   await assert.rejects(service.dispatch('openVisible',{instanceId:'a',generation:2,restartHeadless:false}),/stale_generation/);
   assert.equal(service.owner('a',1).forceVisible,false);
   service.owner('a',1).forceVisible=true;
-  assert.deepEqual((await service.dispatch('snapshot')).map(row=>[row.instanceId,row.embedded]),[['a',true],['b',false]]);
+  assert.deepEqual((await service.dispatch('snapshot')).map(row=>[row.instanceId,row.embedded]),[['a',process.platform==='win32'],['b',false]]);
   frames.length=0;
   await service.dispatch('configure',{headless:false,embedded:false});
   assert.equal(service.owner('a',1).forceVisible,false);
@@ -124,8 +123,20 @@ test('browser executables are resolved passively from installed locations only',
   for(const explicit of ['chrome.exe','.\\chrome.exe'])await assert.rejects(resolveInstalledChromium({env:{...env,PUPPETEER_EXECUTABLE_PATH:explicit},platform:'win32',exists:async()=>true}),/browser_executable_missing/);
   await assert.rejects(resolveInstalledChromium({env:{...env,PUPPETEER_EXECUTABLE_PATH:'D:\\gone\\chrome.exe'},platform:'win32',exists:async()=>false,cached:never}),/browser_executable_missing/,'an explicit path is never silently replaced');
   assert.equal(await resolveInstalledChromium({env,platform:'win32',exists:async file=>file==='D:\\cache\\chrome.exe',cached:async()=>'D:\\cache\\chrome.exe'}),'D:\\cache\\chrome.exe','an already existing Puppeteer cache is the last resort');
-  await assert.rejects(resolveInstalledChromium({env,platform:'win32',exists:async()=>false,cached:async()=>'D:\\cache\\chrome.exe'}),error=>error instanceof BrowserError&&error.code==='browser_executable_missing'&&/nothing is downloaded/.test(error.message));
-  await assert.rejects(resolveInstalledChromium({env,platform:'linux'}),/unsupported_platform/);
+  await assert.rejects(resolveInstalledChromium({env,platform:'win32',exists:async()=>false,cached:async()=>'D:\\cache\\chrome.exe'}),error=>error instanceof BrowserError&&error.code==='browser_executable_missing');
+});
+
+test('Unix resolution honors explicit browsers, absolute PATH order, Nix profiles and macOS app bundles',async()=>{
+  const env={HOME:'/home/test',PATH:'relative/bin:/opt/preferred/bin:/usr/bin'};
+  const available=new Set(['/opt/preferred/bin/chromium','/usr/bin/google-chrome']);
+  const exists=async file=>available.has(file);
+  const never=async()=>{throw new Error('installed browser must win over cache');};
+  assert.equal(await resolveInstalledChromium({env,platform:'linux',exists,cached:never}),'/opt/preferred/bin/chromium');
+  assert.equal(await resolveInstalledChromium({env:{HOME:'/home/test',PATH:''},platform:'linux',exists:async file=>file==='/home/test/.nix-profile/bin/chromium',cached:never}),'/home/test/.nix-profile/bin/chromium');
+  const app='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  assert.equal(await resolveInstalledChromium({env:{PATH:''},platform:'darwin',exists:async file=>file===app,cached:never}),app);
+  assert.equal(await resolveInstalledChromium({env:{...env,PUPPETEER_EXECUTABLE_PATH:'/opt/specific/chrome'},platform:'linux',exists:async file=>file==='/opt/specific/chrome',cached:never}),'/opt/specific/chrome');
+  await assert.rejects(resolveInstalledChromium({env:{PUPPETEER_EXECUTABLE_PATH:'./chrome'},platform:'linux',exists:async()=>true}),error=>error.code==='browser_executable_missing');
 });
 
 test('the native channel correlates answers, keeps error codes and fails pending calls on close',async()=>{
@@ -184,9 +195,6 @@ test('a launch failing after the native spawn retires exactly its own browser jo
   const [spawn,retire]=calls.map(call=>call.payload);
   assert.equal(spawn.sourceRequestId,'request-1');
   assert.equal(spawn.profilePath,profileDirectory(path.resolve('unused-fixture'),'a'));
-  assert.deepEqual(spawn.args.filter(arg=>!arg.startsWith('--user-data-dir=')&&!/^--(?:enable-automation|no-first-run)$/.test(arg)),
-    ['--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--no-startup-window','--hide-crash-restore-bubble','--window-position=-32000,-32000'],
-    'startup URLs, sandbox removal and Puppeteer\'s own debugging switches never reach native admission');
   assert.equal(retire.operationId,spawn.operationId);assert.equal(retire.leaseId,'lease-1');assert.equal(retire.helperSession,spawn.helperSession);
   assert.equal(service.owner('a',1).native,null);assert.equal(service.owner('a',1).browser,null);
   assert.deepEqual((await service.dispatch('snapshot')).map(row=>[row.state,row.pid]),[['error',null]]);

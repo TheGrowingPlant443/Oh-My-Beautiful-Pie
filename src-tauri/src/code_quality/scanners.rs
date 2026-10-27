@@ -47,7 +47,9 @@ pub fn images() -> Result<&'static ImageLock> {
 }
 pub fn default_project_key(folder: &Path) -> String {
     let canonical = fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
-    let path = canonical.to_string_lossy().replace('\\', "/").to_lowercase();
+    let text = canonical.to_string_lossy();
+    // Windows folders compare case-insensitively with either separator; Unix folders are exact (`\` is a filename character).
+    let path = if cfg!(windows) { text.replace('\\', "/").to_lowercase() } else { text.into_owned() };
     let hash = format!("{:x}", Sha256::digest(path.as_bytes())); format!("omp-{}", &hash[..20])
 }
 pub(crate) fn plain_path(path: &Path) -> Result<()> {
@@ -409,5 +411,19 @@ mod tests {
         // A saved project keeps its own exclusions; defaults are only for fresh detection.
         let mut saved = detection.project.clone(); saved.exclusions.clear();
         assert!(detect(&t.0, Some(saved)).unwrap().project.exclusions.is_empty());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unix_folders_differing_only_in_case_or_backslash_get_distinct_default_keys() {
+        let missing = |name: &str| Path::new("/omp-key-test-missing").join(name);
+        let upper = default_project_key(&missing("A"));
+        assert_eq!(upper, default_project_key(&missing("A")));
+        assert_ne!(upper, default_project_key(&missing("a")));
+        assert_ne!(default_project_key(&missing("a/b")), default_project_key(&missing("a\\b")));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_keys_ignore_case_and_separator_style() {
+        assert_eq!(default_project_key(Path::new(r"C:\omp-missing\Repo")), default_project_key(Path::new("c:/omp-missing/repo")));
     }
 }

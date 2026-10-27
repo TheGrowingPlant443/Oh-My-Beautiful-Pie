@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { writable } from "svelte/store";
 import type { SetupItem } from "./api";
 
-export type AgentMarkdownTarget = { kind: "global" | "manager" | "architect" } | { kind: "repository"; projectInstanceId: string } | { kind: "profile"; profileName: string };
+export type AgentMarkdownTarget = { kind: "global" | "manager" | "architect" | "local_ai" } | { kind: "repository"; projectInstanceId: string } | { kind: "profile"; profileName: string };
 export type AgentMarkdownItemState = "nativeOnly" | "new" | "changed" | "deleted" | "unchanged" | "nativeChanged" | "conflict";
 export interface AgentMarkdownItem {
   id: string; nativePath: string; vaultPath: string;

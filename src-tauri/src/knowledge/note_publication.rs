@@ -1,6 +1,7 @@
 //! Shared Markdown publication for admitted vault roots and backend-derived native deployment roots.
 //!
-//! Guarantees (Windows; every other platform returns an explicit "unsupported" error and writes nothing):
+//! Guarantees (Windows: operating-system sharing locks; Linux/macOS: see the last paragraph; a platform with neither
+//! returns an explicit "unsupported" error and writes nothing):
 //!
 //! * **Create** (`expected_hash == None`): the note is staged and published with a create-only rename. An existing
 //!   note, or one created concurrently, is never replaced.
@@ -15,6 +16,12 @@
 //!   [`recover_publications`] from a durable private journal that is written *before* the first move.
 //! * **Delete**: the exact locked, hash-verified object is deleted through its handle; a different file that carries
 //!   the name afterwards is never touched.
+//!
+//! **Linux/macOS** have no mandatory locks, so "locked" there means: the destination is opened without following links
+//! and hashed, then the *name* is moved with an exclusive rename (`renameat2(RENAME_NOREPLACE)` / `renameatx_np`) and the
+//! moved object is verified by device+inode and by re-hashing the bytes behind the handle. A different object or a note
+//! another program edited meanwhile is put back untouched and the replacement fails; nothing is ever overwritten. Only a
+//! writer that already held the note open and writes after that check lands in the superseded original (see `rooted_unix`).
 //!
 //! App writers of one note are additionally serialized in-process. Journals/backups never live in a vault.
 use super::publication_journal::{self, InFlight, PublicationJournal};
@@ -49,7 +56,7 @@ pub(crate) type Hook = Box<dyn Fn(Stage, &Path, &str) -> HookAction + Send>;
 #[cfg(test)]
 pub(crate) static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn crash_requested(stage: u8, parent: &Path, name: &str) -> bool {
     #[cfg(test)]
     {
@@ -76,11 +83,11 @@ fn note_lock(root: &Path, relative: &str) -> Arc<Mutex<()>> {
 /// `journal_dir` is a private application folder (never inside a vault) that holds the crash journal and the
 /// original-bytes backup of a replacement.
 pub(crate) fn write_relative_markdown_journaled(root: &Path, relative: &str, text: &str, expected_hash: Option<&str>, journal_dir: &Path) -> Result<()> {
-    #[cfg(not(windows))] {
+    #[cfg(not(any(windows, unix)))] {
         let _ = (root, relative, text, expected_hash, journal_dir);
-        return Err("Conflict-safe Markdown publication requires Windows handle-sharing/rename support on this platform".into());
+        return Err("Conflict-safe Markdown publication requires handle-based rename support that this platform lacks".into());
     }
-    #[cfg(windows)] {
+    #[cfg(any(windows, unix))] {
         let components = fsio::validate_relative(relative)?;
         let (name, parents) = components.split_last().ok_or("A note path is required")?;
         if !fsio::is_markdown_name(name) { return Err("Only Markdown documents may be published".into()); }
@@ -100,7 +107,7 @@ pub(crate) fn write_relative_markdown_journaled(root: &Path, relative: &str, tex
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn create_only(parent: &fsio::DirectoryPins, name: &str, text: &[u8]) -> Result<()> {
     let staged = super::rooted::stage(parent, text, &format!(".omp-{}.tmp", uuid::Uuid::new_v4()))?;
     let published = super::rooted::rename_handle(&staged.file, parent, name, false);
@@ -108,7 +115,7 @@ fn create_only(parent: &fsio::DirectoryPins, name: &str, text: &[u8]) -> Result<
     published
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn replace_checked(root: &Path, parents: &[String], parent: &fsio::DirectoryPins, name: &str, text: &[u8], expected: &str, journal_dir: &Path) -> Result<()> {
     use std::io::{Seek, SeekFrom};
     let id = uuid::Uuid::new_v4().to_string();
@@ -151,10 +158,10 @@ fn replace_checked(root: &Path, parents: &[String], parent: &fsio::DirectoryPins
         };
         if let Err(e) = publication_journal::save(journal_dir, &record) { discard_backup(); return Err(e); }
         // Step 1: move the exact locked original out of the way (create-only). Nothing is lost if this fails.
-        if let Err(e) = super::rooted::rename_handle(&locked, parent, &reservation, false) {
+        if let Err(e) = super::rooted::reserve_handle(&locked, parent, &reservation) {
             let _ = publication_journal::finish(journal_dir, &id);
             discard_backup();
-            return Err(format!("The note could not be reserved for replacement; nothing changed: {e}"));
+            return Err(format!("The note could not be reserved for replacement; nothing was overwritten or lost: {e}"));
         }
         if crash_requested(1, parent.path(), name) { return Err(CRASH_MARKER.into()); }
         // Step 2: publish the staged note into the now-empty name (create-only).
@@ -194,7 +201,7 @@ fn replace_checked(root: &Path, parents: &[String], parent: &fsio::DirectoryPins
     outcome
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn parent_root_identity(root: &Path) -> Result<String> {
     fsio::dir_identity(root).ok_or_else(|| "The vault root has no stable identity".to_string())
 }

@@ -55,6 +55,7 @@
       case "global": return paths?.globalAgentFolder;
       case "manager": return paths?.managerFolder;
       case "architect": return paths?.architectFolder;
+      case "local_ai": return paths?.localAiFolder;
       case "repository": return repositoryRoot ? `${repositoryRoot}/.omp` : undefined;
       default: return undefined;
     }
@@ -64,6 +65,7 @@
       case "global": return "Global — default OMP profile";
       case "manager": return "The Manager — private setup";
       case "architect": return "The Architect — private setup";
+      case "local_ai": return "Local AI models — private setup";
       case "repository": return `Repository — ${repositoryRoot ?? (repositoryLoading ? "Loading…" : "Unavailable")}`;
       default: return "Choose a scope first";
     }
@@ -190,10 +192,12 @@
     <button onclick={() => editor("global")}>Open global .omp in VS Code</button>
     <button onclick={() => editor("manager")}>Open Manager folder in VS Code</button>
     <button onclick={() => editor("architect")}>Open Architect folder in VS Code</button>
+    <button onclick={() => editor("local_ai")}>Open Local AI models folder in VS Code</button>
     {#if repositoryAvailable}<button disabled={repositoryLoading || !!repositoryError || !repositoryRoot} onclick={() => editor("repository")}>Open repository in VS Code</button>{/if}
   </header>
   <div class="folders dim"><span>Global folder: <code>{paths?.globalOmpFolder || (loading ? "Loading…" : "Unavailable")}</code></span><span>Manager folder: <code>{paths?.managerFolder || (loading ? "Loading…" : "Unavailable")}</code></span></div>
   <div class="folders dim"><span>Architect folder: <code>{paths?.architectFolder || (loading ? "Loading…" : "Unavailable")}</code></span></div>
+  <div class="folders dim"><span>Local AI models folder: <code>{paths?.localAiFolder || (loading ? "Loading…" : "Unavailable")}</code></span></div>
   {#if repositoryAvailable || draft.scope === "repository"}<div class="folders dim"><span>Repository: <code>{repositoryRoot || (repositoryLoading ? "Loading…" : "Unavailable")}</code></span><span>Setup folder: <code>{repositoryRoot ? `${repositoryRoot}/.omp` : "Unavailable"}</code></span></div>{/if}
   {#if repositoryError}<p class="err alert" role="alert">{repositoryError}</p>{/if}
   {#if error}<p class="err alert" role="alert">{error}</p>{/if}
@@ -207,6 +211,7 @@
         {:else if admission?.promptSent === null}<p class="warn">Admission outcome is unknown. Inspect the native conversation before entering another request; automatic resend is disabled.</p>
         {:else if draft.scope === "repository"}<p class="dim">Existing project processes are not reloaded automatically. Reopen OMP from the repository root to use root-scoped rules/tools.</p>
         {:else if draft.scope === "architect"}<p class="dim">Instructions load next Architect turn; skill/tool/rule catalogs need native reload or an explicit reopen. No automatic Architect restart.</p>
+        {:else if draft.scope === "local_ai"}<p class="dim">Instructions load each local-model turn; skill/tool/rule/plugin catalogs need native reload or reopen. Hosted models do not load this setup. Switching to hosted models requires a clean new conversation and reopen; local-enhanced saved sessions cannot resume as hosted.</p>
         {:else}<p class="dim">Instructions load next Manager turn; skill/tool/rule catalogs need native reload or an explicit reopen. No automatic Manager restart.</p>{/if}
         {#if draft.scope === "architect" && $architectInstance}<button onclick={onOpenArchitect}>Open The Architect</button>
         {:else if draft.scope === "manager" && $managerInstance}<button onclick={onOpenManager}>Open The Manager</button>{/if}
@@ -225,6 +230,7 @@
           <label class="choice"><input type="radio" name="setup-scope" value="global" bind:group={draft.scope} /><span><strong>Global — default OMP profile</strong><small>Native instructions under {paths?.globalAgentFolder || "the global OMP agent folder"}. Named profiles remain independent.</small></span></label>
           <label class="choice"><input type="radio" name="setup-scope" value="manager" bind:group={draft.scope} disabled={!$managerInstance} /><span><strong>Just The Manager</strong><small>Private app-owned setup; not loaded into workers or the Manager's project .omp folder.</small></span></label>
           <label class="choice"><input type="radio" name="setup-scope" value="architect" bind:group={draft.scope} disabled={!$architectInstance} /><span><strong>Just the architect</strong><small>Private app-owned setup; not loaded into Manager, workers or the Architect's project .omp folder.</small></span></label>
+          <label class="choice"><input type="radio" name="setup-scope" value="local_ai" bind:group={draft.scope} /><span><strong>Local AI models</strong><small>Private setup under {paths?.localAiFolder || "the app-owned local-ai-setup folder"}, loaded only for concrete loopback HTTP(S) model endpoints. All setup items except Global-only profiles are available.</small></span></label>
           {#if repositoryAvailable}
             <label class="choice"><input type="radio" name="setup-scope" value="repository" bind:group={draft.scope} disabled={repositoryLoading || !!repositoryError || !repositoryRoot} /><span><strong>This repository</strong><small>Create native setup under {repositoryRoot ? `${repositoryRoot}/.omp` : (repositoryLoading ? "Loading…" : "an unavailable repository")}. Existing project sessions stay unchanged.</small></span></label>
           {/if}
@@ -233,7 +239,7 @@
         {:else if draft.step === 1}
           <p>Choose what to create. You describe each selected item in the next step.</p>
           {#each choices.filter(choice => choice.kind !== "profile" || draft.scope === "global") as choice (choice.kind)}
-            <label class="choice"><input type="checkbox" checked={draft.kinds.includes(choice.kind)} onchange={event => toggleKind(choice.kind, event.currentTarget.checked)} /><span><strong>{choice.title}</strong><small>{choice.kind === "agents" && draft.scope === "repository" ? "Instructions inside this repository's .omp; named files are standalone and not automatically loaded" : choice.help}</small></span></label>
+            <label class="choice"><input type="checkbox" checked={draft.kinds.includes(choice.kind)} onchange={event => toggleKind(choice.kind, event.currentTarget.checked)} /><span><strong>{choice.title}</strong><small>{choice.kind === "agents" && (draft.scope === "repository" || draft.scope === "local_ai") ? "Root instructions apply in this scope; named files are standalone, not automatically loaded or added to the Persona picker" : choice.help}</small></span></label>
           {/each}
         {:else if draft.step === 2}
           {#each describeOrder.filter(kind => draft.kinds.includes(kind)) as kind (kind)}
@@ -243,7 +249,7 @@
                 <p>Describe the persistent rules. Existing RULES.md policy will be preserved.</p>
                 <label>Description<textarea rows="7" value={description("rules")} oninput={event => setDescription("rules", event.currentTarget.value)} placeholder="Which policy should always apply?"></textarea></label>
               {:else}
-                {#if kind === "agents"}<p>Describe how the agent should behave. {#if draft.scope === "repository"}An unnamed entry merges into .omp/AGENTS.md; a named entry is a standalone file, not automatically loaded or listed as a Global/Manager Persona. Use it with an explicit --append-system-prompt argument.{:else}An unnamed entry merges into the scope's AGENTS.md; a named entry becomes a standalone file selectable as a Persona.{/if}</p>
+                {#if kind === "agents"}<p>Describe how the agent should behave. {#if draft.scope === "repository" || draft.scope === "local_ai"}An unnamed entry merges into the scope's AGENTS.md; a named entry is a standalone file, not automatically loaded or listed as a Persona. Use it only with an explicit --append-system-prompt argument in an appropriate session.{:else}An unnamed entry merges into the scope's AGENTS.md; a named entry becomes a standalone file selectable as a Persona.{/if}</p>
                 {:else if kind === "skill"}<p>Skills use native SKILL.md definitions. SKILLS.md is a readable catalog.</p>
                 {:else if kind === "workflow"}<p>Workflows are native rules: describe when to delegate, require review, report completion, or ask for a decision. They are not a separate scheduler.</p>
                 {:else if kind === "plugin"}<p>A plugin is a native OMP extension package (package.json plus index.ts) loaded from this scope's extensions folder. Describe the tools, commands or hooks it should provide; nothing is published or installed globally.</p>
@@ -277,6 +283,7 @@
           {#if !selected.length}<p class="warn">No descriptions yet. Select and describe at least one item in the preceding steps.</p>{/if}
           <p class="dim">A real, human-controlled OMP session will propose a plan. No target files are written before you approve. {markdownStatus?.enabled ? "Only Markdown assets are routed to the vault; scripts, tools, plugin code, profile configuration and credentials stay native. Skill references to native resources are preserved. Markdown needs a separate reviewed Apply and native reload/reopen." : "This target has not enabled Markdown migration: all setup destinations remain native, even if a vault is bound."} No credentials, dependencies, telemetry, automatic workflows, or unrelated code are installed.</p>
           {#if draft.scope === "repository"}<p class="dim">Existing project processes are not reloaded or restarted automatically. A nearer .omp or nested cwd can change discovery; reopen OMP from this repository root for root-scoped rules/tools.</p>{/if}
+          {#if draft.scope === "local_ai"}<p class="dim">Only concrete loopback HTTP(S) model endpoints qualify; gateways and pi-native transport do not. Native model requests, including children and fallback, stay local for the process lifetime. Plugins are trusted code, not a network sandbox. Instructions load each local turn; catalog changes need native reload/reopen. Switching to hosted models requires a fresh conversation and reopen, not resuming a local-enhanced session.</p>{/if}
           <button class="primary" disabled={busy || !paths || !draft.scope || !markdownStatus || $previewMarkdown.busy || (draft.scope === "repository" && (repositoryLoading || !!repositoryError || !repositoryRoot))} onclick={() => start()}>{busy ? "Starting native setup…" : "Start setup agent"}</button>
         {/if}
       </div>

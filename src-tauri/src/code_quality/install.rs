@@ -171,6 +171,7 @@ fn remaining_workload_names(containers: &[ContainerInfo]) -> Result<()> {
 
 /// Stop only the receipt-proven app VM, after checking *both* stores for remaining
 /// workloads. This never starts a daemon, changes defaults, or removes containers/data.
+#[cfg(windows)]
 pub fn stop_owned_podman_machine(config_root: &Path, runtime: &QualityRuntime, owner: &str, ctl: &Ctl) -> Result<()> {
     let QualityRuntime::Podman { connection } = runtime else { return Ok(()); };
     validate_selector(owner, "installation owner")?;
@@ -299,6 +300,7 @@ fn features_missing_from(status_text: &str, exit_code: Option<i32>) -> bool {
 
 /// True when `wsl.exe --status` reports a missing Windows feature. Absent `wsl.exe`, a timeout or
 /// any launch failure is not evidence of missing features, so those answer false.
+#[cfg(windows)]
 pub fn wsl_features_missing(ctl: &Ctl) -> bool {
     let Some(program) = wsl_program() else { return false; };
     let mut cmd = Command::new(program);
@@ -310,6 +312,7 @@ pub fn wsl_features_missing(ctl: &Ctl) -> bool {
     features_missing_from(&text, out.status.code())
 }
 
+#[cfg(windows)]
 pub fn probe_prerequisites(config_root: &Path, selected: &QualityRuntime) -> (Vec<Prerequisite>, QualityOptions) {
     let ctl = Ctl::silent();
     let distro_result = wsl_distros(&ctl);
@@ -496,6 +499,7 @@ fn setup_podman(root: &Path, ctl: &Ctl) -> Result<String> {
     Ok(connection)
 }
 
+#[cfg(windows)]
 pub fn install_runtime(config_root: &Path, runtime: &QualityRuntime, ctl: &Ctl) -> Result<InstallOutcome> {
     if ctl.cancelled() { return Err("Runtime installation cancelled before it started.".into()); }
     let mut connection = None;
@@ -550,6 +554,7 @@ pub fn install_runtime(config_root: &Path, runtime: &QualityRuntime, ctl: &Ctl) 
     } else { "Selected runtime is installed and its Linux daemon is ready. No global engine context/default was changed.".into() }, podman_connection: connection })
 }
 
+#[cfg(windows)]
 pub fn enable_windows_features(config_root: &Path, ctl: &Ctl) -> Result<InstallOutcome> {
     let script = materialize(config_root, "enable-windows-features.ps1", WINDOWS_FEATURES)?;
     let mut cmd = Command::new(powershell());
@@ -566,6 +571,7 @@ pub fn enable_windows_features(config_root: &Path, ctl: &Ctl) -> Result<InstallO
 }
 
 /// Integration can use its actual (including harness-isolated) config root directly.
+#[cfg(windows)]
 pub fn raise_vm_limits_at(engine: &dyn Engine, config_root: &Path, ctl: &Ctl) -> Result<()> {
     let script = materialize(config_root, "raise-vm-limits.sh", VM_LIMITS)?;
     let cmd = match engine.runtime() {
@@ -585,6 +591,43 @@ pub fn raise_vm_limits_at(engine: &dyn Engine, config_root: &Path, ctl: &Ctl) ->
         return Err("Linux VM limits could not be verified after the helper. Required: vm.max_map_count>=524288, fs.file-max>=131072. No Community server was started.".into());
     }
     Ok(())
+}
+
+#[cfg(unix)]
+pub fn probe_prerequisites(config_root: &Path, selected: &QualityRuntime) -> (Vec<Prerequisite>, QualityOptions) {
+    native::probe_prerequisites(config_root, selected)
+}
+
+#[cfg(unix)]
+pub fn wsl_features_missing(_: &Ctl) -> bool { false }
+
+#[cfg(unix)]
+pub fn install_runtime(config_root: &Path, runtime: &QualityRuntime, ctl: &Ctl) -> Result<InstallOutcome> {
+    let engine = CliEngine::new(runtime.clone(), config_root)?;
+    engine.ensure_started(ctl)?;
+    Ok(InstallOutcome { needs_restart: false, podman_connection: None,
+        message: "Selected container engine is ready. No software was installed or machine created.".into() })
+}
+
+#[cfg(unix)]
+pub fn enable_windows_features(_: &Path, _: &Ctl) -> Result<InstallOutcome> {
+    Err("Windows feature setup is not applicable on this platform.".into())
+}
+
+#[cfg(unix)]
+pub fn stop_owned_podman_machine(_: &Path, _: &QualityRuntime, _: &str, _: &Ctl) -> Result<()> {
+    // Unix engines and macOS VMs belong to the user, not to the app. Only app-owned containers are stopped.
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn materialize_vm_limits_script(root: &Path) -> Result<PathBuf> {
+    materialize(root, "raise-vm-limits.sh", VM_LIMITS)
+}
+
+#[cfg(unix)]
+pub fn raise_vm_limits_at(engine: &dyn Engine, config_root: &Path, ctl: &Ctl) -> Result<()> {
+    native::raise_vm_limits(engine, config_root, ctl)
 }
 
 #[cfg(test)]
@@ -674,6 +717,7 @@ mod tests {
         assert!(remaining_workload_names(&[]).is_ok());
     }
 
+    #[cfg(windows)]
     #[test]
     fn shutdown_without_receipt_never_discovers_or_adopts_a_machine() {
         let root = std::env::temp_dir().join(format!("omp-quality-stop-{}", uuid::Uuid::new_v4()));

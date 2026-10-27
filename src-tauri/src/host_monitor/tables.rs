@@ -200,3 +200,197 @@ pub fn address_scope(address: &str) -> AddressScope {
 pub fn is_external(remote: Option<&Endpoint>) -> bool {
     remote.is_some_and(|peer| !matches!(address_scope(&peer.address), AddressScope::Loopback | AddressScope::Unspecified))
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Linux `/proc/net/{tcp,tcp6,udp,udp6}` text tables. Pure decoding, so it is testable on any host; only the Linux
+// collector calls it. Lines are read with a hard length bound and the row count is capped.
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Rows kept from one `/proc/net` table; a busy host can have many TIME_WAIT entries, a runaway one must not grow
+/// the snapshot without bound.
+#[cfg(any(target_os = "linux", test))]
+pub const PROC_ROW_LIMIT: usize = 200_000;
+/// A socket row is far shorter; a longer line is not a row.
+#[cfg(any(target_os = "linux", test))]
+const PROC_LINE_LIMIT: usize = 1024;
+
+/// A decoded `/proc/net` row. `socket.pid` is `0` until the inode is joined with a process.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcSocket {
+    pub socket: RawSocket,
+    /// Socket inode; `0` for sockets with no owner file (TIME_WAIT and other orphans).
+    pub inode: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParsedProcTable {
+    pub rows: Vec<ProcSocket>,
+    /// The table held more than `PROC_ROW_LIMIT` rows: the rows returned are a prefix.
+    pub truncated: bool,
+    /// Lines that were not a socket row (counted, never guessed at).
+    pub malformed: usize,
+}
+
+/// The kernel prints each 32-bit address word with `%08X` of the raw network-order bytes, i.e. in host byte order,
+/// so the bytes are recovered with the native-endian view of the parsed word. Ports are plain host-order hex.
+#[cfg(any(target_os = "linux", test))]
+fn proc_endpoint(text: &str, family: Family) -> Option<(String, u16)> {
+    let (address, port) = text.split_once(':')?;
+    if port.len() != 4 {
+        return None;
+    }
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let word = |chunk: &str| -> Option<[u8; 4]> {
+        (chunk.len() == 8 && chunk.bytes().all(|b| b.is_ascii_hexdigit())).then(|| u32::from_str_radix(chunk, 16).ok().map(u32::to_ne_bytes))?
+    };
+    let address = match family {
+        Family::Ipv4 => Ipv4Addr::from(word(address)?).to_string(),
+        Family::Ipv6 => {
+            if address.len() != 32 || !address.is_ascii() {
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            for (index, chunk) in address.as_bytes().chunks(8).enumerate() {
+                octets[index * 4..index * 4 + 4].copy_from_slice(&word(std::str::from_utf8(chunk).ok()?)?);
+            }
+            Ipv6Addr::from(octets).to_string()
+        }
+    };
+    Some((address, port))
+}
+
+/// Linux TCP state number (`include/net/tcp_states.h`) to the Windows MIB number the rest of the monitor uses.
+#[cfg(any(target_os = "linux", test))]
+pub fn tcp_state_from_linux(state: u8) -> u32 {
+    match state {
+        0x01 => 5,  // ESTABLISHED
+        0x02 => 3,  // SYN_SENT
+        0x03 => 4,  // SYN_RECV
+        0x04 => 6,  // FIN_WAIT1
+        0x05 => 7,  // FIN_WAIT2
+        0x06 => 11, // TIME_WAIT
+        0x07 => 1,  // CLOSE
+        0x08 => 8,  // CLOSE_WAIT
+        0x09 => 10, // LAST_ACK
+        0x0a => TCP_LISTEN,
+        0x0b => 9,  // CLOSING
+        0x0c => 4,  // NEW_SYN_RECV: a request socket still in the handshake
+        _ => 0,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn proc_row(line: &str, family: Family, protocol: Protocol) -> Option<ProcSocket> {
+    let mut fields = line.split_ascii_whitespace();
+    let (_slot, local, remote, state) = (fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+    // Skipped columns: tx_queue:rx_queue, tr:tm->when, retrnsmt, uid, timeout; then the inode.
+    let inode: u64 = fields.nth(5)?.parse().ok()?;
+    let (local_address, local_port) = proc_endpoint(local, family)?;
+    let (remote_address, remote_port) = proc_endpoint(remote, family)?;
+    let tcp_state = match protocol {
+        Protocol::Tcp => Some(tcp_state_from_linux(u8::from_str_radix(state, 16).ok().filter(|_| state.len() == 2)?)),
+        Protocol::Udp => None,
+    };
+    Some(ProcSocket {
+        socket: RawSocket {
+            family,
+            protocol,
+            pid: 0,
+            local: Endpoint { address: local_address, port: local_port, scope_id: None },
+            // UDP carries no peer here, exactly like the Windows UDP table: connected UDP sockets list their local side only.
+            remote: match protocol {
+                Protocol::Tcp => peer(remote_address, remote_port, None),
+                Protocol::Udp => None,
+            },
+            tcp_state,
+        },
+        inode,
+    })
+}
+
+/// Reads one `/proc/net` table. The first line must be the column header; rows that do not decode are counted.
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_proc_net(mut reader: impl std::io::BufRead, family: Family, protocol: Protocol) -> Result<ParsedProcTable, String> {
+    use std::io::{BufRead, Read};
+    // `Ok(None)` is end of input; an over-long line yields `Some(None)` after its remainder was discarded.
+    fn next_line(reader: &mut impl std::io::BufRead, buffer: &mut Vec<u8>) -> Result<Option<Option<()>>, String> {
+        buffer.clear();
+        let read = reader.by_ref().take(PROC_LINE_LIMIT as u64 + 1).read_until(b'\n', buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if buffer.last() == Some(&b'\n') || buffer.len() <= PROC_LINE_LIMIT {
+            return Ok(Some(Some(())));
+        }
+        // Discard the rest of an over-long line without keeping it.
+        loop {
+            let mut sink = Vec::new();
+            let read = reader.by_ref().take(PROC_LINE_LIMIT as u64).read_until(b'\n', &mut sink).map_err(|e| e.to_string())?;
+            if read == 0 || sink.last() == Some(&b'\n') {
+                break;
+            }
+        }
+        Ok(Some(None))
+    }
+    let mut buffer = Vec::with_capacity(256);
+    match next_line(&mut reader, &mut buffer)? {
+        Some(Some(())) if buffer.trim_ascii_start().starts_with(b"sl") => {}
+        None => return Err("table is empty".into()),
+        _ => return Err("table header is not the expected one".into()),
+    }
+    let mut parsed = ParsedProcTable { rows: Vec::new(), truncated: false, malformed: 0 };
+    while let Some(line) = next_line(&mut reader, &mut buffer)? {
+        if parsed.rows.len() >= PROC_ROW_LIMIT {
+            parsed.truncated = true;
+            break;
+        }
+        let row = line.and_then(|_| std::str::from_utf8(&buffer).ok()).and_then(|text| proc_row(text, family, protocol));
+        match row {
+            Some(row) => parsed.rows.push(row),
+            None if buffer.trim_ascii().is_empty() => {}
+            None => parsed.malformed += 1,
+        }
+    }
+    Ok(parsed)
+}
+
+/// The fields of `/proc/<pid>/stat` the monitor reads.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcStat {
+    /// `comm`: the kernel's process name, at most 15 bytes.
+    pub name: String,
+    /// Scheduler state letter; `Z` (zombie) and `X` (dead) mean the process has exited.
+    pub state: char,
+    pub parent_pid: u32,
+    pub threads: u32,
+    /// `starttime`: clock ticks since boot at which the process started.
+    pub start_ticks: u64,
+}
+
+/// `comm` may itself contain spaces and parentheses, so the name is delimited by the first `(` and the *last* `)`;
+/// everything after is whitespace-separated numbers (field 3 is the state, 4 the parent, 20 the thread count and 22
+/// the start time).
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_proc_stat(text: &str) -> Option<ProcStat> {
+    let open = text.find('(')?;
+    let close = text.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let mut rest = text[close + 1..].split_ascii_whitespace();
+    let state = rest.next()?.chars().next()?;
+    let parent_pid = rest.next()?.parse().ok()?;
+    let threads = rest.nth(15)?.parse().ok()?;
+    let start_ticks = rest.nth(1)?.parse().ok()?;
+    Some(ProcStat { name: text[open + 1..close].to_string(), state, parent_pid, threads, start_ticks })
+}
+
+/// Start time in the monitor's 100 ns identity unit. Only equality and order matter, so ticks since boot are kept
+/// instead of an absolute time that a clock adjustment could shift under a stored identity.
+#[cfg(any(target_os = "linux", test))]
+pub fn ticks_to_100ns(ticks: u64, ticks_per_second: u64) -> u64 {
+    (u128::from(ticks) * 10_000_000 / u128::from(ticks_per_second.max(1))).min(u128::from(u64::MAX)) as u64
+}

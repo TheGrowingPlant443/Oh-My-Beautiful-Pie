@@ -152,6 +152,14 @@ fn cognee_old_saved_ui_address_and_folder_are_ignored_and_dropped_without_touchi
     service.record_obsidian_decline(repository.to_string_lossy().as_ref()).unwrap();
     let saved: serde_json::Value = serde_json::from_slice(&fs::read(fixture.settings()).unwrap()).unwrap();
     assert_eq!(saved["cognee"], serde_json::json!({}));
+    // The set is sorted: on Windows the kept entry sorts first, on Unix the new absolute `/...` path sorts before it.
+    #[cfg(windows)]
     assert_eq!(saved["obsidian"]["declinedProjects"][0], "c:/kept");
+    #[cfg(unix)]
+    {
+        let declined = saved["obsidian"]["declinedProjects"].as_array().unwrap();
+        assert_eq!(declined.len(), 2, "{declined:?}");
+        assert!(declined.iter().any(|entry| entry == "c:/kept"), "{declined:?}");
+    }
     assert_eq!(saved["graphifyOutputs"]["c:/project"], "c:/out");
 }

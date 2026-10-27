@@ -63,8 +63,27 @@ test("tools, plugin implementation and named profile settings never move to Mark
   assert.deepEqual(agentSetupPreview({ kind: "profile", name: "plan-mode", description: "test" }, "/native", status(), "/omp"), [{ nativePath: "/omp/profiles/plan-mode/agent/config.yml", sourcePath: null }]);
 });
 
+test("Local AI models previews route Markdown to its global vault namespace and keep executable assets native", () => {
+  const source = status({ kind: "local_ai" }, { namespace: "Agent setup/Local AI models", nativeRoot: "/app/local-ai-setup", sourceRoot: "/vault/Agent setup/Local AI models" });
+  const cases = [
+    [{ kind: "agents", name: "" }, ["AGENTS.md"], true],
+    [{ kind: "agents", name: "reviewer" }, ["agent-instructions/reviewer/AGENTS.md"], true],
+    [{ kind: "rules", name: "" }, ["RULES.md"], true],
+    [{ kind: "skill", name: "audit" }, ["skills/audit/SKILL.md", "SKILLS.md"], true],
+    [{ kind: "workflow", name: "review" }, ["rules/workflow-review.md"], true],
+    [{ kind: "tool", name: "audit", language: "python" }, ["tools/audit/index.ts", "tools/audit/run.py"], false],
+    [{ kind: "plugin", name: "audit" }, ["extensions/audit/package.json", "extensions/audit/index.ts"], false],
+  ];
+  for (const [input, paths, markdown] of cases) {
+    assert.deepEqual(agentSetupPreview({ description: "test", ...input }, source.nativeRoot, source, "/omp"), paths.map(path => ({
+      nativePath: `${source.nativeRoot}/${path}`,
+      sourcePath: markdown ? `${source.sourceRoot}/${path}` : null,
+    })));
+  }
+});
+
 test("target identities distinguish repository instances and named profiles", () => {
-  const targets = [globalTarget, managerTarget, { kind: "architect" }, { kind: "repository", projectInstanceId: "a" }, { kind: "repository", projectInstanceId: "b" }, { kind: "profile", profileName: "a" }];
+  const targets = [globalTarget, managerTarget, { kind: "architect" }, { kind: "local_ai" }, { kind: "repository", projectInstanceId: "a" }, { kind: "repository", projectInstanceId: "b" }, { kind: "profile", profileName: "a" }];
   assert.equal(new Set(targets.map(agentMarkdownTargetKey)).size, targets.length);
 });
 

@@ -10,7 +10,7 @@ impl Fixture {
         let knowledge=KnowledgeService::new(app.clone(),home);
         let token=knowledge.prepare_knowledge_vault(ScopeRequest::Global,None,vault.to_str().unwrap(),VaultMode::Markdown).unwrap();
         knowledge.confirm_knowledge_vault(&token.token).unwrap();
-        let paths=SetupPaths{global_omp_folder:root.join("native"),global_agent_folder:root.join("native/agent"),manager_folder:app.join("manager-setup"),architect_folder:app.join("architect-setup")};
+        let paths=SetupPaths{global_omp_folder:root.join("native"),global_agent_folder:root.join("native/agent"),manager_folder:app.join("manager-setup"),architect_folder:app.join("architect-setup"),local_ai_folder:app.join("local-ai-setup")};
         fs::create_dir_all(&paths.global_agent_folder).unwrap();
         let service=AgentMarkdownService::new(app,knowledge);
         service.install_boundary(Arc::new(IdleFixture)).unwrap();
@@ -116,4 +116,30 @@ fn default_and_named_profiles_have_disjoint_roots_and_markdown_only_authority(){
     assert_ne!(a.key,b.key);assert_ne!(a.native,f.resolved.native);assert_ne!(a.namespace,b.namespace);
     for target in ["default","../escape","CON"]{assert!(f.service.resolve_paths(KnowledgeAssetTarget::Profile{profile_name:target.into()},&f.paths,|_|Err("unused".into())).is_err());}
     for bad in ["config.yml","auth.json","sessions/secret.md","AGENTS.md:stream","../AGENTS.md","tools/x/index.ts","skills/x/run.py"]{assert!(!allowed(bad),"{bad}");}
+}
+
+#[test]
+fn local_markdown_import_and_apply_are_isolated_from_other_scopes(){
+    let mut f=Fixture::new();
+    let global=f.resolved.clone();
+    f.native("AGENTS.md","global policy");
+    let local=f.service.resolve_paths(KnowledgeAssetTarget::LocalAi,&f.paths,|_|Err("unused".into())).unwrap();
+    assert_eq!(local.namespace,"Agent setup/Local AI models");
+    assert!(!local.native.exists());
+    for target in [KnowledgeAssetTarget::Global,KnowledgeAssetTarget::Manager,KnowledgeAssetTarget::Architect,KnowledgeAssetTarget::Profile{profile_name:"local".into()},KnowledgeAssetTarget::Repository{project_instance_id:"repo".into()}]{
+        let other=f.service.resolve_paths(target,&f.paths,|_|Ok(f.root.join("repository"))).unwrap();
+        assert_ne!(local.key,other.key);assert_ne!(local.native,other.native);assert_ne!(local.namespace,other.namespace);
+    }
+    f.resolved=local;
+    f.native("AGENTS.md","local policy");f.native("index.ts","loader");f.native("extensions/plugin/package.json","manifest");
+    let imported=f.import();assert_eq!(imported.items.len(),1);
+    let vault=f.resolved.vault.as_ref().unwrap();
+    assert_eq!(String::from_utf8(vault.read_markdown("Agent setup/Local AI models/AGENTS.md").unwrap()).unwrap(),"local policy");
+    assert!(!vault.root.join("Agent setup/Global/AGENTS.md").exists());
+    f.note("AGENTS.md","reviewed local policy");
+    let prepared=f.prepare(false,None);f.commit(&prepared,None).unwrap();
+    assert_eq!(fs::read_to_string(f.resolved.native.join("AGENTS.md")).unwrap(),"reviewed local policy");
+    assert_eq!(fs::read_to_string(global.native.join("AGENTS.md")).unwrap(),"global policy");
+    assert_eq!(fs::read_to_string(f.resolved.native.join("index.ts")).unwrap(),"loader");
+    assert_eq!(fs::read_to_string(f.resolved.native.join("extensions/plugin/package.json")).unwrap(),"manifest");
 }

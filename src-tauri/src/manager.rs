@@ -77,6 +77,8 @@ pub struct BridgeLaunch {
     pub extension_path: PathBuf,
     pub manager_setup_dir: PathBuf,
     pub architect_setup_dir: PathBuf,
+    pub local_ai_setup_dir: PathBuf,
+    pub home_dir: PathBuf,
     pub architect_dir: PathBuf,
     pub terminal_dir: PathBuf,
     pub sdk_dir: Option<PathBuf>,
@@ -522,6 +524,12 @@ impl ManagerHub {
                 .parent()
                 .ok_or("invalid bridge directory")?
                 .join("architect-setup"),
+            local_ai_setup_dir: self
+                .extension_path
+                .parent()
+                .ok_or("invalid bridge directory")?
+                .join("local-ai-setup"),
+            home_dir: home.clone(),
             architect_dir: self
                 .extension_path
                 .parent()

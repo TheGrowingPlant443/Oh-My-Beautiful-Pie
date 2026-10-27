@@ -938,7 +938,14 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize, maximum: u64) -> 
     if bytes.len() as u64 > maximum { return Err("Oversized security review file".into()); }
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|error| error.to_string())?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600); // state files hold ownership capabilities and findings
+        }
+        let mut file = options.open(&temporary).map_err(|error| error.to_string())?;
         file.write_all(&bytes).map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
         drop(file);
