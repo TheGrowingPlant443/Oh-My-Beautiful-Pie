@@ -332,6 +332,8 @@ npm run check
 npm run build
 ```
 
+On macOS, first canonicalize the temporary-directory alias so security-sensitive fixtures use real paths: `TMPDIR="$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.gettempdir()))')"; export TMPDIR`. The macOS release workflow applies this before running the complete Rust suite, including a native process-identity/cancellation smoke check. The package-insights deadline regression holds the second response behind a bounded channel rather than requiring the first response to land within a narrow sleep-based window.
+
 Exercised on Windows: independent real OMP children; terminal handshake, input and response; preview-only startup; stop/restart and saved conversation continuity; application close/reopen with no autostart; native folder picker; native reconnect listing; plan viewing; compact tree with no dashboard terminals; and responsive preview sizing.
 
 Focus regression checked in the native desktop: with an OMP terminal running, open **New instance**, type in the Name field, resize the window, and let background updates arrive. The modal must retain keyboard focus. Creating the second instance must leave the first running. Terminal resizing never requests keyboard focus; the creation form uses a native modal dialog.

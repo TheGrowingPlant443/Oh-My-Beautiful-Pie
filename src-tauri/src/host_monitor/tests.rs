@@ -816,11 +816,21 @@ fn native_snapshot_smoke() {
     drop(listener6);
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 #[test]
 fn native_snapshot_smoke() {
     assert_eq!(super::native::collect(&AtomicBool::new(false)).err().as_deref(), Some("unsupported_platform"));
     assert!(capture_identity(1).is_none());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_snapshot_smoke() {
+    let own = capture_identity(std::process::id()).expect("own process identity");
+    let raw = super::native::collect(&AtomicBool::new(false)).expect("native collection");
+    let process = raw.processes.iter().find(|row| row.pid == own.pid).expect("own process collected");
+    assert_eq!(process.creation, Some(own.creation_time_100ns));
+    assert_eq!(super::native::collect(&AtomicBool::new(true)).err().as_deref(), Some("monitor_cancelled"));
 }
 
 // ---------------------------------------------------------------- Linux /proc decoding (pure, runs on any host)

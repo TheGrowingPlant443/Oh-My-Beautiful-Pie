@@ -1779,9 +1779,16 @@ mod tests {
 
     #[test]
     fn overall_deadline_caps_sequential_requests_and_gate_wait() {
-        let f = Fixture::new(|path| npm(path).delayed(Duration::from_millis(100)));
-        let service = f.service_with(None,Duration::from_millis(400),Duration::from_millis(160));
-        let result = service.lookup("npm:fixture", GithubMode::Demand, false).unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocked = Mutex::new(blocked);
+        let f = Fixture::new(move |path| {
+            if path.starts_with("/npmDownloads/") { let _ = blocked.lock().recv_timeout(Duration::from_secs(4)); }
+            npm(path)
+        });
+        let service = f.service_with(None,Duration::from_secs(5),Duration::from_secs(2));
+        let result = service.lookup("npm:fixture", GithubMode::Demand, false);
+        release.send(()).unwrap();
+        let result = result.unwrap();
         assert_eq!(result.newest_status,InsightStatus::Available);
         assert_eq!(result.downloads.status,InsightStatus::Error);
         assert_eq!(f.paths().len(),2,"deadline prevents later GitHub requests");

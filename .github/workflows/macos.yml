@@ -33,6 +33,8 @@ jobs:
             --features tauri/custom-protocol
       - name: Test native backend
         run: |
+          TMPDIR="$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.gettempdir()))')"
+          export TMPDIR
           cargo --config 'source.crates-io.replace-with="vendored-sources"' \
             --config 'source.vendored-sources.directory="cargo-vendor-dir"' \
             test --manifest-path src-tauri/Cargo.toml --locked --offline \
