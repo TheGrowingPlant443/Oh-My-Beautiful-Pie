@@ -8,15 +8,7 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            arch: arm64
-          - runner: macos-15-intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: '15.0'
     steps:
@@ -46,12 +38,9 @@ jobs:
             test --manifest-path src-tauri/Cargo.toml --locked --offline \
             --features tauri/custom-protocol
       - name: Package app and check portability
-        env:
-          EXPECTED_ARCH: ${{ matrix.arch }}
         run: |
           python3 - <<'PY'
           import json
-          import os
           from pathlib import Path
           import plistlib
           import shutil
@@ -74,7 +63,7 @@ jobs:
                   'NSHighResolutionCapable': True,
               }, stream)
           arch = subprocess.check_output(['lipo', '-archs', binary], text=True).strip()
-          assert arch == os.environ['EXPECTED_ARCH'], arch
+          assert arch == 'arm64', arch
           libraries = subprocess.check_output(['otool', '-L', binary], text=True)
           print(libraries)
           for line in libraries.splitlines()[1:]:
@@ -85,10 +74,10 @@ jobs:
           codesign --verify --deep --strict "$app"
           "$app/Contents/MacOS/omp-manager" --code-quality --help
           mkdir -p artifacts
-          ditto -c -k --sequesterRsrc --keepParent "$app" "artifacts/OMP-Manager-macos-${EXPECTED_ARCH}.zip"
-          shasum -a 256 "artifacts/OMP-Manager-macos-${EXPECTED_ARCH}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" artifacts/OMP-Manager-macos-arm64.zip
+          shasum -a 256 artifacts/OMP-Manager-macos-arm64.zip
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: OMP-Manager-macos-${{ matrix.arch }}
+          name: OMP-Manager-macos-arm64
           path: artifacts/*.zip
           if-no-files-found: error
