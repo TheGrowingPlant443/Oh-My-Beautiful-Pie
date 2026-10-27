@@ -1,6 +1,6 @@
 import { DependencyJobSession, type JobSnapshot } from "./package-insights";
 import { toAdmission, toJobState, type InsightJobState } from "./project-insight";
-import type { InsightProducer, ProjectInsightStatus, VisualizationKind } from "./api";
+import type { InsightProducer, ProjectInsightState, ProjectInsightStatus, VisualizationKind } from "./api";
 import type { GenerateOutcome, GenerateRequest } from "./overview-types";
 
 export type TicketState = "admitting" | "waiting" | "uncertain" | "completed" | "failed" | "timedOut" | "unreadable";
@@ -61,6 +61,7 @@ export const ticketKey = (request: Pick<GenerateRequest, "kind" | "folder" | "sn
   JSON.stringify([request.kind, folderKey, request.snapshotId, request.sourceId ?? null]);
 
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+const ADMITTED_STATE: Partial<Record<ProjectInsightState, TicketState>> = { completed: "completed", failed: "failed", uncertain: "uncertain" };
 
 export class TicketBook {
   private readonly tickets = new Map<string, VisualizationTicket>();
@@ -112,7 +113,7 @@ export class TicketBook {
     const ticket: VisualizationTicket = {
       key, requestId: status.requestId, folder: request.folder, snapshotId: request.snapshotId, kind: request.kind, sourceId: request.sourceId ?? null,
       producer: status.producer ?? null, destinationTab: request.area, selectedRevisionId: status.requestId, navigationEpoch: epoch, autoReturnEligible: true,
-      state: status.state === "completed" ? "completed" : status.state === "failed" ? "failed" : status.state === "uncertain" ? "uncertain" : "waiting",
+      state: ADMITTED_STATE[status.state] ?? "waiting",
       message: status.message, startedAt: this.hooks.clock.now(), lateResult: false,
     };
     this.tickets.set(key, ticket);
@@ -126,7 +127,7 @@ export class TicketBook {
     if (architect === null) message = "The Architect is not available. The request is saved; open The Architect to continue.";
     else if (!await this.hooks.openArchitect(architect)) message = "The Architect could not be opened. The request continues in the background.";
     const current = this.tickets.get(key);
-    if (message !== null && current && current.requestId === status.requestId) this.patch(current, { message });
+    if (message !== null && current?.requestId === status.requestId) this.patch(current, { message });
     return { admitted: true, status, error: null, uncertain: status.state === "uncertain" };
   }
 
@@ -146,7 +147,7 @@ export class TicketBook {
 
   private onSnapshot(ticket: VisualizationTicket, snapshot: JobSnapshot<InsightJobState>): void {
     const live = this.tickets.get(ticket.key);
-    if (!live || live.requestId !== ticket.requestId || ticket.requestId === null) return;
+    if (live?.requestId !== ticket.requestId || ticket.requestId === null) return;
     const state = snapshot.state;
     if (state?.status === "complete") {
       if (live.state !== "completed") { this.patch(live, { state: "completed", message: null }); this.finished(this.tickets.get(ticket.key)!); }
@@ -169,7 +170,7 @@ export class TicketBook {
     const step = (): void => {
       this.returns.delete(ticket.key);
       const live = this.tickets.get(ticket.key);
-      if (!live || live.requestId !== ticket.requestId) return;
+      if (live?.requestId !== ticket.requestId) return;
       if (!live.autoReturnEligible || live.navigationEpoch !== this.hooks.epoch() || !this.hooks.following(live)) { this.late(live); return; }
       if (this.hooks.quiescent(live)) {
         this.patch(live, { lateResult: false });
@@ -194,7 +195,7 @@ export class TicketBook {
   /** User chose to see a result that arrived while they were elsewhere. */
   openResult(key: string): boolean {
     const ticket = this.tickets.get(key);
-    if (!ticket || ticket.state !== "completed") return false;
+    if (ticket?.state !== "completed") return false;
     this.patch(ticket, { lateResult: false, autoReturnEligible: false });
     this.hooks.returnToOverview(this.tickets.get(key)!);
     return true;
@@ -203,7 +204,7 @@ export class TicketBook {
   /** Reads the request again after a stalled or timed-out watch; never admits or resends anything. */
   recheck(key: string): void {
     const ticket = this.tickets.get(key);
-    if (!ticket || ticket.requestId === null || (ticket.state !== "timedOut" && ticket.state !== "unreadable")) return;
+    if (typeof ticket?.requestId !== "string" || (ticket.state !== "timedOut" && ticket.state !== "unreadable")) return;
     this.stopSession(key);
     this.patch(ticket, { state: "waiting", message: null });
     const admitted: ProjectInsightStatus = { requestId: ticket.requestId, folder: ticket.folder, kind: ticket.kind, state: "submitted", message: null, result: null };
@@ -228,7 +229,7 @@ export class TicketBook {
   private stop(ticket: VisualizationTicket): void { this.stopSession(ticket.key); }
 
   dispose(): void {
-    for (const key of [...this.sessions.keys()]) this.stopSession(key);
+    for (const key of this.sessions.keys()) this.stopSession(key);
     this.tickets.clear();
   }
 }

@@ -8,13 +8,16 @@ const POLL_MS = 50;
 
 // Everything except ordinary newline/tab is shown as visible text, so saved or model-written text cannot drive the terminal.
 export function escapeTerminal(value) {
-  return String(value).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/g, ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  return String(value).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/g, ch => '\\u' + ch.codePointAt(0).toString(16).padStart(4, '0'));
 }
 
 const SEPARATOR = '\n';
 const when = ms => Number.isFinite(ms) ? new Date(ms).toISOString() : 'unknown time';
 const lines = (items, indent = '  ') => items.map(item => `${indent}- ${item}`);
-const cite = item => `${item.path}:${item.lineStart}${item.lineEnd !== item.lineStart ? `-${item.lineEnd}` : ''} — ${item.explanation}`;
+const cite = item => {
+  const range = item.lineEnd === item.lineStart ? '' : `-${item.lineEnd}`;
+  return `${item.path}:${item.lineStart}${range} — ${item.explanation}`;
+};
 
 function reviewed(request) {
   const parts = [`resolved ${request.resolvedVersions.join(', ') || 'none'}`, `declared ${request.declaredVersions.join(', ') || 'none'}`,
@@ -23,7 +26,8 @@ function reviewed(request) {
 }
 
 function header(title, request, completedAt) {
-  return [`${title} — ${request.packageId}`, `Request ${request.requestId} · completed ${when(completedAt)}${request.contextId ? ` · context ${request.contextId}` : ''}`,
+  const context = request.contextId ? ` · context ${request.contextId}` : '';
+  return [`${title} — ${request.packageId}`, `Request ${request.requestId} · completed ${when(completedAt)}${context}`,
     reviewed(request), 'Saved analysis — source code and dependencies may have changed since this review.'];
 }
 
@@ -88,7 +92,7 @@ export function createResultConsole(pi, { identity }) {
     for (const [key, item] of queue) if (!sameIdentity(item.identity, current)) queue.delete(key);
     if (!queue.size) return true;
     if (!ctx.isIdle() || ctx.hasPendingMessages()) return false;
-    for (const [key, item] of [...queue]) {
+    for (const [key, item] of queue) {
       queue.delete(key);
       try {
         const state = branchState(ctx, item);

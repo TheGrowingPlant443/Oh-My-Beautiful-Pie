@@ -50,12 +50,55 @@ impl SrsService {
  fn status_value(&self,j:&Job)->Result<Value>{let vault=self.knowledge.vault_root(&j.scope.vault_id);let same= vault.as_ref().is_ok_and(|v|same_path(&v.root,Path::new(&j.scope.vault_root)));let resume=if matches!(j.state,JobState::Running|JobState::Reviewing|JobState::Inventory|JobState::Completed|JobState::Cancelled){"none"}else{let current=self.registry().ok().and_then(|r|r.manager_hub().and_then(|h|j.producer.as_ref().map(|p|h.dependency_producer_live(p))));if current==Some(false){"currentConversationFromCheckpoints"}else{"sameConversation"}};
  Ok(json!({"jobId":j.job_id,"folder":j.scope.folder,"repositoryRoot":j.scope.repository_root,"revision":j.revision,"state":j.state,"phase":j.phase,"vaultId":j.scope.vault_id,"vaultMode":j.scope.vault_mode,"vaultAvailable":same,"outputPath":format!("SRS/{}",j.job_id),"masterPath":format!("SRS/{}/SRS.md",j.job_id),"template":j.scope.template,"scopeHash":j.scope_hash,"sourceHash":j.source_hash,"attemptId":j.attempt_id,"stageId":j.stage.as_ref().map(|s|&s.stage_id),"stage":j.stage,"producer":j.producer,"counts":j.counts,"checkpoint":j.checkpoint,"error":j.error,"usage":{"tokens":null,"costUsd":null},"createdAt":j.created_at,"updatedAt":j.updated_at,"completion":j.completion,"resumeRequired":resume,"humanExclusions":j.human_exclusions,"architectModel":null}))}
  pub fn get_srs_job(&self,job_id:&str)->Result<Value>{let _g=self.gate.lock();self.status_value(&self.store.job(job_id)?)}
- pub fn list_srs_jobs(&self,folder:&str,offset:usize,limit:usize)->Result<Value>{if !(1..=200).contains(&limit){return Err("Page size must be 1..200".into())}let root=crate::setup::find_repository_root(Path::new(folder))?;let _g=self.gate.lock();let mut items=Vec::<Job>::new();let mut total=0;self.store.jobs(|j|{if same_path(Path::new(&j.scope.repository_root),&root){total+=1;items.push(j);items.sort_by(|a,b|(b.created_at,&b.job_id).cmp(&(a.created_at,&a.job_id)));if items.len()>offset.saturating_add(limit){items.pop();}}Ok(())})?;let mut values=Vec::new();for j in items.into_iter().skip(offset){values.push(self.status_value(&j)?)}let next=offset+values.len();Ok(json!({"items":values,"offset":offset,"total":total,"nextOffset":if next<total{Some(next)}else{None}}))}
+ pub fn list_srs_jobs(&self,folder:&str,offset:usize,limit:usize)->Result<Value>{
+  if !(1..=200).contains(&limit){return Err("Page size must be 1..200".into())}
+  let root=crate::setup::find_repository_root(Path::new(folder))?;
+  let _g=self.gate.lock();
+  let(items,total)=self.repository_job_page(&root,offset.saturating_add(limit))?;
+  let mut values=Vec::new();
+  for j in items.into_iter().skip(offset){values.push(self.status_value(&j)?)}
+  let next=offset+values.len();
+  Ok(json!({"items":values,"offset":offset,"total":total,"nextOffset":if next<total{Some(next)}else{None}}))
+ }
+ fn repository_job_page(&self,root:&Path,end:usize)->Result<(Vec<Job>,usize)>{
+  let mut items=Vec::<Job>::new();
+  let mut total=0;
+  self.store.jobs(|j|{
+   if !same_path(Path::new(&j.scope.repository_root),root){return Ok(())}
+   total+=1;
+   items.push(j);
+   items.sort_by(|a,b|(b.created_at,&b.job_id).cmp(&(a.created_at,&a.job_id)));
+   if items.len()>end{items.pop();}
+   Ok(())
+  })?;
+  Ok((items,total))
+ }
+ fn evidence_roots(&self,repository:&Path,vault_root:&Path,evidence_folders:Vec<String>)->Result<Vec<Root>> {
+  let mut roots=vec![Root{path:repository.display().to_string(),kind:"repository".into(),rationale:"Human-selected project repository".into()}];
+  for value in evidence_folders{
+   let p=crate::setup::canonical(Path::new(&value)).map_err(|e|e.to_string())?;safe_root(&p)?;
+   if same_path(&p,&self.config_root)||p.starts_with(&self.config_root)||same_path(&p,vault_root)||p.starts_with(vault_root){return Err("App metadata and managed output cannot be evidence roots".into())}
+   if roots.iter().any(|r|p.starts_with(&r.path)||Path::new(&r.path).starts_with(&p)){return Err("Evidence roots may not overlap".into())}
+   roots.push(Root{path:p.display().to_string(),kind:"evidence".into(),rationale:"Supplementary folder explicitly admitted by the human".into()});
+  }
+  Ok(roots)
+ }
+ fn scope_exclusions(&self,repository:&Path,vault_root:&Path,roots:&[Root],exclusions:Vec<String>)->Result<Vec<Exclusion>> {
+  let mut excluded=Vec::new();
+  for value in exclusions{
+   let requested=Path::new(&value);let p=if requested.is_absolute(){requested.to_path_buf()}else{repository.join(requested)};
+   let p=crate::setup::canonical(&p).map_err(|e|format!("Cannot resolve exclusion: {e}"))?;
+   if !roots.iter().any(|r|p.starts_with(&r.path)&&!same_path(&p,Path::new(&r.path))){return Err("Exclusions must be inside an admitted root, not the entire root".into())}
+   excluded.push(Exclusion{path:p.display().to_string(),reason:"Explicit human scope exclusion".into(),source:"human".into()});
+  }
+  excluded.push(Exclusion{path:vault_root.display().to_string(),reason:"Vault notes and generated SRS output are not primary evidence".into(),source:"app".into()});
+  excluded.push(Exclusion{path:self.config_root.display().to_string(),reason:"Private application state, sessions and credentials".into(),source:"app".into()});
+  Ok(excluded)
+ }
  pub fn prepare_srs_scope(&self,folder:&str,vault_id:&str,evidence_folders:Vec<String>,exclusions:Vec<String>)->Result<Value>{
   if evidence_folders.len()>200||exclusions.len()>200{return Err("A scope preparation admits at most 200 explicit inputs per message".into())}let repository=crate::setup::find_repository_root(Path::new(folder))?;safe_root(&repository)?;let vault=self.knowledge.vault_root(vault_id)?;match &vault.scope{KnowledgeScope::Project{repository_root}if same_path(Path::new(repository_root),&repository)=>{},_=>return Err("Select this project's explicitly bound vault".into())}
-  let mut roots=vec![Root{path:repository.display().to_string(),kind:"repository".into(),rationale:"Human-selected project repository".into()}];for value in evidence_folders{let p=crate::setup::canonical(Path::new(&value)).map_err(|e|e.to_string())?;safe_root(&p)?;if same_path(&p,&self.config_root)||p.starts_with(&self.config_root)||same_path(&p,&vault.root)||p.starts_with(&vault.root){return Err("App metadata and managed output cannot be evidence roots".into())}if roots.iter().any(|r|p.starts_with(&r.path)||Path::new(&r.path).starts_with(&p)){return Err("Evidence roots may not overlap".into())}roots.push(Root{path:p.display().to_string(),kind:"evidence".into(),rationale:"Supplementary folder explicitly admitted by the human".into()});}
-  let mut excluded=Vec::new();for value in exclusions{let requested=Path::new(&value);let p=if requested.is_absolute(){requested.to_path_buf()}else{repository.join(requested)};let p=crate::setup::canonical(&p).map_err(|e|format!("Cannot resolve exclusion: {e}"))?;if !roots.iter().any(|r|p.starts_with(&r.path)&&!same_path(&p,Path::new(&r.path))){return Err("Exclusions must be inside an admitted root, not the entire root".into())}excluded.push(Exclusion{path:p.display().to_string(),reason:"Explicit human scope exclusion".into(),source:"human".into()});}
-  excluded.push(Exclusion{path:vault.root.display().to_string(),reason:"Vault notes and generated SRS output are not primary evidence".into(),source:"app".into()});excluded.push(Exclusion{path:self.config_root.display().to_string(),reason:"Private application state, sessions and credentials".into(),source:"app".into()});
+  let roots=self.evidence_roots(&repository,&vault.root,evidence_folders)?;
+  let excluded=self.scope_exclusions(&repository,&vault.root,&roots,exclusions)?;
   let template=serde_json::to_value(documents::template_manifest()).map_err(|e|e.to_string())?;let scope=Scope{folder:repository.display().to_string(),repository_root:repository.display().to_string(),vault_id:vault_id.into(),vault_root:vault.root.display().to_string(),vault_mode:vault.mode,roots,exclusions:excluded,template};let token=store::id();let expires=self.now()+TOKEN_TTL;let result=json!({"token":token,"expiresAt":expires,"folder":scope.folder,"repositoryRoot":scope.repository_root,"vaultId":scope.vault_id,"vaultRoot":scope.vault_root,"vaultMode":scope.vault_mode,"roots":scope.roots,"exclusions":scope.exclusions,"template":scope.template,"warnings":["No total document/token/time/iteration limit. Provider charges may be very large. Local models still require time and compute.","Only the recorded evidence scope is covered; inaccessible production behavior is not proven.","Closing OMP Manager checkpoints and pauses; there is no background service."]});let mut pending=self.scopes.lock();pending.retain(|_,s|s.expires>self.now());pending.insert(token,PreparedScope{scope,expires});Ok(result)
  }
  pub fn start_srs(self:&Arc<Self>,scope_token:&str)->Result<Value>{let pending=self.scopes.lock().remove(scope_token).ok_or("Scope token expired or consumed; review scope again")?;if self.now()>pending.expires{return Err("Scope token expired; review scope again".into())}let scope=pending.scope;let vault=self.knowledge.vault_root(&scope.vault_id)?;if !same_path(&vault.root,Path::new(&scope.vault_root)){return Err("Vault binding changed; review destination again".into())}for r in &scope.roots{safe_root(Path::new(&r.path))?;}
@@ -86,9 +129,21 @@ impl SrsService {
   let summary=inventory::inventory(&dir,&roots,&exclusions,&protected,&||self.closing.load(Ordering::Acquire)||self.store.job(id).is_ok_and(|j|j.state!=JobState::Inventory))?;
   let _g=self.gate.lock();let mut j=self.store.job(id)?;if j.state!=JobState::Inventory{return Ok(())}
   j.source_hash=Some(summary.source_hash.clone());j.counts.areas=summary.areas;j.counts.evidence_files=summary.files;j.counts.excluded=summary.excluded;
-  // One survey obligation per admitted area and per blocking record; individual files are covered by read receipts.
-  // Reconcile records even if the previous process died between writing a work record and its relation/counters.
-  inventory::for_each(&dir,&mut |item|{
+  self.reconcile_source_work(id,&dir)?;
+  self.ensure_template_work(id)?;
+  self.retire_obsolete_source_work(id,&dir)?;
+  let work_exclusions=self.recount_work(id,&mut j)?;
+  j.counts.excluded=summary.excluded+work_exclusions;
+  let blocked=j.counts.blocked;
+  j.inventory_complete=true;
+  j.state=if blocked>0{JobState::WaitingForHuman}else{JobState::Running};
+  j.error=if blocked>0{Some(Diagnostic{code:"needs_evidence".into(),message:"Unreadable or unsupported evidence needs a readable supply or explicit human exclusion. It is not proof of no behavior.".into()})}else{None};
+  self.save(&mut j,vec![],"Streaming evidence inventory committed")
+ }
+ /// One survey obligation per admitted area and per blocking record; individual files are covered by read receipts.
+ /// Reconcile records even if the previous process died between writing a work record and its relation/counters.
+ fn reconcile_source_work(&self,id:&str,dir:&Path)->Result<()> {
+  inventory::for_each(dir,&mut |item|{
    if item.state=="excluded"||!(item.kind=="area"||item.state=="blocked"){return Ok(())}
    let work_id=format!("source-{}",item.id);
    if !self.store.path(id,"work",&work_id)?.exists(){
@@ -98,17 +153,22 @@ impl SrsService {
    }
    // A prior write may have reached the work record but not this link; always repair it.
    if let Some(r)=self.store.relation(id,&work_id,"evidence",&item.id)?{store::atomic(&self.store.path(id,&r.table,&r.id)?,&r.value)?;}
-   Ok(())})?;
+   Ok(())})
+ }
+ fn ensure_template_work(&self,id:&str)->Result<()> {
   for section in ["Introduction","Product Overview","External Interfaces","Functional","QoS","Compliance","Design/Implementation","AI/ML","Verification","Appendixes"]{
    let wid=format!("template-{}",store::hash(section.as_bytes()));
    if !self.store.path(id,"work",&wid)?.exists(){let w=Work{id:wid.clone(),parent_id:None,phase:Phase::Verify,kind:"templateSection".into(),status:"pending".into(),rationale:section.into(),revision:0};store::atomic(&self.store.path(id,"work",&wid)?,&w)?;}
   }
-  // No model work can be admitted before inventoryComplete. If the source scope changed during an incomplete
-  // inventory, retire obsolete generated source obligations rather than retain dangling evidence references.
+  Ok(())
+ }
+ /// No model work can be admitted before inventoryComplete. If the source scope changed during an incomplete
+ /// inventory, retire obsolete generated source obligations rather than retain dangling evidence references.
+ fn retire_obsolete_source_work(&self,id:&str,dir:&Path)->Result<()> {
   self.store.for_each(id,"work",|value|{
    let w:Work=serde_json::from_value(value).map_err(|e|e.to_string())?;
    if let Some(evidence)=w.id.strip_prefix("source-"){
-    if w.kind=="sourceArea"&&inventory::read_item(&dir,evidence).is_err(){
+    if w.kind=="sourceArea"&&inventory::read_item(dir,evidence).is_err(){
      std::fs::remove_file(self.store.path(id,"work",&w.id)?).map_err(|e|e.to_string())?;
      let relations=dir.join(format!("rel-{}-evidence",w.id));
      store::plain(&relations)?;
@@ -116,7 +176,10 @@ impl SrsService {
     }
    }
    Ok(())
-  })?;
+  })
+ }
+ /// Rebuilds the work counters from the durable records and returns the human-excluded work count.
+ fn recount_work(&self,id:&str,j:&mut Job)->Result<u64> {
   j.counts.work=0;j.counts.work_open=0;j.counts.blocked=0;
   let mut work_exclusions=0;
   self.store.for_each(id,"work",|value|{
@@ -127,12 +190,7 @@ impl SrsService {
    if w.status=="excluded"{work_exclusions+=1;}
    Ok(())
   })?;
-  j.counts.excluded=summary.excluded+work_exclusions;
-  let blocked=j.counts.blocked;
-  j.inventory_complete=true;
-  j.state=if blocked>0{JobState::WaitingForHuman}else{JobState::Running};
-  j.error=if blocked>0{Some(Diagnostic{code:"needs_evidence".into(),message:"Unreadable or unsupported evidence needs a readable supply or explicit human exclusion. It is not proof of no behavior.".into()})}else{None};
-  self.save(&mut j,vec![],"Streaming evidence inventory committed")
+  Ok(work_exclusions)
  }
  pub fn pause_srs(&self,job_id:&str)->Result<Value>{self.stop(job_id,false,"pause")}
  pub fn cancel_srs(&self,job_id:&str)->Result<Value>{self.stop(job_id,true,"cancel")}

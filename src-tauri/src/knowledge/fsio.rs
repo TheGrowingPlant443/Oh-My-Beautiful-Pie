@@ -309,6 +309,24 @@ pub(crate) struct Digest256 {
     pub captured: Vec<u8>,
 }
 
+/// Takes the part of `available` up to the next `\n` into `line` (unless the line already passed `cap`, which is then
+/// only flagged). Returns how many bytes to consume (the newline included) and whether the line ended.
+fn buffer_line_part(line: &mut Vec<u8>, available: &[u8], cap: usize, too_long: &mut bool) -> (usize, bool) {
+    let (take, done) = match available.iter().position(|b| *b == b'\n') {
+        Some(i) => (i, true),
+        None => (available.len(), false),
+    };
+    if !*too_long {
+        if line.len() + take > cap {
+            *too_long = true;
+            line.clear();
+        } else {
+            line.extend_from_slice(&available[..take]);
+        }
+    }
+    (if done { take + 1 } else { take }, done)
+}
+
 impl HashedReader {
     pub(crate) fn new(file: File) -> Self {
         Self { reader: BufReader::with_capacity(64 * 1024, file), hasher: Sha256::new(), bytes: 0, carry: Vec::new(), utf8_ok: true, capture_start: 0, capture_len: 0, captured: Vec::new() }
@@ -373,19 +391,7 @@ impl HashedReader {
                     break;
                 }
                 any = true;
-                let (take, done) = match available.iter().position(|b| *b == b'\n') {
-                    Some(i) => (i, true),
-                    None => (available.len(), false),
-                };
-                if !too_long {
-                    if line.len() + take > cap {
-                        too_long = true;
-                        line.clear();
-                    } else {
-                        line.extend_from_slice(&available[..take]);
-                    }
-                }
-                (if done { take + 1 } else { take }, done)
+                buffer_line_part(line, available, cap, &mut too_long)
             };
             self.account(amount);
             if done {

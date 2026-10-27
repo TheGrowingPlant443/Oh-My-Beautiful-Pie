@@ -278,6 +278,63 @@ fn installer_processes(job: &std::os::windows::io::OwnedHandle) -> Result<u32> {
     else { Ok(accounting.ActiveProcesses) }
 }
 
+#[derive(Default)]
+struct Waited {
+    status: Option<ExitStatus>,
+    timed_out: bool,
+    cancelled: bool,
+    error: Option<String>,
+}
+
+/// Polls until the child exits. A non-installer stops at the first timeout/cancel (status `None`);
+/// an installer keeps waiting and only records that the limit was reached.
+fn wait_child(child: &mut std::process::Child, started: Instant, timeout: Duration, ctl: &Ctl, installer: bool) -> Waited {
+    let mut waited = Waited::default();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => { waited.status = Some(status); return waited; }
+            Ok(None) => {}
+            Err(e) => { waited.error = Some(format!("Wait for code quality process: {e}")); return waited; }
+        }
+        if started.elapsed() >= timeout || ctl.cancelled() {
+            if !installer {
+                waited.timed_out = started.elapsed() >= timeout;
+                waited.cancelled = ctl.cancelled();
+                return waited;
+            }
+            if !waited.timed_out && !waited.cancelled {
+                ctl.say("Installer still running; waiting for it to exit before unlocking code quality settings.");
+            }
+            waited.timed_out |= started.elapsed() >= timeout;
+            waited.cancelled |= ctl.cancelled();
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+}
+
+#[cfg(windows)]
+fn wait_installer_tree(job: &std::os::windows::io::OwnedHandle, started: Instant, timeout: Duration, ctl: &Ctl, mut waited: Waited) -> Waited {
+    let mut notified = waited.timed_out || waited.cancelled;
+    loop {
+        match installer_processes(job) {
+            Ok(0) => return waited,
+            Ok(_) => {}
+            Err(_) => {
+                // Never release/kill an unconfirmed installer tree just because its
+                // tracking probe failed. The service remains locked, visibly.
+                if !notified { ctl.say("Cannot yet confirm installer exit; waiting before unlocking code quality settings."); notified = true; }
+            }
+        }
+        waited.timed_out |= started.elapsed() >= timeout;
+        waited.cancelled |= ctl.cancelled();
+        if (waited.timed_out || waited.cancelled) && !notified {
+            ctl.say("Installer still running; waiting for all installer processes to exit.");
+            notified = true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn run_process(mut cmd: Command, stdin_file: Option<&Path>, stdout_file: Option<&Path>,
     timeout: Duration, ctl: &Ctl, installer: bool) -> Result<RunOutput> {
     if ctl.cancelled() { return Err("Code quality operation cancelled.".into()); }
@@ -299,31 +356,8 @@ fn run_process(mut cmd: Command, stdin_file: Option<&Path>, stdout_file: Option<
     let out_thread = thread::spawn(move || drain(stdout, target, 4 * 1024 * 1024 * 1024));
     let err_thread = thread::spawn(move || drain(stderr, None, u64::MAX));
     let started = Instant::now();
-    let mut timed_out = false;
-    let mut cancelled = false;
-    let mut wait_error = None;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {}
-            Err(e) => { wait_error = Some(format!("Wait for code quality process: {e}")); break None; }
-        }
-        if started.elapsed() >= timeout || ctl.cancelled() {
-            if installer {
-                if !timed_out && !cancelled {
-                    ctl.say("Installer still running; waiting for it to exit before unlocking code quality settings.");
-                }
-                timed_out |= started.elapsed() >= timeout;
-                cancelled |= ctl.cancelled();
-            } else {
-                timed_out = started.elapsed() >= timeout;
-                cancelled = ctl.cancelled();
-                break None;
-            }
-        }
-        thread::sleep(Duration::from_millis(40));
-    };
-    let status = match status {
+    let waited = wait_child(&mut child, started, timeout, ctl, installer);
+    let status = match waited.status {
         Some(status) => status,
         None => {
             // Terminate the direct child first so its exit status is a failure (closing a
@@ -335,29 +369,10 @@ fn run_process(mut cmd: Command, stdin_file: Option<&Path>, stdout_file: Option<
         }
     };
     #[cfg(windows)]
-    if installer {
-        if let Some(job) = &containment {
-            let mut notified = timed_out || cancelled;
-            loop {
-                match installer_processes(job) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(_) => {
-                        // Never release/kill an unconfirmed installer tree just because its
-                        // tracking probe failed. The service remains locked, visibly.
-                        if !notified { ctl.say("Cannot yet confirm installer exit; waiting before unlocking code quality settings."); notified = true; }
-                    }
-                }
-                timed_out |= started.elapsed() >= timeout;
-                cancelled |= ctl.cancelled();
-                if (timed_out || cancelled) && !notified {
-                    ctl.say("Installer still running; waiting for all installer processes to exit.");
-                    notified = true;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
+    let waited = match containment.as_ref().filter(|_| installer) {
+        Some(job) => wait_installer_tree(job, started, timeout, ctl, waited),
+        None => waited,
+    };
     #[cfg(windows)]
     drop(containment); // descendants must not retain inherited pipe handles
     let mut stdout = out_thread.join().map_err(|_| "Code quality stdout reader failed.")?
@@ -366,8 +381,8 @@ fn run_process(mut cmd: Command, stdin_file: Option<&Path>, stdout_file: Option<
         .map_err(|e| format!("Read code quality stderr: {e}"))?;
     private_tail(&mut stdout, &secrets);
     private_tail(&mut stderr, &secrets);
-    if let Some(e) = wait_error { return Err(e); }
-    Ok(RunOutput { status, stdout, stderr, timed_out, cancelled })
+    if let Some(e) = waited.error { return Err(e); }
+    Ok(RunOutput { status, stdout, stderr, timed_out: waited.timed_out, cancelled: waited.cancelled })
 }
 
 /// Runs a Podman machine command (`init`, `start`). `podman machine start` leaves the VM's keep-alive
@@ -565,33 +580,24 @@ impl CliEngine {
         validate_selector(&spec.name, "container name")?;
         validate_selector(&spec.image, "container image")?;
         let mut args = vec!["create".into(), "--name".into(), spec.name.clone(), "--restart=no".into()];
-        for (key, value) in &spec.labels { args.extend(["--label".into(), format!("{key}={value}")]); }
-        for (key, value) in &spec.env { args.extend(["-e".into(), format!("{key}={value}")]); }
-        for (key, _) in &spec.secret_env {
-            validate_env_name(key)?;
-            args.extend(["-e".into(), key.clone()]);
-        }
-        if let Some(network) = &spec.network { args.extend(["--network".into(), network.clone()]); }
-        for alias in &spec.network_aliases { args.extend(["--network-alias".into(), alias.clone()]); }
-        if let Some(p) = &spec.publish {
-            if p.host_ip != "127.0.0.1" { return Err("Quality containers may only publish to 127.0.0.1.".into()); }
-            args.extend(["--publish".into(), format!("{}:{}:{}", p.host_ip, p.host_port, p.container_port)]);
-        }
-        if let Some(cpus) = spec.cpus { args.extend(["--cpus".into(), cpus.to_string()]); }
-        if let Some(memory) = &spec.memory { args.extend(["--memory".into(), memory.clone()]); }
-        for (volume, dest) in &spec.volumes {
-            if volume.contains(['/', '\\', ':']) || volume.is_empty() || volume.starts_with('-') {
-                return Err("Quality storage must use named volumes, never host bind mounts.".into());
-            }
-            args.extend(["--volume".into(), format!("{volume}:{dest}")]);
-        }
-        for dest in &spec.tmpfs { args.extend(["--tmpfs".into(), dest.clone()]); }
-        for limit in &spec.ulimits { args.extend(["--ulimit".into(), limit.clone()]); }
-        if let Some(user) = &spec.user { args.extend(["--user".into(), user.clone()]); }
-        if let Some(dir) = &spec.workdir { args.extend(["--workdir".into(), dir.clone()]); }
+        extend_flag(&mut args, "--label", spec.labels.iter().map(|(key, value)| format!("{key}={value}")));
+        extend_flag(&mut args, "-e", spec.env.iter().map(|(key, value)| format!("{key}={value}")));
+        for (key, _) in &spec.secret_env { validate_env_name(key)?; }
+        extend_flag(&mut args, "-e", spec.secret_env.iter().map(|(key, _)| key.clone()));
+        extend_flag(&mut args, "--network", spec.network.iter().cloned());
+        extend_flag(&mut args, "--network-alias", spec.network_aliases.iter().cloned());
+        extend_flag(&mut args, "--publish", spec.publish.as_ref().map(publish_value).transpose()?);
+        extend_flag(&mut args, "--cpus", spec.cpus.map(|cpus| cpus.to_string()));
+        extend_flag(&mut args, "--memory", spec.memory.iter().cloned());
+        let volumes = spec.volumes.iter().map(|(volume, dest)| volume_value(volume, dest)).collect::<Result<Vec<_>>>()?;
+        extend_flag(&mut args, "--volume", volumes);
+        extend_flag(&mut args, "--tmpfs", spec.tmpfs.iter().cloned());
+        extend_flag(&mut args, "--ulimit", spec.ulimits.iter().cloned());
+        extend_flag(&mut args, "--user", spec.user.iter().cloned());
+        extend_flag(&mut args, "--workdir", spec.workdir.iter().cloned());
         let entry_args = if let Some(entry) = &spec.entrypoint {
             let first = entry.first().ok_or("Container entrypoint must not be empty.")?;
-            args.extend(["--entrypoint".into(), first.clone()]);
+            extend_flag(&mut args, "--entrypoint", [first.clone()]);
             &entry[1..]
         } else { &[] };
         args.push(spec.image.clone());
@@ -606,6 +612,15 @@ impl CliEngine {
         Ok(cmd)
     }
 
+    fn recover_created(&self, spec: &ContainerSpec, ctl: &Ctl) -> Option<String> {
+        let owned = spec.labels.iter().any(|(key, value)| key == OWNER_LABEL && !value.is_empty())
+            && spec.labels.iter().any(|(key, _)| key == ROLE_LABEL);
+        if !owned { return None; }
+        let recovery = Ctl::new(ctl.log.clone());
+        let info = self.inspect(&spec.name, &recovery).ok().flatten()?;
+        (info.image == spec.image && spec.labels.iter().all(|(key, value)| info.labels.get(key) == Some(value))).then_some(info.id)
+    }
+
     fn inspect_json(&self, kind: &str, id: &str, ctl: &Ctl) -> Result<Option<serde_json::Value>> {
         validate_selector(id, kind)?;
         let out = self.call(&[kind, "inspect", id], PROBE_TIMEOUT, ctl)?;
@@ -618,6 +633,22 @@ impl CliEngine {
         let json: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| "Invalid or oversized container inspect response.")?;
         Ok(json.as_array().and_then(|a| a.first()).cloned())
     }
+}
+
+fn extend_flag(args: &mut Vec<String>, flag: &str, values: impl IntoIterator<Item = String>) {
+    for value in values { args.extend([flag.into(), value]); }
+}
+
+fn publish_value(p: &Publish) -> Result<String> {
+    if p.host_ip != "127.0.0.1" { return Err("Quality containers may only publish to 127.0.0.1.".into()); }
+    Ok(format!("{}:{}:{}", p.host_ip, p.host_port, p.container_port))
+}
+
+fn volume_value(volume: &str, dest: &str) -> Result<String> {
+    if volume.contains(['/', '\\', ':']) || volume.is_empty() || volume.starts_with('-') {
+        return Err("Quality storage must use named volumes, never host bind mounts.".into());
+    }
+    Ok(format!("{volume}:{dest}"))
 }
 
 fn validate_env_name(key: &str) -> Result<()> {
@@ -637,6 +668,14 @@ fn verify_resource_labels(kind: &str, name: &str, value: &serde_json::Value, lab
     }
 }
 
+fn created_id(out: &RunOutput, name: &str) -> Result<String> {
+    let id = out.text();
+    if id.len() < 12 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("Engine create for '{name}' returned an invalid container ID; reconcile ownership before retrying."));
+    }
+    Ok(id)
+}
+
 fn container_info(v: &serde_json::Value) -> Result<ContainerInfo> {
     let id = v["Id"].as_str().or_else(|| v["ID"].as_str()).ok_or("Container inspect omitted its ID.")?;
     let labels = v.pointer("/Config/Labels").and_then(|v| v.as_object()).map(|labels|
@@ -650,31 +689,27 @@ fn container_info(v: &serde_json::Value) -> Result<ContainerInfo> {
     })
 }
 
-impl Engine for CliEngine {
-    fn runtime(&self) -> &QualityRuntime { &self.runtime }
-    #[cfg(unix)]
-    fn probe(&self, ctl: &Ctl) -> Result<EngineProbe> { native::probe(self, ctl) }
-    #[cfg(windows)]
-    fn probe(&self, ctl: &Ctl) -> Result<EngineProbe> {
+#[cfg(windows)]
+impl CliEngine {
+    fn require_running_distro(&self, ctl: &Ctl) -> Result<()> {
         if let QualityRuntime::DockerWsl { distro } = &self.runtime {
             if !wsl_running_distros(ctl)?.contains(distro) {
                 return Err(format!("WSL distribution '{distro}' is stopped. Docker installation/readiness cannot be inspected without starting it. Choose Start / retry; read-only Recheck never starts a distro."));
             }
         }
-        if matches!(self.runtime, QualityRuntime::DockerDesktop) {
-            let out = self.success(&["context", "inspect", "desktop-linux"], PROBE_TIMEOUT, ctl, "Inspect Docker Desktop context")?;
-            let contexts: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| "Invalid Docker context response.")?;
-            let host = contexts.pointer("/0/Endpoints/docker/Host").and_then(|v| v.as_str()).unwrap_or("");
-            if !host.eq_ignore_ascii_case("npipe:////./pipe/dockerDesktopLinuxEngine") {
-                return Err("desktop-linux must point to the local Docker Desktop Linux named pipe, not a remote engine or Podman.".into());
-            }
+        Ok(())
+    }
+    fn verify_desktop_context(&self, ctl: &Ctl) -> Result<()> {
+        if !matches!(self.runtime, QualityRuntime::DockerDesktop) { return Ok(()); }
+        let out = self.success(&["context", "inspect", "desktop-linux"], PROBE_TIMEOUT, ctl, "Inspect Docker Desktop context")?;
+        let contexts: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| "Invalid Docker context response.")?;
+        let host = contexts.pointer("/0/Endpoints/docker/Host").and_then(|v| v.as_str()).unwrap_or("");
+        if !host.eq_ignore_ascii_case("npipe:////./pipe/dockerDesktopLinuxEngine") {
+            return Err("desktop-linux must point to the local Docker Desktop Linux named pipe, not a remote engine or Podman.".into());
         }
-        let out = self.success(&["info", "--format", "{{json .}}"], PROBE_TIMEOUT, ctl, "Probe selected container daemon")?;
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| "Invalid or oversized engine info response.")?;
-        let podman = matches!(self.runtime, QualityRuntime::Podman { .. });
-        let os = if podman { v.pointer("/host/os").and_then(|v| v.as_str()) }
-            else { v["OSType"].as_str() }.unwrap_or("");
-        if os != "linux" { return Err("The selected quality runtime must provide a Linux container engine.".into()); }
+        Ok(())
+    }
+    fn verify_daemon_flavour(&self, v: &serde_json::Value) -> Result<()> {
         let operating = v["OperatingSystem"].as_str().unwrap_or("");
         let name = v["Name"].as_str().unwrap_or("");
         if matches!(self.runtime, QualityRuntime::DockerWsl { .. }) &&
@@ -685,31 +720,32 @@ impl Engine for CliEngine {
             !operating.to_lowercase().contains("docker desktop") {
             return Err("The desktop-linux context does not identify the local Docker Desktop daemon.".into());
         }
-        if let QualityRuntime::DockerWsl { distro } = &self.runtime {
-            // A Desktop integration CLI symlink is not a distro-owned Docker installation.
-            let cmd = wsl_command(distro, "/bin/sh", &["-c",
-                "test -r /etc/os-release || exit 4; p=$(command -v docker) || exit 2; p=$(readlink -f \"$p\"); case \"$p\" in /mnt/wsl/docker-desktop/*|/mnt/c/*|*.exe) exit 3;; esac; test -S /var/run/docker.sock || exit 5; cat /etc/os-release"])?;
-            let check = run_bounded(cmd, None, PROBE_TIMEOUT, ctl)?;
-            if !check.status.success() { return Err("Choose Docker Desktop for this distro's Desktop socket, or install the distro's own Docker Engine.".into()); }
-        }
+        Ok(())
+    }
+    fn verify_wsl_docker_engine(&self, ctl: &Ctl) -> Result<()> {
+        let QualityRuntime::DockerWsl { distro } = &self.runtime else { return Ok(()); };
+        // A Desktop integration CLI symlink is not a distro-owned Docker installation.
+        let cmd = wsl_command(distro, "/bin/sh", &["-c",
+            "test -r /etc/os-release || exit 4; p=$(command -v docker) || exit 2; p=$(readlink -f \"$p\"); case \"$p\" in /mnt/wsl/docker-desktop/*|/mnt/c/*|*.exe) exit 3;; esac; test -S /var/run/docker.sock || exit 5; cat /etc/os-release"])?;
+        let check = run_bounded(cmd, None, PROBE_TIMEOUT, ctl)?;
+        if !check.status.success() { return Err("Choose Docker Desktop for this distro's Desktop socket, or install the distro's own Docker Engine.".into()); }
+        Ok(())
+    }
+    fn probe_fingerprint(&self, v: &serde_json::Value, podman: bool, ctl: &Ctl) -> Result<String> {
         let id = if podman {
             v.pointer("/host/hostname").and_then(|v| v.as_str())
         } else { v["ID"].as_str() }.filter(|s| !s.is_empty()).ok_or("The engine did not return a stable daemon identity.")?;
+        if !podman { return Ok(format!("docker:{id}")); }
         let graph = v.pointer("/store/graphRoot").and_then(|v| v.as_str()).unwrap_or("");
-        let mut podman_machine_identity = String::new();
-        if podman {
-            // A rebuilt local machine can reuse hostname/storage paths; its creation identity
-            // makes old resource ownership unreachable instead of silently adopted.
-            if let Some(machine) = super::install::podman_machine_for_connection(&self.config_root, &self.runtime, ctl) {
-                podman_machine_identity = super::install::podman_machine_identity(&machine, ctl).unwrap_or_default();
-            }
-        }
-        let fingerprint = if podman { format!("podman:{id}:{graph}:{podman_machine_identity}") } else { format!("docker:{id}") };
-        let memory_bytes = if podman { v.pointer("/host/memTotal").and_then(|v| v.as_u64()) }
-            else { v["MemTotal"].as_u64() }.ok_or("Engine probe omitted available VM memory.")?;
-        let mut max_map_count = None;
-        let mut file_max = None;
-        let limits = match &self.runtime {
+        // A rebuilt local machine can reuse hostname/storage paths; its creation identity
+        // makes old resource ownership unreachable instead of silently adopted.
+        let machine_identity = super::install::podman_machine_for_connection(&self.config_root, &self.runtime, ctl)
+            .map(|machine| super::install::podman_machine_identity(&machine, ctl).unwrap_or_default())
+            .unwrap_or_default();
+        Ok(format!("podman:{id}:{graph}:{machine_identity}"))
+    }
+    fn limits_command(&self, ctl: &Ctl) -> Result<Option<Command>> {
+        Ok(match &self.runtime {
             QualityRuntime::DockerWsl { distro } => Some(wsl_command(distro, "/bin/sh",
                 &["-c", "cat /proc/sys/vm/max_map_count /proc/sys/fs/file-max"])?),
             QualityRuntime::Podman { .. } => {
@@ -727,15 +763,37 @@ impl Engine for CliEngine {
                         "/proc/sys/vm/max_map_count", "/proc/sys/fs/file-max"])?)
                 } else { None }
             }
-        };
-        if let Some(cmd) = limits {
-            let out = run_bounded(cmd, None, PROBE_TIMEOUT, ctl)?;
-            if out.status.success() {
-                let numbers: Vec<u64> = out.text().split_whitespace().filter_map(|s| s.parse().ok()).collect();
-                max_map_count = numbers.first().copied();
-                file_max = numbers.get(1).copied();
-            }
-        }
+        })
+    }
+    fn kernel_limits(&self, ctl: &Ctl) -> Result<(Option<u64>, Option<u64>)> {
+        let Some(cmd) = self.limits_command(ctl)? else { return Ok((None, None)); };
+        let out = run_bounded(cmd, None, PROBE_TIMEOUT, ctl)?;
+        if !out.status.success() { return Ok((None, None)); }
+        let numbers: Vec<u64> = out.text().split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        Ok((numbers.first().copied(), numbers.get(1).copied()))
+    }
+}
+
+impl Engine for CliEngine {
+    fn runtime(&self) -> &QualityRuntime { &self.runtime }
+    #[cfg(unix)]
+    fn probe(&self, ctl: &Ctl) -> Result<EngineProbe> { native::probe(self, ctl) }
+    #[cfg(windows)]
+    fn probe(&self, ctl: &Ctl) -> Result<EngineProbe> {
+        self.require_running_distro(ctl)?;
+        self.verify_desktop_context(ctl)?;
+        let out = self.success(&["info", "--format", "{{json .}}"], PROBE_TIMEOUT, ctl, "Probe selected container daemon")?;
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| "Invalid or oversized engine info response.")?;
+        let podman = matches!(self.runtime, QualityRuntime::Podman { .. });
+        let os = if podman { v.pointer("/host/os").and_then(|v| v.as_str()) }
+            else { v["OSType"].as_str() }.unwrap_or("");
+        if os != "linux" { return Err("The selected quality runtime must provide a Linux container engine.".into()); }
+        self.verify_daemon_flavour(&v)?;
+        self.verify_wsl_docker_engine(ctl)?;
+        let fingerprint = self.probe_fingerprint(&v, podman, ctl)?;
+        let memory_bytes = if podman { v.pointer("/host/memTotal").and_then(|v| v.as_u64()) }
+            else { v["MemTotal"].as_u64() }.ok_or("Engine probe omitted available VM memory.")?;
+        let (max_map_count, file_max) = self.kernel_limits(ctl)?;
         Ok(EngineProbe { fingerprint, os: os.into(), memory_bytes, max_map_count, file_max })
     }
     #[cfg(unix)]
@@ -835,26 +893,13 @@ impl Engine for CliEngine {
         let spec = &adjusted;
         let result = run_bounded(self.create_command(spec)?, None, PROBE_TIMEOUT, ctl).and_then(|out| {
             out.require_success(&format!("Create analysis container '{}'", spec.name))?;
-            let id = out.text();
-            if id.len() < 12 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(format!("Engine create for '{}' returned an invalid container ID; reconcile ownership before retrying.", spec.name));
-            }
-            Ok(id)
+            created_id(&out, &spec.name)
         });
         if result.is_ok() { return result; }
         // Creation can finish in the daemon just as the CLI times out/is cancelled. Discover
         // only the exact name AND full expected ownership/image, then let the caller journal
         // that ID immediately (and, for a cancelled job, remove it before returning).
-        let recovery = Ctl::new(ctl.log.clone());
-        if spec.labels.iter().any(|(key, value)| key == OWNER_LABEL && !value.is_empty())
-            && spec.labels.iter().any(|(key, _)| key == ROLE_LABEL) {
-            if let Ok(Some(info)) = self.inspect(&spec.name, &recovery) {
-                if info.image == spec.image && spec.labels.iter().all(|(key, value)| info.labels.get(key) == Some(value)) {
-                    return Ok(info.id);
-                }
-            }
-        }
-        result
+        self.recover_created(spec, ctl).map_or(result, Ok)
     }
     fn inspect(&self, id: &str, ctl: &Ctl) -> Result<Option<ContainerInfo>> {
         self.inspect_json("container", id, ctl)?.as_ref().map(container_info).transpose()

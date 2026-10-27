@@ -9,12 +9,12 @@ export default async function terminalScenario(pi) {
   const root = process.env.BROWSER_TEST_ROOT;
   const events = [];
   const abortCalls = [];
-  let session;
+  const captured = {};
   // The scenario captures the live session first; the observer wraps on top and must restore to this wrapper.
   const originalInfos = pi.pi.AgentSession.prototype.getAllToolInfos;
   const originalBash = pi.pi.BashTool.prototype.execute;
   const originalEval = pi.pi.EvalTool.prototype.execute;
-  function captureInfos(...args) { session = this; return originalInfos.apply(this, args); }
+  function captureInfos(...args) { captured.session = this; return originalInfos.apply(this, args); }
   pi.pi.AgentSession.prototype.getAllToolInfos = captureInfos;
   const observer = installTerminalCommands(pi, {
     emit: (kind, payload) => events.push({ kind, payload, at: Date.now() }),
@@ -22,7 +22,11 @@ export default async function terminalScenario(pi) {
     sdkDir: process.env.OMP_SDK_DIR,
   });
   registerCommandHistoryTool(pi, observer);
-  pi.on('session_start', (_event, ctx) => { observer.attachContext(ctx); void run(); });
+  pi.on('before_provider_request', () => {
+    console.error('Terminal fixture must not call a model');
+    process.exit(1);
+  });
+  pi.on('session_start', (_event, ctx) => { observer.attachContext(ctx); run(); });
   const text = result => result.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
   const commands = () => events.filter(event => event.kind === 'terminal_command').map(event => event.payload.command);
   const finals = () => commands().filter(command => command.endedAt !== null);
@@ -36,12 +40,13 @@ export default async function terminalScenario(pi) {
       await sleep(50);
     }
   }
-  const latest = id => commands().filter(command => command.executionId === id).at(-1);
+  const latest = id => commands().findLast(command => command.executionId === id);
 
   async function run() {
     let exitCode = 0;
     try {
-      assert.ok(session, 'native session was not captured');
+      assert.ok(captured.session, 'native session was not captured');
+      const session = captured.session;
       const snapshot = observer.snapshot();
       assert.equal(snapshot.supported, true, `observer must capture the real session: ${snapshot.error}`);
       const bash = (params, id = 'direct-' + crypto.randomUUID()) => session.getToolByName('bash').execute(id, params, undefined, undefined, undefined);
@@ -68,10 +73,9 @@ export default async function terminalScenario(pi) {
       console.log('1 ok: streamed foreground bash, one end event, ledger script');
 
       // 2. Failure exit code.
-      const failed = await bash({ command: 'exit 7' }).catch(error => error);
+      await bash({ command: 'exit 7' }).catch(error => error);
       const failure = finals().find(command => command.preview === 'exit 7');
       assert.ok(failure, 'failed command is recorded'); assert.equal(failure.status, 'failed'); assert.equal(failure.exitCode, 7);
-      void failed;
       console.log('2 ok: exit code 7 => failed/7');
 
       // 3. Concurrent calls keep stable slots; slot is reused after the first exits.
@@ -79,7 +83,7 @@ export default async function terminalScenario(pi) {
       const quick = bash({ command: 'printf beta; sleep 1; printf beta-end' });
       const slowRow = await until(() => commands().find(command => command.preview.startsWith('printf alpha;') && command.endedAt === null), 'alpha running');
       const quickRow = await until(() => commands().find(command => command.preview.startsWith('printf beta;') && command.endedAt === null), 'beta running');
-      assert.deepEqual([slowRow.tab, quickRow.tab].sort(), [2, 3]);
+      assert.deepEqual([slowRow.tab, quickRow.tab].sort((a, b) => a - b), [2, 3]);
       await quick;
       assert.equal(latest(quickRow.executionId).status, 'completed');
       const third = bash({ command: 'printf gamma; sleep 1' });
@@ -87,7 +91,7 @@ export default async function terminalScenario(pi) {
       assert.equal(thirdRow.tab, quickRow.tab, 'the freed slot is reused');
       assert.equal(latest(slowRow.executionId).tab, slowRow.tab, 'a live tab is never renumbered');
       await Promise.all([slow, third]);
-      const alpha = events.filter(event => event.kind === 'terminal_output' && event.payload.executionId === slowRow.executionId).at(-1).payload.text;
+      const alpha = events.findLast(event => event.kind === 'terminal_output' && event.payload.executionId === slowRow.executionId).payload.text;
       assert.ok(alpha.includes('alpha') && !alpha.includes('beta') && !alpha.includes('gamma'), 'outputs are isolated');
       console.log('3 ok: concurrent slots 2/3, reuse, isolation');
 
@@ -105,6 +109,10 @@ export default async function terminalScenario(pi) {
 
       // 5. Explicit background job outlives the initiating call and settles once.
       const background = await bash({ command: 'printf bgstart; sleep 2; printf bgend', async: true });
+      const backgroundId = background.details?.async?.jobId;
+      assert.equal(typeof backgroundId, 'string');
+      // The harness consumes this completion itself; it must not wake a model.
+      session.asyncJobManager.watchJobs([backgroundId]);
       assert.match(text(background), /background/i);
       const bgRow = await until(() => commands().find(command => command.preview.startsWith('printf bgstart') && command.endedAt === null), 'background running');
       await sleep(500);
@@ -112,17 +120,20 @@ export default async function terminalScenario(pi) {
       await until(() => latest(bgRow.executionId).endedAt !== null, 'background settlement');
       assert.equal(latest(bgRow.executionId).status, 'completed');
       assert.equal(commands().filter(command => command.executionId === bgRow.executionId && command.endedAt !== null).length, 1);
-      assert.match(events.filter(event => event.kind === 'terminal_output' && event.payload.executionId === bgRow.executionId).at(-1).payload.text, /bgend/);
+      assert.match(events.findLast(event => event.kind === 'terminal_output' && event.payload.executionId === bgRow.executionId).payload.text, /bgend/);
+      session.asyncJobManager.consumeJobResults([backgroundId]);
+      session.asyncJobManager.unwatchJobs([backgroundId]);
       console.log('5 ok: backgrounded job lifetime');
 
       // 6. Named service stays live after readiness; Kill stops exactly it, interrupts the agent and holds new scripts.
       const heartbeat = path.join(root, 'heartbeat.txt').replaceAll('\\', '/');
       const serviceCommand = `node -e "setInterval(()=>require('fs').writeFileSync('${heartbeat}',String(Date.now())),200);console.log('service-up')"`;
       const started = await bash({ name: 'hb', command: serviceCommand, ready: { log: 'service-up', timeout: 20 } });
-      assert.ok(started.details?.service, 'native service result');
+      assert.equal(started.details?.service?.ready, true, text(started));
       const serviceRow = await until(() => commands().find(command => command.preview.includes('setInterval') && command.endedAt === null), 'service tab');
       await sleep(800);
-      assert.equal(latest(serviceRow.executionId).endedAt, null, 'service tab persists after the starting call returned');
+      const serviceState = latest(serviceRow.executionId);
+      assert.equal(serviceState.endedAt, null, `Service ${serviceState.status}: ${observer.snapshot().error ?? text(started)}`);
       const beat1 = Number(await readFile(heartbeat, 'utf8'));
       await sleep(600);
       assert.ok(Number(await readFile(heartbeat, 'utf8')) > beat1, 'service is alive');
@@ -156,19 +167,23 @@ export default async function terminalScenario(pi) {
       try {
         await evaluate({ language: 'py', code: 'print("py-out")', title: 'Python cell' });
         const python = commands().find(command => command.kind === 'py');
-        assert.ok(python && latest(python.executionId).endedAt !== null);
+        assert.ok(python, 'python eval was recorded');
+        assert.notEqual(latest(python.executionId).endedAt, null);
         console.log('8 ok: python eval recorded');
-      } catch (error) { if (error?.name === 'AssertionError') throw error; console.log('8 skipped: no python runtime', String(error.message).slice(0, 80)); }
+      } catch (error) {
+        if (error?.name === 'AssertionError') throw error;
+        console.log('8 skipped: no python runtime', String(error.message).slice(0, 80));
+      }
 
       // 8b. A failed command keeps its output; the agent reads its own history through the command_history tool.
       const outputOf = id => readFile(path.join(ledgerDir, sessions[0], id, 'output.txt'), 'utf8');
       await bash({ command: 'echo before-fail; exit 7' }).catch(error => error);
       const failedBash = finals().find(command => command.preview === 'echo before-fail; exit 7');
-      assert.ok(failedBash && failedBash.status === 'failed' && failedBash.hasOutput === true, 'failed bash row says its output was saved');
+      assert.ok(failedBash?.status === 'failed' && failedBash?.hasOutput === true, 'failed bash row says its output was saved');
       assert.match(await outputOf(failedBash.executionId), /before-fail/);
       await evaluate({ language: 'js', code: "console.log('eval-out');\nthrow new Error('boom-eval');", title: 'Throws' }).catch(error => error);
       const failedEval = finals().find(command => command.description === 'Throws');
-      assert.ok(failedEval && failedEval.status === 'failed' && failedEval.hasOutput === true, 'failed eval row says its output was saved');
+      assert.ok(failedEval?.status === 'failed' && failedEval?.hasOutput === true, 'failed eval row says its output was saved');
       const evalOutput = await outputOf(failedEval.executionId);
       assert.ok(evalOutput.includes('eval-out') && evalOutput.includes('boom-eval'), `eval output keeps its output and error: ${evalOutput}`);
       await bash({ command: 'echo fine' });
@@ -195,7 +210,7 @@ export default async function terminalScenario(pi) {
       console.log('Terminal command observer verified');
     } catch (error) { process.stderr.write(String(error.stack || error) + '\n'); exitCode = 1; }
     finally {
-      try { observer.dispose(); pi.pi.AgentSession.prototype.getAllToolInfos = originalInfos; await session?.dispose?.(); } finally { process.exit(exitCode); }
+      try { observer.dispose(); pi.pi.AgentSession.prototype.getAllToolInfos = originalInfos; await captured.session?.dispose?.(); } finally { process.exit(exitCode); }
     }
   }
 }

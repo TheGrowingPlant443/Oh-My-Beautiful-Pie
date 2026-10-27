@@ -1466,36 +1466,44 @@ pub async fn open_srs_documents(window: tauri::WebviewWindow, state: State<'_, A
 pub async fn rebind_srs_vault(window: tauri::WebviewWindow, state: State<'_, AppState>, jobId: String, vaultId: String) -> Result<serde_json::Value> {
     srs_only!(window); let s = state.srs.clone(); blocking(move || s.rebind_srs_vault(&jobId, &vaultId)).await
 }
+/// One tick while the app is closing: false once no entered workspace work is left.
+fn tick_closing(app: &AppHandle, registry: &Registry) -> bool {
+    use tauri::Manager as _;
+    if !app.try_state::<AppState>().is_some_and(|state| state.workspace.has_active_work()) { return false; }
+    // Retain the existing process-exit monitor until entered workspace work settles.
+    if let Some(hub)=registry.manager_hub() {hub.observe_processes(&registry.snapshot());}
+    true
+}
+/// Local-only reconciliation of unfinished project security reviews; AppState is managed shortly after tick starts.
+fn reconcile_project_reviews(app: &AppHandle, registry: &Arc<Registry>) {
+    use tauri::Manager as _;
+    if let Some(state) = app.try_state::<AppState>() {
+        state.dependency_project_review.reconcile(registry, &state.dependency_security);
+    }
+}
+fn tick_running(app: &AppHandle, registry: &Arc<Registry>, terminals: &crate::terminal::TerminalService) {
+    if let Err(e) = registry.refresh() {
+        eprintln!("session refresh: {e}");
+    }
+    let rows = registry.snapshot();
+    if let Some(hub) = registry.manager_hub() {
+        hub.observe_processes(&rows);
+    }
+    reconcile_project_reviews(app, registry);
+    let _ = app.emit("instances", rows);
+    if let Some(browser) = registry.browser_supervisor() {
+        if let Some(update) = browser.take_update() { let _ = app.emit("browser_state", update); }
+    }
+    terminals.poll_shells();
+}
 pub fn tick(app: AppHandle, registry: Arc<Registry>, terminals: Arc<crate::terminal::TerminalService>, closing: Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {
         loop {
             if closing.load(std::sync::atomic::Ordering::Relaxed) {
-                use tauri::Manager as _;
-                if !app.try_state::<AppState>().is_some_and(|state| state.workspace.has_active_work()) { break; }
-                // Retain the existing process-exit monitor until entered workspace work settles.
-                if let Some(hub)=registry.manager_hub() {hub.observe_processes(&registry.snapshot());}
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                continue;
+                if !tick_closing(&app, &registry) { break; }
+            } else {
+                tick_running(&app, &registry, &terminals);
             }
-            if let Err(e) = registry.refresh() {
-                eprintln!("session refresh: {e}");
-            }
-            let rows = registry.snapshot();
-            if let Some(hub) = registry.manager_hub() {
-                hub.observe_processes(&rows);
-            }
-            {
-                // Local-only reconciliation of unfinished project security reviews; AppState is managed shortly after tick starts.
-                use tauri::Manager as _;
-                if let Some(state) = app.try_state::<AppState>() {
-                    state.dependency_project_review.reconcile(&registry, &state.dependency_security);
-                }
-            }
-            let _ = app.emit("instances", rows);
-            if let Some(browser) = registry.browser_supervisor() {
-                if let Some(update) = browser.take_update() { let _ = app.emit("browser_state", update); }
-            }
-            terminals.poll_shells();
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });

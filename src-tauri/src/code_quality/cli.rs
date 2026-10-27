@@ -3,7 +3,7 @@ use super::runtime::{Ctl, ROLE_LABEL};
 use super::types::*;
 use super::{store, CodeQualityService};
 use serde_json::{json, Value};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -84,6 +84,31 @@ pub(crate) fn dispatch() -> Option<i32> {
     Some(run(args))
 }
 
+/// The value of `--name VALUE` or `--name=VALUE`; `None` when `arg` is some other argument.
+fn option_value(arg: &OsString, name: &str, duplicate: bool, raw: &mut impl Iterator<Item = OsString>, missing: &str) -> Option<Result<OsString>> {
+    let text = arg.to_str()?;
+    let inline = if text == name { None } else { Some(text.strip_prefix(name)?.strip_prefix('=')?) };
+    if duplicate {
+        return Some(Err(format!("Pass {name} only once.")));
+    }
+    Some(match inline {
+        Some(value) => Ok(OsString::from(value)),
+        None => raw.next().ok_or_else(|| missing.to_string()),
+    })
+}
+
+fn parse_port(value: &OsStr) -> Result<u16> {
+    let value = value.to_str().ok_or("--port must be a number.")?;
+    Ok(value.parse::<u16>().ok().filter(|p| *p >= 1024).ok_or("--port must be between 1024 and 65535.")?)
+}
+
+fn set_project(project: &mut Option<PathBuf>, arg: OsString) -> Result<()> {
+    if project.replace(PathBuf::from(arg)).is_some() {
+        return Err("Pass at most one project directory.".into());
+    }
+    Ok(())
+}
+
 fn parse(raw: Vec<OsString>) -> Result<Args> {
     let mut raw = raw.into_iter();
     let command = raw.next().and_then(|s| s.into_string().ok()).ok_or("Choose status, up, scan or down.")?;
@@ -95,22 +120,20 @@ fn parse(raw: Vec<OsString>) -> Result<Args> {
     let mut root = None;
     let mut positional = false;
     while let Some(arg) = raw.next() {
-        if !positional && arg == "--" {
+        if positional {
+            set_project(&mut project, arg)?;
+        } else if arg == "--" {
             positional = true;
-        } else if !positional && (arg == "--port" || arg.to_str().is_some_and(|s| s.starts_with("--port="))) {
-            if port.is_some() { return Err("Pass --port only once.".into()); }
-            let value = if arg == "--port" { raw.next().ok_or("--port needs a value.")? } else { OsString::from(arg.to_str().unwrap().trim_start_matches("--port=")) };
-            let value = value.to_str().ok_or("--port must be a number.")?;
-            port = Some(value.parse::<u16>().ok().filter(|p| *p >= 1024).ok_or("--port must be between 1024 and 65535.")?);
-        } else if !positional && (arg == "--state-dir" || arg.to_str().is_some_and(|s| s.starts_with("--state-dir="))) {
-            if root.is_some() { return Err("Pass --state-dir only once.".into()); }
-            let value = if arg == "--state-dir" { raw.next().ok_or("--state-dir needs a directory.")? } else { OsString::from(arg.to_str().unwrap().trim_start_matches("--state-dir=")) };
+        } else if let Some(value) = option_value(&arg, "--port", port.is_some(), &mut raw, "--port needs a value.") {
+            port = Some(parse_port(&value?)?);
+        } else if let Some(value) = option_value(&arg, "--state-dir", root.is_some(), &mut raw, "--state-dir needs a directory.") {
+            let value = value?;
             if value.is_empty() { return Err("--state-dir needs a directory.".into()); }
             root = Some(PathBuf::from(value));
-        } else if !positional && arg.to_string_lossy().starts_with('-') {
+        } else if arg.to_string_lossy().starts_with('-') {
             return Err("Unknown option; use --code-quality --help.".into());
-        } else if project.replace(PathBuf::from(arg)).is_some() {
-            return Err("Pass at most one project directory.".into());
+        } else {
+            set_project(&mut project, arg)?;
         }
     }
     let explicit_root = root.is_some();
@@ -184,9 +207,73 @@ fn run(args: Args) -> i32 {
     exit
 }
 
+fn execute_status(svc: &Arc<CodeQualityService>, state: &QualityState, containers: &mut Option<Value>) -> Result<()> {
+    svc.check_prerequisites()?;
+    let engine = svc.factory.engine(&state.config.runtime)?;
+    let ctl = Ctl::silent();
+    let probe = engine.probe(&ctl)?; // read-only: never ensure_started()
+    let resources = store::load_resources(&svc.paths)?;
+    if resources.runtime(&state.config.runtime).is_some_and(|r| r.fingerprint != probe.fingerprint) {
+        return Err("The container daemon identity changed; use up to reconcile the recorded resources.".into());
+    }
+    *containers = Some(Value::Array(engine.list_owned(&svc.installation_id(), &ctl)?.iter().map(|c| json!({
+        "id": c.id, "name": c.name, "role": c.labels.get(ROLE_LABEL), "running": c.running,
+    })).collect()));
+    Ok(())
+}
+
+/// Detection/preparation uses the exact saved-project/build-source route as the GUI.
+/// Resolve ambiguous projects before touching the analyzer.
+fn detect_scan_project(svc: &Arc<CodeQualityService>, project: Option<PathBuf>) -> Result<QualityProject> {
+    let folder = match project {
+        Some(folder) => folder,
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+    let folder = folder.to_str().ok_or("The project path must be valid UTF-8.")?;
+    let detection = svc.detect_project(folder)?;
+    if detection.needs_selection {
+        return Err("The project has ambiguous build families or .NET entries. Select and save the scanner/entry in the GUI first.".into());
+    }
+    Ok(detection.project)
+}
+
+fn run_scan(svc: &Arc<CodeQualityService>, project: QualityProject) -> Result<QualityScan> {
+    let prepared = svc.prepare_scan(project.clone())?;
+    let admission = svc.start_scan(project, prepared.recipe_hash, true)?;
+    // The service owns the one-hour watchdog and per-engine/server deadlines. Join
+    // its actual jobs, not an unrelated HTTP submission or a second timeout policy.
+    for worker in std::mem::take(&mut *svc.workers.lock()) {
+        worker.join().map_err(|_| "The scan worker terminated unexpectedly.")?;
+    }
+    let completed = svc.read_scan(&admission.scan_id)?;
+    if !completed.status.is_terminal() {
+        return Err("The scan worker stopped without a terminal result.".into());
+    }
+    Ok(completed)
+}
+
+fn execute_up_scan(svc: &Arc<CodeQualityService>, command: &str, state: QualityState, project: Option<PathBuf>, port: Option<u16>, scan: &mut Option<QualityScan>) -> Result<()> {
+    let preparation = if command == "scan" { Some(detect_scan_project(svc, project)?) } else { None };
+    let config_changed = port.is_some_and(|port| port != state.config.community_port);
+    let mut config = state.config;
+    if let Some(port) = port { config.community_port = port; }
+    let started = if config_changed {
+        svc.configure(config, state.revision, None)?
+    } else {
+        svc.start_service(state.revision)?
+    };
+    if started.effective_mode != Some(started.config.mode) || started.error.is_some() {
+        return Err(started.error.unwrap_or_else(|| "The analyzer is not ready; check its prerequisites in the GUI.".into()));
+    }
+    if let Some(project) = preparation {
+        *scan = Some(run_scan(svc, project)?);
+    }
+    Ok(())
+}
+
 fn execute(svc: &Arc<CodeQualityService>, command: &str, project: Option<PathBuf>, port: Option<u16>, scan: &mut Option<QualityScan>, containers: &mut Option<Value>) -> Result<()> {
-    let state = svc.state();
-    if let Some(error) = state.error { return Err(error); }
+    let mut state = svc.state();
+    if let Some(error) = state.error.take() { return Err(error); }
     if command != "status" && !svc.owns_resources() {
         return Err("Another OMP Manager process manages this state directory; close it before using this CLI.".into());
     }
@@ -194,63 +281,9 @@ fn execute(svc: &Arc<CodeQualityService>, command: &str, project: Option<PathBuf
         return Err("--port does not match the stored port; change it with up or scan.".into());
     }
     match command {
-        "status" => {
-            svc.check_prerequisites()?;
-            let engine = svc.factory.engine(&state.config.runtime)?;
-            let ctl = Ctl::silent();
-            let probe = engine.probe(&ctl)?; // read-only: never ensure_started()
-            let resources = store::load_resources(&svc.paths)?;
-            if resources.runtime(&state.config.runtime).is_some_and(|r| r.fingerprint != probe.fingerprint) {
-                return Err("The container daemon identity changed; use up to reconcile the recorded resources.".into());
-            }
-            *containers = Some(Value::Array(engine.list_owned(&svc.installation_id(), &ctl)?.iter().map(|c| json!({
-                "id": c.id, "name": c.name, "role": c.labels.get(ROLE_LABEL), "running": c.running,
-            })).collect()));
-            Ok(())
-        }
+        "status" => execute_status(svc, &state, containers),
         "down" => { svc.stop_server()?; Ok(()) }
-        "up" | "scan" => {
-            // Detection/preparation uses the exact saved-project/build-source route as the GUI.
-            // Resolve ambiguous projects before touching the analyzer.
-            let preparation = if command == "scan" {
-                let folder = match project {
-                    Some(folder) => folder,
-                    None => std::env::current_dir().map_err(|e| e.to_string())?,
-                };
-                let folder = folder.to_str().ok_or("The project path must be valid UTF-8.")?;
-                let detection = svc.detect_project(folder)?;
-                if detection.needs_selection {
-                    return Err("The project has ambiguous build families or .NET entries. Select and save the scanner/entry in the GUI first.".into());
-                }
-                Some(detection.project)
-            } else { None };
-            let config_changed = port.is_some_and(|port| port != state.config.community_port);
-            let mut config = state.config;
-            if let Some(port) = port { config.community_port = port; }
-            let started = if config_changed {
-                svc.configure(config, state.revision, None)?
-            } else {
-                svc.start_service(state.revision)?
-            };
-            if started.effective_mode != Some(started.config.mode) || started.error.is_some() {
-                return Err(started.error.unwrap_or_else(|| "The analyzer is not ready; check its prerequisites in the GUI.".into()));
-            }
-            if let Some(project) = preparation {
-                let prepared = svc.prepare_scan(project.clone())?;
-                let admission = svc.start_scan(project, prepared.recipe_hash, true)?;
-                // The service owns the one-hour watchdog and per-engine/server deadlines. Join
-                // its actual jobs, not an unrelated HTTP submission or a second timeout policy.
-                for worker in std::mem::take(&mut *svc.workers.lock()) {
-                    worker.join().map_err(|_| "The scan worker terminated unexpectedly.")?;
-                }
-                let completed = svc.read_scan(&admission.scan_id)?;
-                if !completed.status.is_terminal() {
-                    return Err("The scan worker stopped without a terminal result.".into());
-                }
-                *scan = Some(completed);
-            }
-            Ok(())
-        }
+        "up" | "scan" => execute_up_scan(svc, command, state, project, port, scan),
         _ => unreachable!("validated command"),
     }
 }

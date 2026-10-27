@@ -457,38 +457,12 @@ fn parse_status_v2(bytes: &[u8]) -> Vec<DiffFile> {
     let (mut staged, mut changes): (Vec<DiffFile>, Vec<DiffFile>) = (Vec::new(), Vec::new());
     let mut tokens = split_nul(bytes).into_iter();
     while let Some(record) = tokens.next() {
-        let kind = record.chars().next();
-        match kind {
-            Some('1') | Some('2') => {
-                let rename = kind == Some('2');
-                // A rename record is followed by its original path as a separate token.
-                let original = if rename { tokens.next() } else { None };
-                let fields: Vec<&str> = record.splitn(if rename { 10 } else { 9 }, ' ').collect();
-                let xy: Vec<char> = fields.get(1).map(|f| f.chars().collect()).unwrap_or_default();
-                if fields.len() < 9 || xy.len() != 2 {
-                    continue;
-                }
-                let path = fields[fields.len() - 1].to_string();
-                if xy[0] != '.' {
-                    staged.push(DiffFile { path: path.clone(), old_path: original, status: xy[0].to_string(), group: Some(DiffGroup::Staged) });
-                }
-                if xy[1] != '.' {
-                    changes.push(DiffFile { path, old_path: None, status: xy[1].to_string(), group: Some(DiffGroup::Changes) });
-                }
-            }
-            Some('u') => {
-                let fields: Vec<&str> = record.splitn(11, ' ').collect();
-                if fields.len() == 11 {
-                    changes.push(DiffFile { path: fields[10].to_string(), old_path: None, status: "U".into(), group: Some(DiffGroup::Changes) });
-                }
-            }
-            Some('?') => {
-                let path = record[2..].to_string();
-                // A trailing slash marks an untracked nested repository: not a file we can show.
-                if !path.ends_with('/') {
-                    changes.push(DiffFile { path, old_path: None, status: "?".into(), group: Some(DiffGroup::Changes) });
-                }
-            }
+        match record.chars().next() {
+            Some('1') => push_tracked_status(&record, None, &mut staged, &mut changes),
+            // A rename record is followed by its original path as a separate token.
+            Some('2') => push_tracked_status(&record, tokens.next(), &mut staged, &mut changes),
+            Some('u') => push_unmerged_status(&record, &mut changes),
+            Some('?') => push_untracked_status(&record, &mut changes),
             _ => {}
         }
     }
@@ -496,6 +470,34 @@ fn parse_status_v2(bytes: &[u8]) -> Vec<DiffFile> {
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     staged.extend(changes);
     staged
+}
+/// Ordinary (`1`) and rename/copy (`2`) records: the first XY letter is the Staged entry, the second the Changes entry.
+fn push_tracked_status(record: &str, original: Option<String>, staged: &mut Vec<DiffFile>, changes: &mut Vec<DiffFile>) {
+    let fields: Vec<&str> = record.splitn(if record.starts_with('2') { 10 } else { 9 }, ' ').collect();
+    let xy: Vec<char> = fields.get(1).map(|f| f.chars().collect()).unwrap_or_default();
+    if fields.len() < 9 || xy.len() != 2 {
+        return;
+    }
+    let path = fields[fields.len() - 1].to_string();
+    if xy[0] != '.' {
+        staged.push(DiffFile { path: path.clone(), old_path: original, status: xy[0].to_string(), group: Some(DiffGroup::Staged) });
+    }
+    if xy[1] != '.' {
+        changes.push(DiffFile { path, old_path: None, status: xy[1].to_string(), group: Some(DiffGroup::Changes) });
+    }
+}
+fn push_unmerged_status(record: &str, changes: &mut Vec<DiffFile>) {
+    let fields: Vec<&str> = record.splitn(11, ' ').collect();
+    if fields.len() == 11 {
+        changes.push(DiffFile { path: fields[10].to_string(), old_path: None, status: "U".into(), group: Some(DiffGroup::Changes) });
+    }
+}
+fn push_untracked_status(record: &str, changes: &mut Vec<DiffFile>) {
+    let path = record[2..].to_string();
+    // A trailing slash marks an untracked nested repository: not a file we can show.
+    if !path.ends_with('/') {
+        changes.push(DiffFile { path, old_path: None, status: "?".into(), group: Some(DiffGroup::Changes) });
+    }
 }
 fn status_files(root: &Path) -> Result<Vec<DiffFile>> {
     Ok(parse_status_v2(&git_ok(root, &["status", "--porcelain=v2", "-z", "--untracked-files=all"])?))
@@ -981,29 +983,21 @@ fn apply_file_action(snapshot: &Snapshot, file: &DiffFile, action: FileAction) -
 struct Loaded {
     content: DiffContent,
 }
-/// Appends a blob's text to a side, recording the reason when it cannot be shown.
-fn side_text(root: &Path, blob: &BaseBlob, note: &mut dyn FnMut(&str)) -> Result<Option<String>> {
+/// Keeps the first reason a side is read-only; later ones never replace it.
+fn note_reason(reason: &mut Option<String>, text: &str) {
+    reason.get_or_insert_with(|| text.to_string());
+}
+/// A blob's text, recording the reason when it cannot be shown.
+fn side_text(root: &Path, blob: &BaseBlob, reason: &mut Option<String>) -> Result<Option<String>> {
     let (text, why) = blob_side(root, blob)?;
     if let Some(why) = why {
-        note(why);
+        note_reason(reason, why);
     }
     Ok(text)
 }
 const STAGED_READ_ONLY: &str = "Staged changes are read-only here; edit the file under Changes";
-fn load(snapshot: &Snapshot, file: &DiffFile) -> Result<Loaded> {
-    let mut reason: Option<String> = None;
-    let mut note = |text: &str| {
-        reason.get_or_insert_with(|| text.to_string());
-    };
-    relative_parts(&file.path)?;
-    if file.status == "T" {
-        note("File type changes are shown read-only");
-    }
-    let root = &snapshot.root;
-    let commits = snapshot.mode == DiffMode::Commits;
-    let staged = snapshot.mode == DiffMode::Uncommitted && file.group == Some(DiffGroup::Staged);
-    let in_changes = snapshot.mode == DiffMode::Uncommitted && file.group == Some(DiffGroup::Changes);
-    let (original_label, modified_label) = if commits {
+fn side_labels(snapshot: &Snapshot, in_changes: bool, staged: bool) -> (String, String) {
+    if snapshot.mode == DiffMode::Commits {
         (snapshot.base_label.clone(), snapshot.target_label.clone())
     } else if in_changes {
         ("Staged (index)".to_string(), "Working tree".to_string())
@@ -1011,92 +1005,132 @@ fn load(snapshot: &Snapshot, file: &DiffFile) -> Result<Loaded> {
         (snapshot.base_label.clone(), "Staged (index)".to_string())
     } else {
         (snapshot.base_label.clone(), "Working tree".to_string())
-    };
-    // Original side. Head/branch/staged compare against a commit; the Changes group against the index.
-    let from_commit = match (in_changes, file.status.as_str()) {
+    }
+}
+/// Head/branch/staged entries compare against the baseline commit; the Changes group against the index.
+fn original_from_commit(snapshot: &Snapshot, file: &DiffFile, in_changes: bool) -> bool {
+    match (in_changes, file.status.as_str()) {
         (true, "U") => snapshot.base_commit.is_some(),
         (true, _) => false,
         (false, "A" | "?") => false,
         (false, _) => snapshot.base_commit.is_some(),
-    };
-    let mut original = Some(String::new());
-    if from_commit {
+    }
+}
+fn original_side(snapshot: &Snapshot, file: &DiffFile, in_changes: bool, reason: &mut Option<String>) -> Result<Option<String>> {
+    let root = &snapshot.root;
+    if original_from_commit(snapshot, file, in_changes) {
         let commit = snapshot.base_commit.as_deref().unwrap_or_default();
         let base_path = file.old_path.as_deref().unwrap_or(&file.path);
         relative_parts(base_path)?;
-        match base_blob(root, commit, base_path)? {
-            None if in_changes => {}
-            None => return Err(format!("{base_path} is not in the baseline; refresh Code diff")),
-            Some(blob) => original = side_text(root, &blob, &mut note)?,
-        }
-    } else if in_changes && file.status != "?" && file.status != "U" {
+        return match base_blob(root, commit, base_path)? {
+            None if in_changes => Ok(Some(String::new())),
+            None => Err(format!("{base_path} is not in the baseline; refresh Code diff")),
+            Some(blob) => side_text(root, &blob, reason),
+        };
+    }
+    if in_changes && file.status != "?" && file.status != "U" {
         if let Some(blob) = index_blob(root, &file.path)? {
-            original = side_text(root, &blob, &mut note)?;
+            return side_text(root, &blob, reason);
         }
     }
-    let mut modified = Some(String::new());
-    let (mut working_hash, mut crlf, mut bom) = (None, false, false);
-    if commits {
-        if file.status != "D" {
-            let target = snapshot.target_commit.as_deref().ok_or("Missing target commit")?;
-            let blob = base_blob(root, target, &file.path)?.ok_or_else(|| format!("{} is not in the commit; refresh", file.path))?;
-            modified = side_text(root, &blob, &mut note)?;
+    Ok(Some(String::new()))
+}
+/// The modified side plus, for a working file, its hash and line-ending/BOM facts.
+struct Modified {
+    text: Option<String>,
+    working_hash: Option<String>,
+    crlf: bool,
+    bom: bool,
+}
+impl Modified {
+    fn of(text: Option<String>) -> Self {
+        Self { text, working_hash: None, crlf: false, bom: false }
+    }
+}
+fn commit_modified(snapshot: &Snapshot, file: &DiffFile, reason: &mut Option<String>) -> Result<Option<String>> {
+    if file.status == "D" {
+        return Ok(Some(String::new()));
+    }
+    let target = snapshot.target_commit.as_deref().ok_or("Missing target commit")?;
+    let blob = base_blob(&snapshot.root, target, &file.path)?.ok_or_else(|| format!("{} is not in the commit; refresh", file.path))?;
+    side_text(&snapshot.root, &blob, reason)
+}
+fn staged_modified(root: &Path, file: &DiffFile, reason: &mut Option<String>) -> Result<Option<String>> {
+    if file.status == "D" {
+        return Ok(Some(String::new()));
+    }
+    match index_blob(root, &file.path)? {
+        None => Err(format!("{} is not in the index; refresh Code diff", file.path)),
+        Some(blob) => side_text(root, &blob, reason),
+    }
+}
+fn oversized_working(reason: &mut Option<String>) -> Modified {
+    note_reason(reason, "Files larger than 2 MiB are shown read-only");
+    Modified::of(None)
+}
+fn working_file(path: &Path, meta: &fs::Metadata, reason: &mut Option<String>) -> Result<Modified> {
+    if meta.len() > MAX_BYTES {
+        return Ok(oversized_working(reason));
+    }
+    let bytes = read_limited(path)?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Ok(oversized_working(reason));
+    }
+    let working_hash = Some(hash(&bytes));
+    Ok(match decode(&bytes, true) {
+        Ok(decoded) => Modified { text: Some(decoded.text), working_hash, crlf: decoded.crlf, bom: decoded.bom },
+        Err(why) => {
+            note_reason(reason, why);
+            Modified { working_hash, ..Modified::of(None) }
         }
-    } else if staged {
-        if file.status != "D" {
-            match index_blob(root, &file.path)? {
-                None => return Err(format!("{} is not in the index; refresh Code diff", file.path)),
-                Some(blob) => modified = side_text(root, &blob, &mut note)?,
-            }
+    })
+}
+fn working_modified(root: &Path, path: &str, reason: &mut Option<String>) -> Result<Modified> {
+    match inspect_working(root, path)? {
+        Working::Missing => Ok(Modified::of(Some(String::new()))),
+        Working::Blocked(why) => {
+            note_reason(reason, why);
+            Ok(Modified::of(None))
         }
-    } else {
-        match inspect_working(root, &file.path)? {
-            Working::Missing => {}
-            Working::Blocked(why) => {
-                note(why);
-                modified = None;
-            }
-            Working::File(path, meta) => {
-                if meta.len() > MAX_BYTES {
-                    note("Files larger than 2 MiB are shown read-only");
-                    modified = None;
-                } else {
-                    let bytes = read_limited(&path)?;
-                    if bytes.len() as u64 > MAX_BYTES {
-                        note("Files larger than 2 MiB are shown read-only");
-                        modified = None;
-                    } else {
-                        working_hash = Some(hash(&bytes));
-                        match decode(&bytes, true) {
-                            Ok(decoded) => {
-                                (crlf, bom) = (decoded.crlf, decoded.bom);
-                                modified = Some(decoded.text);
-                            }
-                            Err(why) => {
-                                note(why);
-                                modified = None;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        Working::File(file, meta) => working_file(&file, &meta, reason),
+    }
+}
+fn modified_side(snapshot: &Snapshot, file: &DiffFile, staged: bool, reason: &mut Option<String>) -> Result<Modified> {
+    if snapshot.mode == DiffMode::Commits {
+        return commit_modified(snapshot, file, reason).map(Modified::of);
     }
     if staged {
+        return staged_modified(&snapshot.root, file, reason).map(Modified::of);
+    }
+    working_modified(&snapshot.root, &file.path, reason)
+}
+fn load(snapshot: &Snapshot, file: &DiffFile) -> Result<Loaded> {
+    let mut reason: Option<String> = None;
+    relative_parts(&file.path)?;
+    if file.status == "T" {
+        note_reason(&mut reason, "File type changes are shown read-only");
+    }
+    let commits = snapshot.mode == DiffMode::Commits;
+    let staged = snapshot.mode == DiffMode::Uncommitted && file.group == Some(DiffGroup::Staged);
+    let in_changes = snapshot.mode == DiffMode::Uncommitted && file.group == Some(DiffGroup::Changes);
+    let (original_label, modified_label) = side_labels(snapshot, in_changes, staged);
+    let original = original_side(snapshot, file, in_changes, &mut reason)?;
+    let modified = modified_side(snapshot, file, staged, &mut reason)?;
+    if staged {
         // Last, so a blob problem (binary, submodule, ...) is the reason shown when there is one.
-        note(STAGED_READ_ONLY);
+        note_reason(&mut reason, STAGED_READ_ONLY);
     }
     if commits {
-        note("Commit diffs are read-only");
+        note_reason(&mut reason, "Commit diffs are read-only");
     }
     Ok(Loaded {
         content: DiffContent {
             path: file.path.clone(),
             original,
-            modified,
-            working_hash,
-            eol: if crlf { "crlf" } else { "lf" }.into(),
-            bom,
+            modified: modified.text,
+            working_hash: modified.working_hash,
+            eol: if modified.crlf { "crlf" } else { "lf" }.into(),
+            bom: modified.bom,
             read_only_reason: reason,
             original_label,
             modified_label,

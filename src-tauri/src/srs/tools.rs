@@ -58,6 +58,9 @@ pub(super) fn interrupt_stage(job: &mut Job) -> Result<Vec<store::Mutation>> {
     }
     Ok(writes)
 }
+/// One validated `srs_inspect` page request.
+struct InspectQuery<'a> { section: &'a str, id: Option<&'a str>, offset: u64, limit: u64, revision: u64 }
+
 
 impl SrsService {
     pub(crate) fn handle_bridge(&self, producer: &DependencyProducer, action: &str, p: Value) -> Result<Value> {
@@ -219,69 +222,72 @@ impl SrsService {
         if !(1..=200).contains(&limit) { return Err(err("invalid_request", "limit must be 1..200")); }
         let id = match object.get("id") { None | Some(Value::Null) => None, Some(v) => Some(v.as_str().ok_or_else(|| err("invalid_request", "id must be text"))?) };
         let dir = self.store.dir(&job.job_id)?;
-        let revision = job.revision;
+        let query = InspectQuery { section, id, offset, limit, revision: job.revision };
         match section {
-            "request" => {
-                let roots: Vec<_> = job.scope.roots.iter().map(|r| json!({"path":r.path,"kind":r.kind,"rationale":r.rationale})).collect();
-                let exclusions: Vec<_> = job.scope.exclusions.iter().map(|e| json!({"path":e.path,"reason":e.reason,"source":e.source})).collect();
-                Ok(page_value(section, revision, vec![json!({"jobId":job.job_id,"phase":job.phase,"scopeHash":job.scope_hash,"sourceHash":job.source_hash,"roots":roots,"exclusions":exclusions,"vaultMode":job.scope.vault_mode,"outputRoot":format!("SRS/{}",job.job_id),"template":job.scope.template,"counts":job.counts})], 1, 0, None))
-            }
-            "template" => match id {
-                None => {
-                    let manifest = documents::template_manifest();
-                    let items: Vec<Value> = manifest.files.iter().map(|f| json!({"name":f.name,"sha256":f.sha256,"revision":manifest.revision})).collect();
-                    let total = items.len() as u64;
-                    Ok(page_value(section, revision, items, total, 0, None))
-                }
-                Some(name) => {
-                    let chunk = documents::template_chunk(name, offset as usize).map_err(|e| err("invalid_request", e))?;
-                    Ok(page_value(section, revision, vec![serde_json::to_value(&chunk).map_err(|e| e.to_string())?], 1, 0, None))
-                }
-            },
-            "inventory" => match id {
-                Some(id) => {
-                    store::safe_id(id)?;
-                    let item = inventory::read_item(&dir, id).map_err(|e| err("not_found", e))?;
-                    Ok(page_value(section, revision, vec![serde_json::to_value(&item).map_err(|e| e.to_string())?], 1, 0, None))
-                }
-                None => {
-                    let page = inventory::page(&dir, offset, limit as usize)?;
-                    let items = page.items.iter().map(|i| serde_json::to_value(i).map_err(|e| e.to_string())).collect::<Result<Vec<_>>>()?;
-                    Ok(page_value(section, revision, items, page.total, page.offset, page.next_offset))
-                }
-            },
-            "work" | "documents" | "questions" => match id {
-                Some(id) => {
-                    store::safe_id(id)?;
-                    let mut record: Value = self.store.get(&job.job_id, section, id).map_err(|e| err("not_found", e))?;
-                    self.enrich_inspection_record(job, section, &mut record)?;
-                    let kinds: &[&str] = match section { "work" => &["evidence", "requirement", "question"], "documents" => &["parent", "reviewedWork", "related"], _ => &["work"] };
-                    let mut relations = Map::new();
-                    for kind in kinds { relations.insert((*kind).into(), self.relations(&job.job_id, id, kind, offset, limit)?); }
-                    Ok(page_value(section, revision, vec![json!({"record":record,"relations":relations})], 1, 0, None))
-                }
-                None => {
-                    let page = self.store.page(&job.job_id, section, offset as usize, limit as usize)?;
-                    let mut items = page["items"].as_array().cloned().unwrap_or_default();
-                    for record in &mut items { self.enrich_inspection_record(job, section, record)?; }
-                    Ok(page_value(section, revision, items, page["total"].as_u64().unwrap_or(0), offset, page["nextOffset"].as_u64()))
-                }
-            },
-            "coverage" => {
-                let page = inventory::page(&dir, offset, limit as usize)?;
-                let mut items = Vec::new();
-                for item in &page.items {
-                    let covered = match (item.state.as_str(), item.kind.as_str(), item.sha256.as_deref()) {
-                        ("ready", "text" | "image", Some(hash)) => self.covered(&job.job_id, &item.id, item.bytes, hash)?.0,
-                        _ => 0,
-                    };
-                    items.push(json!({"id":item.id,"path":item.path,"kind":item.kind,"state":item.state,"bytes":item.bytes,"coveredBytes":covered,"rationale":item.rationale,"exclusionSource":item.exclusion_source}));
-                }
-                Ok(page_value(section, revision, items, page.total, page.offset, page.next_offset))
-            }
-            "checkpoint" => Ok(page_value(section, revision, vec![json!({"revision":job.revision,"workRevision":job.work_revision,"documentRevision":job.document_revision,"nextRequirementOrdinal":job.next_requirement,"phase":job.phase,"counts":job.counts,"checkpoint":job.checkpoint,"stage":job.stage.as_ref().map(|s| json!({"stageId":s.stage_id,"number":s.number,"phase":s.phase}))})], 1, 0, None)),
+            "request" => Ok(Self::inspect_request(job, &query)),
+            "template" => Self::inspect_template(&query),
+            "inventory" => Self::inspect_inventory(&dir, &query),
+            "work" | "documents" | "questions" => self.inspect_records(job, &query),
+            "coverage" => self.inspect_coverage(job, &dir, &query),
+            "checkpoint" => Ok(Self::inspect_checkpoint(job, &query)),
             _ => Err(err("invalid_request", "Unknown inspect section")),
         }
+    }
+    fn inspect_request(job: &Job, q: &InspectQuery) -> Value {
+        let roots: Vec<_> = job.scope.roots.iter().map(|r| json!({"path":r.path,"kind":r.kind,"rationale":r.rationale})).collect();
+        let exclusions: Vec<_> = job.scope.exclusions.iter().map(|e| json!({"path":e.path,"reason":e.reason,"source":e.source})).collect();
+        page_value(q.section, q.revision, vec![json!({"jobId":job.job_id,"phase":job.phase,"scopeHash":job.scope_hash,"sourceHash":job.source_hash,"roots":roots,"exclusions":exclusions,"vaultMode":job.scope.vault_mode,"outputRoot":format!("SRS/{}",job.job_id),"template":job.scope.template,"counts":job.counts})], 1, 0, None)
+    }
+    fn inspect_template(q: &InspectQuery) -> Result<Value> {
+        let Some(name) = q.id else {
+            let manifest = documents::template_manifest();
+            let items: Vec<Value> = manifest.files.iter().map(|f| json!({"name":f.name,"sha256":f.sha256,"revision":manifest.revision})).collect();
+            let total = items.len() as u64;
+            return Ok(page_value(q.section, q.revision, items, total, 0, None));
+        };
+        let chunk = documents::template_chunk(name, q.offset as usize).map_err(|e| err("invalid_request", e))?;
+        Ok(page_value(q.section, q.revision, vec![serde_json::to_value(&chunk).map_err(|e| e.to_string())?], 1, 0, None))
+    }
+    fn inspect_inventory(dir: &Path, q: &InspectQuery) -> Result<Value> {
+        let Some(id) = q.id else {
+            let page = inventory::page(dir, q.offset, q.limit as usize)?;
+            let items = page.items.iter().map(|i| serde_json::to_value(i).map_err(|e| e.to_string())).collect::<Result<Vec<_>>>()?;
+            return Ok(page_value(q.section, q.revision, items, page.total, page.offset, page.next_offset));
+        };
+        store::safe_id(id)?;
+        let item = inventory::read_item(dir, id).map_err(|e| err("not_found", e))?;
+        Ok(page_value(q.section, q.revision, vec![serde_json::to_value(&item).map_err(|e| e.to_string())?], 1, 0, None))
+    }
+    fn inspect_records(&self, job: &Job, q: &InspectQuery) -> Result<Value> {
+        let section = q.section;
+        let Some(id) = q.id else {
+            let page = self.store.page(&job.job_id, section, q.offset as usize, q.limit as usize)?;
+            let mut items = page["items"].as_array().cloned().unwrap_or_default();
+            for record in &mut items { self.enrich_inspection_record(job, section, record)?; }
+            return Ok(page_value(section, q.revision, items, page["total"].as_u64().unwrap_or(0), q.offset, page["nextOffset"].as_u64()));
+        };
+        store::safe_id(id)?;
+        let mut record: Value = self.store.get(&job.job_id, section, id).map_err(|e| err("not_found", e))?;
+        self.enrich_inspection_record(job, section, &mut record)?;
+        let kinds: &[&str] = match section { "work" => &["evidence", "requirement", "question"], "documents" => &["parent", "reviewedWork", "related"], _ => &["work"] };
+        let mut relations = Map::new();
+        for kind in kinds { relations.insert((*kind).into(), self.relations(&job.job_id, id, kind, q.offset, q.limit)?); }
+        Ok(page_value(section, q.revision, vec![json!({"record":record,"relations":relations})], 1, 0, None))
+    }
+    fn inspect_coverage(&self, job: &Job, dir: &Path, q: &InspectQuery) -> Result<Value> {
+        let page = inventory::page(dir, q.offset, q.limit as usize)?;
+        let mut items = Vec::new();
+        for item in &page.items {
+            let covered = match (item.state.as_str(), item.kind.as_str(), item.sha256.as_deref()) {
+                ("ready", "text" | "image", Some(hash)) => self.covered(&job.job_id, &item.id, item.bytes, hash)?.0,
+                _ => 0,
+            };
+            items.push(json!({"id":item.id,"path":item.path,"kind":item.kind,"state":item.state,"bytes":item.bytes,"coveredBytes":covered,"rationale":item.rationale,"exclusionSource":item.exclusion_source}));
+        }
+        Ok(page_value(q.section, q.revision, items, page.total, page.offset, page.next_offset))
+    }
+    fn inspect_checkpoint(job: &Job, q: &InspectQuery) -> Value {
+        page_value(q.section, q.revision, vec![json!({"revision":job.revision,"workRevision":job.work_revision,"documentRevision":job.document_revision,"nextRequirementOrdinal":job.next_requirement,"phase":job.phase,"counts":job.counts,"checkpoint":job.checkpoint,"stage":job.stage.as_ref().map(|s| json!({"stageId":s.stage_id,"number":s.number,"phase":s.phase}))})], 1, 0, None)
     }
     fn enrich_inspection_record(&self, job: &Job, section: &str, value: &mut Value) -> Result<()> {
         if section == "questions" {
@@ -363,51 +369,54 @@ impl SrsService {
 
     /// Resolves an allocated public path to its document record without any whole-job path map.
     fn document_by_path(&self, job: &str, path: &str) -> Result<Option<Document>> {
-        let load = |id: &str| -> Result<Option<Document>> {
-            if store::safe_id(id).is_err() { return Ok(None); }
-            Ok(self.store.get::<Document>(job, "documents", id).ok().filter(|d| d.path == path))
-        };
-        if let Some(rest) = path.strip_prefix("Requirements/") {
-            let Some(id) = rest.strip_suffix(".md") else { return Ok(None) };
-            if store::safe_id(id).is_err() { return Ok(None); }
-            return match self.store.get::<Requirement>(job, "requirements", id) { Ok(r) => load(&r.document_id), Err(_) => Ok(None) };
-        }
+        if let Some(rest) = path.strip_prefix("Requirements/") { return self.requirement_document(job, path, rest); }
         for prefix in ["Domains/", "Flows/", "Interfaces/"] {
-            if let Some(rest) = path.strip_prefix(prefix) { return match rest.strip_suffix(".md") { Some(id) => load(id), None => Ok(None) }; }
+            if let Some(rest) = path.strip_prefix(prefix) {
+                return match rest.strip_suffix(".md") { Some(id) => self.document_at(job, id, path), None => Ok(None) };
+            }
         }
+        self.fixed_document(job, path)
+    }
+    /// The document `id` when it exists and publishes exactly `path`.
+    fn document_at(&self, job: &str, id: &str, path: &str) -> Result<Option<Document>> {
+        if store::safe_id(id).is_err() { return Ok(None); }
+        Ok(self.store.get::<Document>(job, "documents", id).ok().filter(|d| d.path == path))
+    }
+    fn requirement_document(&self, job: &str, path: &str, rest: &str) -> Result<Option<Document>> {
+        let Some(id) = rest.strip_suffix(".md") else { return Ok(None) };
+        if store::safe_id(id).is_err() { return Ok(None); }
+        match self.store.get::<Requirement>(job, "requirements", id) { Ok(r) => self.document_at(job, &r.document_id, path), Err(_) => Ok(None) }
+    }
+    fn fixed_document(&self, job: &str, path: &str) -> Result<Option<Document>> {
         let nil = uuid::Uuid::nil().to_string();
         for kind in ["master", "uiObservations", "structureObservations", "traceability", "coverage", "glossary", "questions"] {
-            if documents::document_path(kind, &nil, None).ok().as_deref() != Some(path) { continue; }
-            if let Ok(fixed) = self.store.get::<Value>(job, "fixed", kind) {
-                return Ok(fixed["documentId"].as_str().and_then(|id| load(id).ok().flatten()));
-            }
-            let mut found: Option<Document> = None;
-            self.store.for_each(job, "documents", |v| {
-                let d: Document = serde_json::from_value(v).map_err(|e| e.to_string())?;
-                if d.r#type == kind { found = Some(d); }
-                Ok(())
-            })?;
-            if let Some(d) = &found { store::atomic(&self.store.path(job, "fixed", kind)?, &json!({"documentId":d.document_id}))?; }
-            return Ok(found.filter(|d| d.path == path));
+            if documents::document_path(kind, &nil, None).ok().as_deref() == Some(path) { return self.fixed_kind_document(job, kind, path); }
         }
         Ok(None)
     }
-
-    fn tool_commit(&self, job: &mut Job, p: &Value) -> Result<Value> {
-        only(p, &["action", "jobId", "attemptId", "stageId", "documentId", "revisionId", "expectedHash", "metadata"])?;
-        let document_id = text(p, "documentId")?;
-        let revision_id = text(p, "revisionId")?;
-        let expected = text(p, "expectedHash")?;
-        store::safe_id(document_id)?;
-        let meta: Metadata = serde_json::from_value(p.get("metadata").cloned().unwrap_or(Value::Null)).map_err(|e| err("invalid_request", format!("metadata: {e}")))?;
-        let mut doc: Document = self.store.get(&job.job_id, "documents", document_id).map_err(|e| err("not_found", e))?;
-        if let Ok(record) = self.store.get::<Value>(&job.job_id, "revisions", revision_id) {
-            if record["documentId"] == document_id {
-                if record["hash"] != expected { return Err(err("hash_mismatch", "This revision was committed with a different hash")); }
-                return Ok(json!({"documentId":document_id,"revisionId":revision_id,"path":record["path"],"hash":record["hash"],"bytes":record["bytes"],"nextRevisionId":doc.revision_id,"replayed":true,"reviewCurrent":ledger::document_review_current(&self.store,job,&doc)?}));
-            }
+    /// A singleton document kind is pinned in `fixed` on first lookup so later lookups skip the document scan.
+    fn fixed_kind_document(&self, job: &str, kind: &str, path: &str) -> Result<Option<Document>> {
+        if let Ok(fixed) = self.store.get::<Value>(job, "fixed", kind) {
+            return Ok(fixed["documentId"].as_str().and_then(|id| self.document_at(job, id, path).ok().flatten()));
         }
-        if doc.revision_id != revision_id { return Err(err("stale_stage", "That revision is not the document's current editable revision")); }
+        let mut found: Option<Document> = None;
+        self.store.for_each(job, "documents", |v| {
+            let d: Document = serde_json::from_value(v).map_err(|e| e.to_string())?;
+            if d.r#type == kind { found = Some(d); }
+            Ok(())
+        })?;
+        if let Some(d) = &found { store::atomic(&self.store.path(job, "fixed", kind)?, &json!({"documentId":d.document_id}))?; }
+        Ok(found.filter(|d| d.path == path))
+    }
+
+    /// A revision already committed for this document replays its stored result (or rejects a different hash).
+    fn commit_replay(&self, job: &Job, doc: &Document, revision_id: &str, expected: &str) -> Result<Option<Value>> {
+        let Ok(record) = self.store.get::<Value>(&job.job_id, "revisions", revision_id) else { return Ok(None); };
+        if record["documentId"] != doc.document_id { return Ok(None); }
+        if record["hash"] != expected { return Err(err("hash_mismatch", "This revision was committed with a different hash")); }
+        Ok(Some(json!({"documentId":doc.document_id,"revisionId":revision_id,"path":record["path"],"hash":record["hash"],"bytes":record["bytes"],"nextRevisionId":doc.revision_id,"replayed":true,"reviewCurrent":ledger::document_review_current(&self.store, job, doc)?})))
+    }
+    fn check_commit_metadata(doc: &Document, meta: &Metadata) -> Result<()> {
         if meta.r#type != doc.r#type || meta.requirement_id != doc.requirement_id || meta.related_document_ids.len() > 200 || meta.reviewed_work_ids.len() > 200 || meta.citations.len() > 200 {
             return Err(err("invalid_request", "Metadata does not match the allocated document or exceeds a 200-entry reference page"));
         }
@@ -420,14 +429,20 @@ impl SrsService {
         if required.is_some_and(|r| r != meta.specificity) || !["portable", "uiSpecific", "implementationSpecific"].contains(&meta.specificity.as_str()) {
             return Err(err("invalid_request", format!("A {} note requires specificity {}", doc.r#type, required.unwrap_or("portable, uiSpecific or implementationSpecific"))));
         }
-        let vault = self.vault_for(job)?;
-        let staged = self.store.chunk_path(&job.job_id, revision_id)?;
+        Ok(())
+    }
+    /// The staged note bytes, which must hash to `expected` and be UTF-8.
+    fn staged_body(&self, job_id: &str, revision_id: &str, expected: &str) -> Result<String> {
+        let staged = self.store.chunk_path(job_id, revision_id)?;
         store::plain(&staged)?;
         if !staged.exists() { return Err(err("precondition_failed", "No chunks are staged for this revision")); }
         let bytes = fs::read(&staged).map_err(|e| err("storage_error", e.to_string()))?;
         if store::hash(&bytes) != expected { return Err(err("hash_mismatch", "The staged bytes do not match expectedHash")); }
-        let body = String::from_utf8(bytes).map_err(|_| err("invalid_request", "The staged note is not valid UTF-8"))?;
-        let dir = self.store.dir(&job.job_id)?;
+        String::from_utf8(bytes).map_err(|_| err("invalid_request", "The staged note is not valid UTF-8"))
+    }
+    /// Evidence file names and paths a note must not leak into its body.
+    fn forbidden_terms(&self, job_id: &str, meta: &Metadata) -> Result<Vec<String>> {
+        let dir = self.store.dir(job_id)?;
         let mut forbidden = Vec::new();
         for citation in &meta.citations {
             store::safe_id(&citation.evidence_id)?;
@@ -435,6 +450,31 @@ impl SrsService {
             if let Some(name) = item.path.rsplit('/').next() { forbidden.push(name.to_string()); }
             forbidden.push(item.path);
         }
+        Ok(forbidden)
+    }
+    fn publish_note(vault: &crate::knowledge::VaultRoot, relative: &str, body: &str, current_hash: Option<&str>, expected: &str) -> Result<WriteReceipt> {
+        let precondition = match current_hash { None => WritePrecondition::Create, Some(hash) => WritePrecondition::Replace { expected_hash: hash.to_string() } };
+        let error = match vault.write_markdown(relative, body, precondition) { Ok(receipt) => return Ok(receipt), Err(error) => error };
+        match vault.read_markdown(relative) {
+            // A crash after publication but before the ledger commit replays idempotently.
+            Ok(existing) if store::hash(&existing) == expected => Ok(WriteReceipt { path: relative.to_string(), hash: expected.to_string(), bytes: existing.len() as u64 }),
+            _ => Err(err("vault_conflict", format!("{error}. The note was not overwritten; review it in the vault"))),
+        }
+    }
+    fn tool_commit(&self, job: &mut Job, p: &Value) -> Result<Value> {
+        only(p, &["action", "jobId", "attemptId", "stageId", "documentId", "revisionId", "expectedHash", "metadata"])?;
+        let document_id = text(p, "documentId")?;
+        let revision_id = text(p, "revisionId")?;
+        let expected = text(p, "expectedHash")?;
+        store::safe_id(document_id)?;
+        let meta: Metadata = serde_json::from_value(p.get("metadata").cloned().unwrap_or(Value::Null)).map_err(|e| err("invalid_request", format!("metadata: {e}")))?;
+        let mut doc: Document = self.store.get(&job.job_id, "documents", document_id).map_err(|e| err("not_found", e))?;
+        if let Some(replay) = self.commit_replay(job, &doc, revision_id, expected)? { return Ok(replay); }
+        if doc.revision_id != revision_id { return Err(err("stale_stage", "That revision is not the document's current editable revision")); }
+        Self::check_commit_metadata(&doc, &meta)?;
+        let vault = self.vault_for(job)?;
+        let body = self.staged_body(&job.job_id, revision_id, expected)?;
+        let forbidden = self.forbidden_terms(&job.job_id, &meta)?;
         let context = documents::ValidationContext { path: &doc.path, document_type: &doc.r#type, specificity: &meta.specificity, requirement_id: doc.requirement_id.as_deref(), forbidden_terms: &forbidden };
         let report = documents::validate_document(&body, &context, |path| self.document_by_path(&job.job_id, path).ok().flatten().is_some()).map_err(|e| err("invalid_request", e))?;
         if !report.not_applicable_sections.is_empty() && meta.citations.is_empty() {
@@ -443,15 +483,7 @@ impl SrsService {
         for related in &meta.related_document_ids { store::safe_id(related)?; let _: Document = self.store.get(&job.job_id, "documents", related).map_err(|_| err("invalid_request", "Unknown related document"))?; }
         let mut writes = ledger::review_mutations(&self.store, job, document_id, &meta.reviewed_work_ids)?;
         let relative = format!("SRS/{}/{}", job.job_id, doc.path);
-        let precondition = match &doc.hash { None => WritePrecondition::Create, Some(hash) => WritePrecondition::Replace { expected_hash: hash.clone() } };
-        let receipt: WriteReceipt = match vault.write_markdown(&relative, &body, precondition) {
-            Ok(receipt) => receipt,
-            Err(error) => match vault.read_markdown(&relative) {
-                // A crash after publication but before the ledger commit replays idempotently.
-                Ok(existing) if store::hash(&existing) == expected => WriteReceipt { path: relative.clone(), hash: expected.to_string(), bytes: existing.len() as u64 },
-                _ => return Err(err("vault_conflict", format!("{error}. The note was not overwritten; review it in the vault"))),
-            },
-        };
+        let receipt = Self::publish_note(&vault, &relative, &body, doc.hash.as_deref(), expected)?;
         let next_revision = store::id();
         doc.state = "committed".into();
         doc.hash = Some(receipt.hash.clone());
@@ -523,11 +555,8 @@ impl SrsService {
         Ok((manifest, hash))
     }
 
-    fn tool_finish(&self, job: &mut Job, stage: Stage, p: &Value) -> Result<Value> {
-        let object = only(p, &["action", "jobId", "attemptId", "stageId", "expectedRevision", "review"])?;
-        if stage.state == "committed" {
-            return Ok(json!({"advanced":true,"state":job.state,"nextPhase":job.phase,"completed":job.state == JobState::Completed,"reasons":[],"replayed":true}));
-        }
+    /// Expected revision, bounds and phase checks on the submitted review.
+    fn parse_review(job: &Job, stage: &Stage, object: &Map<String, Value>) -> Result<Review> {
         let expected = object.get("expectedRevision").and_then(Value::as_u64).ok_or_else(|| err("invalid_request", "expectedRevision is required"))?;
         if expected != job.revision { return Err(err("revision_conflict", format!("The current revision is {}; inspect the checkpoint section again", job.revision))); }
         let review: Review = serde_json::from_value(object.get("review").cloned().unwrap_or(Value::Null)).map_err(|e| err("invalid_request", format!("review: {e}")))?;
@@ -537,38 +566,68 @@ impl SrsService {
             return Err(err("revision_conflict", "The review names stale document/work revisions"));
         }
         if review.gap_ids.len() > 200 || review.unresolved_question_ids.len() > 200 { return Err(err("invalid_request", "gapIds and unresolvedQuestionIds accept at most 200 entries")); }
+        Ok(review)
+    }
+    fn check_review_ids(&self, job: &Job, review: &Review) -> Result<()> {
         for id in &review.gap_ids { store::safe_id(id)?; let _: Work = self.store.get(&job.job_id, "work", id).map_err(|_| err("invalid_request", "A gap ID must identify existing work"))?; }
         for id in &review.unresolved_question_ids { store::safe_id(id)?; let _: Question = self.store.get(&job.job_id, "questions", id).map_err(|_| err("invalid_request", "Unknown question ID"))?; }
-        let declaration = match review.final_declaration.as_deref() { None => None, Some(d @ ("noKnownGap" | "moreWorkNeeded")) => Some(d), Some(_) => return Err(err("invalid_request", "finalDeclaration must be noKnownGap or moreWorkNeeded")) };
+        Ok(())
+    }
+    fn declaration(review: &Review) -> Result<Option<&str>> {
+        match review.final_declaration.as_deref() {
+            None => Ok(None),
+            Some(d @ ("noKnownGap" | "moreWorkNeeded")) => Ok(Some(d)),
+            Some(_) => Err(err("invalid_request", "finalDeclaration must be noKnownGap or moreWorkNeeded")),
+        }
+    }
+    fn push_blocker(blockers: &mut Vec<String>, reason: String) { if blockers.len() < 200 { blockers.push(reason); } }
+    /// Blockers that hold in every phase, in reporting order.
+    fn base_blockers(job: &Job, review: &Review, declaration: Option<&str>, lowest: Option<Phase>) -> Vec<String> {
         let mut blockers: Vec<String> = Vec::new();
         if !review.gap_ids.is_empty() { blockers.push("The reviewer reported known gaps; queue and complete work for them".into()); }
         if declaration == Some("moreWorkNeeded") { blockers.push("The reviewer declared more work is needed".into()); }
         if matches!(job.phase, Phase::GapReview | Phase::Verify) && declaration != Some("noKnownGap") { blockers.push("This phase needs an explicit noKnownGap declaration".into()); }
-        let lowest = self.open_phase(&job.job_id)?;
         if lowest.is_some_and(|l| rank(l) <= rank(job.phase)) { blockers.push("Pending or active work remains at or before this phase".into()); }
         if job.counts.blocked > 0 { blockers.push("Blocked work needs a human disposition or readable evidence".into()); }
         if job.counts.questions_open > 0 { blockers.push("Required stakeholder questions are unresolved".into()); }
+        blockers
+    }
+    fn verify_blockers(&self, job: &Job, blockers: &mut Vec<String>) -> Result<()> {
+        for reason in ledger::validate_completion(&self.store, job)? { Self::push_blocker(blockers, reason); }
+        match self.vault_for(job).and_then(|v| self.check_publications(job, &v).map_err(|e| err("vault_conflict", e))) {
+            Ok(()) => {}
+            Err(e) if e.starts_with("vault_unavailable") => return Err(e),
+            Err(e) => Self::push_blocker(blockers, e),
+        }
+        Ok(())
+    }
+    fn phase_blockers(&self, job: &Job, blockers: &mut Vec<String>) -> Result<()> {
         match job.phase {
-            Phase::Survey => self.uncovered(job, &mut blockers)?,
+            Phase::Survey => self.uncovered(job, blockers)?,
             Phase::Specify => if job.counts.requirements == 0 { blockers.push("No stable requirements were recorded".into()); },
             Phase::GapReview => {}
-            Phase::Verify => {
-                for reason in ledger::validate_completion(&self.store, job)? { if blockers.len() < 200 { blockers.push(reason); } }
-                match self.vault_for(job).and_then(|v| self.check_publications(job, &v).map_err(|e| err("vault_conflict", e))) {
-                    Ok(()) => {}
-                    Err(e) if e.starts_with("vault_unavailable") => return Err(e),
-                    Err(e) => { if blockers.len() < 200 { blockers.push(e); } }
-                }
-            }
+            Phase::Verify => self.verify_blockers(job, blockers)?,
         }
+        Ok(())
+    }
+    /// The next phase and whether finishing it completes the job.
+    fn next_phase(phase: Phase, advance: bool, lowest: Option<Phase>) -> (Phase, bool) {
+        if advance { return match phase.next() { Some(next) => (next, false), None => (phase, true) }; }
+        (lowest.filter(|low| rank(*low) < rank(phase)).unwrap_or(phase), false)
+    }
+    fn tool_finish(&self, job: &mut Job, stage: Stage, p: &Value) -> Result<Value> {
+        let object = only(p, &["action", "jobId", "attemptId", "stageId", "expectedRevision", "review"])?;
+        if stage.state == "committed" {
+            return Ok(json!({"advanced":true,"state":job.state,"nextPhase":job.phase,"completed":job.state == JobState::Completed,"reasons":[],"replayed":true}));
+        }
+        let review = Self::parse_review(job, &stage, object)?;
+        self.check_review_ids(job, &review)?;
+        let declaration = Self::declaration(&review)?;
+        let lowest = self.open_phase(&job.job_id)?;
+        let mut blockers = Self::base_blockers(job, &review, declaration, lowest);
+        self.phase_blockers(job, &mut blockers)?;
         let advance = blockers.is_empty();
-        let mut next = job.phase;
-        let mut complete = false;
-        if advance {
-            match job.phase.next() { Some(n) => next = n, None => complete = true }
-        } else if let Some(low) = lowest {
-            if rank(low) < rank(job.phase) { next = low; }
-        }
+        let (next, complete) = Self::next_phase(job.phase, advance, lowest);
         let now = self.now();
         let mut finished = stage.clone();
         finished.state = "committed".into();

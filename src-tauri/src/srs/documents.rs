@@ -248,6 +248,27 @@ fn has_word(text: &str, word: &str) -> bool {
     })
 }
 
+fn has_line_reference(lower: &str) -> bool {
+    let mut words = lower.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        if matches!(word, "line" | "lines") && words.peek().is_some_and(|next| next.starts_with(|c: char| c.is_ascii_digit())) { return true; }
+    }
+    false
+}
+
+/// Bare filenames may be public product contracts; paths and citations are not.
+fn is_internal_reference(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| matches!(c, '*' | '_' | '.' | '!' | '?'));
+    let lower = token.to_ascii_lowercase();
+    let without_line = lower.split([':', '#']).next().unwrap_or("");
+    lower.starts_with('/') || lower.as_bytes().get(1) == Some(&b':') && lower.as_bytes().get(2) == Some(&b'/') ||
+        without_line.contains('/') && without_line.rsplit('/').next().is_some_and(|name| name.contains('.')) ||
+        lower.split_once(':').is_some_and(|(_, tail)| tail.starts_with(|c: char| c.is_ascii_digit())) ||
+        lower.contains("#l") && lower.split("#l").nth(1).is_some_and(|tail| tail.starts_with(|c: char| c.is_ascii_digit())) ||
+        lower.starts_with("src/") || lower.starts_with("src-tauri/") || lower.starts_with("evid-") ||
+        token.strip_prefix('L').is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn public_prose(text: &str, forbidden: &[String]) -> Result<(), String> {
     let lower = text.to_ascii_lowercase();
     if ["{{", "}}", "<%", "%>", "to be determined", "to be completed", "insert here", "system shall...", "system shall…"].iter().any(|marker| lower.contains(marker)) ||
@@ -257,64 +278,58 @@ fn public_prose(text: &str, forbidden: &[String]) -> Result<(), String> {
     if ["http:", "https:", "file:", "javascript:", "data:", "vbscript:", "command:", "vscode:", "blob:", "::", "()", "evidenceid", "receiptid", "source excerpt", "source citation", "source://", "citation:", "【", "†"].iter().any(|marker| lower.contains(marker)) {
         return Err("Public note contains a source citation, symbol, or active/remote destination".into());
     }
-    for term in forbidden.iter().filter(|term| !term.is_empty()) {
-        if has_word(text, term) { return Err("Public note contains private evidence terminology".into()); }
-    }
-    let mut words = lower.split_whitespace().peekable();
-    while let Some(word) = words.next() {
-        if matches!(word, "line" | "lines") && words.peek().is_some_and(|next| next.starts_with(|c: char| c.is_ascii_digit())) {
-            return Err("Public note contains an internal source line reference".into());
-        }
-    }
-    for token in text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '"' | '\'' | ',' | ';')) {
-        let token = token.trim_matches(|c: char| matches!(c, '*' | '_' | '.' | '!' | '?'));
-        let lower = token.to_ascii_lowercase();
-        let without_line = lower.split([':', '#']).next().unwrap_or("");
-        // Bare filenames may be public product contracts; paths and citations are not.
-        if lower.starts_with('/') || lower.as_bytes().get(1) == Some(&b':') && lower.as_bytes().get(2) == Some(&b'/') ||
-            without_line.contains('/') && without_line.rsplit('/').next().is_some_and(|name| name.contains('.')) ||
-            lower.split_once(':').is_some_and(|(_, tail)| tail.starts_with(|c: char| c.is_ascii_digit())) ||
-            lower.contains("#l") && lower.split("#l").nth(1).is_some_and(|tail| tail.starts_with(|c: char| c.is_ascii_digit())) ||
-            lower.starts_with("src/") || lower.starts_with("src-tauri/") || lower.starts_with("evid-") ||
-            token.strip_prefix('L').is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit())) {
-            return Err("Public note contains an internal source path or line reference".into());
-        }
+    if forbidden.iter().any(|term| !term.is_empty() && has_word(text, term)) { return Err("Public note contains private evidence terminology".into()); }
+    if has_line_reference(&lower) { return Err("Public note contains an internal source line reference".into()); }
+    if text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '"' | '\'' | ',' | ';')).any(is_internal_reference) {
+        return Err("Public note contains an internal source path or line reference".into());
     }
     Ok(())
+}
+
+fn has_forbidden_syntax(line: &str) -> bool {
+    line.contains(['`', '<', '\\']) || line.trim_start().starts_with("~~~") ||
+        line.contains("![") || line.contains("[[") || line.contains("]]") ||
+        (line.starts_with("    ") && !line.trim_start().starts_with("* [") && !line.trim_start().starts_with("- [")) ||
+        line.starts_with('\t')
+}
+
+/// Entity decoding must not introduce hidden HTML, executable schemes or paths.
+fn has_entity(line: &str) -> bool {
+    line.match_indices('&').any(|(index, _)| {
+        line[index..].find(';').is_some_and(|end| end <= 32 && !line[index..index + end].contains(char::is_whitespace))
+    })
+}
+
+/// Validates the link opening at `rest[open]` and returns the text after it.
+fn validate_link<'a>(
+    rest: &'a str, open: usize, context: &ValidationContext<'_>, prefix: usize,
+    lookup: &mut impl FnMut(&str) -> bool, report: &mut ValidationReport,
+) -> Result<&'a str, String> {
+    let label_start = open + 1;
+    let close = rest[label_start..].find(']').map(|index| label_start + index).ok_or("Malformed public Markdown link")?;
+    let label = &rest[label_start..close];
+    if label.is_empty() || label.contains('[') { return Err("Nested or empty public Markdown link".into()); }
+    public_prose(label, context.forbidden_terms)?;
+    let destination = rest[close + 1..].strip_prefix('(').ok_or("Reference, wiki and shortcut links are not portable public links")?;
+    let end = destination.find(')').ok_or("Unterminated public Markdown link")?;
+    let target = &destination[..end];
+    if target.contains('(') || target.chars().any(char::is_whitespace) { return Err("Ambiguous public Markdown link destination".into()); }
+    let resolved = link_target(target, context.path, prefix)?;
+    if !lookup(&resolved) { return Err("Public Markdown link does not name an admitted run document".into()); }
+    report.links.push(resolved);
+    Ok(&destination[end + 1..])
 }
 
 fn validate_line(
     line: &str, context: &ValidationContext<'_>, prefix: usize,
     lookup: &mut impl FnMut(&str) -> bool, report: &mut ValidationReport,
 ) -> Result<(), String> {
-    if line.contains(['`', '<', '\\']) || line.trim_start().starts_with("~~~") ||
-        line.contains("![") || line.contains("[[") || line.contains("]]") ||
-        (line.starts_with("    ") && !line.trim_start().starts_with("* [") && !line.trim_start().starts_with("- [")) ||
-        line.starts_with('\t') {
-        return Err("Public notes cannot contain HTML, code, source excerpts, or embeds".into());
-    }
-    // Entity decoding must not introduce hidden HTML, executable schemes or paths.
-    for (index, _) in line.match_indices('&') {
-        if line[index..].find(';').is_some_and(|end| end <= 32 && !line[index..index + end].contains(char::is_whitespace)) {
-            return Err("HTML entities are not part of the public Markdown dialect".into());
-        }
-    }
+    if has_forbidden_syntax(line) { return Err("Public notes cannot contain HTML, code, source excerpts, or embeds".into()); }
+    if has_entity(line) { return Err("HTML entities are not part of the public Markdown dialect".into()); }
     let mut rest = line;
     while let Some(open) = rest.find('[') {
         public_prose(&rest[..open], context.forbidden_terms)?;
-        let label_start = open + 1;
-        let close = rest[label_start..].find(']').map(|index| label_start + index).ok_or("Malformed public Markdown link")?;
-        let label = &rest[label_start..close];
-        if label.is_empty() || label.contains('[') { return Err("Nested or empty public Markdown link".into()); }
-        public_prose(label, context.forbidden_terms)?;
-        let destination = rest[close + 1..].strip_prefix('(').ok_or("Reference, wiki and shortcut links are not portable public links")?;
-        let end = destination.find(')').ok_or("Unterminated public Markdown link")?;
-        let target = &destination[..end];
-        if target.contains('(') || target.chars().any(char::is_whitespace) { return Err("Ambiguous public Markdown link destination".into()); }
-        let resolved = link_target(target, context.path, prefix)?;
-        if !lookup(&resolved) { return Err("Public Markdown link does not name an admitted run document".into()); }
-        report.links.push(resolved);
-        rest = &destination[end + 1..];
+        rest = validate_link(rest, open, context, prefix, lookup, report)?;
     }
     if rest.contains(']') { return Err("Malformed public Markdown link".into()); }
     public_prose(rest, context.forbidden_terms)
@@ -342,7 +357,7 @@ fn meaningful_body(body: &str) -> bool {
     })
 }
 
-fn check_sections(text: &str, required: &[&str], report: &mut ValidationReport) -> Result<(), String> {
+fn collect_sections(text: &str) -> Result<BTreeMap<&str, &str>, String> {
     let mut sections: BTreeMap<&str, &str> = BTreeMap::new();
     let mut current: Option<(&str, usize)> = None;
     let mut offset = 0;
@@ -358,6 +373,11 @@ fn check_sections(text: &str, required: &[&str], report: &mut ValidationReport) 
     if let Some((title, start)) = current {
         if sections.insert(title, &text[start..]).is_some() { return Err(format!("Duplicate public section: {title}")); }
     }
+    Ok(sections)
+}
+
+fn check_sections(text: &str, required: &[&str], report: &mut ValidationReport) -> Result<(), String> {
+    let sections = collect_sections(text)?;
     for title in required {
         let body = sections.get(title).ok_or_else(|| format!("Required template section is missing: {title}"))?;
         if !meaningful_body(body) { return Err(format!("Template section is not populated: {title}")); }
@@ -374,18 +394,7 @@ fn check_sections(text: &str, required: &[&str], report: &mut ValidationReport) 
     Ok(())
 }
 
-/// Validate one complete document without consulting or loading an entire job catalog.
-/// `lookup` must consult the admitted on-disk document catalog, including this document.
-/// Its argument is normalized in the same path namespace as `context.path`.
-/// Citations are deliberately absent from this API: validate/store those privately.
-pub fn validate_document(
-    text: &str, context: &ValidationContext<'_>, mut lookup: impl FnMut(&str) -> bool,
-) -> Result<ValidationReport, String> {
-    if !known_type(context.document_type) { return Err("Unknown public document type".into()); }
-    let prefix = validate_allocated_path(context)?;
-    if text.trim().is_empty() || text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
-        return Err("Public note is empty or contains control characters".into());
-    }
+fn validate_specificity(text: &str, context: &ValidationContext<'_>) -> Result<(), String> {
     let required_label = match context.specificity {
         "portable" => None,
         "uiSpecific" => Some(UI_ONLY_LABEL),
@@ -403,22 +412,42 @@ pub fn validate_document(
     } else if text.contains(UI_ONLY_LABEL) || text.contains(IMPLEMENTATION_ONLY_LABEL) {
         return Err("Portable note cannot claim a UI-only or implementation-only label".into());
     }
-    let mut report = ValidationReport::default();
-    for line in text.lines() { validate_line(line, context, prefix, &mut lookup, &mut report)?; }
-    if !text.lines().any(|line| heading(line).is_some_and(|(level, _)| level == 1)) {
-        return Err("Public note must have a Markdown title".into());
-    }
+    Ok(())
+}
+
+fn check_type_sections(text: &str, context: &ValidationContext<'_>, report: &mut ValidationReport) -> Result<(), String> {
     match context.document_type {
-        "master" => check_sections(text, &master_sections(), &mut report)?,
+        "master" => check_sections(text, &master_sections(), report),
         "requirement" => {
             let id = context.requirement_id.filter(|id| valid_requirement_id(id)).ok_or("Requirement note lacks its backend ID")?;
             if !text.lines().filter_map(heading).any(|(level, title)| level == 1 && title.split_whitespace().next() == Some(id)) {
                 return Err("Requirement title must start with its backend-allocated stable REQ ID".into());
             }
-            check_sections(text, &["Statement", "Rationale", "Acceptance Criteria", "Verification Method", "More Information"], &mut report)?;
+            check_sections(text, &["Statement", "Rationale", "Acceptance Criteria", "Verification Method", "More Information"], report)
         },
-        _ => check_sections(text, &[], &mut report)?,
+        _ => check_sections(text, &[], report),
     }
+}
+
+/// Validate one complete document without consulting or loading an entire job catalog.
+/// `lookup` must consult the admitted on-disk document catalog, including this document.
+/// Its argument is normalized in the same path namespace as `context.path`.
+/// Citations are deliberately absent from this API: validate/store those privately.
+pub fn validate_document(
+    text: &str, context: &ValidationContext<'_>, mut lookup: impl FnMut(&str) -> bool,
+) -> Result<ValidationReport, String> {
+    if !known_type(context.document_type) { return Err("Unknown public document type".into()); }
+    let prefix = validate_allocated_path(context)?;
+    if text.trim().is_empty() || text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+        return Err("Public note is empty or contains control characters".into());
+    }
+    validate_specificity(text, context)?;
+    let mut report = ValidationReport::default();
+    for line in text.lines() { validate_line(line, context, prefix, &mut lookup, &mut report)?; }
+    if !text.lines().any(|line| heading(line).is_some_and(|(level, _)| level == 1)) {
+        return Err("Public note must have a Markdown title".into());
+    }
+    check_type_sections(text, context, &mut report)?;
     // Avoid repeated catalog edges in the caller's validation result.
     report.links.sort_unstable();
     report.links.dedup();

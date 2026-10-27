@@ -1,6 +1,6 @@
 //! Configuration transitions and the managed Community (SonarQube + PostgreSQL) lifecycle.
 //! Everything here runs under the single operation `Gate`; nothing is queued or speculative.
-use super::runtime::{ContainerSpec, Engine, Publish, OWNER_LABEL, ROLE_DB, ROLE_LABEL, ROLE_SONAR};
+use super::runtime::{ContainerInfo, ContainerSpec, Engine, Publish, OWNER_LABEL, ROLE_DB, ROLE_LABEL, ROLE_SONAR};
 use super::secrets::{random_password, random_sonar_password, sha256_hex};
 use super::sonar::{self, SonarClient, SonarKind};
 use super::store::{self, ResourceRecord, RuntimeRecord};
@@ -647,6 +647,29 @@ impl CodeQualityService {
         Ok(())
     }
 
+    fn stop_managed_container(&self, gate: &Gate, runtime: &QualityRuntime, engine: &dyn Engine, container: &ContainerInfo, expected: (&str, &str)) -> Result<()> {
+        let Some(current) = engine.inspect(&container.id, &gate.ctl).map_err(|error| {
+            let message = format!("{} could not be inspected before stopping: {error}", container.name);
+            self.mark_unresolved(runtime, message.clone());
+            message
+        })? else { return Ok(()); };
+        if current.labels.get(OWNER_LABEL).map(String::as_str) != Some(expected.0)
+            || current.labels.get(ROLE_LABEL).map(String::as_str) != Some(expected.1) {
+            let message = format!("{} no longer has the expected managed ownership labels; it was left running.", container.name);
+            self.mark_unresolved(runtime, message.clone());
+            return Err(message);
+        }
+        gate.say(&format!("Stopping {}", container.name));
+        let stopped = engine.stop(&container.id, 30, &gate.ctl).and_then(|_| match engine.inspect(&container.id, &gate.ctl)? {
+            Some(info) if info.running => Err(format!("{} is still running", container.name)),
+            _ => Ok(()),
+        });
+        stopped.map_err(|error| {
+            let message = format!("{} could not be stopped on {}: {error}", container.name, runtime.label());
+            self.mark_unresolved(runtime, message.clone());
+            message
+        })
+    }
     /// Stops (and verifies) every app-owned server container on `runtime`: Sonar first, then PostgreSQL.
     pub(crate) fn stop_runtime(&self, gate: &Gate, runtime: &QualityRuntime) -> Result<()> {
         let engine = self.engine(runtime).map_err(|e| {
@@ -667,27 +690,7 @@ impl CodeQualityService {
         })?;
         for role in [super::runtime::ROLE_SCAN, ROLE_SONAR, ROLE_DB] {
             for container in owned.iter().filter(|c| c.running && c.labels.get(ROLE_LABEL).map(String::as_str) == Some(role)) {
-                let Some(current) = engine.inspect(&container.id, &gate.ctl).map_err(|error| {
-                    let message = format!("{} could not be inspected before stopping: {error}", container.name);
-                    self.mark_unresolved(runtime, message.clone());
-                    message
-                })? else { continue };
-                if current.labels.get(OWNER_LABEL).map(String::as_str) != Some(owner.as_str())
-                    || current.labels.get(ROLE_LABEL).map(String::as_str) != Some(role) {
-                    let message = format!("{} no longer has the expected managed ownership labels; it was left running.", container.name);
-                    self.mark_unresolved(runtime, message.clone());
-                    return Err(message);
-                }
-                gate.say(&format!("Stopping {}", container.name));
-                let stopped = engine.stop(&container.id, 30, &gate.ctl).and_then(|_| match engine.inspect(&container.id, &gate.ctl)? {
-                    Some(info) if info.running => Err(format!("{} is still running", container.name)),
-                    _ => Ok(()),
-                });
-                if let Err(e) = stopped {
-                    let message = format!("{} could not be stopped on {}: {e}", container.name, runtime.label());
-                    self.mark_unresolved(runtime, message.clone());
-                    return Err(message);
-                }
+                self.stop_managed_container(gate, runtime, engine.as_ref(), container, (&owner, role))?;
             }
         }
         let remaining = engine.list_owned(&owner, &gate.ctl).map_err(|error| {

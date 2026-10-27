@@ -51,39 +51,57 @@ fn parse_json(text: &str) -> Result<Value> {
     Ok(value)
 }
 
-fn plain(text: &str) -> String {
-    // Decode before removing tags, including numeric HTML entities. Never render markup.
+fn entity_char(entity: &str) -> Option<char> {
+    match entity {
+        "lt" => Some('<'), "gt" => Some('>'), "amp" => Some('&'),
+        "quot" => Some('"'), "apos" | "#39" => Some('\''), "nbsp" => Some(' '),
+        _ => entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X"))
+            .and_then(|s| u32::from_str_radix(s, 16).ok()).and_then(char::from_u32)
+            .or_else(|| entity.strip_prefix('#').and_then(|s| s.parse::<u32>().ok()).and_then(char::from_u32)),
+    }
+}
+
+fn decode_entities(text: &str) -> String {
     let mut decoded = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find('&') {
         decoded.push_str(&rest[..at]);
         rest = &rest[at..];
         if let Some(end) = rest.find(';').filter(|end| *end <= 12) {
-            let entity = &rest[1..end];
-            let ch = match entity {
-                "lt" => Some('<'), "gt" => Some('>'), "amp" => Some('&'),
-                "quot" => Some('"'), "apos" | "#39" => Some('\''), "nbsp" => Some(' '),
-                _ => entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X"))
-                    .and_then(|s| u32::from_str_radix(s, 16).ok()).and_then(char::from_u32)
-                    .or_else(|| entity.strip_prefix('#').and_then(|s| s.parse::<u32>().ok()).and_then(char::from_u32)),
-            };
-            if let Some(ch) = ch { decoded.push(ch); rest = &rest[end + 1..]; continue; }
+            if let Some(ch) = entity_char(&rest[1..end]) { decoded.push(ch); rest = &rest[end + 1..]; continue; }
         }
         decoded.push('&');
         rest = &rest[1..];
     }
     decoded.push_str(rest);
+    decoded
+}
+
+/// Consumes through the closing `>`; the flag is false when the tag never closes.
+fn read_tag(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (String, bool) {
+    let mut tag = String::new();
+    for next in chars.by_ref() {
+        if next == '>' { return (tag, true); }
+        tag.push(next);
+    }
+    (tag, false)
+}
+
+fn strip_tags(decoded: &str) -> String {
     let mut out = String::with_capacity(decoded.len());
     let mut chars = decoded.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '<' && chars.peek().is_some_and(|c| c.is_ascii_alphabetic() || *c == '/' || *c == '!') {
-            let mut tag = String::new();
-            let mut closed = false;
-            for next in chars.by_ref() { if next == '>' { closed = true; break; } tag.push(next); }
+            let (tag, closed) = read_tag(&mut chars);
             if closed { out.push(' '); } else { out.push('<'); out.push_str(&tag); }
         } else if !ch.is_control() || matches!(ch, '\n' | '\t') { out.push(ch); }
     }
-    out.trim().to_string()
+    out
+}
+
+fn plain(text: &str) -> String {
+    // Decode before removing tags, including numeric HTML entities. Never render markup.
+    strip_tags(&decode_entities(text)).trim().to_string()
 }
 
 fn help_url(value: Option<&str>) -> Option<String> {
@@ -140,22 +158,21 @@ fn decoded_path(raw: &str) -> Option<String> {
     Some(decoded)
 }
 
+fn workspace_suffix<'a>(candidate: &'a str, bases: &[&str]) -> Option<&'a str> {
+    bases.iter().filter_map(|base| {
+        let base = decoded_path(base)?;
+        let base = base.trim_end_matches('/');
+        if !base.starts_with('/') || base.is_empty() { return None; }
+        candidate.strip_prefix(base)?.strip_prefix('/')
+    }).min_by_key(|suffix| suffix.len())
+}
+
 pub fn safe_relative_path(raw: &str, bases: &[&str]) -> Option<String> {
     let decoded = decoded_path(raw)?;
     let mut candidate = decoded.as_str();
     if candidate.starts_with('/') {
         // Only explicitly known container workspaces are authoritative.
-        let mut matched = None;
-        for base in bases {
-            if let Some(base) = decoded_path(base) {
-                let base = base.trim_end_matches('/');
-                if !base.starts_with('/') || base.is_empty() { continue; }
-                if let Some(suffix) = candidate.strip_prefix(base).and_then(|s| s.strip_prefix('/')) {
-                    if matched.map_or(true, |old: &str| suffix.len() < old.len()) { matched = Some(suffix); }
-                }
-            }
-        }
-        candidate = matched?;
+        candidate = workspace_suffix(candidate, bases)?;
     }
     let parts: Vec<_> = candidate.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
     if parts.is_empty() || parts.iter().any(|s| s.contains(':') || *s == "..") { return None; }
@@ -281,6 +298,49 @@ fn sarif_message(run: &Value, result: &Value, rule: &Value) -> Option<String> {
     Some(text)
 }
 
+fn sarif_notification_warnings(tool: &str, invocation: &Value, warnings: &mut Vec<String>) {
+    for field in ["toolExecutionNotifications", "toolConfigurationNotifications"] {
+        let notifications = invocation.get(field).and_then(Value::as_array).into_iter().flatten();
+        for notification in notifications {
+            let level = notification.get("level").and_then(Value::as_str).unwrap_or("warning");
+            if level != "note" {
+                warning(warnings, format!("{tool}: SARIF {field} ({level}); inspect the redacted diagnostic report."));
+            }
+        }
+    }
+}
+
+fn sarif_invocation_warnings(tool: &str, run: &Value, run_index: usize, warnings: &mut Vec<String>) {
+    let invocations = run.get("invocations").and_then(Value::as_array).into_iter().flatten();
+    for invocation in invocations {
+        if invocation.get("executionSuccessful").and_then(Value::as_bool) == Some(false) {
+            warning(warnings, format!("{tool}: SARIF run {} reports unsuccessful execution.", run_index + 1));
+        }
+        sarif_notification_warnings(tool, invocation, warnings);
+    }
+}
+
+fn collect_sarif_results(tool: &str, run: &Value, run_index: usize, results: &[Value],
+    path_bases: &[&str], parsed: &mut ParsedReport) -> Result<()> {
+    for (index, result) in results.iter().enumerate() {
+        if !result.is_object() { return Err("SARIF contains a non-object result.".into()); }
+        let rule = sarif_rule(run, result).unwrap_or(&Value::Null);
+        let rule_id = result.get("ruleId").and_then(Value::as_str)
+            .or_else(|| result.pointer("/rule/id").and_then(Value::as_str))
+            .or_else(|| rule.get("id").and_then(Value::as_str));
+        let Some(rule_id) = rule_id.filter(|s| !s.trim().is_empty()) else {
+            warning(&mut parsed.warnings, format!("{tool}: SARIF run {} result {} has no resolvable rule id; finding retained with an unknown rule.", run_index + 1, index + 1));
+            let mut unknown = result.clone();
+            unknown["ruleId"] = Value::String("unknown-rule".into());
+            // The rest of parsing uses the same fields without dropping the finding.
+            parsed.findings.push(sarif_finding(tool, run, &unknown, rule, "unknown-rule", path_bases, &mut parsed.warnings));
+            continue;
+        };
+        parsed.findings.push(sarif_finding(tool, run, result, rule, rule_id, path_bases, &mut parsed.warnings));
+    }
+    Ok(())
+}
+
 pub fn parse_sarif(tool: &str, text: &str, path_bases: &[&str]) -> Result<ParsedReport> {
     let root = parse_json(text)?;
     if root.get("version").and_then(Value::as_str) != Some("2.1.0") {
@@ -290,23 +350,7 @@ pub fn parse_sarif(tool: &str, text: &str, path_bases: &[&str]) -> Result<Parsed
     let mut parsed = ParsedReport { findings: Vec::new(), warnings: Vec::new(), result_count: 0 };
     if runs.is_empty() { warning(&mut parsed.warnings, "SARIF contains no runs; coverage is unavailable.".into()); }
     for (run_index, run) in runs.iter().enumerate() {
-        if let Some(invocations) = run.get("invocations").and_then(Value::as_array) {
-            for invocation in invocations {
-                if invocation.get("executionSuccessful").and_then(Value::as_bool) == Some(false) {
-                    warning(&mut parsed.warnings, format!("{tool}: SARIF run {} reports unsuccessful execution.", run_index + 1));
-                }
-                for field in ["toolExecutionNotifications", "toolConfigurationNotifications"] {
-                    if let Some(notifications) = invocation.get(field).and_then(Value::as_array) {
-                        for notification in notifications {
-                            let level = notification.get("level").and_then(Value::as_str).unwrap_or("warning");
-                            if level != "note" {
-                                warning(&mut parsed.warnings, format!("{tool}: SARIF {field} ({level}); inspect the redacted diagnostic report."));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        sarif_invocation_warnings(tool, run, run_index, &mut parsed.warnings);
         let results = match run.get("results") {
             Some(Value::Array(results)) => results,
             None => { warning(&mut parsed.warnings, format!("{tool}: SARIF run {} has no results; coverage is unavailable.", run_index + 1)); continue; }
@@ -314,22 +358,7 @@ pub fn parse_sarif(tool: &str, text: &str, path_bases: &[&str]) -> Result<Parsed
         };
         parsed.result_count = parsed.result_count.checked_add(results.len()).ok_or("SARIF result count overflow.")?;
         if parsed.result_count > MAX_RESULTS { return Err("SARIF exceeds the 100,000 result limit; narrow the scan.".into()); }
-        for (index, result) in results.iter().enumerate() {
-            if !result.is_object() { return Err("SARIF contains a non-object result.".into()); }
-            let rule = sarif_rule(run, result).unwrap_or(&Value::Null);
-            let rule_id = result.get("ruleId").and_then(Value::as_str)
-                .or_else(|| result.pointer("/rule/id").and_then(Value::as_str))
-                .or_else(|| rule.get("id").and_then(Value::as_str));
-            let Some(rule_id) = rule_id.filter(|s| !s.trim().is_empty()) else {
-                warning(&mut parsed.warnings, format!("{tool}: SARIF run {} result {} has no resolvable rule id; finding retained with an unknown rule.", run_index + 1, index + 1));
-                let mut unknown = result.clone();
-                unknown["ruleId"] = Value::String("unknown-rule".into());
-                // The rest of parsing uses the same fields without dropping the finding.
-                parsed.findings.push(sarif_finding(tool, run, &unknown, rule, "unknown-rule", path_bases, &mut parsed.warnings));
-                continue;
-            };
-            parsed.findings.push(sarif_finding(tool, run, result, rule, rule_id, path_bases, &mut parsed.warnings));
-        }
+        collect_sarif_results(tool, run, run_index, results, path_bases, &mut parsed)?;
     }
     parsed.findings = merge_findings(parsed.findings);
     Ok(parsed)
@@ -376,46 +405,55 @@ fn sarif_finding(tool: &str, run: &Value, result: &Value, rule: &Value, rule_id:
         help_url: help_url(rule.get("helpUri").and_then(Value::as_str)), hotspot: false }
 }
 
+/// Warns for every tool error and returns how many were fatal.
+fn grep_error_warnings(tool: &str, root: &Value, warnings: &mut Vec<String>) -> Result<usize> {
+    let Some(errors) = root.get("errors") else { return Ok(0); };
+    let errors = errors.as_array().ok_or("Grep report errors must be an array.")?;
+    let mut fatal_errors = 0;
+    for error in errors {
+        let level = error.get("level").and_then(Value::as_str).unwrap_or("error");
+        if !matches!(level.to_ascii_lowercase().as_str(), "warn" | "warning" | "info") { fatal_errors += 1; }
+        // Tool errors can contain arbitrary matched source in message/spans: only expose type.
+        let kind = error.get("type").and_then(Value::as_str).unwrap_or("analysis error");
+        warning(warnings, format!("{tool}: {} ({}) reported; coverage is incomplete. Inspect redacted diagnostics.", plain(kind), plain(level)));
+    }
+    Ok(fatal_errors)
+}
+
+fn grep_finding(tool: &str, result: &Value, path_bases: &[&str], warnings: &mut Vec<String>) -> Result<QualityFinding> {
+    let check_id = result.get("check_id").and_then(Value::as_str).filter(|s| !s.is_empty())
+        .ok_or("Grep result is missing check_id.")?;
+    let extra = result.get("extra").ok_or("Grep result is missing extra metadata.")?;
+    let metadata = extra.get("metadata").unwrap_or(&Value::Null);
+    let rule_id = metadata.get("original_rule_id").or_else(|| metadata.get("original-rule-id"))
+        .and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(check_id);
+    let message = extra.get("message").and_then(Value::as_str).ok_or("Grep result is missing its message.")?;
+    let path = result.get("path").and_then(Value::as_str).and_then(|p| safe_relative_path(p, path_bases));
+    if path.is_none() {
+        warning(warnings, format!("{tool}: an absent, unsafe or unknown-base path for rule {} is display-only; no source path was assigned.", plain(rule_id)));
+    }
+    let (line, column, end_line) = if path.is_some() {
+        (positive(result.pointer("/start/line")), positive(result.pointer("/start/col")), positive(result.pointer("/end/line")))
+    } else { (None, None, None) };
+    let help = [metadata.get("source"), metadata.get("help_url"), metadata.get("help"), metadata.get("references").and_then(|v| v.as_array()).and_then(|a| a.first())]
+        .into_iter().flatten().filter_map(Value::as_str).find_map(|s| help_url(Some(s)));
+    Ok(QualityFinding { id: String::new(), tools: vec![plain(tool)], rule_id: plain(rule_id),
+        category: category(metadata), severity: grep_severity(extra.get("severity").and_then(Value::as_str).unwrap_or("INFO")),
+        message: finding_message(tool, rule_id, metadata, message), path, line, column, end_line,
+        help_url: help, hotspot: false })
+}
+
 pub fn parse_grep_json(tool: &str, text: &str, path_bases: &[&str]) -> Result<ParsedReport> {
     let root = parse_json(text)?;
     let results = root.get("results").and_then(Value::as_array).ok_or("Grep report has no results array.")?;
     if results.len() > MAX_RESULTS { return Err("Grep report exceeds the 100,000 result limit; narrow the scan.".into()); }
     let mut parsed = ParsedReport { findings: Vec::new(), warnings: Vec::new(), result_count: results.len() };
-    let mut fatal_errors = 0;
-    if let Some(errors) = root.get("errors") {
-        let errors = errors.as_array().ok_or("Grep report errors must be an array.")?;
-        for error in errors {
-            let level = error.get("level").and_then(Value::as_str).unwrap_or("error");
-            if !matches!(level.to_ascii_lowercase().as_str(), "warn" | "warning" | "info") { fatal_errors += 1; }
-            // Tool errors can contain arbitrary matched source in message/spans: only expose type.
-            let kind = error.get("type").and_then(Value::as_str).unwrap_or("analysis error");
-            warning(&mut parsed.warnings, format!("{tool}: {} ({}) reported; coverage is incomplete. Inspect redacted diagnostics.", plain(kind), plain(level)));
-        }
-    }
+    let fatal_errors = grep_error_warnings(tool, &root, &mut parsed.warnings)?;
     if fatal_errors > 0 && results.is_empty() {
         return Err(format!("{tool} reported {fatal_errors} analysis error(s) and no usable findings; this is not a clean scan."));
     }
     for result in results {
-        let check_id = result.get("check_id").and_then(Value::as_str).filter(|s| !s.is_empty())
-            .ok_or("Grep result is missing check_id.")?;
-        let extra = result.get("extra").ok_or("Grep result is missing extra metadata.")?;
-        let metadata = extra.get("metadata").unwrap_or(&Value::Null);
-        let rule_id = metadata.get("original_rule_id").or_else(|| metadata.get("original-rule-id"))
-            .and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(check_id);
-        let message = extra.get("message").and_then(Value::as_str).ok_or("Grep result is missing its message.")?;
-        let path = result.get("path").and_then(Value::as_str).and_then(|p| safe_relative_path(p, path_bases));
-        if path.is_none() {
-            warning(&mut parsed.warnings, format!("{tool}: an absent, unsafe or unknown-base path for rule {} is display-only; no source path was assigned.", plain(rule_id)));
-        }
-        let (line, column, end_line) = if path.is_some() {
-            (positive(result.pointer("/start/line")), positive(result.pointer("/start/col")), positive(result.pointer("/end/line")))
-        } else { (None, None, None) };
-        let help = [metadata.get("source"), metadata.get("help_url"), metadata.get("help"), metadata.get("references").and_then(|v| v.as_array()).and_then(|a| a.first())]
-            .into_iter().flatten().filter_map(Value::as_str).find_map(|s| help_url(Some(s)));
-        parsed.findings.push(QualityFinding { id: String::new(), tools: vec![plain(tool)], rule_id: plain(rule_id),
-            category: category(metadata), severity: grep_severity(extra.get("severity").and_then(Value::as_str).unwrap_or("INFO")),
-            message: finding_message(tool, rule_id, metadata, message), path, line, column, end_line,
-            help_url: help, hotspot: false });
+        parsed.findings.push(grep_finding(tool, result, path_bases, &mut parsed.warnings)?);
     }
     if let Some(skipped) = root.pointer("/paths/skipped").and_then(Value::as_array).filter(|a| !a.is_empty()) {
         warning(&mut parsed.warnings, format!("{tool}: {} paths were skipped; coverage is incomplete.", skipped.len()));
@@ -427,6 +465,49 @@ pub fn parse_grep_json(tool: &str, text: &str, path_bases: &[&str]) -> Result<Pa
     Ok(parsed)
 }
 
+fn linter_count(linter: &Value, field: &str) -> Result<Option<u64>> {
+    match linter.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| format!("MegaLinter {field} is not a nonnegative integer.")),
+    }
+}
+
+fn failed_linter_message(name: &str, found_errors: u64, warnings: u64, return_code: Option<i64>) -> String {
+    // Do not quote files_lint_results: it may contain unredacted Betterleaks matches.
+    let exit = return_code.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into());
+    if found_errors > 0 || warnings > 0 {
+        format!("{} reported {found_errors} error(s), {warnings} warning(s); inspect its reports (exit {exit}).", plain(name))
+    } else {
+        format!("{} failed without a finding count (exit {exit}); coverage is incomplete.", plain(name))
+    }
+}
+
+fn linter_status(linter: &Value) -> Result<LinterStatus> {
+    let name = linter.get("name").or_else(|| linter.get("linter_name")).and_then(Value::as_str)
+        .filter(|s| !s.is_empty()).ok_or("MegaLinter entry is missing its linter name.")?;
+    let active = linter.get("is_active").and_then(Value::as_bool).unwrap_or(true);
+    let return_code = match linter.get("return_code") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_i64().ok_or("MegaLinter return_code is not an integer.")?),
+    };
+    let found_errors = linter_count(linter, "total_number_errors")?.or(linter_count(linter, "number_errors")?).unwrap_or(0);
+    let warnings = linter_count(linter, "total_number_warnings")?.unwrap_or(0);
+    let file_count = linter_count(linter, "files_number")?.or_else(|| linter.get("files").and_then(Value::as_array).map(|a| a.len() as u64));
+    let raw_status = linter.get("status").and_then(Value::as_str);
+    let mut status = if !active { "skipped".into() } else {
+        raw_status.map(|s| plain(s).to_ascii_lowercase()).filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".into())
+    };
+    let failed = active && (return_code.is_some_and(|c| c != 0)
+        || matches!(status.as_str(), "error" | "failed" | "failure"));
+    let error = if failed {
+        Some(failed_linter_message(name, found_errors, warnings, return_code))
+    } else if active && status == "unknown" { Some("Linter status is missing; coverage is unknown.".into()) }
+    else { None };
+    if active && file_count == Some(0) && !failed { status = "skipped".into(); }
+    Ok(LinterStatus { name: plain(name), status, found_errors, return_code, file_count, error })
+}
+
 /// Field names follow MegaLinter v10.1.0 JsonReporter.linter_fields, not SARIF coverage.
 /// https://github.com/oxsecurity/megalinter/blob/v10.1.0/megalinter/reporters/JsonReporter.py
 pub fn parse_megalinter_json(text: &str) -> Result<Vec<LinterStatus>> {
@@ -435,42 +516,7 @@ pub fn parse_megalinter_json(text: &str) -> Result<Vec<LinterStatus>> {
     if linters.len() > 10_000 { return Err("MegaLinter JSON contains too many linter entries.".into()); }
     if linters.is_empty() { return Err("MegaLinter reported no linter outcomes; coverage is unavailable.".into()); }
     let mut statuses = Vec::with_capacity(linters.len());
-    for linter in linters {
-        let name = linter.get("name").or_else(|| linter.get("linter_name")).and_then(Value::as_str)
-            .filter(|s| !s.is_empty()).ok_or("MegaLinter entry is missing its linter name.")?;
-        let active = linter.get("is_active").and_then(Value::as_bool).unwrap_or(true);
-        let return_code = match linter.get("return_code") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(value.as_i64().ok_or("MegaLinter return_code is not an integer.")?),
-        };
-        let count = |field: &str| -> Result<Option<u64>> {
-            match linter.get(field) {
-                None | Some(Value::Null) => Ok(None),
-                Some(value) => value.as_u64().map(Some).ok_or_else(|| format!("MegaLinter {field} is not a nonnegative integer.")),
-            }
-        };
-        let found_errors = count("total_number_errors")?.or(count("number_errors")?).unwrap_or(0);
-        let warnings = count("total_number_warnings")?.unwrap_or(0);
-        let file_count = count("files_number")?.or_else(|| linter.get("files").and_then(Value::as_array).map(|a| a.len() as u64));
-        let raw_status = linter.get("status").and_then(Value::as_str);
-        let mut status = if !active { "skipped".into() } else {
-            raw_status.map(|s| plain(s).to_ascii_lowercase()).filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "unknown".into())
-        };
-        let failed = active && (return_code.is_some_and(|c| c != 0)
-            || matches!(status.as_str(), "error" | "failed" | "failure"));
-        let error = if failed {
-            // Do not quote files_lint_results: it may contain unredacted Betterleaks matches.
-            if found_errors > 0 || warnings > 0 {
-                Some(format!("{} reported {found_errors} error(s), {warnings} warning(s); inspect its reports (exit {}).", plain(name), return_code.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into())))
-            } else {
-                Some(format!("{} failed without a finding count (exit {}); coverage is incomplete.", plain(name), return_code.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into())))
-            }
-        } else if active && status == "unknown" { Some("Linter status is missing; coverage is unknown.".into()) }
-        else { None };
-        if active && file_count == Some(0) && !failed { status = "skipped".into(); }
-        statuses.push(LinterStatus { name: plain(name), status, found_errors, return_code, file_count, error });
-    }
+    for linter in linters { statuses.push(linter_status(linter)?); }
     Ok(statuses)
 }
 
@@ -523,40 +569,55 @@ fn base64(bytes: &[u8], url_safe: bool, padding: bool) -> String {
     out
 }
 
+fn add_base64_forms(forms: &mut BTreeSet<String>, secret: &str) {
+    for url_safe in [false, true] { for padding in [false, true] {
+        let encoded = base64(secret.as_bytes(), url_safe, padding);
+        if encoded.len() >= 6 { forms.insert(encoded); }
+    } }
+}
+
+/// Returns the unreserved-only, form (`+` for space) and every-byte percent encodings.
+fn percent_encodings(secret: &str) -> [String; 3] {
+    let mut encoded = String::new();
+    let mut form = String::new();
+    let mut all_encoded = String::new();
+    for &b in secret.as_bytes() {
+        all_encoded.push_str(&format!("%{b:02X}"));
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(b as char); form.push(b as char);
+        } else {
+            encoded.push_str(&format!("%{b:02X}"));
+            if b == b' ' { form.push('+'); } else { form.push_str(&format!("%{b:02X}")); }
+        }
+    }
+    [encoded, form, all_encoded]
+}
+
+/// Lowercase hex escapes, not the secret's literal characters.
+fn lowercase_escapes(value: &str) -> Option<String> {
+    let mut lowercase = value.as_bytes().to_vec();
+    let mut i = 0;
+    while i + 2 < lowercase.len() {
+        if lowercase[i] == b'%' { lowercase[i + 1].make_ascii_lowercase(); lowercase[i + 2].make_ascii_lowercase(); i += 3; }
+        else { i += 1; }
+    }
+    String::from_utf8(lowercase).ok()
+}
+
+fn add_percent_forms(forms: &mut BTreeSet<String>, secret: &str) {
+    for value in percent_encodings(secret) {
+        if value.len() < 6 { continue; }
+        forms.extend(lowercase_escapes(&value));
+        forms.insert(value);
+    }
+}
+
 pub fn redact(text: &str, secrets: &[&str]) -> String {
     let mut forms = BTreeSet::new();
     for secret in secrets.iter().copied().filter(|s| !s.is_empty()) {
         forms.insert(secret.to_string());
-        {
-            for url_safe in [false, true] { for padding in [false, true] {
-                let encoded = base64(secret.as_bytes(), url_safe, padding);
-                if encoded.len() >= 6 { forms.insert(encoded); }
-            } }
-            let mut encoded = String::new();
-            let mut form = String::new();
-            let mut all_encoded = String::new();
-            for &b in secret.as_bytes() {
-                all_encoded.push_str(&format!("%{b:02X}"));
-                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-                    encoded.push(b as char); form.push(b as char);
-                } else {
-                    encoded.push_str(&format!("%{b:02X}"));
-                    if b == b' ' { form.push('+'); } else { form.push_str(&format!("%{b:02X}")); }
-                }
-            }
-            for value in [encoded, form, all_encoded] {
-                if value.len() < 6 { continue; }
-                // Lowercase hex escapes, not the secret's literal characters.
-                let mut lowercase = value.clone().into_bytes();
-                let mut i = 0;
-                while i + 2 < lowercase.len() {
-                    if lowercase[i] == b'%' { lowercase[i + 1].make_ascii_lowercase(); lowercase[i + 2].make_ascii_lowercase(); i += 3; }
-                    else { i += 1; }
-                }
-                forms.insert(value);
-                if let Ok(value) = String::from_utf8(lowercase) { forms.insert(value); }
-            }
-        }
+        add_base64_forms(&mut forms, secret);
+        add_percent_forms(&mut forms, secret);
     }
     let mut forms: Vec<_> = forms.into_iter().collect();
     forms.sort_by_key(|s| std::cmp::Reverse(s.len()));
@@ -606,17 +667,60 @@ fn collect_match_values(value: &Value, matched: bool, values: &mut BTreeSet<Stri
     }
 }
 
+fn secret_result_flags(json: &Value, tool: &str, secret_context: bool) -> Vec<bool> {
+    if json.get("tool").is_none() { return Vec::new(); }
+    json.get("results").and_then(Value::as_array).map(|results| results.iter().map(|result| {
+        let rule = sarif_rule(json, result).unwrap_or(&Value::Null);
+        let id = result.get("ruleId").or_else(|| rule.get("id")).and_then(Value::as_str).unwrap_or("");
+        secret_context || is_secret(tool, id, rule.get("properties").unwrap_or(&Value::Null))
+    }).collect()).unwrap_or_default()
+}
+
+fn mask_sensitive_values(object: &mut serde_json::Map<String, Value>, values: &mut BTreeSet<String>) {
+    for (_, value) in object.iter().filter(|(key, _)| sensitive_field(key)) {
+        collect_match_values(value, true, values);
+    }
+    if values.is_empty() { return; }
+    let secrets: Vec<&str> = values.iter().map(String::as_str).collect();
+    for value in object.values_mut() { mask_json_strings(value, &secrets); }
+}
+
+fn mask_secret_messages(object: &mut serde_json::Map<String, Value>) {
+    if let Some(message) = object.get_mut("message") { mask_message(message); }
+    if let Some(Value::Object(extra)) = object.get_mut("extra") {
+        if let Some(message) = extra.get_mut("message") { mask_message(message); }
+    }
+}
+
+fn strip_children(object: &mut serde_json::Map<String, Value>, secret: bool, secret_results: &[bool]) {
+    for (key, value) in object.iter_mut() {
+        match value {
+            Value::Array(results) if key == "results" && !secret_results.is_empty() => {
+                for (result, secret) in results.iter_mut().zip(secret_results) { strip_fields_inner(result, *secret); }
+            }
+            _ => strip_fields_inner(value, secret),
+        }
+    }
+}
+
+fn strip_object(object: &mut serde_json::Map<String, Value>, values: &mut BTreeSet<String>,
+    secret_context: bool, secret_results: &[bool]) {
+    mask_sensitive_values(object, values);
+    object.retain(|key, _| !sensitive_field(key));
+    let metadata = object.get("metadata")
+        .or_else(|| object.get("extra").and_then(|extra| extra.get("metadata"))).unwrap_or(&Value::Null);
+    let rule = object.get("check_id").or_else(|| object.get("ruleId")).or_else(|| object.get("RuleID"))
+        .and_then(Value::as_str).unwrap_or("");
+    let secret = secret_context || is_secret("", rule, metadata);
+    if secret { mask_secret_messages(object); }
+    strip_children(object, secret, secret_results);
+}
+
 fn strip_fields_inner(json: &mut Value, inherited_secret: bool) {
     let tool = json.pointer("/tool/driver/name").and_then(Value::as_str).unwrap_or("");
     let secret_context = inherited_secret || is_secret(tool, "", &Value::Null);
     // Preserve per-rule secret provenance before removing snippets and rule metadata.
-    let secret_results: Vec<bool> = if json.get("tool").is_some() {
-        json.get("results").and_then(Value::as_array).map(|results| results.iter().map(|result| {
-            let rule = sarif_rule(json, result).unwrap_or(&Value::Null);
-            let id = result.get("ruleId").or_else(|| rule.get("id")).and_then(Value::as_str).unwrap_or("");
-            secret_context || is_secret(tool, id, rule.get("properties").unwrap_or(&Value::Null))
-        }).collect()).unwrap_or_default()
-    } else { Vec::new() };
+    let secret_results = secret_result_flags(json, tool, secret_context);
     let mut values = BTreeSet::new();
     if json.get("message").is_some() || json.pointer("/extra/message").is_some() {
         // SARIF can put Secret/Match inside properties while repeating it in message.text.
@@ -624,38 +728,7 @@ fn strip_fields_inner(json: &mut Value, inherited_secret: bool) {
     }
     match json {
         Value::Array(array) => for value in array { strip_fields_inner(value, secret_context); },
-        Value::Object(object) => {
-            for (_, value) in object.iter().filter(|(key, _)| sensitive_field(key)) {
-                collect_match_values(value, true, &mut values);
-            }
-            if !values.is_empty() {
-                let secrets: Vec<&str> = values.iter().map(String::as_str).collect();
-                for value in object.values_mut() { mask_json_strings(value, &secrets); }
-            }
-            object.retain(|key, _| !sensitive_field(key));
-            let metadata = object.get("metadata")
-                .or_else(|| object.get("extra").and_then(|extra| extra.get("metadata"))).unwrap_or(&Value::Null);
-            let rule = object.get("check_id").or_else(|| object.get("ruleId")).or_else(|| object.get("RuleID"))
-                .and_then(Value::as_str).unwrap_or("");
-            let secret = secret_context || is_secret("", rule, metadata);
-            if secret {
-                if let Some(message) = object.get_mut("message") { mask_message(message); }
-                if let Some(Value::Object(extra)) = object.get_mut("extra") {
-                    if let Some(message) = extra.get_mut("message") { mask_message(message); }
-                }
-            }
-            for (key, value) in object.iter_mut() {
-                if key == "results" && !secret_results.is_empty() {
-                    if let Value::Array(results) = value {
-                        for (result, secret) in results.iter_mut().zip(secret_results.iter()) {
-                            strip_fields_inner(result, *secret);
-                        }
-                        continue;
-                    }
-                }
-                strip_fields_inner(value, secret);
-            }
-        }
+        Value::Object(object) => strip_object(object, &mut values, secret_context, &secret_results),
         _ => {}
     }
 }

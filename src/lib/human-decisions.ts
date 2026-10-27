@@ -34,15 +34,16 @@ export function toggleQuestionOption(question: NativeDecisionQuestion, draft: Qu
   if (option === undefined || question.disabledIndices?.includes(index)) return draft;
   const label = nativeOption(option).label;
   const selected = draft.selectedOptions.includes(label);
-  return { ...draft, selectedOptions: question.multi
-    ? selected ? draft.selectedOptions.filter(value => value !== label) : [...draft.selectedOptions, label]
-    : selected ? [] : [label] };
+  let selectedOptions: string[];
+  if (!question.multi) selectedOptions = selected ? [] : [label];
+  else selectedOptions = selected ? draft.selectedOptions.filter(value => value !== label) : [...draft.selectedOptions, label];
+  return { ...draft, selectedOptions };
 }
 export function askResponse(item: HumanDecision, draft: DecisionDraft): HumanDecisionResponse {
   const results: NativeDecisionResult[] = (item.payload.questions ?? []).map(question => {
     const answer = draft.questions[question.id];
-    const enabled = question.options.map(nativeOption).filter((_, index) => !question.disabledIndices?.includes(index)).map(option => option.label);
-    if (!answer || answer.selectedOptions.some(label => !enabled.includes(label)) || new Set(answer.selectedOptions).size !== answer.selectedOptions.length || (!question.multi && answer.selectedOptions.length > 1)) throw new Error("Invalid native question selection");
+    const enabled = new Set(question.options.map(nativeOption).filter((_, index) => !question.disabledIndices?.includes(index)).map(option => option.label));
+    if (!answer || answer.selectedOptions.some(label => !enabled.has(label)) || new Set(answer.selectedOptions).size !== answer.selectedOptions.length || (!question.multi && answer.selectedOptions.length > 1)) throw new Error("Invalid native question selection");
     const result: NativeDecisionResult = { id: question.id, selectedOptions: [...answer.selectedOptions] };
     if (answer.customInput !== "") result.customInput = answer.customInput;
     if (answer.note !== "") result.note = answer.note;
@@ -60,7 +61,7 @@ export async function readDecisionImage(file: File): Promise<NativeDecisionImage
   const bytes = new Uint8Array(await file.arrayBuffer());
   const chunks: string[] = [];
   for (let offset = 0; offset < bytes.length; offset += 32768) {
-    chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 32768)));
+    chunks.push(String.fromCodePoint(...bytes.subarray(offset, offset + 32768)));
   }
   return { type: "image", data: btoa(chunks.join("")), mimeType: file.type };
 }

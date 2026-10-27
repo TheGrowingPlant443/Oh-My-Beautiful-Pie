@@ -58,6 +58,29 @@ pub fn read_derived(root: &Path) -> BTreeMap<String, MemoryEntry> {
     }
     memory
 }
+/// One entry's new facts, bounded by the per-language id and version limits.
+fn add_derived(file: &mut DerivedFile, id: &str, entry: &MemoryEntry, now: u64) -> usize {
+    if !file.items.contains_key(id) {
+        if file.items.len() >= MAX_DERIVED_IDS || (entry.versions.is_empty() && !entry.unversioned) { return 0; }
+        file.items.insert(id.to_string(), DerivedItem { added_at: now, ..DerivedItem::default() });
+    }
+    let item = file.items.get_mut(id).expect("inserted above");
+    let mut added = 0;
+    for version in &entry.versions {
+        if item.versions.len() < MAX_DERIVED_VERSIONS && item.versions.insert(version.clone()) { added += 1; }
+    }
+    if entry.unversioned && !item.unversioned { item.unversioned = true; added += 1; }
+    added
+}
+fn learn_language(root: &Path, language: &str, entries: &BTreeMap<String, MemoryEntry>, now: u64) -> Result<usize, String> {
+    let prefix = format!("{language}:");
+    let mut file = load_derived(root, language);
+    let added: usize = entries.iter().filter(|(id, _)| id.starts_with(&prefix)).map(|(id, entry)| add_derived(&mut file, id, entry, now)).sum();
+    if added > 0 {
+        save(&derived_path(root, language), &serde_json::to_vec(&file).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    }
+    Ok(added)
+}
 /// Unions `entries` (the closure below `roots`) into the per-language files and returns the number of new facts.
 /// Learns nothing when a root is no longer a remembered standard package (cleared while the scan ran).
 pub fn learn(root: &Path, roots: &BTreeSet<String>, entries: &BTreeMap<String, MemoryEntry>) -> Result<usize, String> {
@@ -66,26 +89,7 @@ pub fn learn(root: &Path, roots: &BTreeSet<String>, entries: &BTreeMap<String, M
     if roots.iter().any(|id| !known.contains_key(id)) { return Ok(0); }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     let mut learned = 0;
-    for language in LANGUAGES {
-        let prefix = format!("{language}:");
-        let mut file = load_derived(root, language);
-        let mut added = 0;
-        for (id, entry) in entries.iter().filter(|(id, _)| id.starts_with(&prefix)) {
-            if !file.items.contains_key(id) {
-                if file.items.len() >= MAX_DERIVED_IDS || (entry.versions.is_empty() && !entry.unversioned) { continue; }
-                file.items.insert(id.clone(), DerivedItem { added_at: now, ..DerivedItem::default() });
-            }
-            let item = file.items.get_mut(id).expect("inserted above");
-            for version in &entry.versions {
-                if item.versions.len() < MAX_DERIVED_VERSIONS && item.versions.insert(version.clone()) { added += 1; }
-            }
-            if entry.unversioned && !item.unversioned { item.unversioned = true; added += 1; }
-        }
-        if added > 0 {
-            save(&derived_path(root, language), &serde_json::to_vec(&file).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-            learned += added;
-        }
-    }
+    for language in LANGUAGES { learned += learn_language(root, language, entries, now)?; }
     Ok(learned)
 }
 #[cfg(not(windows))]
@@ -99,6 +103,23 @@ fn atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
     if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x1 | 0x8) } == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
+fn read_classification(entry: &fs::DirEntry) -> std::io::Result<Option<crate::architect::Classification>> {
+    if entry.path().extension().is_none_or(|e| e != "json") { return Ok(None); }
+    let metadata = entry.metadata()?;
+    if !metadata.is_file() || metadata.len() > 5 * 1024 * 1024 { return Ok(None); }
+    let bytes = fs::read(entry.path())?;
+    Ok(serde_json::from_slice(&bytes).ok())
+}
+fn merge_classification(files: &mut BTreeMap<&str, File>, changed: &mut BTreeSet<String>, classification: crate::architect::Classification) {
+    for (id, item) in classification.items {
+        if !item.basic { continue; }
+        let Some((language, _)) = id.split_once(':') else { continue; };
+        let Some(file) = files.get_mut(language) else { continue; };
+        if file.items.contains_key(&id) { continue; }
+        changed.insert(language.to_string());
+        file.items.insert(id, Item { reason: item.reason, added_at: classification.updated_at.unwrap_or(0) });
+    }
+}
 fn import(root: &Path) -> std::io::Result<()> {
     let dir = root.join("architect/known-standard");
     let mut files: BTreeMap<&str, File> = LANGUAGES.iter().map(|l| (*l, load(&dir.join(format!("{l}.json")), l))).collect();
@@ -106,22 +127,7 @@ fn import(root: &Path) -> std::io::Result<()> {
     let source = root.join("architect/classifications");
     match fs::read_dir(source) {
         Ok(entries) => for entry in entries {
-            let entry = entry?;
-            if entry.path().extension().is_none_or(|e| e != "json") { continue; }
-            let metadata = entry.metadata()?;
-            if !metadata.is_file() || metadata.len() > 5 * 1024 * 1024 { continue; }
-            let bytes = fs::read(entry.path())?;
-            let Ok(classification) = serde_json::from_slice::<crate::architect::Classification>(&bytes) else { continue; };
-            for (id, item) in classification.items {
-                if !item.basic { continue; }
-                let Some((language, _)) = id.split_once(':') else { continue; };
-                if let Some(file) = files.get_mut(language) {
-                    if !file.items.contains_key(&id) {
-                        changed.insert(language.to_string());
-                        file.items.insert(id, Item { reason: item.reason, added_at: classification.updated_at.unwrap_or(0) });
-                    }
-                }
-            }
+            if let Some(classification) = read_classification(&entry?)? { merge_classification(&mut files, &mut changed, classification); }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
         Err(e) => return Err(e),

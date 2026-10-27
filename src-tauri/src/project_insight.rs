@@ -335,6 +335,22 @@ fn request_key(request: &InsightRequest) -> Key {
     (request.key.clone(), request.kind, discriminator)
 }
 
+fn validate_visualization_arguments(kind: InsightKind, snapshot_id: &str, source_id: Option<&str>, base: Option<&str>, supersedes: Option<&str>) -> Result<()> {
+    if !kind.is_visualization() { return Err("Only systemOverview, helicopter, structureCurrent and structureProposed are requested here".into()); }
+    let proposed = kind == InsightKind::StructureProposed;
+    match (proposed, source_id) {
+        (true, None) => return Err("Select the target Markdown first: paste it in the Architect chat, then choose it as the source.".into()),
+        (false, Some(_)) => return Err("Only a proposed structure takes a target Markdown source.".into()),
+        _ => (),
+    }
+    if base.is_some() && !proposed { return Err("Only a proposed structure can name a base analysis.".into()); }
+    if source_id.is_some_and(|source| !valid_text(source, 300, true)) { return Err("Invalid target Markdown source id.".into()); }
+    for id in [Some(snapshot_id), base, supersedes].into_iter().flatten() {
+        if validate_id(id).is_err() { return Err("Invalid snapshot or request id.".into()); }
+    }
+    Ok(())
+}
+
 impl ProjectInsightService {
     pub fn new(config_root: PathBuf) -> Self {
         let service = Self {
@@ -484,28 +500,10 @@ impl ProjectInsightService {
     pub fn request_visualization(
         &self, registry: &Arc<Registry>, folder: &Path, kind: InsightKind, snapshot_id: &str, source_id: Option<&str>, base: Option<&str>, supersedes: Option<&str>,
     ) -> Result<ProjectInsightStatus> {
-        if !kind.is_visualization() { return Err("Only systemOverview, helicopter, structureCurrent and structureProposed are requested here".into()); }
-        let proposed = kind == InsightKind::StructureProposed;
-        match (proposed, source_id) {
-            (true, None) => return Err("Select the target Markdown first: paste it in the Architect chat, then choose it as the source.".into()),
-            (false, Some(_)) => return Err("Only a proposed structure takes a target Markdown source.".into()),
-            _ => (),
-        }
-        if base.is_some() && !proposed { return Err("Only a proposed structure can name a base analysis.".into()); }
-        if source_id.is_some_and(|source| !valid_text(source, 300, true)) { return Err("Invalid target Markdown source id.".into()); }
-        for id in [Some(snapshot_id), base, supersedes].into_iter().flatten() {
-            if validate_id(id).is_err() { return Err("Invalid snapshot or request id.".into()); }
-        }
+        validate_visualization_arguments(kind, snapshot_id, source_id, base, supersedes)?;
         let folder = dependencies::canonical_folder(folder)?;
         let folder_key = dependencies::folder_key(&folder);
-        let facts = self.facts()?;
-        let snapshot_hash = {
-            let index = facts.index(snapshot_id)?;
-            if index.snapshot_id != snapshot_id || dependencies::folder_key(Path::new(&index.folder)) != folder_key {
-                return Err("That source index snapshot belongs to a different folder.".into());
-            }
-            index.source_hash.clone()
-        };
+        let snapshot_hash = self.snapshot_hash(snapshot_id, &folder_key)?;
         self.check_predecessors(registry, &folder_key, kind, snapshot_id, base, supersedes)?;
         let key: Key = (folder_key.clone(), kind, format!("{snapshot_id}|{}", source_id.unwrap_or_default()));
         self.settle(registry, &key);
@@ -521,29 +519,42 @@ impl ProjectInsightService {
         let (mut entry, claimed) = self.claim(key, request, rerun);
         let id = entry.request.request_id.clone();
         if !claimed { return self.status(registry, &id); }
-        let prepared = (|| -> Result<(DependencyProducer, String)> {
-            let producer = ensure_producer(registry)?;
-            let mut target: Option<Vec<u8>> = None;
-            let mut frozen_hash: Option<String> = None;
-            if let Some(source_id) = source_id {
-                // The selection is read under the producer's current session and generation; a switch rejects it.
-                let loaded = system_overview::load_structure_source(&HubSources(registry), &producer, source_id)?;
-                let hub = registry.manager_hub().ok_or("manager bridge not initialized")?;
-                if hub.dependency_producer(&producer.instance_id, producer.generation)? != producer {
-                    return Err("The Architect session changed while the target Markdown was being read.".into());
-                }
-                frozen_hash = Some(loaded.row.sha256.clone());
-                target = Some(loaded.bytes);
-            }
-            let index_ref = IndexRef::new(&**facts, snapshot_id)?;
-            let request = Arc::make_mut(&mut entry.request);
-            request.bind(&producer);
-            request.source_hash = frozen_hash;
-            self.save_visualization_request(&entry.request, target.as_deref(), &index_ref)?;
-            self.index.lock().admitted.insert(id.clone(), entry.clone());
-            Ok((producer, visualization_prompt(&entry.request)?))
-        })();
+        let prepared = self.prepare_visualization(registry, snapshot_id, source_id, &mut entry);
         self.dispatch(registry, &entry, prepared)
+    }
+
+    /// The source hash of a snapshot that belongs to this folder.
+    fn snapshot_hash(&self, snapshot_id: &str, folder_key: &str) -> Result<String> {
+        let index = self.facts()?.index(snapshot_id)?;
+        if index.snapshot_id != snapshot_id || dependencies::folder_key(Path::new(&index.folder)) != folder_key {
+            return Err("That source index snapshot belongs to a different folder.".into());
+        }
+        Ok(index.source_hash.clone())
+    }
+
+    /// Bind the claimed request to the Architect (reading a proposed target under its session), persist it and build the prompt.
+    fn prepare_visualization(&self, registry: &Arc<Registry>, snapshot_id: &str, source_id: Option<&str>, entry: &mut Entry) -> Result<(DependencyProducer, String)> {
+        let id = entry.request.request_id.clone();
+        let producer = ensure_producer(registry)?;
+        let mut target: Option<Vec<u8>> = None;
+        let mut frozen_hash: Option<String> = None;
+        if let Some(source_id) = source_id {
+            // The selection is read under the producer's current session and generation; a switch rejects it.
+            let loaded = system_overview::load_structure_source(&HubSources(registry), &producer, source_id)?;
+            let hub = registry.manager_hub().ok_or("manager bridge not initialized")?;
+            if hub.dependency_producer(&producer.instance_id, producer.generation)? != producer {
+                return Err("The Architect session changed while the target Markdown was being read.".into());
+            }
+            frozen_hash = Some(loaded.row.sha256.clone());
+            target = Some(loaded.bytes);
+        }
+        let index_ref = IndexRef::new(&**self.facts()?, snapshot_id)?;
+        let request = Arc::make_mut(&mut entry.request);
+        request.bind(&producer);
+        request.source_hash = frozen_hash;
+        self.save_visualization_request(&entry.request, target.as_deref(), &index_ref)?;
+        self.index.lock().admitted.insert(id, entry.clone());
+        Ok((producer, visualization_prompt(&entry.request)?))
     }
 
     fn check_predecessors(&self, registry: &Registry, folder_key: &str, kind: InsightKind, snapshot_id: &str, base: Option<&str>, supersedes: Option<&str>) -> Result<()> {
@@ -783,7 +794,6 @@ impl ProjectInsightService {
         let request = entry.request.clone();
         let label = request.kind.title();
         let marker = self.load_terminal(request_id);
-        let completed_marker = marker.as_ref().is_some_and(|marker| marker.status == TerminalStatus::Complete);
         let (state, message) = match entry.admission.prompt_sent {
             Some(_) => (InsightState::Submitted, None),
             None if entry.admission.error.is_some() => (InsightState::Uncertain, entry.admission.error.clone()),
@@ -791,41 +801,12 @@ impl ProjectInsightService {
         };
         let mut job = JobRead { request: request.clone(), state, message, result: None, result_hash: None };
         match self.load_result(&request) {
-            Ok(Some((result, hash))) => {
-                if marker.as_ref().is_some_and(|marker| marker.status == TerminalStatus::Complete && marker.result_hash.as_deref() != Some(hash.as_str())) {
-                    job.state = InsightState::Failed;
-                    job.message = Some(format!("The saved {label} result no longer matches its completion marker."));
-                } else {
-                    if !completed_marker {
-                        // A crash between publication and the marker is recovered from the validated result.
-                        let _ = self.write_terminal(request_id, &Terminal { status: TerminalStatus::Complete, code: None, message: None, result_hash: Some(hash.clone()), at: now_ms() });
-                    }
-                    job.state = InsightState::Completed;
-                    job.message = None;
-                    job.result = Some(result);
-                    job.result_hash = Some(hash);
-                }
-            }
+            Ok(Some((result, hash))) => self.apply_saved_result(request_id, label, marker.as_ref(), result, hash, &mut job),
             Err(error) => {
                 job.state = InsightState::Failed;
                 job.message = Some(format!("Invalid Architect {label} result: {error}"));
             }
-            Ok(None) => {
-                if completed_marker {
-                    job.state = InsightState::Failed;
-                    job.message = Some(format!("The completed {label} result file is missing."));
-                } else if let Some(marker) = marker.filter(|marker| marker.status == TerminalStatus::Error) {
-                    job.state = InsightState::Failed;
-                    job.message = Some(marker.message.unwrap_or_else(|| "The request ended without a result.".into()));
-                } else if entry.admission.prompt_sent == Some(false) {
-                    job.state = InsightState::Failed;
-                    job.message = entry.admission.error.clone().or_else(|| Some("The request prompt was not sent.".into()));
-                } else if let Some(message) = self.ended_producer(registry, &request) {
-                    let _ = self.write_terminal(request_id, &Terminal { status: TerminalStatus::Error, code: Some(PRODUCER_ENDED.into()), message: Some(message.clone()), result_hash: None, at: now_ms() });
-                    job.state = InsightState::Failed;
-                    job.message = Some(message);
-                }
-            }
+            Ok(None) => self.apply_missing_result(registry, request_id, label, marker, &entry, &mut job),
         }
         if matches!(job.state, InsightState::Completed | InsightState::Failed) {
             let key = request_key(&request);
@@ -833,6 +814,42 @@ impl ProjectInsightService {
             if index.active.get(&key).is_some_and(|id| id == request_id) { index.active.remove(&key); }
         }
         Ok(job)
+    }
+
+    /// Validate a saved result against its completion marker, recovering a missing marker.
+    fn apply_saved_result(&self, request_id: &str, label: &str, marker: Option<&Terminal>, result: ProjectInsightResult, hash: String, job: &mut JobRead) {
+        let completed_marker = marker.is_some_and(|marker| marker.status == TerminalStatus::Complete);
+        if completed_marker && marker.is_some_and(|marker| marker.result_hash.as_deref() != Some(hash.as_str())) {
+            job.state = InsightState::Failed;
+            job.message = Some(format!("The saved {label} result no longer matches its completion marker."));
+            return;
+        }
+        if !completed_marker {
+            // A crash between publication and the marker is recovered from the validated result.
+            let _ = self.write_terminal(request_id, &Terminal { status: TerminalStatus::Complete, code: None, message: None, result_hash: Some(hash.clone()), at: now_ms() });
+        }
+        job.state = InsightState::Completed;
+        job.message = None;
+        job.result = Some(result);
+        job.result_hash = Some(hash);
+    }
+
+    /// Decide the state of a request without a result file from its marker, admission and Architect liveness.
+    fn apply_missing_result(&self, registry: &Registry, request_id: &str, label: &str, marker: Option<Terminal>, entry: &Entry, job: &mut JobRead) {
+        if marker.as_ref().is_some_and(|marker| marker.status == TerminalStatus::Complete) {
+            job.state = InsightState::Failed;
+            job.message = Some(format!("The completed {label} result file is missing."));
+        } else if let Some(marker) = marker.filter(|marker| marker.status == TerminalStatus::Error) {
+            job.state = InsightState::Failed;
+            job.message = Some(marker.message.unwrap_or_else(|| "The request ended without a result.".into()));
+        } else if entry.admission.prompt_sent == Some(false) {
+            job.state = InsightState::Failed;
+            job.message = entry.admission.error.clone().or_else(|| Some("The request prompt was not sent.".into()));
+        } else if let Some(message) = self.ended_producer(registry, &entry.request) {
+            let _ = self.write_terminal(request_id, &Terminal { status: TerminalStatus::Error, code: Some(PRODUCER_ENDED.into()), message: Some(message.clone()), result_hash: None, at: now_ms() });
+            job.state = InsightState::Failed;
+            job.message = Some(message);
+        }
     }
 
     /// `Some(message)` once the Architect launch/session that was asked for the result no longer exists.
@@ -924,41 +941,48 @@ impl ProjectInsightService {
             let snapshot_hash = request.snapshot_source_hash.as_deref().ok_or("The request has no source snapshot hash")?;
             Some(Snapshot::open(&**self.facts()?, snapshot_id, snapshot_hash)?)
         };
-        let result = match request.kind {
-            InsightKind::SystemOverview => {
-                let payload: SystemOverviewPayload = serde_json::from_value(payload).map_err(|error| error.to_string())?;
-                ProjectInsightResult::SystemOverview(SystemOverviewResult {
-                    payload: system_overview::validate_system(payload, snapshot_id, snapshot.as_ref())?, completed_at: header.completed_at,
-                })
-            }
-            InsightKind::Helicopter => {
-                let payload: HelicopterPayload = serde_json::from_value(payload).map_err(|error| error.to_string())?;
-                ProjectInsightResult::Helicopter(HelicopterResult {
-                    payload: system_overview::validate_helicopter(payload, snapshot_id, snapshot.as_ref())?, completed_at: header.completed_at,
-                })
-            }
-            InsightKind::StructureCurrent | InsightKind::StructureProposed => {
-                let proposed = request.kind == InsightKind::StructureProposed;
-                let payload: StructurePayload = serde_json::from_value(payload).map_err(|error| error.to_string())?;
-                let context = StructureContext {
-                    kind: if proposed { StructureKind::Proposed } else { StructureKind::Current }, snapshot_id, source_id: request.source_id.as_deref(),
-                    source_hash: request.source_hash.as_deref(), base_request_id: request.base_request_id.as_deref(),
-                    supersedes_request_id: request.supersedes_request_id.as_deref(),
-                };
-                let result = StructureResult { payload: system_overview::validate_structure(payload, &context, snapshot.as_ref())?, completed_at: header.completed_at };
-                if proposed { ProjectInsightResult::StructureProposed(result) } else { ProjectInsightResult::StructureCurrent(result) }
-            }
-            InsightKind::DependencyDiscovery | InsightKind::Requirements => return Err("Not a visualization request".into()),
-        };
+        let result = visualization_result(request, payload, snapshot_id, snapshot.as_ref(), header.completed_at)?;
         if !proven {
-            if request.kind == InsightKind::StructureProposed {
-                let target = bounded_bytes(&system_overview::target_path(&self.request_dir(&request.request_id)), MAX_TARGET_BYTES)?.ok_or("The saved target Markdown is missing")?;
-                if request.source_hash.as_deref() != Some(format!("{:x}", Sha256::digest(&target)).as_str()) { return Err("The saved target Markdown no longer matches its hash".into()); }
-            }
+            self.verify_proposed_target(request)?;
             self.validated.lock().insert((request.request_id.clone(), hash.to_string()));
         }
         Ok(result)
     }
+
+    /// A proposed structure is only valid while its saved target Markdown still matches the frozen hash.
+    fn verify_proposed_target(&self, request: &InsightRequest) -> Result<()> {
+        if request.kind != InsightKind::StructureProposed { return Ok(()); }
+        let target = bounded_bytes(&system_overview::target_path(&self.request_dir(&request.request_id)), MAX_TARGET_BYTES)?.ok_or("The saved target Markdown is missing")?;
+        if request.source_hash.as_deref() != Some(format!("{:x}", Sha256::digest(&target)).as_str()) { return Err("The saved target Markdown no longer matches its hash".into()); }
+        Ok(())
+    }
+}
+
+fn visualization_result(request: &InsightRequest, payload: serde_json::Value, snapshot_id: &str, snapshot: Option<&Snapshot>, completed_at: u64) -> Result<ProjectInsightResult> {
+    Ok(match request.kind {
+        InsightKind::SystemOverview => {
+            let payload: SystemOverviewPayload = serde_json::from_value(payload).map_err(|error| error.to_string())?;
+            ProjectInsightResult::SystemOverview(SystemOverviewResult { payload: system_overview::validate_system(payload, snapshot_id, snapshot)?, completed_at })
+        }
+        InsightKind::Helicopter => {
+            let payload: HelicopterPayload = serde_json::from_value(payload).map_err(|error| error.to_string())?;
+            ProjectInsightResult::Helicopter(HelicopterResult { payload: system_overview::validate_helicopter(payload, snapshot_id, snapshot)?, completed_at })
+        }
+        InsightKind::StructureCurrent | InsightKind::StructureProposed => structure_result(request, payload, snapshot_id, snapshot, completed_at)?,
+        InsightKind::DependencyDiscovery | InsightKind::Requirements => return Err("Not a visualization request".into()),
+    })
+}
+
+fn structure_result(request: &InsightRequest, payload: serde_json::Value, snapshot_id: &str, snapshot: Option<&Snapshot>, completed_at: u64) -> Result<ProjectInsightResult> {
+    let proposed = request.kind == InsightKind::StructureProposed;
+    let payload: StructurePayload = serde_json::from_value(payload).map_err(|error| error.to_string())?;
+    let context = StructureContext {
+        kind: if proposed { StructureKind::Proposed } else { StructureKind::Current }, snapshot_id, source_id: request.source_id.as_deref(),
+        source_hash: request.source_hash.as_deref(), base_request_id: request.base_request_id.as_deref(),
+        supersedes_request_id: request.supersedes_request_id.as_deref(),
+    };
+    let result = StructureResult { payload: system_overview::validate_structure(payload, &context, snapshot)?, completed_at };
+    Ok(if proposed { ProjectInsightResult::StructureProposed(result) } else { ProjectInsightResult::StructureCurrent(result) })
 }
 
 fn check_producer(request: &InsightRequest, id: &str, kind: InsightKind, instance: &str, generation: u64, launch: &Option<String>, session: &Option<String>) -> Result<()> {

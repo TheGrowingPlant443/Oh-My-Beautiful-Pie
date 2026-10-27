@@ -124,39 +124,41 @@ fn walk(root: &Path, components: &mut Vec<String>, out: &mut Walked) -> Result<(
     let entries = fs::read_dir(&dir).map_err(|e| err("Cannot list the vault", e))?;
     for entry in entries {
         let entry = entry.map_err(|e| err("Cannot list the vault", e))?;
-        let Ok(name) = entry.file_name().into_string() else {
-            out.skipped_unsafe += 1;
-            continue;
-        };
-        if name.starts_with('.') {
-            continue;
-        }
-        let meta = match fs::symlink_metadata(entry.path()) {
-            Ok(meta) => meta,
-            Err(_) => {
-                out.skipped_unsafe += 1;
-                continue;
-            }
-        };
-        if is_link(&meta) {
-            out.skipped_links += 1;
-            continue;
-        }
-        components.push(name.clone());
-        let relative = components.join("/");
-        if validate_relative(&relative).is_err() {
-            out.skipped_unsafe += 1;
-        } else if meta.is_dir() {
-            if components.len() >= MAX_DEPTH {
-                out.too_deep += 1;
-            } else {
-                walk(root, components, out)?;
-            }
-        } else if meta.is_file() && is_markdown_name(&name) {
-            out.candidates.push(Candidate { path: relative, components: components.clone(), bytes: meta.len(), mtime: fsio::mtime_nanos(&meta) });
-        }
-        components.pop();
+        walk_entry(root, components, &entry, out)?;
     }
+    Ok(())
+}
+
+fn walk_entry(root: &Path, components: &mut Vec<String>, entry: &fs::DirEntry, out: &mut Walked) -> Result<()> {
+    let Ok(name) = entry.file_name().into_string() else {
+        out.skipped_unsafe += 1;
+        return Ok(());
+    };
+    if name.starts_with('.') {
+        return Ok(());
+    }
+    let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+        out.skipped_unsafe += 1;
+        return Ok(());
+    };
+    if is_link(&meta) {
+        out.skipped_links += 1;
+        return Ok(());
+    }
+    components.push(name.clone());
+    let relative = components.join("/");
+    if validate_relative(&relative).is_err() {
+        out.skipped_unsafe += 1;
+    } else if meta.is_dir() {
+        if components.len() >= MAX_DEPTH {
+            out.too_deep += 1;
+        } else {
+            walk(root, components, out)?;
+        }
+    } else if meta.is_file() && is_markdown_name(&name) {
+        out.candidates.push(Candidate { path: relative, components: components.clone(), bytes: meta.len(), mtime: fsio::mtime_nanos(&meta) });
+    }
+    components.pop();
     Ok(())
 }
 
@@ -279,6 +281,17 @@ fn normalize_join(base: &str, relative: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
+fn found_note(index: usize) -> Resolved {
+    Resolved { status: VaultLinkStatus::Resolved, target: Some(index), candidates: Vec::new() }
+}
+
+fn unique_or_ambiguous(list: &[usize]) -> Resolved {
+    match list {
+        [only] => found_note(*only),
+        _ => Resolved { status: VaultLinkStatus::Ambiguous, target: None, candidates: list.to_vec() },
+    }
+}
+
 fn has_other_extension(name: &str) -> bool {
     let last = name.rsplit('/').next().unwrap_or(name);
     match last.rsplit_once('.') {
@@ -393,29 +406,30 @@ impl VaultIndex {
     pub(crate) fn resolve_target(&self, from: &str, target: &str) -> Resolved {
         let decoded = percent_decode(target).unwrap_or_else(|| target.to_string()).replace('\\', "/");
         let decoded = decoded.trim();
-        let found = |i: usize| Resolved { status: VaultLinkStatus::Resolved, target: Some(i), candidates: Vec::new() };
-        let ambiguous = |list: &[usize]| Resolved { status: VaultLinkStatus::Ambiguous, target: None, candidates: list.to_vec() };
         if !decoded.is_empty() {
-            let named = if is_markdown_name(decoded) { decoded.to_string() } else { format!("{decoded}.md") };
-            let directory = from.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-            if let Some(i) = normalize_join(directory, &named).and_then(|p| self.by_path.get(&p).copied()) {
-                return found(i);
-            }
-            if let Some(i) = normalize_join("", &named).and_then(|p| self.by_path.get(&p).copied()) {
-                return found(i);
-            }
-            let suffix = named.trim_start_matches("./").trim_start_matches('/');
-            if let Some(list) = self.by_suffix.get(suffix) {
-                return if list.len() == 1 { found(list[0]) } else { ambiguous(list) };
-            }
-            if !suffix.contains('/') {
-                if let Some(list) = self.by_filename_lower.get(&suffix.to_lowercase()) {
-                    return if list.len() == 1 { found(list[0]) } else { ambiguous(list) };
-                }
+            if let Some(resolved) = self.lookup_named(from, decoded) {
+                return resolved;
             }
         }
         let status = if has_other_extension(decoded) { VaultLinkStatus::NonDocument } else { VaultLinkStatus::Missing };
         Resolved { status, target: None, candidates: Vec::new() }
+    }
+
+    fn lookup_named(&self, from: &str, decoded: &str) -> Option<Resolved> {
+        let named = if is_markdown_name(decoded) { decoded.to_string() } else { format!("{decoded}.md") };
+        let directory = from.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let by_path = |joined: Option<String>| joined.and_then(|p| self.by_path.get(&p).copied()).map(found_note);
+        if let Some(resolved) = by_path(normalize_join(directory, &named)).or_else(|| by_path(normalize_join("", &named))) {
+            return Some(resolved);
+        }
+        let suffix = named.trim_start_matches("./").trim_start_matches('/');
+        if let Some(list) = self.by_suffix.get(suffix) {
+            return Some(unique_or_ambiguous(list));
+        }
+        if suffix.contains('/') {
+            return None;
+        }
+        self.by_filename_lower.get(&suffix.to_lowercase()).map(|list| unique_or_ambiguous(list))
     }
 
     fn note_index(&self, path: &str) -> Result<usize> {
@@ -620,42 +634,43 @@ impl VaultIndex {
         let lowered = needle.to_lowercase();
         let mut hits: Vec<(u8, usize, VaultSearchHit)> = Vec::new();
         for (i, note) in self.notes.iter().enumerate() {
-            let name = note.path.rsplit('/').next().unwrap_or(&note.path);
-            let stem = &name[..name.len() - 3];
-            let (title_lower, path_lower) = (note.title.to_lowercase(), note.path.to_lowercase());
-            let mut best: Option<(u8, Option<u64>, String, bool)> = None;
-            let mut offer = |rank: u8, line: Option<u64>, snippet: &str| {
-                if best.as_ref().map_or(true, |(r, _, _, _)| rank < *r) {
-                    best = Some((rank, line, display_prefix(snippet, MAX_DISPLAY_BYTES).to_string(), snippet.len() > MAX_DISPLAY_BYTES));
-                }
-            };
-            if stem == needle || note.title == needle || stem.to_lowercase() == lowered || title_lower == lowered {
-                offer(0, None, &note.title);
-            } else if note.path.contains(needle) || note.title.contains(needle) {
-                offer(1, None, if note.title.contains(needle) { &note.title } else { &note.path });
-            } else if path_lower.contains(&lowered) || title_lower.contains(&lowered) {
-                offer(2, None, if title_lower.contains(&lowered) { &note.title } else { &note.path });
-            }
-            for heading in &note.headings {
-                if heading.text.to_lowercase().contains(&lowered) {
-                    offer(3, Some(heading.line), &heading.text);
-                    break;
-                }
-            }
-            if let Some((rank, line, snippet, snippet_truncated)) = best {
-                hits.push((rank, i, VaultSearchHit {
-                    path: note.path.clone(),
-                    title: display_prefix(&note.title, MAX_DISPLAY_BYTES).to_string(),
-                    title_truncated: note.title.len() > MAX_DISPLAY_BYTES,
-                    line,
-                    snippet,
-                    snippet_truncated,
-                }));
-            }
+            let Some((rank, line, snippet)) = best_hit(note, needle, &lowered) else { continue };
+            hits.push((rank, i, VaultSearchHit {
+                path: note.path.clone(),
+                title: display_prefix(&note.title, MAX_DISPLAY_BYTES).to_string(),
+                title_truncated: note.title.len() > MAX_DISPLAY_BYTES,
+                line,
+                snippet: display_prefix(snippet, MAX_DISPLAY_BYTES).to_string(),
+                snippet_truncated: snippet.len() > MAX_DISPLAY_BYTES,
+            }));
         }
         hits.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         Ok(hits.into_iter().map(|(_, _, hit)| hit).collect())
     }
+}
+
+/// Ranks a path/title match: exact name (0), exact substring (1), case-folded substring (2).
+fn name_match<'a>(note: &'a Note, needle: &str, lowered: &str) -> Option<(u8, &'a str)> {
+    let name = note.path.rsplit('/').next().unwrap_or(&note.path);
+    let stem = &name[..name.len() - 3];
+    let (title_lower, path_lower) = (note.title.to_lowercase(), note.path.to_lowercase());
+    if stem == needle || note.title == needle || stem.to_lowercase() == lowered || title_lower == lowered {
+        Some((0, &note.title))
+    } else if note.path.contains(needle) || note.title.contains(needle) {
+        Some((1, if note.title.contains(needle) { &note.title } else { &note.path }))
+    } else if path_lower.contains(lowered) || title_lower.contains(lowered) {
+        Some((2, if title_lower.contains(lowered) { &note.title } else { &note.path }))
+    } else {
+        None
+    }
+}
+
+/// The best match of one note: a name match, otherwise (rank 3) its first matching heading.
+fn best_hit<'a>(note: &'a Note, needle: &str, lowered: &str) -> Option<(u8, Option<u64>, &'a str)> {
+    if let Some((rank, snippet)) = name_match(note, needle, lowered) {
+        return Some((rank, None, snippet));
+    }
+    note.headings.iter().find(|heading| heading.text.to_lowercase().contains(lowered)).map(|heading| (3, Some(heading.line), heading.text.as_str()))
 }
 
 fn refresh_dto(vault_id: &str, index: &VaultIndex, changed: bool) -> VaultRefresh {

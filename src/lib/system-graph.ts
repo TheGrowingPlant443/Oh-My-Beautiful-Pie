@@ -65,7 +65,10 @@ export interface ModelEdge {
 
 export interface GraphModel { nodes: ModelNode[]; edges: ModelEdge[] }
 
-export const compareText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+export const compareText = (a: string, b: string): number => {
+  if (a < b) return -1;
+  return a > b ? 1 : 0;
+};
 
 export function node(partial: Partial<ModelNode> & Pick<ModelNode, "id" | "label">): ModelNode {
   return {
@@ -98,17 +101,20 @@ export interface GraphIndex {
   duplicates: number;
 }
 
-/** Validated lookup tables over a model: first duplicate wins, parent cycles are cut, dangling edges are set aside and counted. */
-export function buildIndex(model: GraphModel): GraphIndex {
+function indexNodes(model: GraphModel): { nodes: Map<string, ModelNode>; duplicates: number } {
   const nodes = new Map<string, ModelNode>();
   let duplicates = 0;
   for (const item of model.nodes) {
     if (nodes.has(item.id)) { duplicates++; continue; }
     nodes.set(item.id, item);
   }
+  return { nodes, duplicates };
+}
+
+/** The parent of every node (null for roots, self and unknown parents); a parent cycle is cut at the first node, by id, that closes it. */
+function parentLinks(nodes: ReadonlyMap<string, ModelNode>): Map<string, string | null> {
   const parent = new Map<string, string | null>();
   for (const [id, item] of nodes) parent.set(id, item.parentId !== null && item.parentId !== id && nodes.has(item.parentId) ? item.parentId : null);
-  // A parent cycle is cut at the first node that closes it.
   for (const id of [...nodes.keys()].sort(compareText)) {
     const seen = new Set<string>([id]);
     let cursor = parent.get(id) ?? null;
@@ -118,16 +124,25 @@ export function buildIndex(model: GraphModel): GraphIndex {
       cursor = parent.get(cursor) ?? null;
     }
   }
+  return parent;
+}
+
+function childTables(nodes: ReadonlyMap<string, ModelNode>, parent: ReadonlyMap<string, string | null>): { children: Map<string, string[]>; roots: string[] } {
   const children = new Map<string, string[]>();
   const roots: string[] = [];
   for (const id of nodes.keys()) {
     const owner = parent.get(id) ?? null;
-    if (owner === null) roots.push(id);
-    else { const list = children.get(owner); if (list) list.push(id); else children.set(owner, [id]); }
+    if (owner === null) { roots.push(id); continue; }
+    const list = children.get(owner);
+    if (list) list.push(id); else children.set(owner, [id]);
   }
   const byLabel = (a: string, b: string): number => compareText(nodes.get(a)!.label, nodes.get(b)!.label) || compareText(a, b);
   roots.sort(byLabel);
   for (const list of children.values()) list.sort(byLabel);
+  return { children, roots };
+}
+
+function splitEdges(model: GraphModel, nodes: ReadonlyMap<string, ModelNode>): { edges: ModelEdge[]; dangling: ModelEdge[]; endpoints: Set<string> } {
   const edges: ModelEdge[] = [];
   const dangling: ModelEdge[] = [];
   const endpoints = new Set<string>();
@@ -137,33 +152,53 @@ export function buildIndex(model: GraphModel): GraphIndex {
     endpoints.add(edge.source);
     endpoints.add(edge.target);
   }
-  // Subtree sums in one iterative post-order (deep hierarchies cannot overflow the stack).
-  const sums = (weight: (item: ModelNode) => number): Map<string, number> => {
-    const totals = new Map<string, number>();
-    for (const start of nodes.keys()) {
-      if (totals.has(start)) continue;
-      const stack: { id: string; next: number; total: number }[] = [{ id: start, next: 0, total: weight(nodes.get(start)!) }];
-      while (stack.length) {
-        const top = stack[stack.length - 1];
-        const kids = children.get(top.id) ?? [];
-        if (top.next < kids.length) {
-          const kid = kids[top.next++];
-          const done = totals.get(kid);
-          if (done !== undefined) top.total += done;
-          else stack.push({ id: kid, next: 0, total: weight(nodes.get(kid)!) });
-        } else {
-          totals.set(top.id, top.total);
-          stack.pop();
-          if (stack.length) stack[stack.length - 1].total += top.total;
-        }
-      }
-    }
-    return totals;
-  };
-  // A cycle group stands for all its members and a directory aggregate for its direct files; once a cycle's members are loaded as children they replace it.
+  return { edges, dangling, endpoints };
+}
+
+/** A cycle group stands for all its members and a directory aggregate for its direct files; once a cycle's members are loaded as children they replace it. */
+function ownMembers(item: ModelNode, loadedChildren: number): number {
+  if (item.synthetic) return 0;
+  return item.lazyMembers.length > 0 ? Math.max(0, item.memberCount - loadedChildren) : item.memberCount;
+}
+
+interface SumFrame { id: string; next: number; total: number }
+
+/** One step of the iterative post-order walk: descend into the next unfinished child, or settle the top frame into its parent. */
+function sumStep(stack: SumFrame[], children: ReadonlyMap<string, string[]>, weight: ReadonlyMap<string, number>, totals: Map<string, number>): void {
+  const top = stack.at(-1)!;
+  const kids = children.get(top.id) ?? [];
+  if (top.next < kids.length) {
+    const kid = kids[top.next++];
+    const done = totals.get(kid);
+    if (done === undefined) stack.push({ id: kid, next: 0, total: weight.get(kid) ?? 0 }); else top.total += done;
+    return;
+  }
+  totals.set(top.id, top.total);
+  stack.pop();
+  const owner = stack.at(-1);
+  if (owner) owner.total += top.total;
+}
+
+/** Subtree sums in one iterative post-order (deep hierarchies cannot overflow the stack). */
+function subtreeSums(nodes: ReadonlyMap<string, ModelNode>, children: ReadonlyMap<string, string[]>, weight: ReadonlyMap<string, number>): Map<string, number> {
+  const totals = new Map<string, number>();
+  for (const start of nodes.keys()) {
+    if (totals.has(start)) continue;
+    const stack: SumFrame[] = [{ id: start, next: 0, total: weight.get(start) ?? 0 }];
+    while (stack.length) sumStep(stack, children, weight, totals);
+  }
+  return totals;
+}
+
+/** Validated lookup tables over a model: first duplicate wins, parent cycles are cut, dangling edges are set aside and counted. */
+export function buildIndex(model: GraphModel): GraphIndex {
+  const { nodes, duplicates } = indexNodes(model);
+  const parent = parentLinks(nodes);
+  const { children, roots } = childTables(nodes, parent);
+  const { edges, dangling, endpoints } = splitEdges(model, nodes);
   const own = new Map<string, number>();
-  for (const [id, item] of nodes) own.set(id, item.synthetic ? 0 : item.lazyMembers.length > 0 ? Math.max(0, item.memberCount - (children.get(id)?.length ?? 0)) : item.memberCount);
-  const members = sums(item => own.get(item.id) ?? 0);
+  for (const [id, item] of nodes) own.set(id, ownMembers(item, children.get(id)?.length ?? 0));
+  const members = subtreeSums(nodes, children, own);
   let totalNodes = 0, totalGroups = 0;
   for (const [id, item] of nodes) { totalNodes += own.get(id) ?? 0; if (!item.synthetic) totalGroups++; }
   return { nodes, edges, children, parent, roots, endpoints, own, members, totalNodes, totalGroups, totalEdges: edges.length, dangling, duplicates };
@@ -174,50 +209,51 @@ export const expandable = (index: GraphIndex, id: string): boolean => (index.chi
 
 // ---- strongly connected components ------------------------------------------------------------------------------
 
+interface TarjanState { order: Int32Array; low: Int32Array; on: Uint8Array; stack: number[]; components: number[][]; counter: number }
+interface TarjanFrame { v: number; i: number }
+
+function enterVertex(state: TarjanState, frames: TarjanFrame[], v: number): void {
+  state.order[v] = state.low[v] = state.counter++;
+  state.stack.push(v);
+  state.on[v] = 1;
+  frames.push({ v, i: 0 });
+}
+
+/** Pops the finished vertex; when it roots a component the component is cut off the stack, and its lowlink always reaches the parent. */
+function finishVertex(state: TarjanState, frames: TarjanFrame[]): void {
+  const { v } = frames.pop()!;
+  if (state.low[v] === state.order[v]) {
+    const component: number[] = [];
+    let w: number;
+    do {
+      w = state.stack.pop()!;
+      state.on[w] = 0;
+      component.push(w);
+    } while (w !== v);
+    state.components.push(component);
+  }
+  const parent = frames.at(-1);
+  if (parent) state.low[parent.v] = Math.min(state.low[parent.v], state.low[v]);
+}
+
 /** Iterative Tarjan over dense indexes. Components are returned sinks first; neighbour order is the given order. */
 export function stronglyConnected(adjacency: readonly (readonly number[])[]): number[][] {
   const n = adjacency.length;
-  const order = new Int32Array(n).fill(-1), low = new Int32Array(n), on = new Uint8Array(n);
-  const stack: number[] = [];
-  const components: number[][] = [];
-  let counter = 0;
+  const state: TarjanState = { order: new Int32Array(n).fill(-1), low: new Int32Array(n), on: new Uint8Array(n), stack: [], components: [], counter: 0 };
   for (let root = 0; root < n; root++) {
-    if (order[root] !== -1) continue;
-    const frames: { v: number; i: number }[] = [{ v: root, i: 0 }];
-    order[root] = low[root] = counter++;
-    stack.push(root);
-    on[root] = 1;
+    if (state.order[root] !== -1) continue;
+    const frames: TarjanFrame[] = [];
+    enterVertex(state, frames, root);
     while (frames.length) {
-      const frame = frames[frames.length - 1];
+      const frame = frames.at(-1)!;
       const next = adjacency[frame.v];
-      if (frame.i < next.length) {
-        const w = next[frame.i++];
-        if (order[w] === -1) {
-          order[w] = low[w] = counter++;
-          stack.push(w);
-          on[w] = 1;
-          frames.push({ v: w, i: 0 });
-        } else if (on[w]) low[frame.v] = Math.min(low[frame.v], order[w]);
-      } else {
-        if (low[frame.v] === order[frame.v]) {
-          const component: number[] = [];
-          for (;;) {
-            const w = stack.pop()!;
-            on[w] = 0;
-            component.push(w);
-            if (w === frame.v) break;
-          }
-          components.push(component);
-        }
-        frames.pop();
-        if (frames.length) {
-          const parent = frames[frames.length - 1].v;
-          low[parent] = Math.min(low[parent], low[frame.v]);
-        }
-      }
+      if (frame.i >= next.length) { finishVertex(state, frames); continue; }
+      const w = next[frame.i++];
+      if (state.order[w] === -1) enterVertex(state, frames, w);
+      else if (state.on[w]) state.low[frame.v] = Math.min(state.low[frame.v], state.order[w]);
     }
   }
-  return components;
+  return state.components;
 }
 
 // ---- layered layout ---------------------------------------------------------------------------------------------
@@ -234,17 +270,14 @@ export interface LayoutResult {
 }
 
 const BARYCENTER_NODE_LIMIT = 2000;
-const bandOf = (role: Role | null): 0 | 1 | 2 => role === "input" ? 0 : role === "output" ? 2 : 1;
+const bandOf = (role: Role | null): 0 | 1 | 2 => {
+  if (role === "input") return 0;
+  return role === "output" ? 2 : 1;
+};
 
-/**
- * Condenses strongly connected components, layers the acyclic result by longest path and orders each layer by stable id with a few
- * barycentre sweeps. With roles the columns run input -> application -> output regardless of edge direction. Response edges
- * (`responds`) never decide layers or components: a response is not a new caller.
- */
-export function layoutLayers(nodes: readonly { id: string; role: Role | null }[], edges: readonly { source: string; target: string; relation: string }[], useRoles: boolean): LayoutResult {
-  const ids = nodes.map(item => item.id).sort(compareText);
+/** Dense-index pairs: `adjacency` decides layers (no self pairs, repeats or responses), `neighbours` lists every incident pair for ordering. */
+function pairGraph(ids: readonly string[], edges: readonly { source: string; target: string; relation: string }[]): { adjacency: number[][]; neighbours: number[][] } {
   const position = new Map(ids.map((id, i) => [id, i]));
-  const roleOf = new Map(nodes.map(item => [item.id, item.role]));
   const adjacency: number[][] = ids.map(() => []);
   const neighbours: number[][] = ids.map(() => []);
   const seenPair = new Set<string>();
@@ -260,15 +293,13 @@ export function layoutLayers(nodes: readonly { id: string; role: Role | null }[]
     adjacency[a].push(b);
   }
   for (const list of adjacency) list.sort((x, y) => x - y);
-  const components = stronglyConnected(adjacency);
-  const componentOf = new Int32Array(ids.length);
-  // Number components by their smallest member id so numbering is independent of traversal order.
-  const ordered = components.map(members => members.sort((a, b) => a - b)).sort((a, b) => a[0] - b[0]);
-  ordered.forEach((members, c) => { for (const m of members) componentOf[m] = c; });
-  const band = ordered.map(members => useRoles ? Math.min(...members.map(m => bandOf(roleOf.get(ids[m]) ?? null))) as 0 | 1 | 2 : 1);
-  const successors: Set<number>[] = ordered.map(() => new Set<number>());
-  const indegree = new Int32Array(ordered.length);
-  for (let a = 0; a < ids.length; a++) {
+  return { adjacency, neighbours };
+}
+
+function componentSuccessors(adjacency: readonly (readonly number[])[], componentOf: Int32Array, count: number): { successors: Set<number>[]; indegree: Int32Array } {
+  const successors: Set<number>[] = Array.from({ length: count }, () => new Set<number>());
+  const indegree = new Int32Array(count);
+  for (let a = 0; a < adjacency.length; a++) {
     for (const b of adjacency[a]) {
       const from = componentOf[a], to = componentOf[b];
       if (from === to || successors[from].has(to)) continue;
@@ -276,21 +307,93 @@ export function layoutLayers(nodes: readonly { id: string; role: Role | null }[]
       indegree[to]++;
     }
   }
-  const layer = new Int32Array(ordered.length);
+  return { successors, indegree };
+}
+
+/** Longest-path layer of every component; a layer only grows along edges that stay inside one band. */
+function longestPathLayers(successors: readonly Set<number>[], indegree: Int32Array, band: readonly number[]): Int32Array {
+  const layer = new Int32Array(successors.length);
   const ready: number[] = [];
-  for (let c = 0; c < ordered.length; c++) if (indegree[c] === 0) ready.push(c);
-  for (let head = 0; head < ready.length; head++) {
-    const c = ready[head];
+  for (let c = 0; c < successors.length; c++) if (indegree[c] === 0) ready.push(c);
+  // `ready` grows while it is walked: the iterator follows the appended components.
+  for (const c of ready) {
     for (const next of successors[c]) {
       if (band[next] === band[c]) layer[next] = Math.max(layer[next], layer[c] + 1);
       if (--indegree[next] === 0) ready.push(next);
     }
   }
-  const depth = [0, 0, 0], used = [false, false, false];
-  for (let c = 0; c < ordered.length; c++) { used[band[c]] = true; depth[band[c]] = Math.max(depth[band[c]], layer[c] + 1); }
-  const base = [0, 0, 0];
-  base[1] = used[0] ? depth[0] : 0;
-  base[2] = base[1] + (used[1] ? depth[1] : 0);
+  return layer;
+}
+
+/** First column of each band: input columns, then application columns, then output columns. */
+function bandOffsets(band: readonly number[], layer: Int32Array): number[] {
+  const depth = [0, 0, 0];
+  band.forEach((b, c) => { depth[b] = Math.max(depth[b], layer[c] + 1); });
+  return [0, depth[0], depth[0] + depth[1]];
+}
+
+interface ColumnOrder { componentOf: Int32Array; columnOf: Int32Array; neighbours: readonly (readonly number[])[]; rank: Float64Array }
+
+function placeRanks(list: readonly number[], rank: Float64Array): void {
+  list.forEach((m, r) => { rank[m] = list.length > 1 ? r / (list.length - 1) : 0.5; });
+}
+
+/** Mean rank of the already placed neighbours of each component of a column (a component moves as one unit). */
+function columnUnits(list: readonly number[], c: number, down: boolean, order: ColumnOrder): Map<number, { sum: number; count: number }> {
+  const unit = new Map<number, { sum: number; count: number }>();
+  for (const m of list) {
+    const entry = unit.get(order.componentOf[m]) ?? { sum: 0, count: 0 };
+    for (const other of order.neighbours[m]) {
+      const placed = down ? order.columnOf[other] < c : order.columnOf[other] > c;
+      if (placed) { entry.sum += order.rank[other]; entry.count++; }
+    }
+    unit.set(order.componentOf[m], entry);
+  }
+  return unit;
+}
+
+function sweepColumn(list: number[], c: number, down: boolean, order: ColumnOrder): void {
+  const { componentOf, rank } = order;
+  const unit = columnUnits(list, c, down, order);
+  const weight = (m: number): number => { const entry = unit.get(componentOf[m])!; return entry.count ? entry.sum / entry.count : rank[m]; };
+  list.sort((a, b) => weight(a) - weight(b) || componentOf[a] - componentOf[b] || a - b);
+  placeRanks(list, rank);
+}
+
+/** Orders each column by component, then (up to the node limit) by a few alternating barycentre sweeps. */
+function orderColumns(perColumn: number[][], order: ColumnOrder): void {
+  const { componentOf, rank } = order;
+  for (const list of perColumn) {
+    list.sort((a, b) => componentOf[a] - componentOf[b] || a - b);
+    placeRanks(list, rank);
+  }
+  if (order.columnOf.length > BARYCENTER_NODE_LIMIT) return;
+  for (let sweep = 0; sweep < 4; sweep++) {
+    const down = sweep % 2 === 0;
+    const sequence = down ? [...perColumn.keys()] : [...perColumn.keys()].reverse();
+    for (const c of sequence) sweepColumn(perColumn[c], c, down, order);
+  }
+}
+
+/**
+ * Condenses strongly connected components, layers the acyclic result by longest path and orders each layer by stable id with a few
+ * barycentre sweeps. With roles the columns run input -> application -> output regardless of edge direction. Response edges
+ * (`responds`) never decide layers or components: a response is not a new caller.
+ */
+export function layoutLayers(nodes: readonly { id: string; role: Role | null }[], edges: readonly { source: string; target: string; relation: string }[], useRoles: boolean): LayoutResult {
+  const ids = nodes.map(item => item.id).sort(compareText);
+  const roleOf = new Map(nodes.map(item => [item.id, item.role]));
+  const { adjacency, neighbours } = pairGraph(ids, edges);
+  const componentOf = new Int32Array(ids.length);
+  // Number components by their smallest member id so numbering is independent of traversal order.
+  const ordered = stronglyConnected(adjacency);
+  for (const members of ordered) members.sort((a, b) => a - b);
+  ordered.sort((a, b) => a[0] - b[0]);
+  ordered.forEach((members, c) => { for (const m of members) componentOf[m] = c; });
+  const band = ordered.map(members => useRoles ? Math.min(...members.map(m => bandOf(roleOf.get(ids[m]) ?? null))) : 1);
+  const { successors, indegree } = componentSuccessors(adjacency, componentOf, ordered.length);
+  const layer = longestPathLayers(successors, indegree, band);
+  const base = bandOffsets(band, layer);
   const columnOf = new Int32Array(ids.length);
   let columns = 0;
   for (let i = 0; i < ids.length; i++) {
@@ -300,29 +403,7 @@ export function layoutLayers(nodes: readonly { id: string; role: Role | null }[]
   }
   const perColumn: number[][] = Array.from({ length: columns }, () => []);
   for (let i = 0; i < ids.length; i++) perColumn[columnOf[i]].push(i);
-  const rank = new Float64Array(ids.length);
-  const place = (list: number[]): void => { list.forEach((m, r) => { rank[m] = list.length > 1 ? r / (list.length - 1) : 0.5; }); };
-  for (const list of perColumn) { list.sort((a, b) => componentOf[a] - componentOf[b] || a - b); place(list); }
-  if (ids.length <= BARYCENTER_NODE_LIMIT) {
-    for (let sweep = 0; sweep < 4; sweep++) {
-      const down = sweep % 2 === 0;
-      const sequence = down ? [...perColumn.keys()] : [...perColumn.keys()].reverse();
-      for (const c of sequence) {
-        const list = perColumn[c];
-        const unit = new Map<number, { sum: number; count: number }>();
-        for (const m of list) {
-          const entry = unit.get(componentOf[m]) ?? { sum: 0, count: 0 };
-          for (const other of neighbours[m]) {
-            if (down ? columnOf[other] < c : columnOf[other] > c) { entry.sum += rank[other]; entry.count++; }
-          }
-          unit.set(componentOf[m], entry);
-        }
-        const weight = (m: number): number => { const entry = unit.get(componentOf[m])!; return entry.count ? entry.sum / entry.count : rank[m]; };
-        list.sort((a, b) => weight(a) - weight(b) || componentOf[a] - componentOf[b] || a - b);
-        place(list);
-      }
-    }
-  }
+  orderColumns(perColumn, { componentOf, columnOf, neighbours, rank: new Float64Array(ids.length) });
   const result: LayoutResult = { column: new Map(), row: new Map(), component: new Map(), componentSize: new Map(), x: new Map(), y: new Map(), columns };
   ordered.forEach((members, c) => result.componentSize.set(c, members.length));
   for (const list of perColumn) {
@@ -471,65 +552,103 @@ function shownSet(index: GraphIndex, expanded: ReadonlySet<string>): Set<string>
   return shown;
 }
 
+function representativeOf(index: GraphIndex, expanded: ReadonlySet<string>, representatives: Map<string, string>, id: string): string {
+  const known = representatives.get(id);
+  if (known !== undefined) return known;
+  // The first collapsed container on the way down from the root represents every node below it.
+  const chain: string[] = [];
+  for (let cursor: string | null = id; cursor !== null; cursor = index.parent.get(cursor) ?? null) chain.push(cursor);
+  let representative = id;
+  for (let i = chain.length - 1; i > 0; i--) {
+    if (expanded.has(chain[i])) continue;
+    representative = chain[i];
+    break;
+  }
+  representatives.set(id, representative);
+  return representative;
+}
+
+function addRecursion(recursion: Aggregate["recursion"], card: string, count: number, id: string | null): void {
+  const entry = recursion.get(card) ?? { count: 0, ids: [] };
+  entry.count += count;
+  if (id !== null) entry.ids.push(id);
+  recursion.set(card, entry);
+}
+
+function edgeFiltered(edge: ModelEdge, options: ProjectionOptions): boolean {
+  return !!(options.relations && !options.relations.has(edge.relation))
+    || !!(options.grades && !options.grades.has(edge.grade))
+    || (options.derived === false && edge.derived);
+}
+
+function aggregateEdgeKey(edge: ModelEdge, from: string, to: string): string {
+  // Opposite directed records stay separate; an undirected pair is one line whichever order it was stored in.
+  const separator = edge.direction === "undirected" ? "~" : ">";
+  let ends = `${from}${separator}${to}`;
+  if (edge.direction === "undirected" && compareText(to, from) < 0) ends = `${to}~${from}`;
+  return `${ends}|${edge.relation}|${edge.grade}|${edge.derived ? 1 : 0}`;
+}
+
+function addAggregateEdge(measured: Aggregate, edge: ModelEdge, from: string, to: string): void {
+  if (edge.source === edge.target) {
+    addRecursion(measured.recursion, from, edge.count, edge.id);
+    measured.recursionTotal += edge.count;
+    return;
+  }
+  if (from === to) {
+    measured.internal.set(from, (measured.internal.get(from) ?? 0) + edge.count);
+    measured.internalTotal += edge.count;
+    return;
+  }
+  const key = aggregateEdgeKey(edge, from, to);
+  const draft = measured.edges.get(key);
+  if (!draft) {
+    measured.edges.set(key, { source: from, target: to, direction: edge.direction, relation: edge.relation, grade: edge.grade, derived: edge.derived, label: edge.label, edgeIds: [edge.id], evidenceIds: new Set(edge.evidenceIds), count: edge.count, truncated: edge.truncated });
+    return;
+  }
+  draft.edgeIds.push(edge.id);
+  for (const id of edge.evidenceIds) draft.evidenceIds.add(id);
+  draft.count += edge.count;
+  draft.truncated ||= edge.truncated;
+  if (draft.label !== edge.label) draft.label = "";
+}
+
 function aggregate(index: GraphIndex, expanded: ReadonlySet<string>, options: ProjectionOptions): Aggregate {
-  const shown = shownSet(index, expanded);
-  const representative = new Map<string, string>();
-  const repOf = (id: string): string => {
-    const known = representative.get(id);
-    if (known !== undefined) return known;
-    // The first collapsed container on the way down from the root represents every node below it.
-    const chain: string[] = [];
-    for (let cursor: string | null = id; cursor !== null; cursor = index.parent.get(cursor) ?? null) chain.push(cursor);
-    let rep = id;
-    for (let i = chain.length - 1; i > 0; i--) if (!expanded.has(chain[i])) { rep = chain[i]; break; }
-    representative.set(id, rep);
-    return rep;
-  };
-  const edges = new Map<string, ViewEdgeDraft>();
-  const internal = new Map<string, number>();
-  const recursion = new Map<string, { count: number; ids: string[] }>();
-  const addRecursion = (card: string, count: number, id: string | null): void => {
-    const entry = recursion.get(card) ?? { count: 0, ids: [] };
-    entry.count += count;
-    if (id !== null) entry.ids.push(id);
-    recursion.set(card, entry);
-  };
-  let filtered = 0, internalTotal = 0, recursionTotal = 0;
-  // Self-loops counted by the index on a node itself (recursion) are not model edges but belong to that node's card.
+  const measured: Aggregate = { shown: shownSet(index, expanded), edges: new Map(), internal: new Map(), recursion: new Map(), recursionTotal: 0, filtered: 0, internalTotal: 0 };
+  const representatives = new Map<string, string>();
+  // Self-loops counted by the index are not model edges but belong to that node's card.
   for (const item of index.nodes.values()) {
-    if (item.selfLoops > 0 && !item.synthetic) { addRecursion(repOf(item.id), item.selfLoops, null); recursionTotal += item.selfLoops; }
+    if (item.selfLoops > 0 && !item.synthetic) {
+      addRecursion(measured.recursion, representativeOf(index, expanded, representatives, item.id), item.selfLoops, null);
+      measured.recursionTotal += item.selfLoops;
+    }
   }
   for (const edge of index.edges) {
-    if ((options.relations && !options.relations.has(edge.relation)) || (options.grades && !options.grades.has(edge.grade)) || (options.derived === false && edge.derived)) { filtered += edge.count; continue; }
-    const from = repOf(edge.source), to = repOf(edge.target);
-    if (edge.source === edge.target) { addRecursion(from, edge.count, edge.id); recursionTotal += edge.count; continue; }
-    if (from === to) { internal.set(from, (internal.get(from) ?? 0) + edge.count); internalTotal += edge.count; continue; }
-    // Directed and undirected records never share an arrow; opposite directed edges stay separate arrows; an undirected pair is one line whichever order it was stored in.
-    const ends = edge.direction === "undirected" && compareText(to, from) < 0 ? `${to}~${from}` : `${from}${edge.direction === "undirected" ? "~" : ">"}${to}`;
-    const key = `${ends}|${edge.relation}|${edge.grade}|${edge.derived ? 1 : 0}`;
-    const draft = edges.get(key);
-    if (draft) {
-      draft.edgeIds.push(edge.id);
-      for (const id of edge.evidenceIds) draft.evidenceIds.add(id);
-      draft.count += edge.count;
-      draft.truncated ||= edge.truncated;
-      if (draft.label !== edge.label) draft.label = "";
-    } else edges.set(key, { source: from, target: to, direction: edge.direction, relation: edge.relation, grade: edge.grade, derived: edge.derived, label: edge.label, edgeIds: [edge.id], evidenceIds: new Set(edge.evidenceIds), count: edge.count, truncated: edge.truncated });
+    if (edgeFiltered(edge, options)) {
+      measured.filtered += edge.count;
+      continue;
+    }
+    const from = representativeOf(index, expanded, representatives, edge.source);
+    const to = representativeOf(index, expanded, representatives, edge.target);
+    addAggregateEdge(measured, edge, from, to);
   }
-  return { shown, edges, internal, recursion, recursionTotal, filtered, internalTotal };
+  return measured;
+}
+
+function systemExpanded(index: GraphIndex): Set<string> {
+  const expanded = new Set<string>();
+  // One application-flow box, or a few meaningful groups.
+  for (const id of index.roots) {
+    const kids = index.children.get(id) ?? [];
+    if (index.nodes.get(id)!.kind === "application" && kids.length > 0 && kids.length <= SYSTEM_DEFAULT_GROUPS) expanded.add(id);
+  }
+  return expanded;
 }
 
 /** Initial cut: open containers breadth-first while the visible node count fits the Flow bound; the edge bound is applied by `fitExpanded`. */
 export function defaultExpanded(index: GraphIndex, mode: GraphMode, limits: ProjectionLimits = DEFAULT_LIMITS): Set<string> {
+  if (mode === "system") return systemExpanded(index);
   const expanded = new Set<string>();
-  if (mode === "system") {
-    // One application-flow box, or a few meaningful groups.
-    for (const id of index.roots) {
-      const kids = index.children.get(id) ?? [];
-      if (index.nodes.get(id)!.kind === "application" && kids.length > 0 && kids.length <= SYSTEM_DEFAULT_GROUPS) expanded.add(id);
-    }
-    return expanded;
-  }
   let count = index.roots.length;
   let level = [...index.roots];
   while (level.length) {
@@ -548,6 +667,32 @@ export function defaultExpanded(index: GraphIndex, mode: GraphMode, limits: Proj
   return expanded;
 }
 
+function expandedByDepth(index: GraphIndex, open: ReadonlySet<string>): Map<number, string[]> {
+  const byDepth = new Map<number, string[]>();
+  for (const id of open) {
+    let depth = 0;
+    for (let cursor = index.parent.get(id) ?? null; cursor !== null; cursor = index.parent.get(cursor) ?? null) depth++;
+    const list = byDepth.get(depth);
+    if (list) list.push(id); else byDepth.set(depth, [id]);
+  }
+  return byDepth;
+}
+
+function withoutContainers(open: ReadonlySet<string>, level: readonly string[], count: number): Set<string> {
+  const trial = new Set(open);
+  for (let i = 0; i < count; i++) trial.delete(level[i]);
+  return trial;
+}
+
+function minimumCollapses(open: ReadonlySet<string>, level: readonly string[], fits: (set: ReadonlySet<string>) => boolean): number {
+  let low = 1, high = level.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (fits(withoutContainers(open, level, middle))) high = middle; else low = middle + 1;
+  }
+  return high;
+}
+
 /**
  * Collapses opened containers, deepest level first, until the projection fits `nodes`/`edges`. Within the level that makes it fit,
  * the fewest containers (largest first) are collapsed, found by bisection.
@@ -556,29 +701,21 @@ function fitExpanded(index: GraphIndex, expanded: ReadonlySet<string>, options: 
   const open = new Set([...expanded].filter(id => (index.children.get(id)?.length ?? 0) > 0));
   const fits = (set: ReadonlySet<string>): boolean => { const measured = aggregate(index, set, options); return measured.shown.size <= nodes && measured.edges.size <= edges; };
   if (fits(open)) return { expanded: open, collapsed: 0 };
-  const byDepth = new Map<number, string[]>();
-  for (const id of open) {
-    let depth = 0;
-    for (let cursor = index.parent.get(id) ?? null; cursor !== null; cursor = index.parent.get(cursor) ?? null) depth++;
-    const list = byDepth.get(depth);
-    if (list) list.push(id); else byDepth.set(depth, [id]);
-  }
+  const byDepth = expandedByDepth(index, open);
+  const depths = [...byDepth.keys()];
+  depths.sort((a, b) => b - a);
   let collapsed = 0;
-  for (const depth of [...byDepth.keys()].sort((a, b) => b - a)) {
-    const level = byDepth.get(depth)!.sort((a, b) => (index.members.get(b) ?? 0) - (index.members.get(a) ?? 0) || compareText(a, b));
-    const without = (count: number): Set<string> => { const trial = new Set(open); for (let i = 0; i < count; i++) trial.delete(level[i]); return trial; };
-    if (!fits(without(level.length))) {
+  for (const depth of depths) {
+    const level = byDepth.get(depth)!;
+    level.sort((a, b) => (index.members.get(b) ?? 0) - (index.members.get(a) ?? 0) || compareText(a, b));
+    if (!fits(withoutContainers(open, level, level.length))) {
       for (const id of level) open.delete(id);
       collapsed += level.length;
       continue;
     }
-    let low = 1, high = level.length;
-    while (low < high) {
-      const middle = (low + high) >> 1;
-      if (fits(without(middle))) high = middle; else low = middle + 1;
-    }
-    for (let i = 0; i < high; i++) open.delete(level[i]);
-    return { expanded: open, collapsed: collapsed + high };
+    const count = minimumCollapses(open, level, fits);
+    for (let i = 0; i < count; i++) open.delete(level[i]);
+    return { expanded: open, collapsed: collapsed + count };
   }
   return { expanded: open, collapsed };
 }
@@ -593,6 +730,61 @@ function automaticCut(index: GraphIndex, options: ProjectionOptions, limits: Pro
   const flow = fitExpanded(index, defaultExpanded(index, options.mode, limits), options, limits.flowNodes, limits.flowEdges).expanded;
   if (options.mode === "system" || shownSet(index, flow).size >= 2) return flow;
   return defaultExpanded(index, options.mode, { ...limits, flowNodes: limits.sigmaNodes });
+}
+
+function projectedNode(index: GraphIndex, id: string, expanded: ReadonlySet<string>, measured: Aggregate, layout: LayoutResult, degree: ReadonlyMap<string, number>): ViewNode {
+  const item = index.nodes.get(id)!;
+  const kids = index.children.get(id);
+  const isOpen = expanded.has(id) && !!kids?.length;
+  const collapsed = (kids?.length ?? 0) > 0 && !isOpen;
+  const within: string[] = [];
+  for (let cursor = index.parent.get(id) ?? null; cursor !== null; cursor = index.parent.get(cursor) ?? null) within.unshift(index.nodes.get(cursor)!.label);
+  const loops = measured.recursion.get(id);
+  return {
+    id, kind: item.kind, label: item.label, subtitle: item.subtitle, description: item.description, evidence: item.evidence, role: item.role,
+    memberCount: collapsed ? index.members.get(id) ?? 0 : item.memberCount, collapsed, open: isOpen, expandable: expandable(index, id),
+    cyclic: item.cyclic, selfLoops: loops?.count ?? 0, selfLoopIds: loops?.ids ?? [],
+    internal: measured.internal.get(id) ?? 0, within, path: item.path, ref: item.ref, evidenceIds: item.evidenceIds,
+    column: layout.column.get(id)!, row: layout.row.get(id)!, component: layout.component.get(id)!, x: layout.x.get(id)!, y: layout.y.get(id)!, degree: degree.get(id) ?? 0,
+  };
+}
+
+function projectedEdges(drafts: Aggregate["edges"], window: ReadonlySet<string>, layout: LayoutResult): ViewEdge[] {
+  const edges: ViewEdge[] = [];
+  for (const [key, draft] of drafts) {
+    if (!window.has(draft.source) || !window.has(draft.target)) continue;
+    const cycle = layout.component.get(draft.source) === layout.component.get(draft.target);
+    const response = draft.relation === "responds";
+    edges.push({
+      id: key, source: draft.source, target: draft.target, direction: draft.direction, relation: draft.relation, grade: draft.grade, derived: draft.derived, label: draft.label,
+      count: draft.count, edgeIds: draft.edgeIds, evidenceIds: [...draft.evidenceIds], truncated: draft.truncated, cycle, response,
+      back: !response && !cycle && layout.column.get(draft.target)! <= layout.column.get(draft.source)!,
+    });
+  }
+  edges.sort((a, b) => compareText(a.id, b.id));
+  return edges;
+}
+
+function hiddenOpenContainers(index: GraphIndex, expanded: ReadonlySet<string>, shown: ReadonlySet<string>): number {
+  // Opened non-synthetic containers without relationships of their own are not cards; they stay counted.
+  let hidden = 0;
+  for (const id of expanded) {
+    const item = index.nodes.get(id);
+    if (item && !item.synthetic && (index.children.get(id)?.length ?? 0) > 0 && !shown.has(id)) hidden++;
+  }
+  return hidden;
+}
+
+function projectionReason(nodes: readonly ViewNode[], collapsed: number, maxNodes: number, maxEdges: number, totalNodes: number, paged: Projection["paged"]): string | null {
+  const reasons: string[] = [];
+  if (collapsed > 0) reasons.push(`Groups were collapsed to keep the view within ${maxNodes.toLocaleString()} nodes and ${maxEdges.toLocaleString()} arrows.`);
+  if (paged) reasons.push(`Even fully grouped, the view has ${totalNodes.toLocaleString()} nodes; showing window ${paged.page + 1} of ${paged.pages}.`);
+  const oversize = nodes.filter(item => item.collapsed && item.memberCount > maxNodes);
+  if (oversize.length) {
+    const subject = oversize.length === 1 ? `"${oversize[0].label}" holds` : `${oversize.length} groups hold`;
+    reasons.push(`${subject} more than ${maxNodes.toLocaleString()} nodes, which is more than the view can draw; use search to open an exact neighbourhood.`);
+  }
+  return reasons.length ? reasons.join(" ") : null;
 }
 
 /**
@@ -623,62 +815,32 @@ export function projectGraph(index: GraphIndex, options: ProjectionOptions): Pro
   const page = Math.min(Math.max(0, options.page ?? 0), pages - 1);
   const windowIds = pages > 1 ? ids.slice(page * pageSize, (page + 1) * pageSize) : ids;
   const windowSet = new Set(windowIds);
-  let indexedDisplayed = 0;
-  const nodes: ViewNode[] = windowIds.map(id => {
-    const item = index.nodes.get(id)!;
-    const kids = index.children.get(id);
-    const isOpen = expanded.has(id) && !!kids?.length;
-    const collapsed = (kids?.length ?? 0) > 0 && !isOpen;
-    const within: string[] = [];
-    for (let cursor = index.parent.get(id) ?? null; cursor !== null; cursor = index.parent.get(cursor) ?? null) within.unshift(index.nodes.get(cursor)!.label);
-    const loops = measured.recursion.get(id);
-    indexedDisplayed += collapsed ? index.members.get(id) ?? 0 : index.own.get(id) ?? 0;
-    return {
-      id, kind: item.kind, label: item.label, subtitle: item.subtitle, description: item.description, evidence: item.evidence, role: item.role,
-      memberCount: collapsed ? index.members.get(id) ?? 0 : item.memberCount, collapsed, open: isOpen, expandable: expandable(index, id),
-      cyclic: item.cyclic, selfLoops: loops?.count ?? 0, selfLoopIds: loops?.ids ?? [],
-      internal: measured.internal.get(id) ?? 0, within, path: item.path, ref: item.ref, evidenceIds: item.evidenceIds,
-      column: layout.column.get(id)!, row: layout.row.get(id)!, component: layout.component.get(id)!, x: layout.x.get(id)!, y: layout.y.get(id)!, degree: degree.get(id) ?? 0,
-    };
-  });
-  const edges: ViewEdge[] = [];
-  for (const [key, draft] of measured.edges) {
-    if (!windowSet.has(draft.source) || !windowSet.has(draft.target)) continue;
-    const cycle = layout.component.get(draft.source) === layout.component.get(draft.target);
-    const response = draft.relation === "responds";
-    edges.push({
-      id: key, source: draft.source, target: draft.target, direction: draft.direction, relation: draft.relation, grade: draft.grade, derived: draft.derived, label: draft.label,
-      count: draft.count, edgeIds: draft.edgeIds, evidenceIds: [...draft.evidenceIds], truncated: draft.truncated, cycle, response,
-      back: !response && !cycle && layout.column.get(draft.target)! <= layout.column.get(draft.source)!,
-    });
-  }
-  edges.sort((a, b) => compareText(a.id, b.id));
-  // Opened non-synthetic containers without relationships of their own are not cards; they stay counted.
-  let openHidden = 0;
-  for (const id of expanded) {
-    const item = index.nodes.get(id);
-    if (item && !item.synthetic && (index.children.get(id)?.length ?? 0) > 0 && !measured.shown.has(id)) openHidden++;
-  }
+  const nodes = windowIds.map(id => projectedNode(index, id, expanded, measured, layout, degree));
+  const indexedDisplayed = nodes.reduce((sum, item) => sum + (item.collapsed ? index.members.get(item.id) ?? 0 : index.own.get(item.id) ?? 0), 0);
+  const edges = projectedEdges(measured.edges, windowSet, layout);
+  const openHidden = hiddenOpenContainers(index, expanded, measured.shown);
   const edgeTotal = index.edges.reduce((sum, edge) => sum + edge.count, 0);
-  const reasons: string[] = [];
-  if (fitted.collapsed > 0) reasons.push(`Groups were collapsed to keep the view within ${maxNodes.toLocaleString()} nodes and ${maxEdges.toLocaleString()} arrows.`);
-  if (pages > 1) reasons.push(`Even fully grouped, the view has ${ids.length.toLocaleString()} nodes; showing window ${page + 1} of ${pages}.`);
-  const oversize = nodes.filter(item => item.collapsed && item.memberCount > maxNodes);
-  if (oversize.length) reasons.push(`${oversize.length === 1 ? `"${oversize[0].label}" holds` : `${oversize.length} groups hold`} more than ${maxNodes.toLocaleString()} nodes, which is more than the view can draw; use search to open an exact neighbourhood.`);
+  const paged = pages > 1 ? { page, pages, pageSize } : null;
   const total = edgeTotal + selfIndexLoops(index) + danglingCount(index);
   return {
     nodes, edges, renderer: chooseRenderer(options.mode, nodes.length, edges.length, limits),
     total: { nodes: index.totalNodes, groups: index.totalGroups, edges: total },
     displayed: { nodes: indexedDisplayed, edges: edges.reduce((sum, item) => sum + item.count, 0) },
     accounted: { internal: measured.internalTotal, recursion: measured.recursionTotal, filtered: measured.filtered, dangling: danglingCount(index), openContainers: openHidden },
-    aggregated: nodes.some(item => item.collapsed) || automatic && fitted.collapsed > 0, reason: reasons.length ? reasons.join(" ") : null,
-    paged: pages > 1 ? { page, pages, pageSize } : null,
+    aggregated: nodes.some(item => item.collapsed) || automatic && fitted.collapsed > 0,
+    reason: projectionReason(nodes, fitted.collapsed, maxNodes, maxEdges, ids.length, paged), paged,
     expanded: [...expanded], columns: layout.columns, loopKind: options.loopKind ?? "recursion",
   };
 }
 
 const danglingCount = (index: GraphIndex): number => index.dangling.reduce((sum, edge) => sum + edge.count, 0);
-const selfIndexLoops = (index: GraphIndex): number => { let sum = 0; for (const item of index.nodes.values()) if (!item.synthetic) sum += item.selfLoops; return sum; };
+const selfIndexLoops = (index: GraphIndex): number => {
+  let sum = 0;
+  for (const item of index.nodes.values()) {
+    if (!item.synthetic) sum += item.selfLoops;
+  }
+  return sum;
+};
 
 /** Edge accounting: drawn + inside cards + recursion + filtered + dangling equals the model total, unless the view is windowed. */
 export function edgeCountsReconcile(index: GraphIndex, projection: Projection): boolean {
@@ -695,6 +857,13 @@ const ROLE_BY_KIND: Partial<Record<SystemNodeKind, Role>> = {
 };
 const AMBIGUOUS: ReadonlySet<string> = new Set<SystemNodeKind>(["external", "service", "sidecar"]);
 
+function systemRole(kind: SystemNodeKind, id: string, inbound: ReadonlySet<string>, outbound: ReadonlySet<string>): Role | null {
+  const role = ROLE_BY_KIND[kind] ?? null;
+  if (role !== null || !AMBIGUOUS.has(kind)) return role;
+  if (outbound.has(id) || !inbound.has(id)) return "output";
+  return "input";
+}
+
 /**
  * The Architect's system diagram as a model. Nodes keep their evidence ids; arrows keep certainty and the static fact id as grade/evidence.
  * Ambiguous kinds (external/service/sidecar) become inputs when only they call the application, outputs when the application calls them.
@@ -709,8 +878,7 @@ export function modelFromSystem(payload: SystemOverviewPayload): GraphModel {
     if (insideApp(edge.sourceId) && !insideApp(edge.targetId)) outbound.add(edge.targetId);
   }
   const nodes = payload.nodes.map(item => {
-    let role: Role | null = ROLE_BY_KIND[item.kind] ?? null;
-    if (role === null && AMBIGUOUS.has(item.kind)) role = outbound.has(item.id) ? "output" : inbound.has(item.id) ? "input" : "output";
+    const role = systemRole(item.kind, item.id, inbound, outbound);
     return node({
       id: item.id, kind: item.kind, label: item.label, description: item.description, parentId: item.parentId, evidence: "analysis", role,
       evidenceIds: item.evidenceIds, subtitle: item.kind,
@@ -758,6 +926,60 @@ function commonDirectory(paths: readonly string[]): string {
   return prefix.join("/");
 }
 
+function ensureDirectory(containers: Map<string, ModelNode>, path: string): string {
+  const id = dirId(path);
+  if (containers.has(id)) return id;
+  const parent = path === "" ? null : ensureDirectory(containers, dirOf(path));
+  containers.set(id, node({ id, kind: "directory", label: path === "" ? "." : baseName(path), subtitle: path, parentId: parent, synthetic: true, path: path === "" ? null : path }));
+  return id;
+}
+
+function ensureFileContainer(containers: Map<string, ModelNode>, path: string): string {
+  const id = fileContainerId(path);
+  if (containers.has(id)) return id;
+  const parent = ensureDirectory(containers, dirOf(path));
+  containers.set(id, node({ id, kind: "file", label: baseName(path), subtitle: path, parentId: parent, synthetic: true, path }));
+  return id;
+}
+
+function cycleGroupNode(group: OverviewGroupRow, parent: string, level: SourceIndexLevel): ModelNode {
+  return node({
+    id: group.id, kind: "cycle", label: group.label, parentId: parent, cyclic: true, memberCount: group.memberCount, ref: group.id,
+    evidence: "parsed", subtitle: `${group.memberCount} ${level} in a cycle`, lazyMembers: group.membersTruncated ? [] : [...group.members],
+  });
+}
+
+function fileGroupNode(group: OverviewGroupRow, files: ReadonlyMap<string, SourceFileRow>, containers: Map<string, ModelNode>): ModelNode {
+  if (group.memberCount === 1 && group.members.length === 1) {
+    const memberId = group.members[0];
+    const row = files.get(memberId);
+    const path = row?.path ?? group.label;
+    return node({
+      id: memberId, kind: "file", label: baseName(group.label), subtitle: path, parentId: ensureDirectory(containers, dirOf(path)),
+      evidence: row ? FILE_STATUS[row.status] ?? "none" : "none", path, ref: memberId, cyclic: group.cyclic, selfLoops: group.internalEdges, memberCount: 1,
+    });
+  }
+  const known = group.members.map(member => files.get(member)?.path).filter((value): value is string => !!value);
+  return cycleGroupNode(group, ensureDirectory(containers, commonDirectory(known)), "files");
+}
+
+function symbolGroupNode(group: OverviewGroupRow, symbols: ReadonlyMap<string, SourceSymbolRow>, containers: Map<string, ModelNode>): ModelNode {
+  if (group.memberCount === 1 && group.members.length === 1) {
+    const memberId = group.members[0];
+    const row = symbols.get(memberId);
+    const path = row?.path ?? null;
+    const parent = path !== null ? ensureFileContainer(containers, path) : ensureDirectory(containers, "");
+    return node({
+      id: memberId, kind: row?.kind ?? "function", label: group.label, subtitle: row ? `${row.path}:${row.span.lineStart}` : "",
+      parentId: parent, evidence: "parsed", path, ref: memberId, cyclic: group.cyclic, selfLoops: group.internalEdges, memberCount: 1,
+    });
+  }
+  const known = group.members.map(member => symbols.get(member)?.path).filter((value): value is string => !!value);
+  const sameFile = known.length > 0 && known.every(value => value === known[0]);
+  const parent = sameFile ? ensureFileContainer(containers, known[0]) : ensureDirectory(containers, commonDirectory(known));
+  return cycleGroupNode(group, parent, "functions");
+}
+
 /**
  * The index's per-node strongly-connected overview as a model. Every group is a node (isolated files/functions included); every link
  * keeps its relation, resolution, derived flag, total count and the sampled underlying edge ids. Directories (and files, for functions)
@@ -769,64 +991,12 @@ export function modelFromOverview(input: OverviewInput): GraphModel {
   const nodes: ModelNode[] = [];
   const nodeOfGroup = new Map<string, string>();
   const containers = new Map<string, ModelNode>();
-  const ensureDir = (path: string): string => {
-    const id = dirId(path);
-    if (containers.has(id)) return id;
-    const parent = path === "" ? null : ensureDir(dirOf(path));
-    containers.set(id, node({ id, kind: "directory", label: path === "" ? "." : baseName(path), subtitle: path, parentId: parent, synthetic: true, path: path === "" ? null : path }));
-    return id;
-  };
-  const ensureFile = (path: string): string => {
-    const id = fileContainerId(path);
-    if (containers.has(id)) return id;
-    const parent = ensureDir(dirOf(path));
-    containers.set(id, node({ id, kind: "file", label: baseName(path), subtitle: path, parentId: parent, synthetic: true, path }));
-    return id;
-  };
-  ensureDir("");
-  for (const directory of input.directories ?? []) ensureDir(directory);
+  ensureDirectory(containers, "");
+  for (const directory of input.directories ?? []) ensureDirectory(containers, directory);
   for (const group of input.groups) {
-    const single = group.memberCount === 1 && group.members.length === 1;
-    const memberId = group.members[0];
-    let path: string | null = null;
-    let parent: string;
-    let kind = "cycle";
-    let evidence: EvidenceState = "none";
-    let subtitle = "";
-    const id = single ? memberId : group.id;
-    if (input.level === "files") {
-      const row = single ? files.get(memberId) : undefined;
-      path = single ? row?.path ?? group.label : null;
-      if (single) { kind = "file"; evidence = row ? FILE_STATUS[row.status] ?? "none" : "none"; subtitle = row?.language ?? ""; }
-      else {
-        const known = group.members.map(member => files.get(member)?.path).filter((value): value is string => !!value);
-        parent = ensureDir(commonDirectory(known));
-        nodes.push(node({ id, kind, label: group.label, parentId: parent, cyclic: true, memberCount: group.memberCount, path: null, ref: group.id, evidence: "parsed", subtitle: `${group.memberCount} files in a cycle`, lazyMembers: group.membersTruncated ? [] : [...group.members] }));
-        nodeOfGroup.set(group.id, id);
-        continue;
-      }
-      parent = ensureDir(dirOf(path ?? group.label));
-    } else {
-      const row = single ? symbols.get(memberId) : undefined;
-      if (single) {
-        path = row?.path ?? null; kind = row?.kind ?? "function"; evidence = "parsed";
-        subtitle = row ? `${row.path}:${row.span.lineStart}` : "";
-        parent = path !== null ? ensureFile(path) : ensureDir("");
-      } else {
-        const known = group.members.map(member => symbols.get(member)?.path).filter((value): value is string => !!value);
-        const common = commonDirectory(known);
-        const sameFile = known.length > 0 && known.every(value => value === known[0]);
-        parent = sameFile ? ensureFile(known[0]) : ensureDir(common);
-        nodes.push(node({ id, kind, label: group.label, parentId: parent, cyclic: true, memberCount: group.memberCount, ref: group.id, evidence: "parsed", subtitle: `${group.memberCount} functions in a cycle`, lazyMembers: group.membersTruncated ? [] : [...group.members] }));
-        nodeOfGroup.set(group.id, id);
-        continue;
-      }
-    }
-    nodes.push(node({
-      id, kind, label: input.level === "files" ? baseName(group.label) : group.label, subtitle: input.level === "files" ? path ?? "" : subtitle,
-      parentId: parent, evidence, path, ref: memberId, cyclic: group.cyclic, selfLoops: group.internalEdges, memberCount: 1,
-    }));
-    nodeOfGroup.set(group.id, id);
+    const item = input.level === "files" ? fileGroupNode(group, files, containers) : symbolGroupNode(group, symbols, containers);
+    nodes.push(item);
+    nodeOfGroup.set(group.id, item.id);
   }
   const edges: ModelEdge[] = [];
   for (const group of input.groups) {
@@ -872,6 +1042,32 @@ export interface NeighborhoodInput {
   rows: readonly NeighborRow[];
 }
 
+function addNeighborPeer(nodes: Map<string, ModelNode>, level: SourceIndexLevel, id: string, label: string | null): void {
+  if (nodes.has(id)) return;
+  const file = level === "files";
+  let displayLabel = id;
+  if (label) displayLabel = file ? baseName(label) : label;
+  nodes.set(id, node({
+    id, kind: file ? "file" : "function", label: displayLabel, subtitle: file ? label ?? "" : "", path: file ? label : null, ref: id, evidence: "parsed",
+  }));
+}
+
+function edgeFromNeighbor(centerId: string, row: Extract<NeighborRow, { kind: "edge" }>): ModelEdge {
+  const outgoing = row.direction === "out";
+  return {
+    id: row.edge.id, source: outgoing ? centerId : row.peerId, target: outgoing ? row.peerId : centerId, direction: "directed", relation: row.edge.relation,
+    grade: row.edge.resolution, derived: false, label: row.edge.relation, count: 1, evidenceIds: row.edge.evidenceIds, truncated: false,
+  };
+}
+
+function edgeFromAggregateNeighbor(centerId: string, peerId: string, row: Extract<NeighborRow, { kind: "aggregate" }>): ModelEdge {
+  const outgoing = row.direction === "out";
+  return {
+    id: `agg:${row.direction}:${peerId}:${row.relation}:${row.resolution}`, source: outgoing ? centerId : peerId, target: outgoing ? peerId : centerId, direction: "directed",
+    relation: row.relation, grade: row.resolution, derived: true, label: row.relation, count: row.count, evidenceIds: row.edgeIds, truncated: row.edgeIdsTruncated || row.count > row.edgeIds.length,
+  };
+}
+
 /** Exact neighbourhood of one node from neighbour rows: peers become nodes, edge rows keep their site evidence, missing endpoints stay sites. */
 export function modelFromNeighbors(input: NeighborhoodInput): { model: GraphModel; sites: SourceSiteRow[] } {
   const nodes = new Map<string, ModelNode>();
@@ -879,25 +1075,13 @@ export function modelFromNeighbors(input: NeighborhoodInput): { model: GraphMode
   const sites: SourceSiteRow[] = [];
   const kind = input.level === "files" ? "file" : "function";
   nodes.set(input.centerId, node({ id: input.centerId, kind, label: input.level === "files" ? baseName(input.centerLabel) : input.centerLabel, subtitle: input.centerPath ?? "", path: input.centerPath, ref: input.centerId, evidence: "parsed" }));
-  const peer = (id: string, label: string | null): void => {
-    if (nodes.has(id)) return;
-    nodes.set(id, node({ id, kind, label: label ? (input.level === "files" ? baseName(label) : label) : id, subtitle: input.level === "files" ? label ?? "" : "", path: input.level === "files" ? label : null, ref: id, evidence: "parsed" }));
-  };
   for (const row of input.rows) {
     if (row.kind === "edge") {
-      peer(row.peerId, row.peerLabel);
-      const outgoing = row.direction === "out";
-      edges.push({
-        id: row.edge.id, source: outgoing ? input.centerId : row.peerId, target: outgoing ? row.peerId : input.centerId, direction: "directed", relation: row.edge.relation,
-        grade: row.edge.resolution, derived: false, label: row.edge.relation, count: 1, evidenceIds: row.edge.evidenceIds, truncated: false,
-      });
+      addNeighborPeer(nodes, input.level, row.peerId, row.peerLabel);
+      edges.push(edgeFromNeighbor(input.centerId, row));
     } else if (row.kind === "aggregate" && row.peerId) {
-      peer(row.peerId, row.peerLabel);
-      const outgoing = row.direction === "out";
-      edges.push({
-        id: `agg:${row.direction}:${row.peerId}:${row.relation}:${row.resolution}`, source: outgoing ? input.centerId : row.peerId, target: outgoing ? row.peerId : input.centerId, direction: "directed",
-        relation: row.relation, grade: row.resolution, derived: true, label: row.relation, count: row.count, evidenceIds: row.edgeIds, truncated: row.edgeIdsTruncated || row.count > row.edgeIds.length,
-      });
+      addNeighborPeer(nodes, input.level, row.peerId, row.peerLabel);
+      edges.push(edgeFromAggregateNeighbor(input.centerId, row.peerId, row));
     } else if (row.kind === "site") sites.push(row.site);
   }
   return { model: { nodes: [...nodes.values()], edges }, sites };
@@ -966,7 +1150,10 @@ export const edgeDashed = (edge: Pick<ViewEdge, "grade" | "response">): boolean 
 /** Only directed records get an arrowhead; an undirected relationship is a plain line. */
 export const edgeArrow = (edge: Pick<ViewEdge, "direction">): boolean => edge.direction === "directed";
 /** Name of a card's relationships to itself: source recursion, or a graph-domain self-link. */
-export const loopText = (kind: LoopKind, count: number): string => kind === "selfLink" ? (count === 1 ? "Self-link" : "Self-links") : count === 1 ? "recursive reference" : "recursive references";
+export const loopText = (kind: LoopKind, count: number): string => {
+  if (kind === "selfLink") return count === 1 ? "Self-link" : "Self-links";
+  return count === 1 ? "recursive reference" : "recursive references";
+};
 
 /** Display-only clipping; the full text always stays in the model and is shown on selection. */
 export function clipText(text: string, max: number): string {

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 const FRAME_LIMIT: usize = 16 * 1024;
@@ -128,6 +128,69 @@ fn write_frame(stream: &mut TcpStream, value: &impl Serialize) -> Result<()> {
     stream.write_all(&bytes).map_err(|_| CLOSE_OTHER.to_string())
 }
 
+fn handover_status(result: Result<()>) -> (&'static str, Option<String>) {
+    match result {
+        Ok(()) => ("released", None),
+        Err(error) if error == BUSY_MESSAGE => ("busy", Some("Code quality is busy. Retry after the current operation finishes.".into())),
+        Err(error) => ("error", Some(error)),
+    }
+}
+
+fn valid_handover(request: &Request, generation: &str, capability: &str) -> bool {
+    request.version == 1 && request.instance_id == generation && request.capability == capability
+        && request.action == "handover" && uuid::Uuid::parse_str(&request.request_id).is_ok()
+}
+
+fn serve_handover(mut stream: TcpStream, weak: &Weak<CodeQualityService>, generation: &str, capability: &str) {
+    // Accepted sockets can inherit nonblocking mode on Windows.
+    let Ok(request) = stream.set_nonblocking(false).map_err(|e| e.to_string())
+        .and_then(|_| read_frame::<Request>(&mut stream, Instant::now() + HEADER_TIMEOUT)) else { return; };
+    if !valid_handover(&request, generation, capability) { return; }
+    let Some(service) = weak.upgrade() else { return; };
+    let (status, message) = handover_status(service.handover(generation, Instant::now() + TRANSFER_TIMEOUT));
+    let _ = write_frame(&mut stream, &Response { version: 1, instance_id: generation.to_owned(), request_id: request.request_id, status: status.into(), message });
+}
+
+fn dispatch_handover(stream: TcpStream, address: SocketAddr, weak: &Weak<CodeQualityService>, active: &Arc<AtomicUsize>, descriptor: (&str, &str)) {
+    if !address.ip().is_loopback() { return; }
+    if active.fetch_add(1, Ordering::AcqRel) >= 8 {
+        active.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+    let weak = weak.clone();
+    let (generation, capability) = (descriptor.0.to_owned(), descriptor.1.to_owned());
+    let (finished, failed) = (active.clone(), active.clone());
+    let handler = move || {
+        serve_handover(stream, &weak, &generation, &capability);
+        finished.fetch_sub(1, Ordering::AcqRel);
+    };
+    if std::thread::Builder::new().name("code-quality-handover-request".into()).spawn(handler).is_err() {
+        failed.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn accept_handovers(listener: TcpListener, stopping: &AtomicBool, weak: &Weak<CodeQualityService>, active: &Arc<AtomicUsize>, generation: &str, capability: &str) {
+    while !stopping.load(Ordering::Acquire) && weak.strong_count() != 0 {
+        match listener.accept() {
+            Ok((stream, address)) => dispatch_handover(stream, address, weak, active, (generation, capability)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Cancels `cancel` when the returned sender is still alive at `deadline`; dropping it disarms the watchdog.
+fn cancel_at_deadline(cancel: Arc<AtomicBool>, deadline: Instant) -> Result<std::sync::mpsc::Sender<()>> {
+    let (done, completed) = std::sync::mpsc::channel::<()>();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    std::thread::Builder::new().name("code-quality-handover-deadline".into()).spawn(move || {
+        if matches!(completed.recv_timeout(remaining), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }).map_err(|e| e.to_string())?;
+    Ok(done)
+}
+
 impl CodeQualityService {
     pub(crate) fn owns_resources(&self) -> bool { self.ownership.lock().lock.is_some() }
 
@@ -151,51 +214,8 @@ impl CodeQualityService {
         let stopping = stop.clone();
         let weak = Arc::downgrade(self);
         let active = Arc::new(AtomicUsize::new(0));
-        let generation = descriptor.instance_id;
-        let capability = descriptor.capability;
         let thread = std::thread::Builder::new().name("code-quality-handover".into()).spawn(move || {
-            while !stopping.load(Ordering::Acquire) && weak.strong_count() != 0 {
-                match listener.accept() {
-                    Ok((mut stream, address)) => {
-                        if !address.ip().is_loopback() { continue; }
-                        if active.fetch_add(1, Ordering::AcqRel) >= 8 {
-                            active.fetch_sub(1, Ordering::AcqRel);
-                            continue;
-                        }
-                        let weak = weak.clone();
-                        let generation = generation.clone();
-                        let capability = capability.clone();
-                        let active = active.clone();
-                        let failed_active = active.clone();
-                        let handler = move || {
-                            // Accepted sockets can inherit nonblocking mode on Windows.
-                            let result = stream.set_nonblocking(false).map_err(|e| e.to_string()).and_then(|_| {
-                                read_frame::<Request>(&mut stream, Instant::now() + HEADER_TIMEOUT)
-                            });
-                            if let Ok(request) = result {
-                                if request.version == 1 && request.instance_id == generation && request.capability == capability
-                                    && request.action == "handover" && uuid::Uuid::parse_str(&request.request_id).is_ok() {
-                                    if let Some(service) = weak.upgrade() {
-                                        let result = service.handover(&generation, Instant::now() + TRANSFER_TIMEOUT);
-                                        let (status, message) = match result {
-                                            Ok(()) => ("released", None),
-                                            Err(error) if error == BUSY_MESSAGE => ("busy", Some("Code quality is busy. Retry after the current operation finishes.".into())),
-                                            Err(error) => ("error", Some(error)),
-                                        };
-                                        let _ = write_frame(&mut stream, &Response { version: 1, instance_id: generation, request_id: request.request_id, status: status.into(), message });
-                                    }
-                                }
-                            }
-                            active.fetch_sub(1, Ordering::AcqRel);
-                        };
-                        if std::thread::Builder::new().name("code-quality-handover-request".into()).spawn(handler).is_err() {
-                            failed_active.fetch_sub(1, Ordering::AcqRel);
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => break,
-                }
-            }
+            accept_handovers(listener, &stopping, &weak, &active, &descriptor.instance_id, &descriptor.capability);
         }).map_err(|e| e.to_string())?;
         ownership.listener = Some(ListenerHandle { stop, thread: Some(thread) });
         Ok(())
@@ -302,45 +322,42 @@ impl CodeQualityService {
         }
     }
 
-    fn handover(self: &Arc<Self>, generation: &str, deadline: Instant) -> Result<()> {
-        {
-            let mut ownership = self.ownership.lock();
-            if ownership.lock.is_none() || ownership.instance_id != generation || ownership.handed_off { return Err(CLOSE_OTHER.into()); }
-            if ownership.transferring || self.closing.load(Ordering::Relaxed) { return Err(BUSY_MESSAGE.into()); }
-            let inner = self.inner.lock();
-            if inner.busy && inner.active_scan.is_none() { return Err(BUSY_MESSAGE.into()); }
-            ownership.transferring = true;
-            if let Some(scan) = &inner.active_scan { scan.cancel.store(true, Ordering::Relaxed); }
+    fn begin_transfer(&self, generation: &str) -> Result<()> {
+        let mut ownership = self.ownership.lock();
+        if ownership.lock.is_none() || ownership.instance_id != generation || ownership.handed_off { return Err(CLOSE_OTHER.into()); }
+        if ownership.transferring || self.closing.load(Ordering::Relaxed) { return Err(BUSY_MESSAGE.into()); }
+        let inner = self.inner.lock();
+        if inner.busy && inner.active_scan.is_none() { return Err(BUSY_MESSAGE.into()); }
+        ownership.transferring = true;
+        if let Some(scan) = &inner.active_scan { scan.cancel.store(true, Ordering::Relaxed); }
+        Ok(())
+    }
+
+    fn release_before(self: &Arc<Self>, deadline: Instant) -> Result<()> {
+        while self.inner.lock().busy {
+            if Instant::now() >= deadline { return Err("The active scan did not finish cancelling; control was not released.".into()); }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        let result: Result<()> = (|| {
-            while self.inner.lock().busy {
-                if Instant::now() >= deadline { return Err("The active scan did not finish cancelling; control was not released.".into()); }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if Instant::now() >= deadline { return Err("Code quality handover timed out; control was not released.".into()); }
-            let gate = self.admit_internal(QualityPhase::Stopping, None, true, false)?;
-            let (done, completed) = std::sync::mpsc::channel::<()>();
-            let cancel = gate.ctl.cancel.clone();
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            std::thread::Builder::new().name("code-quality-handover-deadline".into()).spawn(move || {
-                if matches!(completed.recv_timeout(remaining), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
-                    cancel.store(true, Ordering::Relaxed);
-                }
-            }).map_err(|e| e.to_string())?;
-            let _done = done;
-            self.verify_pending_tasks_stopped()?;
-            self.stop_recorded_servers(&gate)?;
-            if self.has_unresolved() || Instant::now() >= deadline { return Err("Managed work could not be confirmed stopped; control was not released.".into()); }
-            {
-                let mut inner = self.inner.lock();
-                inner.effective = None;
-                inner.community.running = Some(false);
-                inner.error = None;
-            }
-            gate.finish(QualityPhase::Idle, None);
-            self.release_owner(true);
-            Ok(())
-        })();
+        if Instant::now() >= deadline { return Err("Code quality handover timed out; control was not released.".into()); }
+        let gate = self.admit_internal(QualityPhase::Stopping, None, true, false)?;
+        let _done = cancel_at_deadline(gate.ctl.cancel.clone(), deadline)?;
+        self.verify_pending_tasks_stopped()?;
+        self.stop_recorded_servers(&gate)?;
+        if self.has_unresolved() || Instant::now() >= deadline { return Err("Managed work could not be confirmed stopped; control was not released.".into()); }
+        {
+            let mut inner = self.inner.lock();
+            inner.effective = None;
+            inner.community.running = Some(false);
+            inner.error = None;
+        }
+        gate.finish(QualityPhase::Idle, None);
+        self.release_owner(true);
+        Ok(())
+    }
+
+    fn handover(self: &Arc<Self>, generation: &str, deadline: Instant) -> Result<()> {
+        self.begin_transfer(generation)?;
+        let result = self.release_before(deadline);
         if let Err(error) = &result { self.inner.lock().error = Some(error.clone()); }
         self.ownership.lock().transferring = false;
         result

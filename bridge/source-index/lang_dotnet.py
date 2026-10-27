@@ -375,7 +375,6 @@ class CSharpVisitor(Visitor):
 
     def _callee(self, fn):
         t = fn.type
-        raw = self.text(fn)
         if t in ("identifier", "generic_name"):
             name, gen = self._simple(fn)
             b = {"kind": "identifier", "name": name, "receiver": None, "receiverKind": None}
@@ -383,20 +382,9 @@ class CSharpVisitor(Visitor):
                 b["generic"] = True
             return b, False
         if t == "member_access_expression":
-            expr = fn.child_by_field_name("expression")
-            name, gen = self._simple(fn.child_by_field_name("name"))
-            if expr is None:
-                # `this`/`base` keyword receivers appear as anonymous tokens
-                tok = next((c for c in fn.children if c.type in ("this", "base")), None)
-                recv_text = self.text(tok) if tok is not None else None
-                rk = "this" if tok is not None and tok.type == "this" else ("super" if tok is not None else None)
-            else:
-                recv_text, rk = self.text(expr), self._rk(expr)
-            if name is not None:
-                b = {"kind": "path" if rk == "path" else "member", "name": name, "receiver": recv_text, "receiverKind": rk}
-                if gen:
-                    b["generic"] = True
-                return b, False
+            binding = self._member_callee(fn)
+            if binding is not None:
+                return binding, False
         if t == "conditional_access_expression":
             cond = fn.child_by_field_name("condition")
             mb = child_of_type(fn, "member_binding_expression")
@@ -405,6 +393,24 @@ class CSharpVisitor(Visitor):
                 return {"kind": "member", "name": name, "receiver": self.text(cond) if cond is not None else None,
                         "receiverKind": self._rk(cond), "safeCall": True}, False
         return {"kind": "dynamic", "name": None, "receiver": None, "receiverKind": None, "dynamic": True}, True
+
+    def _member_callee(self, fn):
+        expr = fn.child_by_field_name("expression")
+        name, generic = self._simple(fn.child_by_field_name("name"))
+        if expr is None:
+            # `this`/`base` keyword receivers appear as anonymous tokens.
+            token = next((c for c in fn.children if c.type in ("this", "base")), None)
+            receiver = self.text(token) if token is not None else None
+            receiver_kind = self._rk(token)
+        else:
+            receiver, receiver_kind = self.text(expr), self._rk(expr)
+        if name is None:
+            return None
+        binding = {"kind": "path" if receiver_kind == "path" else "member", "name": name,
+                   "receiver": receiver, "receiverKind": receiver_kind}
+        if generic:
+            binding["generic"] = True
+        return binding
 
     def visit_invocation_expression(self, node):
         fn = node.child_by_field_name("function")
@@ -435,11 +441,13 @@ class CSharpVisitor(Visitor):
         first = node.children[0] if node.children else None
         # the keyword precedes the argument list: `: base(...)` / `: this(...)`
         kw = next((c for c in node.children if c.type in ("base", "this")), None)
-        name = self.text(kw) if kw is not None else (self.text(first) if first is not None else "base")
+        name = self.text(first) if first is not None else "base"
+        if kw is not None:
+            name = self.text(kw)
         self.site("calls", node, name, {"kind": "identifier", "name": name, "receiver": None, "receiverKind": None,
                                         "constructor": True}, node_kind="constructor_initializer")
         return None
 
 
-def extract(language: str, source: bytes, ctx: common.Context) -> dict:
+def extract(_language: str, _source: bytes, ctx: common.Context) -> dict:
     return kit_walk.run_extract(ctx, CSharpVisitor)

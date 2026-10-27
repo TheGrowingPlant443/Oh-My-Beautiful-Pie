@@ -50,6 +50,7 @@ PROFILES = {
 }
 
 _IDENT = frozenset({"identifier"})
+_INIT = "<init>"
 
 
 def _last(dotted: str) -> str:
@@ -102,7 +103,9 @@ class _Base(Visitor):
 
     def import_site(self, node, spec: str, imported, alias, namespace: bool, *, raw: str | None = None,
                     kind: str = "import", **extra) -> dict:
-        local = None if namespace else (alias if alias else imported)
+        local = alias or imported
+        if namespace:
+            local = None
         if local == "_":
             local = None
         binding = {"kind": kind, "specifier": spec, "imported": imported, "alias": alias, "default": False,
@@ -238,21 +241,30 @@ class JavaVisitor(_Base):
         return None
 
     # -- callables ---------------------------------------------------------------------------------
-    def _params(self, plist, rng) -> list[str]:
+    def _params(self, plist) -> list[str]:
         names: list[str] = []
         if plist is None:
             return names
         for p in plist.children:
-            if p.type in ("formal_parameter", "spread_parameter", "receiver_parameter"):
-                n = p.child_by_field_name("name")
-                if n is None:
-                    ids = [c for c in p.children if c.type in ("identifier", "variable_declarator")]
-                    n = ids[-1] if ids else None
-                    if n is not None and n.type == "variable_declarator":
-                        n = n.child_by_field_name("name")
-                if n is not None:
-                    names.append(self.text(n))
+            if p.type not in ("formal_parameter", "spread_parameter", "receiver_parameter"):
+                continue
+            n = self._parameter_name(p)
+            if n is not None:
+                names.append(self.text(n))
         return names
+
+    @staticmethod
+    def _parameter_name(parameter):
+        name = parameter.child_by_field_name("name")
+        if name is not None:
+            return name
+        ids = [c for c in parameter.children if c.type in ("identifier", "variable_declarator")]
+        if not ids:
+            return None
+        name = ids[-1]
+        if name.type == "variable_declarator":
+            return name.child_by_field_name("name")
+        return name
 
     def _callable(self, node, kind: str, name: str, extra: dict | None = None):
         mods = self.modifiers(node)
@@ -263,7 +275,7 @@ class JavaVisitor(_Base):
             b.update(extra)
         in_iface = node.parent is not None and node.parent.type == "interface_body"
         sym = self.open_symbol(node, kind, name, bindings=b, exported=self._exp(mods, in_iface))
-        sym["bindings"]["parameters"] = self._params(node.child_by_field_name("parameters"), None)
+        sym["bindings"]["parameters"] = self._params(node.child_by_field_name("parameters"))
         owner = self._outer_owner()
         if kind == "method":
             start, end = self.container_range(node)
@@ -289,7 +301,7 @@ class JavaVisitor(_Base):
 
     def visit_block(self, node):
         if node.parent is not None and node.parent.type == "class_body":
-            self.open_symbol(node, "initializer", "<init>", bindings={"static": False, "body": True},
+            self.open_symbol(node, "initializer", _INIT, bindings={"static": False, "body": True},
                              scope_name=f"<init@{node.start_point[0] + 1}>")
         return None
 
@@ -340,7 +352,9 @@ class JavaVisitor(_Base):
         obj = node.child_by_field_name("object")
         recv = self.text(obj) if obj is not None else None
         rk = self._receiver_kind(obj)
-        kind = "identifier" if obj is None else ("path" if rk == "path" else "member")
+        kind = "path" if rk == "path" else "member"
+        if obj is None:
+            kind = "identifier"
         b = {"kind": kind, "name": self.text(name), "receiver": recv, "receiverKind": rk}
         raw = f"{recv}.{self.text(name)}" if recv else self.text(name)
         self.callee_site(node, raw, b)
@@ -399,7 +413,7 @@ class GroovyVisitor(JavaVisitor):
         body = node.child_by_field_name("body")
         b = {"body": body is not None, "script": True}
         sym = self.open_symbol(node, "function", name, bindings=b, exported=True)
-        sym["bindings"]["parameters"] = self._params(node.child_by_field_name("parameters"), None)
+        sym["bindings"]["parameters"] = self._params(node.child_by_field_name("parameters"))
         self.ctx.declare(name, "function", 0, len(self.ctx.source), symbol_id=sym["id"], owner=self._outer_owner())
         return None
 
@@ -510,7 +524,9 @@ class KotlinVisitor(_Base):
         name = self.field_text(node, "name") or ""
         is_iface = any(c.type == "interface" for c in node.children)
         mods = self._mods(node)
-        kind = "interface" if is_iface else ("enum" if "enum" in mods else "class")
+        kind = "enum" if "enum" in mods else "class"
+        if is_iface:
+            kind = "interface"
         self._class_like(node, kind, name, {"data": "data" in mods})
         return None
 
@@ -594,14 +610,14 @@ class KotlinVisitor(_Base):
     def visit_secondary_constructor(self, node):
         cls = self.ctx.current_scope
         cname = cls.name if cls is not None else ""
-        sym = self.open_symbol(node, "constructor", "constructor", qualified=self.qual("<init>"),
-                               scope_name="<init>", bindings={"body": True, "className": cname})
+        sym = self.open_symbol(node, "constructor", "constructor", qualified=self.qual(_INIT),
+                               scope_name=_INIT, bindings={"body": True, "className": cname})
         rng = (node.start_byte, node.end_byte)
         sym["bindings"]["parameters"] = self._params(node, rng)
         return None
 
     def visit_anonymous_initializer(self, node):
-        self.open_symbol(node, "initializer", "<init>", bindings={"body": True},
+        self.open_symbol(node, "initializer", _INIT, bindings={"body": True},
                          scope_name=f"<init@{node.start_point[0] + 1}>")
         return None
 
@@ -614,7 +630,7 @@ class KotlinVisitor(_Base):
                 n = child_of_type(vd, "identifier")
                 prop = self.text(n) if n is not None else ""
         label = f"{which} {prop}".strip()
-        sym = self.open_symbol(node, "accessor", which, qualified=self.qual(label), scope_name=label,
+        self.open_symbol(node, "accessor", which, qualified=self.qual(label), scope_name=label,
                                bindings={"property": prop, "accessor": which, "body": True})
         if which == "set":
             n = child_of_type(node, "identifier")
@@ -650,12 +666,7 @@ class KotlinVisitor(_Base):
 
     # -- variables ---------------------------------------------------------------------------------------
     def visit_property_declaration(self, node):
-        vds = []
-        for c in node.children:
-            if c.type == "variable_declaration":
-                vds.append(c)
-            elif c.type == "multi_variable_declaration":
-                vds += children_of_type(c, "variable_declaration")
+        vds = self._property_variables(node)
         value = None
         for c in node.children:
             if c.is_named and c.type not in ("variable_declaration", "multi_variable_declaration", "modifiers",
@@ -665,19 +676,25 @@ class KotlinVisitor(_Base):
                 break
         if value is not None and value.type == "property_delegate":
             value = None
-        mods = self._mods(node)
-        member = self._in_class_body(node)
+        range_for = self.container_range if self._in_class_body(node) else self.local_range
         for vd in vds:
             n = child_of_type(vd, "identifier")
             if n is None:
                 continue
-            if member:
-                start, end = self.container_range(node)
-            else:
-                start, end = self.local_range(node)
+            start, end = range_for(node)
             self.declare(self.text(n), "variable", start, end, mutable="val" not in self.text(node)[:8],
                          value=value if len(vds) == 1 else None, position=n.start_byte)
         return None
+
+    @staticmethod
+    def _property_variables(node):
+        variables = []
+        for child in node.children:
+            if child.type == "variable_declaration":
+                variables.append(child)
+            elif child.type == "multi_variable_declaration":
+                variables += children_of_type(child, "variable_declaration")
+        return variables
 
     def visit_for_statement(self, node):
         for vd in children_of_type(node, "variable_declaration"):
@@ -785,21 +802,24 @@ class ScalaVisitor(_Base):
             self.import_site(node, path, None, None, True, raw=raw, wildcardKind=self.text(direct_wild))
         if sel is not None:
             for c in sel.children:
-                if not c.is_named:
-                    continue
-                if c.type == "identifier":
-                    self.import_site(c, f"{path}.{self.text(c)}", self.text(c), None, False, raw=raw)
-                elif c.type == "arrow_renamed_identifier":
-                    nm = c.child_by_field_name("name")
-                    al = c.child_by_field_name("alias")
-                    nm_t = self.text(nm) if nm is not None else ""
-                    al_t = self.text(al) if al is not None else None
-                    self.import_site(c, f"{path}.{nm_t}", nm_t, al_t, False, raw=raw, hidden=al_t == "_")
-                elif c.type == "namespace_wildcard":
-                    self.import_site(c, path, None, None, True, raw=raw, wildcardKind=self.text(c))
-                else:  # given selectors etc.: kept lossless, not analyzed
-                    self.import_site(c, f"{path}", None, None, True, raw=raw, selector=self.text(c), given=True)
+                if c.is_named:
+                    self._import_selector(c, path, raw)
         return None
+
+    def _import_selector(self, node, path, raw):
+        if node.type == "identifier":
+            self.import_site(node, f"{path}.{self.text(node)}", self.text(node), None, False, raw=raw)
+        elif node.type == "arrow_renamed_identifier":
+            name = node.child_by_field_name("name")
+            alias = node.child_by_field_name("alias")
+            name_text = self.text(name) if name is not None else ""
+            alias_text = self.text(alias) if alias is not None else None
+            self.import_site(node, f"{path}.{name_text}", name_text, alias_text, False,
+                             raw=raw, hidden=alias_text == "_")
+        elif node.type == "namespace_wildcard":
+            self.import_site(node, path, None, None, True, raw=raw, wildcardKind=self.text(node))
+        else:  # given selectors etc.: kept lossless, not analyzed
+            self.import_site(node, path, None, None, True, raw=raw, selector=self.text(node), given=True)
 
     # -- types --------------------------------------------------------------------------------------------
     def _extends(self, node) -> list[str]:
@@ -863,14 +883,13 @@ class ScalaVisitor(_Base):
         return None
 
     # -- callables -----------------------------------------------------------------------------------------
-    def _function(self, node, has_body_default: bool):
+    def _function(self, node):
         name = self.field_text(node, "name") or ""
         mods = self._mods(node)
         body = node.child_by_field_name("body")
         p = node.parent
         in_class = p is not None and p.type in self._CLASS_BODIES
-        in_ext = p is not None and p.parent is not None and p.type == "extension_definition" or (
-            p is not None and p.type == "extension_definition")
+        in_ext = p is not None and p.type == "extension_definition"
         kind = "function"
         if name == "this" and in_class:
             kind = "constructor"
@@ -880,25 +899,26 @@ class ScalaVisitor(_Base):
              "extension": bool(in_ext)}
         sym = self.open_symbol(node, kind, name, bindings=b, exported=self._exported(mods))
         rng = (body.start_byte, body.end_byte) if body is not None else (node.end_byte, node.end_byte)
-        names = []
-        for plist in fields_of(node, "parameters"):
-            for q in plist.children:
-                if q.type == "parameter":
-                    n = q.child_by_field_name("name")
-                    if n is not None:
-                        names.append(self.text(n))
-                        self.ctx.declare(self.text(n), "parameter", rng[0], rng[1], position=n.start_byte)
-        sym["bindings"]["parameters"] = names
+        sym["bindings"]["parameters"] = self._function_parameters(node, rng)
         if kind in ("function", "method"):
             start, end = self.container_range(node)
             self.ctx.declare(name, "function", start, end, symbol_id=sym["id"], owner=self._outer_owner())
         return None
 
-    def visit_function_definition(self, node):
-        return self._function(node, True)
+    def _function_parameters(self, node, rng):
+        names = []
+        for plist in fields_of(node, "parameters"):
+            for parameter in plist.children:
+                if parameter.type != "parameter":
+                    continue
+                name = parameter.child_by_field_name("name")
+                if name is not None:
+                    names.append(self.text(name))
+                    self.ctx.declare(self.text(name), "parameter", rng[0], rng[1], position=name.start_byte)
+        return names
 
-    def visit_function_declaration(self, node):
-        return self._function(node, False)
+    visit_function_definition = _function
+    visit_function_declaration = _function
 
     def visit_lambda_expression(self, node):
         sym = self.open_lambda(node, bindings={"body": True}, node_kind="lambda_expression")
@@ -963,7 +983,7 @@ class ScalaVisitor(_Base):
             return None
         if n.type == "identifier":
             t = self.text(n)
-            return "this" if t == "this" else ("super" if t == "super" else "identifier")
+            return {"this": "this", "super": "super"}.get(t, "identifier")
         return {"field_expression": "path"}.get(n.type, "expression")
 
     def _callee(self, fn, depth=0):
@@ -1018,7 +1038,7 @@ class ScalaVisitor(_Base):
 _VISITORS = {"java": JavaVisitor, "groovy": GroovyVisitor, "kotlin": KotlinVisitor, "scala": ScalaVisitor}
 
 
-def extract(language: str, source: bytes, ctx: common.Context) -> dict:
+def extract(language: str, _source: bytes, ctx: common.Context) -> dict:
     cls = _VISITORS.get(language)
     if cls is None:
         raise common.GrammarUnavailable(f"lang_jvm does not handle language '{language}'")

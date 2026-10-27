@@ -203,5 +203,49 @@ class ContainerRecipes(unittest.TestCase):
         )
 
 
+class ContainerScanners(unittest.TestCase):
+    """Lexer-level behavior that does not need a grammar."""
+
+    def test_skip_braces_ignores_braces_in_strings_templates_and_comments(self):
+        src = b'{ "}" /* } */ // }\n `}${"}"}` } tail'
+        self.assertEqual(containers._skip_braces(src, 0), src.index(b" tail"))
+        self.assertEqual(containers._skip_braces(b"{ /* never closed }", 0), len(b"{ /* never closed }"))
+
+    def test_parse_tag_attribute_forms(self):
+        src = '<Foo A="x>y" b=\'{1}\' c={ {"}": 1} } d e=f />'.encode()
+        name, attrs, end, self_closing = containers._parse_tag(src, 0, True)
+        self.assertEqual(name, b"Foo")
+        self.assertEqual(attrs, {"a": "x>y", "b": "{1}", "c": '{ {"}": 1} }', "d": True, "e": "f"})
+        self.assertEqual((end, self_closing), (len(src), True))
+        _, attrs, _, _ = containers._parse_tag(b"<a b={x y}>", 0, False)
+        self.assertEqual(attrs, {"b": "{x", "y}": True})
+        self.assertIsNone(containers._parse_tag(b"< a>", 0, False))
+
+    def test_scan_html_skips_raw_text_cdata_and_tracks_top_level(self):
+        src = b"<title><script>no</script></title><![CDATA[<script>no</script>]]><div><script>a</script></div><script>b</script>"
+        blocks = list(containers._scan_html(src, mustache=False))
+        self.assertEqual([(src[b["start"]:b["end"]], b["top"], b["closed"]) for b in blocks], [(b"a", False, True), (b"b", True, True)])
+        forced = list(containers._scan_html(src, mustache=False, all_scripts_top_level=True))
+        self.assertEqual([b["top"] for b in forced], [True, True])
+
+    def test_scan_vue_blocks_skip_nested_templates_comments_and_report_unterminated(self):
+        src = (
+            b"<template><template v-if><i/></template><script>no()</script></template>\n"
+            b"<script setup>y</script><!-- <script>z</script> -->\n<script>open"
+        )
+        blocks = list(containers._scan_vue_blocks(src))
+        self.assertEqual([(src[b["start"]:b["end"]], b["closed"]) for b in blocks], [(b"y", True), (b"open", False)])
+        self.assertIn("setup", blocks[0]["attrs"])
+
+    def test_astro_frontmatter_boundaries(self):
+        src = b"\xef\xbb\xbf---\nconst a = 1;\n---\n<p/>"
+        start = src.index(b"const")
+        self.assertEqual(containers._astro_frontmatter(src), (start, src.index(b"---", start), src.index(b"<p/>")))
+        src = b"---\n// ---\nx\n---\n"
+        self.assertEqual(containers._astro_frontmatter(src)[1], src.rindex(b"---"))
+        self.assertIsNone(containers._astro_frontmatter(b"---\n/* never closed\n---\n"))
+        self.assertIsNone(containers._astro_frontmatter(b"---x\nconst a = 1;\n---\n"))
+
+
 if __name__ == "__main__":
     unittest.main()

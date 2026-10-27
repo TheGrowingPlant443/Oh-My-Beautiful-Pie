@@ -332,7 +332,7 @@ impl SrsService {
     }
 
     // ----- bridge: srs_ask_map -----
-    fn ask_map(&self, producer: &DependencyProducer, req: MapRequest, notices: &mut Vec<PauseNotice>) -> Result<Value> {
+    fn validate_map(req: &MapRequest) -> Result<()> {
         ask_id(&req.invocation_id, "invocationId")?;
         if let Some(t) = &req.tool_call_id { ask_id(t, "toolCallId")?; }
         if req.questions.is_empty() || req.questions.len() > MAX_ASK_QUESTIONS { return Err(invalid("An Ask maps 1..50 questions")); }
@@ -342,50 +342,61 @@ impl SrsService {
             if !ids.insert(q.id.as_str()) { return Err(invalid("Duplicate native question ID")); }
             if q.question.len() > 65_536 || q.options.len() > 200 || q.options.iter().any(|o| o.label().len() > 4096) { return Err(invalid("Native question exceeds the supported bounds")); }
         }
-        let fingerprint = store::hash(&serde_json::to_vec(&json!({
+        Ok(())
+    }
+    fn map_fingerprint(req: &MapRequest) -> Result<String> {
+        Ok(store::hash(&serde_json::to_vec(&json!({
             "toolCallId":req.tool_call_id,
             "questions":req.questions.iter().map(|q| json!({"id":q.id,"question":q.question,"options":q.options.iter().map(|o| o.label()).collect::<Vec<_>>(),"multi":q.multi})).collect::<Vec<_>>(),
-        })).map_err(storage)?);
-        let jobs = self.bound_jobs(producer)?;
-        for job in &jobs {
-            if let Some(inv) = self.invocation(&job.job_id, &req.invocation_id)? {
-                if inv.fingerprint != fingerprint { return Err(precondition("The invocation mapping is immutable and this request differs from it")); }
-                if job.attempt_id.as_deref() != Some(inv.attempt_id.as_str()) || job.stage.as_ref().map(|s| s.stage_id.as_str()) != Some(inv.stage_id.as_str()) {
-                    return Err("stale_stage: The invocation belongs to an earlier attempt or stage".into());
-                }
-                return Ok(mapping_value(&inv));
+        })).map_err(storage)?))
+    }
+    /// An invocation ID maps once: an identical replay returns the stored mapping, anything else is rejected.
+    fn replay_mapping(&self, jobs: &[Job], invocation_id: &str, fingerprint: &str) -> Result<Option<Value>> {
+        for job in jobs {
+            let Some(inv) = self.invocation(&job.job_id, invocation_id)? else { continue; };
+            if inv.fingerprint != fingerprint { return Err(precondition("The invocation mapping is immutable and this request differs from it")); }
+            if job.attempt_id.as_deref() != Some(inv.attempt_id.as_str()) || job.stage.as_ref().map(|s| s.stage_id.as_str()) != Some(inv.stage_id.as_str()) {
+                return Err("stale_stage: The invocation belongs to an earlier attempt or stage".into());
             }
+            return Ok(Some(mapping_value(&inv)));
         }
+        Ok(None)
+    }
+    fn accepts_ask(job: &Job) -> bool {
+        matches!(job.state, JobState::Running | JobState::Reviewing)
+            && job.stage.as_ref().is_some_and(|s| Some(&s.attempt_id) == job.attempt_id.as_ref() && matches!(s.state.as_str(), "queued" | "active"))
+    }
+    /// The durable question a native question is bound to, when it may be asked now.
+    fn map_candidate(&self, job: &Job, native: &NativeQuestion, retired: &mut Vec<Invocation>) -> Result<Option<Question>> {
+        if store::safe_id(&native.id).is_err() || !self.store.path(&job.job_id, "questions", &native.id)?.exists() { return Ok(None); }
+        let q: Question = self.store.get(&job.job_id, "questions", &native.id)?;
+        Ok(if bound(&q, native) && self.ask_eligible(job, &q, retired)? { Some(q) } else { None })
+    }
+    fn map_questions(&self, job: &Job, req: &MapRequest, retired: &mut Vec<Invocation>) -> Result<(Vec<String>, Vec<String>, Vec<Mutation>)> {
+        let (mut mapped, mut unmapped, mut writes) = (Vec::new(), Vec::new(), Vec::new());
+        for native in &req.questions {
+            let Some(mut q) = self.map_candidate(job, native, retired)? else { unmapped.push(native.id.clone()); continue; };
+            q.state = "asked".into();
+            q.live = true;
+            q.invocation_id = Some(req.invocation_id.clone());
+            writes.push(store::mutation("questions", &q.question_id, &q)?);
+            mapped.push(native.id.clone());
+        }
+        Ok((mapped, unmapped, writes))
+    }
+    fn ask_map(&self, producer: &DependencyProducer, req: MapRequest, notices: &mut Vec<PauseNotice>) -> Result<Value> {
+        Self::validate_map(&req)?;
+        let fingerprint = Self::map_fingerprint(&req)?;
+        let jobs = self.bound_jobs(producer)?;
+        if let Some(mapping) = self.replay_mapping(&jobs, &req.invocation_id, &fingerprint)? { return Ok(mapping); }
         let all_ids: Vec<&str> = req.questions.iter().map(|q| q.id.as_str()).collect();
-        let Some(mut job) = jobs.into_iter().find(|j| {
-            matches!(j.state, JobState::Running | JobState::Reviewing)
-                && j.stage.as_ref().is_some_and(|s| Some(&s.attempt_id) == j.attempt_id.as_ref() && matches!(s.state.as_str(), "queued" | "active"))
-        }) else {
+        let Some(mut job) = jobs.into_iter().find(Self::accepts_ask) else {
             return Ok(json!({"mapped":false,"mappedIds":[],"unmappedIds":all_ids}));
         };
         let stage_id = job.stage.as_ref().map(|s| s.stage_id.clone()).ok_or_else(|| "stale_stage: No current stage".to_string())?;
         let attempt_id = job.attempt_id.clone().ok_or_else(|| "stale_attempt: No bound attempt".to_string())?;
-        let mut mapped = Vec::new();
-        let mut unmapped = Vec::new();
-        let mut question_writes = Vec::new();
         let mut retired: Vec<Invocation> = Vec::new();
-        for native in &req.questions {
-            let mut eligible = None;
-            if store::safe_id(&native.id).is_ok() && self.store.path(&job.job_id, "questions", &native.id)?.exists() {
-                let q: Question = self.store.get(&job.job_id, "questions", &native.id)?;
-                if bound(&q, native) && self.ask_eligible(&job, &q, &mut retired)? { eligible = Some(q); }
-            }
-            match eligible {
-                Some(mut q) => {
-                    q.state = "asked".into();
-                    q.live = true;
-                    q.invocation_id = Some(req.invocation_id.clone());
-                    question_writes.push(store::mutation("questions", &q.question_id, &q)?);
-                    mapped.push(native.id.clone());
-                }
-                None => unmapped.push(native.id.clone()),
-            }
-        }
+        let (mapped, unmapped, question_writes) = self.map_questions(&job, &req, &mut retired)?;
         if mapped.is_empty() { return Ok(json!({"mapped":false,"mappedIds":[],"unmappedIds":unmapped})); }
         let inv = Invocation {
             invocation_id: req.invocation_id, tool_call_id: req.tool_call_id, job_id: job.job_id.clone(), attempt_id, stage_id, producer: producer.clone(),
@@ -424,24 +435,24 @@ impl SrsService {
     }
 
     // ----- bridge: srs_ask_receipt -----
-    fn ask_receipt(&self, producer: &DependencyProducer, req: ReceiptRequest, notices: &mut Vec<PauseNotice>) -> Result<Value> {
-        ask_id(&req.invocation_id, "invocationId")?;
-        if req.results.is_empty() || req.results.len() > MAX_ASK_QUESTIONS { return Err(invalid("A receipt carries 1..50 results")); }
+    fn normalize_results(results: Vec<AskResult>) -> Result<Vec<Norm>> {
         let mut norm = Vec::new();
-        for r in req.results { ask_id(&r.id, "result id")?; norm.push(normalize_answer(&r.id, r.selected_options, r.custom_input, r.note)?); }
+        for r in results { ask_id(&r.id, "result id")?; norm.push(normalize_answer(&r.id, r.selected_options, r.custom_input, r.note)?); }
         norm.sort_by(|a, b| a.id.cmp(&b.id));
         if norm.windows(2).any(|w| w[0].id == w[1].id) { return Err(invalid("Duplicate result ID")); }
-        let digest = store::hash(&serde_json::to_vec(&json!({"provenance":req.provenance.as_str(),"answers":norm})).map_err(storage)?);
-        let jobs = self.bound_jobs(producer)?;
-        if jobs.is_empty() { return Err("stale_attempt: No SRS job is bound to this Architect producer".into()); }
-        let mut found = None;
+        Ok(norm)
+    }
+    fn find_invocation(&self, jobs: Vec<Job>, id: &str) -> Result<Option<(Job, Invocation)>> {
         for job in jobs {
-            if let Some(inv) = self.invocation(&job.job_id, &req.invocation_id)? { found = Some((job, inv)); break; }
+            if let Some(inv) = self.invocation(&job.job_id, id)? { return Ok(Some((job, inv))); }
         }
-        let Some((mut job, mut inv)) = found else { return Err(not_found("Unknown or unmapped Ask invocation")); };
+        Ok(None)
+    }
+    /// A settled invocation replays only its identical receipt; otherwise it must still be live for this job.
+    fn check_receipt_target(&self, job: &Job, inv: &Invocation, digest: &str) -> Result<Option<Value>> {
         match inv.state.as_str() {
             "answered" => {
-                if inv.results_hash.as_deref() == Some(digest.as_str()) { return Ok(json!({"receiptId":inv.receipt_id,"satisfiedIds":inv.satisfied_ids})); }
+                if inv.results_hash.as_deref() == Some(digest) { return Ok(Some(json!({"receiptId":inv.receipt_id,"satisfiedIds":inv.satisfied_ids}))); }
                 return Err(precondition("This invocation already has a different durable receipt"));
             }
             "retired" => return Err(precondition("This invocation was retired; its answer cannot be recorded")),
@@ -450,12 +461,13 @@ impl SrsService {
         if !matches!(job.state, JobState::Running | JobState::Reviewing | JobState::WaitingForHuman) {
             return Err(precondition(format!("A {:?} job does not accept Ask receipts", job.state)));
         }
-        if !self.is_current(&job, &inv) { return Err("stale_attempt: The invocation no longer belongs to this producer, attempt and stage".into()); }
-        let receipt_id = store::id();
-        let mut question_writes = Vec::new();
-        let mut satisfied: Vec<String> = Vec::new();
-        let mut answers = Vec::new();
-        for n in &norm {
+        if !self.is_current(job, inv) { return Err("stale_attempt: The invocation no longer belongs to this producer, attempt and stage".into()); }
+        Ok(None)
+    }
+    /// Marks each answered result's question answered; returns the question writes, satisfied IDs and receipt answers.
+    fn answer_mapped(&self, job: &mut Job, inv: &Invocation, norm: &[Norm], receipt_id: &str) -> Result<(Vec<Mutation>, Vec<String>, Vec<Value>)> {
+        let (mut writes, mut satisfied, mut answers) = (Vec::new(), Vec::new(), Vec::new());
+        for n in norm {
             if inv.unmapped_ids.contains(&n.id) { continue; }
             if !inv.mapped_ids.contains(&n.id) { return Err(invalid(format!("Result {} does not belong to this invocation", n.id))); }
             let mut q: Question = self.store.get(&job.job_id, "questions", &n.id)?;
@@ -464,25 +476,42 @@ impl SrsService {
             }
             check_answer(&q, n)?;
             q.state = "answered".into();
-            q.answer_receipt_id = Some(receipt_id.clone());
+            q.answer_receipt_id = Some(receipt_id.to_string());
             q.live = false;
             q.invocation_id = None;
             dec(&mut job.counts.questions_open, "open questions")?;
-            question_writes.push(store::mutation("questions", &q.question_id, &q)?);
+            writes.push(store::mutation("questions", &q.question_id, &q)?);
             satisfied.push(q.question_id.clone());
             answers.push(answer_value(n));
         }
         if satisfied.is_empty() { return Err(invalid("The receipt answers no mapped ledger question")); }
-        for id in &inv.mapped_ids {
-            if satisfied.contains(id) { continue; }
-            let mut q: Question = self.store.get(&job.job_id, "questions", id)?;
+        Ok((writes, satisfied, answers))
+    }
+    /// Reopens this invocation's still-asked questions that are not in `skip`.
+    fn release_asked(&self, job_id: &str, inv: &Invocation, skip: &[String], writes: &mut Vec<Mutation>) -> Result<()> {
+        for id in inv.mapped_ids.iter().filter(|id| !skip.contains(id)) {
+            let mut q: Question = self.store.get(job_id, "questions", id)?;
             if q.state == "asked" && q.invocation_id.as_deref() == Some(inv.invocation_id.as_str()) {
                 q.state = "open".into();
                 q.live = false;
                 q.invocation_id = None;
-                question_writes.push(store::mutation("questions", &q.question_id, &q)?);
+                writes.push(store::mutation("questions", &q.question_id, &q)?);
             }
         }
+        Ok(())
+    }
+    fn ask_receipt(&self, producer: &DependencyProducer, req: ReceiptRequest, notices: &mut Vec<PauseNotice>) -> Result<Value> {
+        ask_id(&req.invocation_id, "invocationId")?;
+        if req.results.is_empty() || req.results.len() > MAX_ASK_QUESTIONS { return Err(invalid("A receipt carries 1..50 results")); }
+        let norm = Self::normalize_results(req.results)?;
+        let digest = store::hash(&serde_json::to_vec(&json!({"provenance":req.provenance.as_str(),"answers":norm})).map_err(storage)?);
+        let jobs = self.bound_jobs(producer)?;
+        if jobs.is_empty() { return Err("stale_attempt: No SRS job is bound to this Architect producer".into()); }
+        let Some((mut job, mut inv)) = self.find_invocation(jobs, &req.invocation_id)? else { return Err(not_found("Unknown or unmapped Ask invocation")); };
+        if let Some(replay) = self.check_receipt_target(&job, &inv, &digest)? { return Ok(replay); }
+        let receipt_id = store::id();
+        let (mut question_writes, satisfied, answers) = self.answer_mapped(&mut job, &inv, &norm, &receipt_id)?;
+        self.release_asked(&job.job_id, &inv, &satisfied, &mut question_writes)?;
         let at = self.now();
         let receipt = json!({
             "receiptId":receipt_id,"kind":"humanAnswer","provenance":req.provenance.as_str(),"source":"nativeAsk","jobId":job.job_id,
@@ -510,15 +539,7 @@ impl SrsService {
             // Answered and already-retired invocations are final; retirement never undoes an answer.
             if inv.state != "live" { return Ok(json!({"ok":true})); }
             let mut writes = Vec::new();
-            for id in &inv.mapped_ids {
-                let mut q: Question = self.store.get(&job.job_id, "questions", id)?;
-                if q.state == "asked" && q.invocation_id.as_deref() == Some(inv.invocation_id.as_str()) {
-                    q.state = "open".into();
-                    q.live = false;
-                    q.invocation_id = None;
-                    writes.push(store::mutation("questions", &q.question_id, &q)?);
-                }
-            }
+            self.release_asked(&job.job_id, &inv, &[], &mut writes)?;
             inv.state = "retired".into();
             inv.retired_reason = Some(req.reason.as_str().into());
             inv.resolved_at = Some(self.now());
@@ -588,68 +609,73 @@ impl SrsService {
         Ok(())
     }
 
+    fn exclude_question(&self, job: &mut Job, item: &str, record: &mut Value, writes: &mut Vec<Mutation>) -> Result<(String, String)> {
+        let job_id = job.job_id.clone();
+        let mut q: Question = self.store.get(&job_id, "questions", item)?;
+        if !matches!(q.state.as_str(), "open" | "asked") { return Err(precondition(format!("Question is already {}", q.state))); }
+        if self.live_invocation(job, &q)?.is_some() {
+            return Err(precondition("A live native Ask holds this question; answer it from the Decisions card or wait for its retirement"));
+        }
+        self.retire_stale(job, &q, writes)?;
+        let mut affected = HashSet::new();
+        self.store.related(&job_id, &q.question_id, "work", |id| { affected.insert(id.to_string()); Ok(()) })?;
+        record["kind"] = json!("question");
+        record["previousState"] = json!(q.state);
+        record["workIds"] = json!(affected.iter().collect::<Vec<_>>());
+        q.state = "excluded".into();
+        q.live = false;
+        q.invocation_id = None;
+        q.answer_receipt_id = None;
+        dec(&mut job.counts.questions_open, "open questions")?;
+        if !affected.is_empty() { inc(&mut job.work_revision, "work revision")?; }
+        self.revise(job, &affected, true, writes)?;
+        writes.push(store::mutation("questions", &q.question_id, &q)?);
+        Ok((q.question_id.clone(), format!("Human excluded question {}", q.question_id)))
+    }
+    /// The durable work an excluded item maps to: the work item itself, or the work allocated for source evidence.
+    fn exclusion_target(&self, job_id: &str, item: &str) -> Result<(String, &'static str, Option<inventory::InventoryItem>)> {
+        if self.store.path(job_id, "work", item)?.exists() { return Ok((item.to_string(), "work", None)); }
+        let dir = self.store.dir(job_id)?;
+        let ev = inventory::read_item(&dir, item).map_err(|_| not_found("No question, work or evidence item has this ID"))?;
+        if ev.state == "excluded" { return Err(precondition("This evidence is already excluded from the recorded scope")); }
+        Ok((format!("source-{item}"), "evidence", Some(ev)))
+    }
+    fn exclude_work(&self, job: &mut Job, item: &str, rationale: &str, record: &mut Value, writes: &mut Vec<Mutation>) -> Result<(String, String)> {
+        let job_id = job.job_id.clone();
+        let (work_id, kind, evidence) = self.exclusion_target(&job_id, item)?;
+        if !self.store.path(&job_id, "work", &work_id)?.exists() { return Err(not_found("This item has no durable work to exclude")); }
+        let mut work: Work = self.store.get(&job_id, "work", &work_id)?;
+        if work.status == "excluded" { return Err(precondition("This work is already excluded by a human")); }
+        if work.kind == "templateSection" { return Err(precondition("Template sections cannot be excluded; review them or record evidence-backed notApplicable")); }
+        record["kind"] = json!(kind);
+        record["workId"] = json!(work_id);
+        record["previousStatus"] = json!(work.status);
+        record["previousRationale"] = json!(work.rationale);
+        if let Some(ev) = &evidence { record["evidence"] = json!({"id":ev.id,"path":ev.path,"kind":ev.kind,"state":ev.state,"sha256":ev.sha256}); }
+        if is_open(&work.status) { dec(&mut job.counts.work_open, "open work")?; }
+        if work.status == "blocked" { dec(&mut job.counts.blocked, "blocked work")?; }
+        inc(&mut job.counts.excluded, "excluded")?;
+        inc(&mut job.work_revision, "work revision")?;
+        work.status = "excluded".into();
+        work.rationale = format!("Human exclusion: {rationale}");
+        work.revision = job.work_revision;
+        let affected = HashSet::from([work_id.clone()]);
+        self.revise(job, &affected, false, writes)?;
+        writes.push(store::mutation("work", &work_id, &work)?);
+        Ok((work_id, format!("Human excluded {kind} {item}")))
+    }
     fn exclude_locked(&self, job: &mut Job, item: &str, rationale: &str, notices: &mut Vec<PauseNotice>) -> Result<Value> {
         if !matches!(job.state, JobState::Paused | JobState::WaitingForHuman) { return Err(precondition("Human exclusions require a paused or waiting job")); }
         let job_id = job.job_id.clone();
         let disposition_id = store::id();
         let at = self.now();
         let mut writes = Vec::new();
-        let mut affected = HashSet::new();
-        let owner: String;
         let mut record = json!({"id":disposition_id,"jobId":job_id,"itemId":item,"disposition":"excludeFromScope","rationale":rationale,"at":at,"actor":"human","revision":job.revision.saturating_add(1)});
-        let summary: String;
-        if self.store.path(&job_id, "questions", item)?.exists() {
-            let mut q: Question = self.store.get(&job_id, "questions", item)?;
-            if !matches!(q.state.as_str(), "open" | "asked") { return Err(precondition(format!("Question is already {}", q.state))); }
-            if self.live_invocation(job, &q)?.is_some() {
-                return Err(precondition("A live native Ask holds this question; answer it from the Decisions card or wait for its retirement"));
-            }
-            self.retire_stale(job, &q, &mut writes)?;
-            self.store.related(&job_id, &q.question_id, "work", |id| { affected.insert(id.to_string()); Ok(()) })?;
-            record["kind"] = json!("question");
-            record["previousState"] = json!(q.state);
-            record["workIds"] = json!(affected.iter().collect::<Vec<_>>());
-            q.state = "excluded".into();
-            q.live = false;
-            q.invocation_id = None;
-            q.answer_receipt_id = None;
-            dec(&mut job.counts.questions_open, "open questions")?;
-            if !affected.is_empty() { inc(&mut job.work_revision, "work revision")?; }
-            self.revise(job, &affected, true, &mut writes)?;
-            writes.push(store::mutation("questions", &q.question_id, &q)?);
-            owner = q.question_id.clone();
-            summary = format!("Human excluded question {}", q.question_id);
+        let (owner, summary) = if self.store.path(&job_id, "questions", item)?.exists() {
+            self.exclude_question(job, item, &mut record, &mut writes)?
         } else {
-            let (work_id, kind, evidence) = if self.store.path(&job_id, "work", item)?.exists() {
-                (item.to_string(), "work", None)
-            } else {
-                let dir = self.store.dir(&job_id)?;
-                let ev = inventory::read_item(&dir, item).map_err(|_| not_found("No question, work or evidence item has this ID"))?;
-                if ev.state == "excluded" { return Err(precondition("This evidence is already excluded from the recorded scope")); }
-                (format!("source-{item}"), "evidence", Some(ev))
-            };
-            if !self.store.path(&job_id, "work", &work_id)?.exists() { return Err(not_found("This item has no durable work to exclude")); }
-            let mut work: Work = self.store.get(&job_id, "work", &work_id)?;
-            if work.status == "excluded" { return Err(precondition("This work is already excluded by a human")); }
-            if work.kind == "templateSection" { return Err(precondition("Template sections cannot be excluded; review them or record evidence-backed notApplicable")); }
-            record["kind"] = json!(kind);
-            record["workId"] = json!(work_id);
-            record["previousStatus"] = json!(work.status);
-            record["previousRationale"] = json!(work.rationale);
-            if let Some(ev) = &evidence { record["evidence"] = json!({"id":ev.id,"path":ev.path,"kind":ev.kind,"state":ev.state,"sha256":ev.sha256}); }
-            if is_open(&work.status) { dec(&mut job.counts.work_open, "open work")?; }
-            if work.status == "blocked" { dec(&mut job.counts.blocked, "blocked work")?; }
-            inc(&mut job.counts.excluded, "excluded")?;
-            inc(&mut job.work_revision, "work revision")?;
-            work.status = "excluded".into();
-            work.rationale = format!("Human exclusion: {rationale}");
-            work.revision = job.work_revision;
-            affected.insert(work_id.clone());
-            self.revise(job, &affected, false, &mut writes)?;
-            writes.push(store::mutation("work", &work_id, &work)?);
-            summary = format!("Human excluded {kind} {item}");
-            owner = work_id;
-        }
+            self.exclude_work(job, item, rationale, &mut record, &mut writes)?
+        };
         writes.insert(0, store::mutation("dispositions", &disposition_id, &record)?);
         if let Some(relation) = self.store.relation(&job_id, &owner, "humanDisposition", &disposition_id)? { writes.insert(1, relation); }
         inc(&mut job.human_exclusions, "human exclusions")?;

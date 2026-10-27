@@ -70,7 +70,7 @@ pub(crate) fn read_config(path: &Path) -> Result<Option<String>> {
     if text.len() as u64 > CONFIG_LIMIT { return Err(format!("Build configuration exceeds 1 MiB: {}", path.display())); }
     Ok(Some(text))
 }
-fn unescape_property(raw: &str) -> Result<String> {
+pub(crate) fn unescape_property(raw: &str) -> Result<String> {
     let mut output = String::new(); let mut chars = raw.chars();
     while let Some(c) = chars.next() {
         if c != '\\' { output.push(c); continue; }
@@ -80,27 +80,40 @@ fn unescape_property(raw: &str) -> Result<String> {
         }
     } Ok(output)
 }
-fn explicit_project_key(folder: &Path) -> Result<Option<String>> {
-    let Some(text) = read_config(&folder.join("sonar-project.properties"))? else { return Ok(None); };
-    let mut logical = String::new(); let mut key = None;
+fn has_continuation(line: &str) -> bool { line.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1 }
+/// `(name, raw value)` of one logical properties line; only the name is unescaped here, so a malformed escape in a
+/// value the caller never reads cannot fail an unrelated analysis.
+fn split_property(logical: &str) -> Result<Option<(String, &str)>> {
+    let mut escaped = false;
+    let split = logical.char_indices().find(|&(_, c)| {
+        let found = !escaped && (c == '=' || c == ':' || c.is_whitespace());
+        escaped = !escaped && c == '\\';
+        found
+    });
+    let Some((i, _)) = split else { return Ok(None); };
+    let value = logical[i..].trim_start().trim_start_matches(['=', ':']).trim_start();
+    Ok(Some((unescape_property(logical[..i].trim())?, value)))
+}
+// Visit logical properties without copying values that the caller never uses.
+pub(crate) fn visit_properties(text: &str, mut visit: impl FnMut(&str, &str) -> Result<()>) -> Result<()> {
+    let mut logical = String::new();
     for line in text.lines() {
-        let trimmed = line.trim(); if logical.is_empty() && (trimmed.starts_with('#') || trimmed.starts_with('!')) { continue; }
+        let trimmed = line.trim();
+        if logical.is_empty() && trimmed.starts_with(['#', '!']) { continue; }
         logical.push_str(trimmed);
-        if logical.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1 { logical.pop(); continue; }
-        let mut escaped = false; let mut split = None;
-        for (i, c) in logical.char_indices() {
-            if !escaped && (c == '=' || c == ':' || c.is_whitespace()) { split = Some(i); break; }
-            escaped = !escaped && c == '\\';
-        }
-        if let Some(i) = split {
-            let name = unescape_property(logical[..i].trim())?;
-            if name == "sonar.projectKey" {
-                let value = logical[i..].trim_start().trim_start_matches(['=', ':']).trim_start();
-                key = Some(unescape_property(value)?);
-            }
-        }
+        if has_continuation(&logical) { logical.pop(); continue; }
+        if let Some((name, value)) = split_property(&logical)? { visit(&name, value)?; }
         logical.clear();
     }
+    Ok(())
+}
+fn explicit_project_key(folder: &Path) -> Result<Option<String>> {
+    let Some(text) = read_config(&folder.join("sonar-project.properties"))? else { return Ok(None); };
+    let mut key = None;
+    visit_properties(&text, |name, raw| {
+        if name == "sonar.projectKey" { key = Some(unescape_property(raw)?); }
+        Ok(())
+    })?;
     Ok(key.filter(|k| !k.is_empty()))
 }
 fn valid_key(key: &str) -> bool { !key.is_empty() && key.len() <= 400 && key.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.:".contains(&c)) && key.bytes().any(|c| !c.is_ascii_digit()) }
@@ -114,50 +127,73 @@ pub(crate) fn display_folder(path: &Path) -> String {
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") { format!(r"\\{rest}") }
     else { text.strip_prefix(r"\\?\").unwrap_or(&text).to_string() }
 }
-pub fn detect(folder: &Path, saved: Option<QualityProject>) -> Result<QualityProjectDetection> {
-    plain_path(folder)?;
-    let folder = fs::canonicalize(folder).map_err(|e| format!("Cannot resolve project folder: {e}"))?;
-    if !folder.is_dir() { return Err("Project folder is not a directory".into()); }
-    let key = explicit_project_key(&folder)?;
+const DOTNET_ENTRY_EXTENSIONS: [&str; 4] = [".sln", ".slnx", ".csproj", ".vbproj"];
+fn has_file(names: &[String], name: &str) -> bool { names.iter().any(|n| n == name) }
+fn root_file_names(folder: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
-    for child in fs::read_dir(&folder).map_err(|e| format!("Cannot inspect root build manifests: {e}"))? {
+    for child in fs::read_dir(folder).map_err(|e| format!("Cannot inspect root build manifests: {e}"))? {
         let child = child.map_err(|e| format!("Cannot enumerate root build manifests: {e}"))?;
         let meta = fs::symlink_metadata(child.path()).map_err(|e| format!("Cannot inspect root build manifest: {e}"))?;
         if meta.is_file() && !snapshot::is_link(&meta) { names.push(child.file_name().to_string_lossy().into_owned()); }
     }
     names.sort();
+    Ok(names)
+}
+fn build_families(names: &[String], has_entry_files: bool, has_dotnet_source: bool) -> Vec<Scanner> {
     let mut families = Vec::new();
-    if names.iter().any(|n| n == "pom.xml") { families.push(Scanner::Maven); }
-    if names.iter().any(|n| matches!(n.as_str(), "build.gradle" | "build.gradle.kts" | "settings.gradle" | "settings.gradle.kts")) { families.push(Scanner::Gradle); }
-    let entry_files: Vec<String> = names.iter().filter(|n| [".sln", ".slnx", ".csproj", ".vbproj"].iter().any(|ext| n.ends_with(ext))).cloned().collect();
-    let has_dotnet_source = names.iter().any(|n| n.ends_with(".cs") || n.ends_with(".vb"));
-    if !entry_files.is_empty() || has_dotnet_source { families.push(Scanner::Dotnet); }
-    let ambiguous = families.len() > 1 || (families.contains(&Scanner::Dotnet) && entry_files.len() != 1);
-    let had_saved = saved.is_some();
-    let has = |name: &str| names.iter().any(|n| n == name);
-    let mut project = saved.unwrap_or_else(|| {
-        let mut exclusions = Vec::new();
-        if has("nx.json") { exclusions.push(".nx/**".to_string()); }
-        if has("angular.json") { exclusions.push(".angular/**".to_string()); }
-        QualityProject { folder: display_folder(&folder), project_key: key.clone().unwrap_or_else(|| default_project_key(&folder)), scanner: families.first().copied().unwrap_or(Scanner::Cli), entry_file: if entry_files.len() == 1 { Some(entry_files[0].clone()) } else { None }, image: None, build_args: Vec::new(), prepare_npm_dependencies: false, exclusions }
-    });
-    project.folder = display_folder(&folder);
-    let selection_valid = if project.scanner == Scanner::Dotnet { project.entry_file.as_ref().map(|e| entry_files.contains(e)).unwrap_or(false) } else { project.scanner != Scanner::Cli || !families.contains(&Scanner::Dotnet) };
-    let needs_selection = (ambiguous && !had_saved) || !selection_valid;
+    if has_file(names, "pom.xml") { families.push(Scanner::Maven); }
+    if ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"].iter().any(|n| has_file(names, n)) { families.push(Scanner::Gradle); }
+    if has_entry_files || has_dotnet_source { families.push(Scanner::Dotnet); }
+    families
+}
+fn default_project(folder: &Path, key: Option<&str>, names: &[String], families: &[Scanner], entry_files: &[String]) -> QualityProject {
+    let mut exclusions = Vec::new();
+    if has_file(names, "nx.json") { exclusions.push(".nx/**".to_string()); }
+    if has_file(names, "angular.json") { exclusions.push(".angular/**".to_string()); }
+    QualityProject { folder: display_folder(folder), project_key: key.map_or_else(|| default_project_key(folder), str::to_string), scanner: families.first().copied().unwrap_or(Scanner::Cli), entry_file: if entry_files.len() == 1 { Some(entry_files[0].clone()) } else { None }, image: None, build_args: Vec::new(), prepare_npm_dependencies: false, exclusions }
+}
+fn selection_valid(project: &QualityProject, families: &[Scanner], entry_files: &[String]) -> bool {
+    if project.scanner == Scanner::Dotnet { return project.entry_file.as_ref().is_some_and(|e| entry_files.contains(e)); }
+    project.scanner != Scanner::Cli || !families.contains(&Scanner::Dotnet)
+}
+fn detection_warnings(needs_selection: bool, dotnet_without_project: bool) -> Vec<String> {
     let mut warnings = Vec::new();
     if needs_selection { warnings.push("Select a scanner/build family and, for .NET, one entry file before preparing analysis.".into()); }
-    if has_dotnet_source && entry_files.is_empty() { warnings.push("C#/VB requires a compatible .NET project; the CLI scanner does not analyze C#/VB.".into()); }
-    let mut labels: Vec<String> = Vec::new();
-    if has("package.json") { labels.push("Node.js / TypeScript (package.json)".into()); }
-    if has("angular.json") { labels.push("Angular (angular.json)".into()); }
-    if has("nx.json") { labels.push("Nx workspace (nx.json)".into()); }
-    if has("pyproject.toml") || has("requirements.txt") { labels.push("Python".into()); }
-    if has("go.mod") { labels.push("Go".into()); }
-    if has("Cargo.toml") { labels.push("Rust".into()); }
-    if has("pom.xml") { labels.push("Maven (pom.xml)".into()); }
-    if has("build.gradle") || has("build.gradle.kts") { labels.push("Gradle".into()); }
-    if !entry_files.is_empty() { labels.push(".NET".into()); }
-    if families.is_empty() { labels.push("No build tool found — analyzed directly".into()); }
+    if dotnet_without_project { warnings.push("C#/VB requires a compatible .NET project; the CLI scanner does not analyze C#/VB.".into()); }
+    warnings
+}
+fn detection_labels(names: &[String], has_entry_files: bool, no_families: bool) -> Vec<String> {
+    const FILE_LABELS: [(&[&str], &str); 8] = [
+        (&["package.json"], "Node.js / TypeScript (package.json)"),
+        (&["angular.json"], "Angular (angular.json)"),
+        (&["nx.json"], "Nx workspace (nx.json)"),
+        (&["pyproject.toml", "requirements.txt"], "Python"),
+        (&["go.mod"], "Go"),
+        (&["Cargo.toml"], "Rust"),
+        (&["pom.xml"], "Maven (pom.xml)"),
+        (&["build.gradle", "build.gradle.kts"], "Gradle"),
+    ];
+    let mut labels: Vec<String> = FILE_LABELS.iter().filter(|(files, _)| files.iter().any(|f| has_file(names, f))).map(|(_, label)| (*label).to_string()).collect();
+    if has_entry_files { labels.push(".NET".into()); }
+    if no_families { labels.push("No build tool found — analyzed directly".into()); }
+    labels
+}
+pub fn detect(folder: &Path, saved: Option<QualityProject>) -> Result<QualityProjectDetection> {
+    plain_path(folder)?;
+    let folder = fs::canonicalize(folder).map_err(|e| format!("Cannot resolve project folder: {e}"))?;
+    if !folder.is_dir() { return Err("Project folder is not a directory".into()); }
+    let key = explicit_project_key(&folder)?;
+    let names = root_file_names(&folder)?;
+    let entry_files: Vec<String> = names.iter().filter(|n| DOTNET_ENTRY_EXTENSIONS.iter().any(|ext| n.ends_with(ext))).cloned().collect();
+    let has_dotnet_source = names.iter().any(|n| n.ends_with(".cs") || n.ends_with(".vb"));
+    let families = build_families(&names, !entry_files.is_empty(), has_dotnet_source);
+    let ambiguous = families.len() > 1 || (families.contains(&Scanner::Dotnet) && entry_files.len() != 1);
+    let had_saved = saved.is_some();
+    let mut project = saved.unwrap_or_else(|| default_project(&folder, key.as_deref(), &names, &families, &entry_files));
+    project.folder = display_folder(&folder);
+    let needs_selection = (ambiguous && !had_saved) || !selection_valid(&project, &families, &entry_files);
+    let warnings = detection_warnings(needs_selection, has_dotnet_source && entry_files.is_empty());
+    let labels = detection_labels(&names, !entry_files.is_empty(), families.is_empty());
     Ok(QualityProjectDetection { project, families, entry_files, explicit_key: key.is_some(), needs_selection, warnings, labels })
 }
 fn gradle_declares_plugin(folder: &Path) -> Result<bool> {
@@ -182,44 +218,65 @@ fn image_for(project: &QualityProject, folder: &Path) -> Result<String> {
     let lock = images()?;
     Ok(match project.scanner { Scanner::Cli => lock.scanner_cli.clone(), Scanner::Maven => lock.maven.clone(), Scanner::Gradle => lock.gradle.clone(), Scanner::Dotnet => sdk_image(folder, lock)? })
 }
+/// Directory filter shared by the build-configuration walks: vendored/output folders and links are not read.
+fn plain_source_entry(e: &ignore::DirEntry) -> bool {
+    e.depth() == 0 || (!matches!(e.file_name().to_str().unwrap_or(""), ".git" | "node_modules" | "target" | "build" | "dist" | ".venv" | "venv") && fs::symlink_metadata(e.path()).map(|m| !snapshot::is_link(&m)).unwrap_or(true))
+}
+fn is_build_file(name: &str, relative: &str) -> bool {
+    matches!(name, "pom.xml" | "global.json" | "sonar-project.properties" | "gradlew" | "gradlew.bat" | "gradle-wrapper.jar" | "gradle-wrapper.properties" | "package.json" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "nuget.config" | "NuGet.Config")
+        || [".gradle", ".gradle.kts", ".csproj", ".vbproj", ".sln", ".slnx", ".props", ".targets"].iter().any(|ext| name.ends_with(ext))
+        || relative.starts_with(".mvn/") || relative.starts_with("gradle/")
+}
+fn hash_config_file(path: &Path, relative: &str) -> Result<String> {
+    plain_path(path)?;
+    let file = File::open(path).map_err(|e| format!("Cannot read build file {relative}: {e}"))?;
+    if file.metadata().map_err(|e| e.to_string())?.len() > 16 * CONFIG_LIMIT { return Err(format!("Build/configuration file exceeds 16 MiB: {relative}")); }
+    let mut hash = Sha256::new(); let mut reader = file.take(16 * CONFIG_LIMIT + 1); let mut buf = [0u8; 65536]; let mut bytes = 0;
+    loop { let n = reader.read(&mut buf).map_err(|e| format!("Cannot hash build file {relative}: {e}"))?; if n == 0 { break; } bytes += n as u64; if bytes > 16 * CONFIG_LIMIT { return Err(format!("Build file changed beyond size limit: {relative}")); } hash.update(&buf[..n]); }
+    Ok(format!("{:x}", hash.finalize()))
+}
 fn config_hashes(folder: &Path) -> Result<Vec<(String, String)>> {
     let mut hashes = Vec::new();
     let mut walk = ignore::WalkBuilder::new(folder); walk.hidden(false).follow_links(false).git_global(false).require_git(false);
-    walk.filter_entry(|e| e.depth() == 0 || !matches!(e.file_name().to_str().unwrap_or(""), ".git" | "node_modules" | "target" | "build" | "dist" | ".venv" | "venv") && fs::symlink_metadata(e.path()).map(|m| !snapshot::is_link(&m)).unwrap_or(true));
+    walk.filter_entry(plain_source_entry);
     for entry in walk.build() {
         let entry = entry.map_err(|e| format!("Cannot enumerate build configuration for recipe consent: {e}"))?;
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
+        if !entry.file_type().is_some_and(|t| t.is_file()) { continue; }
         let name = entry.file_name().to_string_lossy();
         let relative = entry.path().strip_prefix(folder).map_err(|_| "Build configuration escaped project")?.to_string_lossy().replace('\\', "/");
-        let relevant = matches!(&*name, "pom.xml" | "global.json" | "sonar-project.properties" | "gradlew" | "gradlew.bat" | "gradle-wrapper.jar" | "gradle-wrapper.properties" | "package.json" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "nuget.config" | "NuGet.Config") || name.ends_with(".gradle") || name.ends_with(".gradle.kts") || name.ends_with(".csproj") || name.ends_with(".vbproj") || name.ends_with(".sln") || name.ends_with(".slnx") || name.ends_with(".props") || name.ends_with(".targets") || relative.starts_with(".mvn/") || relative.starts_with("gradle/");
-        if relevant {
-            plain_path(entry.path())?;
-            let file = File::open(entry.path()).map_err(|e| format!("Cannot read build file {relative}: {e}"))?;
-            if file.metadata().map_err(|e| e.to_string())?.len() > 16 * CONFIG_LIMIT { return Err(format!("Build/configuration file exceeds 16 MiB: {relative}")); }
-            let mut hash = Sha256::new(); let mut reader = file.take(16 * CONFIG_LIMIT + 1); let mut buf = [0u8; 65536]; let mut bytes = 0;
-            loop { let n = reader.read(&mut buf).map_err(|e| format!("Cannot hash build file {relative}: {e}"))?; if n == 0 { break; } bytes += n as u64; if bytes > 16 * CONFIG_LIMIT { return Err(format!("Build file changed beyond size limit: {relative}")); } hash.update(&buf[..n]); }
-            hashes.push((relative, format!("{:x}", hash.finalize())));
-        }
+        if is_build_file(&name, &relative) { let hash = hash_config_file(entry.path(), &relative)?; hashes.push((relative, hash)); }
     }
     hashes.sort(); Ok(hashes)
+}
+fn is_dotnet_source(path: &Path) -> bool { matches!(path.extension().and_then(|s| s.to_str()), Some("cs" | "vb" | "csproj" | "vbproj")) }
+const RESERVED_SONAR_ARGS: [&str; 9] = ["sonar.token", "sonar.login", "sonar.password", "sonar.host.url", "sonar.projectkey", "sonar.projectname", "sonar.projectbasedir", "sonar.working.directory", "sonar.scm.disabled"];
+fn validate_build_args(args: &[String]) -> Result<()> {
+    for arg in args {
+        let lower = arg.to_ascii_lowercase();
+        if arg.contains(['\n', '\r', '\0']) || RESERVED_SONAR_ARGS.iter().any(|reserved| lower.contains(reserved)) { return Err("Build arguments cannot contain credentials or override managed Sonar connection/project/workspace settings".into()); }
+    }
+    Ok(())
+}
+fn reject_dotnet_sources(folder: &Path) -> Result<()> {
+    let mut walk = ignore::WalkBuilder::new(folder); walk.hidden(false).follow_links(false).require_git(false);
+    walk.filter_entry(plain_source_entry);
+    for e in walk.build() {
+        let e = e.map_err(|e| e.to_string())?;
+        if e.file_type().is_some_and(|t| t.is_file()) && is_dotnet_source(e.path()) { return Err("C#/VB analysis requires the .NET scanner and an explicitly selected build entry point; CLI cannot analyze these languages".into()); }
+    }
+    Ok(())
+}
+fn validate_dotnet_entry(project: &QualityProject, folder: &Path) -> Result<()> {
+    let entry = entry_name(project.entry_file.as_deref().ok_or("Choose a .NET solution/project entry file before preparing analysis")?)?;
+    if !DOTNET_ENTRY_EXTENSIONS.iter().any(|ext| entry.ends_with(ext)) { return Err("Choose a .sln, .slnx, .csproj or .vbproj entry file".into()); }
+    plain_path(&folder.join(entry))
 }
 fn validate_project(project: &QualityProject, folder: &Path) -> Result<()> {
     plain_path(folder)?;
     if !valid_key(&project.project_key) { return Err("Sonar project key must use letters, digits, '-', '_', '.', ':' and cannot be all digits".into()); }
-    for arg in &project.build_args {
-        let lower = arg.to_ascii_lowercase();
-        if arg.contains(['\n', '\r', '\0']) || ["sonar.token", "sonar.login", "sonar.password", "sonar.host.url", "sonar.projectkey", "sonar.projectname", "sonar.projectbasedir", "sonar.working.directory", "sonar.scm.disabled"].iter().any(|reserved| lower.contains(reserved)) { return Err("Build arguments cannot contain credentials or override managed Sonar connection/project/workspace settings".into()); }
-    }
-    if project.scanner == Scanner::Cli {
-        let mut walk = ignore::WalkBuilder::new(folder); walk.hidden(false).follow_links(false).require_git(false);
-        walk.filter_entry(|e| e.depth() == 0 || !matches!(e.file_name().to_str().unwrap_or(""), ".git" | "node_modules" | "target" | "dist" | "build" | ".venv" | "venv") && fs::symlink_metadata(e.path()).map(|m| !snapshot::is_link(&m)).unwrap_or(true));
-        for e in walk.build() { let e = e.map_err(|e| e.to_string())?; if e.file_type().map(|t| t.is_file()).unwrap_or(false) && matches!(e.path().extension().and_then(|s| s.to_str()), Some("cs" | "vb" | "csproj" | "vbproj")) { return Err("C#/VB analysis requires the .NET scanner and an explicitly selected build entry point; CLI cannot analyze these languages".into()); } }
-    }
-    if project.scanner == Scanner::Dotnet {
-        let entry = entry_name(project.entry_file.as_deref().ok_or("Choose a .NET solution/project entry file before preparing analysis")?)?;
-        if ![".sln", ".slnx", ".csproj", ".vbproj"].iter().any(|ext| entry.ends_with(ext)) { return Err("Choose a .sln, .slnx, .csproj or .vbproj entry file".into()); }
-        plain_path(&folder.join(entry))?;
-    }
+    validate_build_args(&project.build_args)?;
+    if project.scanner == Scanner::Cli { reject_dotnet_sources(folder)?; }
+    if project.scanner == Scanner::Dotnet { validate_dotnet_entry(project, folder)?; }
     if project.prepare_npm_dependencies && read_config(&folder.join("package-lock.json"))?.is_none() { return Err("Prepare npm dependencies requires package-lock.json; for another package manager select an approved custom analysis image with the needed dependencies".into()); }
     Ok(())
 }
@@ -281,6 +338,19 @@ impl Drop for DisposablePath {
         if self.directory { let _ = fs::remove_dir_all(&self.path); } else { let _ = fs::remove_file(&self.path); }
     }
 }
+fn needs_metadata(name: &str, project: &QualityProject) -> bool {
+    matches!(name, "global.json" | "gradlew" | "build.gradle" | "build.gradle.kts" | "settings.gradle" | "settings.gradle.kts" | "gradle/libs.versions.toml")
+        || (name == "package-lock.json" && project.prepare_npm_dependencies)
+        || project.entry_file.as_deref() == Some(name)
+}
+fn stage_metadata(entry: &mut tar::Entry<'_, File>, stage: &Path, path: &Path, name: &str) -> Result<()> {
+    if entry.size() > CONFIG_LIMIT { return Err(format!("Captured scanner metadata exceeds 1 MiB: {name}")); }
+    let destination = stage.join(path);
+    if let Some(parent) = destination.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let mut file = fs::OpenOptions::new().create_new(true).write(true).open(&destination).map_err(|e| e.to_string())?;
+    std::io::copy(entry, &mut file).map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())
+}
 fn snapshot_metadata(source: &Snapshot, stage: &Path, project: &QualityProject, ctl: &Ctl) -> Result<()> {
     let mut archive = tar::Archive::new(File::open(&source.tar_path).map_err(|e| e.to_string())?);
     for entry in archive.entries().map_err(|e| e.to_string())? {
@@ -288,28 +358,49 @@ fn snapshot_metadata(source: &Snapshot, stage: &Path, project: &QualityProject, 
         let mut entry = entry.map_err(|e| e.to_string())?;
         if !entry.header().entry_type().is_file() { continue; }
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
-        if project.scanner == Scanner::Cli && matches!(path.extension().and_then(|s| s.to_str()), Some("cs" | "vb" | "csproj" | "vbproj")) {
-            return Err("C#/VB requires the .NET scanner, not CLI".into());
-        }
+        if project.scanner == Scanner::Cli && is_dotnet_source(&path) { return Err("C#/VB requires the .NET scanner, not CLI".into()); }
         let name = path.to_string_lossy().replace('\\', "/");
-        let needed = matches!(name.as_str(), "global.json" | "gradlew" | "build.gradle" | "build.gradle.kts" | "settings.gradle" | "settings.gradle.kts" | "gradle/libs.versions.toml")
-            || (name == "package-lock.json" && project.prepare_npm_dependencies)
-            || project.entry_file.as_deref() == Some(name.as_str());
-        if needed {
-            if entry.size() > CONFIG_LIMIT { return Err(format!("Captured scanner metadata exceeds 1 MiB: {name}")); }
-            let destination = stage.join(&path);
-            if let Some(parent) = destination.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
-            let mut file = fs::OpenOptions::new().create_new(true).write(true).open(&destination).map_err(|e| e.to_string())?;
-            std::io::copy(&mut entry, &mut file).map_err(|e| e.to_string())?;
-            file.flush().map_err(|e| e.to_string())?;
-        }
+        if needs_metadata(&name, project) { stage_metadata(&mut entry, stage, &path, &name)?; }
     }
     Ok(())
 }
-pub fn run_scanner(engine: &dyn Engine, owner: &str, job_id: &str, source: &Snapshot, project: &QualityProject, target: &SonarRunTarget, token: &str, job_dir: &Path, on_container: &dyn Fn(&str), ctl: &Ctl) -> Result<ScannerRun> {
+fn check_scan_inputs(project: &QualityProject, target: &SonarRunTarget, token: &str, ctl: &Ctl) -> Result<()> {
     if ctl.cancelled() { return Err("Scan cancelled before scanner preparation".into()); }
     if token.is_empty() { return Err("Save a Sonar user token before scanning".into()); }
     if target.project_key != project.project_key || !valid_key(&target.project_key) { return Err("Scanner target does not match the approved project key".into()); }
+    Ok(())
+}
+/// The selected scanner image, pulled when absent; .NET gets a derived image that carries the pinned scanner tool.
+fn prepare_image(engine: &dyn Engine, project: &QualityProject, stage: &Path, job_dir: &Path, ctl: &Ctl) -> Result<String> {
+    let image = image_for(project, stage)?;
+    if !engine.image_exists(&image, ctl)? { engine.pull(&image, ctl)?; }
+    if project.scanner != Scanner::Dotnet { return Ok(image); }
+    let context = job_dir.join("dotnet-image-context"); fs::create_dir_all(&context).map_err(|e| e.to_string())?;
+    let dockerfile = format!("FROM {image}\nENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1\nRUN dotnet tool install --tool-path /opt/omp-sonarscanner --version {} dotnet-sonarscanner && /opt/omp-sonarscanner/dotnet-sonarscanner --version\n", images()?.dotnet_scanner_version);
+    let digest = format!("{:x}", Sha256::digest(dockerfile.as_bytes()));
+    let derived = format!("localhost/omp-quality-dotnet:{}", &digest[..24]);
+    if !engine.image_exists(&derived, ctl)? { write_asset(&context.join("Dockerfile"), &dockerfile)?; engine.build_image(&derived, &context, ctl)?; }
+    Ok(derived)
+}
+fn redacting_ctl(ctl: &Ctl, token: &str) -> Ctl {
+    let sink = ctl.log.clone(); let secret = token.to_owned();
+    Ctl { cancel: ctl.cancel.clone(), log: std::sync::Arc::new(move |line: &str| sink(&super::reports::redact(line, &[secret.as_str()]))) }
+}
+/// The single redacted `report-task.txt` the scanner left behind; the unredacted transfer archive is removed.
+fn collect_report_task(report_tar: &Path, job_dir: &Path, token: &str) -> Result<String> {
+    let report_dir = job_dir.join("scanner-report-task");
+    let paths = snapshot::extract_tar_safely(report_tar, &report_dir, CONFIG_LIMIT)?;
+    let candidates: Vec<_> = paths.iter().filter(|p| p.file_name().and_then(|s| s.to_str()) == Some("report-task.txt") && report_dir.join(p).is_file()).collect();
+    if candidates.len() != 1 { return Err("Scanner report archive must contain exactly one report-task.txt".into()); }
+    let text = read_config(&report_dir.join(candidates[0]))?.ok_or("Scanner report-task.txt is missing")?;
+    let redacted = super::reports::redact(&text, &[token]);
+    // Even previews/raw report-tasks may not persist the managed credential.
+    write_asset(&report_dir.join(candidates[0]), &redacted)?;
+    fs::remove_file(report_tar).map_err(|e| format!("Cannot remove unredacted scanner transfer archive: {e}"))?;
+    Ok(redacted)
+}
+pub fn run_scanner(engine: &dyn Engine, owner: &str, job_id: &str, source: &Snapshot, project: &QualityProject, target: &SonarRunTarget, token: &str, job_dir: &Path, on_container: &dyn Fn(&str), ctl: &Ctl) -> Result<ScannerRun> {
+    check_scan_inputs(project, target, token, ctl)?;
     snapshot::validate_tar(&source.tar_path, 1024 * 1024 * 1024)?;
     // Approved build metadata is read from the captured snapshot, never from a later working-tree edit.
     let stage = job_dir.join("scanner-source-metadata");
@@ -319,15 +410,7 @@ pub fn run_scanner(engine: &dyn Engine, owner: &str, job_id: &str, source: &Snap
     validate_project(project, &stage)?;
     let wrapper = project.scanner == Scanner::Gradle && read_config(&stage.join("gradlew"))?.is_some();
     let init = project.scanner == Scanner::Gradle && !gradle_declares_plugin(&stage)?;
-    let mut image = image_for(project, &stage)?;
-    if !engine.image_exists(&image, ctl)? { engine.pull(&image, ctl)?; }
-    if project.scanner == Scanner::Dotnet {
-        let context = job_dir.join("dotnet-image-context"); fs::create_dir_all(&context).map_err(|e| e.to_string())?;
-        let dockerfile = format!("FROM {image}\nENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1\nRUN dotnet tool install --tool-path /opt/omp-sonarscanner --version {} dotnet-sonarscanner && /opt/omp-sonarscanner/dotnet-sonarscanner --version\n", images()?.dotnet_scanner_version);
-        let digest = format!("{:x}", Sha256::digest(dockerfile.as_bytes()));
-        image = format!("localhost/omp-quality-dotnet:{}", &digest[..24]);
-        if !engine.image_exists(&image, ctl)? { write_asset(&context.join("Dockerfile"), &dockerfile)?; engine.build_image(&image, &context, ctl)?; }
-    }
+    let image = prepare_image(engine, project, &stage, job_dir, ctl)?;
     if ctl.cancelled() { return Err("Scan cancelled during scanner preparation".into()); }
     let assets = job_dir.join("scanner-assets"); fs::create_dir_all(&assets).map_err(|e| e.to_string())?;
     // Git autocrlf must not turn the POSIX helper into CRLF.
@@ -337,21 +420,12 @@ pub fn run_scanner(engine: &dyn Engine, owner: &str, job_id: &str, source: &Snap
     let report_tar = job_dir.join("scanner-report-task.tar");
     let report_source = match project.scanner { Scanner::Dotnet => format!("{WORKSPACE}/.sonarqube/out/.sonar/report-task.txt"), _ => format!("{WORKSPACE}/.scannerwork/report-task.txt") };
     let spec = scanner_spec(image, project, target, token, owner, job_id, wrapper, init);
-    let safe_ctl = Ctl { cancel: ctl.cancel.clone(), log: { let sink = ctl.log.clone(); let secret = token.to_owned(); std::sync::Arc::new(move |line: &str| sink(&super::reports::redact(line, &[secret.as_str()]))) } };
-    let result = run_job(engine, &JobStep { spec, copy_in: vec![("/tmp".into(), bootstrap), (WORKSPACE.into(), source.tar_path.clone()), (MANAGED.into(), asset_tar)], copy_out: vec![(report_source, report_tar.clone())], timeout_secs: 60 * 60 }, on_container, &safe_ctl).map_err(|e| super::reports::redact(&e, &[token]))?;
+    let result = run_job(engine, &JobStep { spec, copy_in: vec![("/tmp".into(), bootstrap), (WORKSPACE.into(), source.tar_path.clone()), (MANAGED.into(), asset_tar)], copy_out: vec![(report_source, report_tar.clone())], timeout_secs: 60 * 60 }, on_container, &redacting_ctl(ctl, token)).map_err(|e| super::reports::redact(&e, &[token]))?;
     let mut log_tail = super::reports::redact(&result.log_tail, &[token]);
-    let report_task = if !result.cancelled && report_tar.is_file() {
-        let report_dir = job_dir.join("scanner-report-task");
-        let paths = snapshot::extract_tar_safely(&report_tar, &report_dir, CONFIG_LIMIT)?;
-        let candidates: Vec<_> = paths.iter().filter(|p| p.file_name().and_then(|s| s.to_str()) == Some("report-task.txt") && report_dir.join(p).is_file()).collect();
-        if candidates.len() != 1 { return Err("Scanner report archive must contain exactly one report-task.txt".into()); }
-        let text = read_config(&report_dir.join(candidates[0]))?.ok_or("Scanner report-task.txt is missing")?;
-        let redacted = super::reports::redact(&text, &[token]);
-        // Even previews/raw report-tasks may not persist the managed credential.
-        write_asset(&report_dir.join(candidates[0]), &redacted)?;
-        fs::remove_file(&report_tar).map_err(|e| format!("Cannot remove unredacted scanner transfer archive: {e}"))?;
-        Some(redacted)
-    } else { if !result.cancelled { log_tail.push_str("\nScanner did not produce report-task.txt; submission is not a completed analysis."); } None };
+    let report_task = if result.cancelled { None } else if report_tar.is_file() { Some(collect_report_task(&report_tar, job_dir, token)?) } else {
+        log_tail.push_str("\nScanner did not produce report-task.txt; submission is not a completed analysis.");
+        None
+    };
     // The captured source archive + manifest remain the provenance; the metadata copy is removed on return.
     Ok(ScannerRun { exit_code: result.exit_code, report_task, log_tail, timed_out: result.timed_out, cancelled: result.cancelled })
 }
@@ -369,6 +443,18 @@ mod tests {
             fs::write(t.0.join("sonar-project.properties"), "# comment\nsonar.projectKey = team\\:explicit\n").unwrap();
             let detection = detect(&t.0, None).unwrap(); assert_eq!(detection.families, expected); assert_eq!(detection.needs_selection, needs); assert_eq!(detection.project.project_key, "team:explicit"); assert!(detection.explicit_key);
         }
+    }
+    #[test]
+    fn property_keys_unescape_without_parsing_unused_values() {
+        let t = Temp::new();
+        fs::write(t.0.join("sonar-project.properties"), "ignored=\\uXYZ\nsonar.projectKey=first\nsonar.project\\u004bey=team\\:final\n").unwrap();
+        let selected = detect(&t.0, None).unwrap();
+        assert!(selected.explicit_key);
+        assert_eq!(selected.project.project_key, "team:final");
+        fs::write(t.0.join("sonar-project.properties"), "sonar.projectKey=first\nsonar.projectKey=\n").unwrap();
+        assert!(!detect(&t.0, None).unwrap().explicit_key);
+        fs::write(t.0.join("sonar-project.properties"), "sonar.projectKey=\\uXYZ\n").unwrap();
+        assert!(detect(&t.0, None).unwrap_err().contains("Unicode escape"));
     }
     #[test]
     fn recipe_is_deterministic_and_config_changes_revoke_approval() {

@@ -131,6 +131,34 @@ pub fn document_review_current(store: &Store, job: &Job, document: &Document) ->
 /// Prepare one atomic checkpoint. The caller alone increments/publishes the job revision and commits.
 /// On validation failure neither the durable store nor the supplied job is changed.
 pub fn checkpoint(store: &Store, job: &mut Job, updates: Updates, now: u64) -> Result<(Vec<Mutation>, Value)> {
+    require_checkpointable(job)?;
+    validate_update_bounds(&updates)?;
+    let mut draft = Draft {
+        next: job.clone(), writes: Vec::new(), touched: HashSet::new(), new_paths: HashSet::new(),
+        work: Vec::new(), documents: Vec::new(), requirements: Vec::new(), questions: Vec::new(),
+    };
+    if changes_work(&updates) { checked_add(&mut draft.next.work_revision, "work revision")?; }
+    for add in updates.add_work { add_work_item(store, job, &mut draft, add)?; }
+    for update in updates.update_work { update_work_item(store, job, &mut draft, update)?; }
+    for add in updates.add_documents { add_document_item(store, job, &mut draft, add)?; }
+    for add in updates.add_requirements { add_requirement_item(store, job, &mut draft, add)?; }
+    for add in updates.add_questions { add_question_item(store, job, &mut draft, add)?; }
+    finish_checkpoint(job, draft, updates.summary, now)
+}
+
+/// Candidate checkpoint state; the caller's job is replaced only after every update validates.
+struct Draft {
+    next: Job,
+    writes: Vec<Mutation>,
+    touched: HashSet<String>,
+    new_paths: HashSet<String>,
+    work: Vec<Value>,
+    documents: Vec<Value>,
+    requirements: Vec<Value>,
+    questions: Vec<Value>,
+}
+
+fn require_checkpointable(job: &Job) -> Result<()> {
     if !job.inventory_complete || !matches!(job.state, JobState::Running | JobState::Reviewing | JobState::WaitingForHuman) {
         return Err("precondition_failed: Checkpoints require a running job with a complete inventory".into());
     }
@@ -139,151 +167,195 @@ pub fn checkpoint(store: &Store, job: &mut Job, updates: Updates, now: u64) -> R
             return Err("stale_stage: Checkpoint does not belong to the active backend phase".into());
         }
     }
+    Ok(())
+}
+
+fn validate_update_bounds(updates: &Updates) -> Result<()> {
     bounded(&updates.add_work, "addWork")?;
     bounded(&updates.update_work, "updateWork")?;
     bounded(&updates.add_documents, "addDocuments")?;
     bounded(&updates.add_requirements, "addRequirements")?;
     bounded(&updates.add_questions, "addQuestions")?;
     if let Some(summary) = &updates.summary { text(summary, "summary", 16_384)?; }
-    let mut next = job.clone();
-    let mut writes = Vec::new();
-    let mut work_allocated = Vec::new();
-    let mut document_allocated = Vec::new();
-    let mut requirement_allocated = Vec::new();
-    let mut question_allocated = Vec::new();
-    let work_changed = !updates.add_work.is_empty() || !updates.update_work.is_empty()
-        || updates.add_requirements.iter().any(|add| !add.work_ids.is_empty());
-    if work_changed { checked_add(&mut next.work_revision, "work revision")?; }
-    let mut touched = HashSet::new();
+    Ok(())
+}
 
-    for add in updates.add_work {
-        reference(&add.r#ref)?;
-        if !WORK_KINDS.contains(&add.kind.as_str()) { return Err(invalid("Unknown work kind")); }
-        let status = add.status.unwrap_or_else(|| "pending".into());
-        if !STATUSES.contains(&status.as_str()) { return Err(invalid("Invalid model work status; excluded is human-only")); }
-        text(&add.rationale, "rationale", 16_384)?;
-        if phase_number(add.phase) > phase_number(job.phase) && matches!(status.as_str(), "reviewed" | "notApplicable") {
-            return Err("precondition_failed: Future-phase work cannot be reviewed before that backend phase".into());
-        }
-        if let Some(parent) = &add.parent_id { let _: Work = existing(store, job, "work", parent)?; }
-        let id = store::id();
-        let work = Work { id: id.clone(), parent_id: add.parent_id, phase: add.phase, kind: add.kind, status, rationale: add.rationale, revision: next.work_revision };
-        work_links(store, job, &mut writes, &id, &add.evidence_ids, &add.requirement_ids, &add.question_ids)?;
-        not_applicable(store, job, &work, &add.evidence_ids)?;
-        checked_add(&mut next.counts.work, "work")?;
-        if is_open(&work.status) { checked_add(&mut next.counts.work_open, "open work")?; }
-        if work.status == "blocked" { checked_add(&mut next.counts.blocked, "blocked work")?; }
-        writes.push(store::mutation("work", &id, &work)?);
-        work_allocated.push(json!({"ref":add.r#ref,"id":id}));
+fn changes_work(updates: &Updates) -> bool {
+    !updates.add_work.is_empty() || !updates.update_work.is_empty()
+        || updates.add_requirements.iter().any(|add| !add.work_ids.is_empty())
+}
+
+fn valid_status(status: &str) -> Result<()> {
+    if !STATUSES.contains(&status) { return Err(invalid("Invalid model work status; excluded is human-only")); }
+    Ok(())
+}
+
+fn reject_future_review(work_phase: Phase, job_phase: Phase, status: &str) -> Result<()> {
+    if phase_number(work_phase) > phase_number(job_phase) && matches!(status, "reviewed" | "notApplicable") {
+        return Err("precondition_failed: Future-phase work cannot be reviewed before that backend phase".into());
     }
-    for update in updates.update_work {
-        if !touched.insert(update.id.clone()) { return Err(invalid("updateWork contains the same ID more than once")); }
-        let mut work: Work = existing(store, job, "work", &update.id)?;
-        if work.status == "excluded" { return Err(invalid("Human-excluded work cannot be modified by the model")); }
-        let old_open = is_open(&work.status);
-        let old_blocked = work.status == "blocked";
-        if let Some(status) = update.status {
-            if !STATUSES.contains(&status.as_str()) { return Err(invalid("Invalid model work status; excluded is human-only")); }
-            work.status = status;
-        } else if work.status == "reviewed" && (update.rationale.is_some() || !update.evidence_ids.is_empty() || !update.requirement_ids.is_empty() || !update.question_ids.is_empty()) {
-            work.status = "pending".into();
-        }
-        if let Some(rationale) = update.rationale { text(&rationale, "rationale", 16_384)?; work.rationale = rationale; }
-        if phase_number(work.phase) > phase_number(job.phase) && matches!(work.status.as_str(), "reviewed" | "notApplicable") {
-            return Err("precondition_failed: Future-phase work cannot be reviewed before that backend phase".into());
-        }
-        work_links(store, job, &mut writes, &work.id, &update.evidence_ids, &update.requirement_ids, &update.question_ids)?;
-        not_applicable(store, job, &work, &update.evidence_ids)?;
-        if old_open != is_open(&work.status) {
-            if old_open { next.counts.work_open = next.counts.work_open.checked_sub(1).ok_or("storage_error: Open work counter underflow")?; }
-            else { checked_add(&mut next.counts.work_open, "open work")?; }
-        }
-        if old_blocked != (work.status == "blocked") {
-            if old_blocked { next.counts.blocked = next.counts.blocked.checked_sub(1).ok_or("storage_error: Blocked work counter underflow")?; }
-            else { checked_add(&mut next.counts.blocked, "blocked work")?; }
-        }
-        work.revision = next.work_revision;
-        writes.push(store::mutation("work", &work.id, &work)?);
+    Ok(())
+}
+
+fn add_work_item(store: &Store, job: &Job, draft: &mut Draft, add: AddWork) -> Result<()> {
+    reference(&add.r#ref)?;
+    if !WORK_KINDS.contains(&add.kind.as_str()) { return Err(invalid("Unknown work kind")); }
+    let status = add.status.unwrap_or_else(|| "pending".into());
+    valid_status(&status)?;
+    text(&add.rationale, "rationale", 16_384)?;
+    reject_future_review(add.phase, job.phase, &status)?;
+    if let Some(parent) = &add.parent_id { let _: Work = existing(store, job, "work", parent)?; }
+    let id = store::id();
+    let work = Work { id: id.clone(), parent_id: add.parent_id, phase: add.phase, kind: add.kind, status, rationale: add.rationale, revision: draft.next.work_revision };
+    work_links(store, job, &mut draft.writes, &id, &add.evidence_ids, &add.requirement_ids, &add.question_ids)?;
+    not_applicable(store, job, &work, &add.evidence_ids)?;
+    checked_add(&mut draft.next.counts.work, "work")?;
+    if is_open(&work.status) { checked_add(&mut draft.next.counts.work_open, "open work")?; }
+    if work.status == "blocked" { checked_add(&mut draft.next.counts.blocked, "blocked work")?; }
+    draft.writes.push(store::mutation("work", &id, &work)?);
+    draft.work.push(json!({"ref":add.r#ref,"id":id}));
+    Ok(())
+}
+
+fn update_changes_review(update: &UpdateWork) -> bool {
+    update.rationale.is_some() || !update.evidence_ids.is_empty() || !update.requirement_ids.is_empty() || !update.question_ids.is_empty()
+}
+
+fn apply_work_fields(work: &mut Work, update: &mut UpdateWork) -> Result<()> {
+    if let Some(status) = update.status.take() {
+        valid_status(&status)?;
+        work.status = status;
+    } else if work.status == "reviewed" && update_changes_review(update) {
+        work.status = "pending".into();
     }
-    let mut new_paths = HashSet::new();
-    for add in updates.add_documents {
-        reference(&add.r#ref)?;
-        text(&add.title, "title", 1024)?;
-        if let Some(parent) = &add.parent_document_id { let _: Document = existing(store, job, "documents", parent)?; }
-        // Requirement notes are allocated together with the stable requirement; never create a second owner.
-        if add.r#type == "requirement" { return Err(invalid("Requirement documents are allocated by addRequirements")); }
-        if add.requirement_id.is_some() { return Err(invalid("Only auto-allocated requirement documents may have requirementId")); }
-        let doc = document(&add.r#type, add.title, None, add.parent_document_id)?;
-        if !new_paths.insert(doc.path.clone()) { return Err(invalid("Duplicate document path in checkpoint")); }
-        if FIXED_DOCUMENTS.contains(&doc.r#type.as_str()) {
-            let mut collision = false;
-            store.for_each(&job.job_id, "documents", |v| { let existing: Document = decode(v)?; collision |= existing.r#type == doc.r#type; Ok(()) })?;
-            if collision { return Err(invalid(format!("Document type {} is already allocated", doc.r#type))); }
-        }
-        if let Some(parent) = &doc.parent_document_id { link(store, job, &mut writes, &doc.document_id, "parent", parent)?; }
-        checked_add(&mut next.counts.documents, "documents")?;
-        document_allocated.push(json!({"ref":add.r#ref,"documentId":doc.document_id,"revisionId":doc.revision_id,"path":doc.path}));
-        writes.push(store::mutation("documents", &doc.document_id, &doc)?);
+    if let Some(rationale) = update.rationale.take() { text(&rationale, "rationale", 16_384)?; work.rationale = rationale; }
+    Ok(())
+}
+
+/// Moves `counter` by the open/blocked transition; `was`/`now` are the membership before and after.
+fn shift_counter(counter: &mut u64, was: bool, now: bool, name: &str, underflow: &str) -> Result<()> {
+    if was == now { return Ok(()); }
+    if !was { return checked_add(counter, name); }
+    *counter = counter.checked_sub(1).ok_or(underflow)?;
+    Ok(())
+}
+
+fn update_work_item(store: &Store, job: &Job, draft: &mut Draft, mut update: UpdateWork) -> Result<()> {
+    if !draft.touched.insert(update.id.clone()) { return Err(invalid("updateWork contains the same ID more than once")); }
+    let mut work: Work = existing(store, job, "work", &update.id)?;
+    if work.status == "excluded" { return Err(invalid("Human-excluded work cannot be modified by the model")); }
+    let old_open = is_open(&work.status);
+    let old_blocked = work.status == "blocked";
+    apply_work_fields(&mut work, &mut update)?;
+    reject_future_review(work.phase, job.phase, &work.status)?;
+    work_links(store, job, &mut draft.writes, &work.id, &update.evidence_ids, &update.requirement_ids, &update.question_ids)?;
+    not_applicable(store, job, &work, &update.evidence_ids)?;
+    let counts = &mut draft.next.counts;
+    shift_counter(&mut counts.work_open, old_open, is_open(&work.status), "open work", "storage_error: Open work counter underflow")?;
+    shift_counter(&mut counts.blocked, old_blocked, work.status == "blocked", "blocked work", "storage_error: Blocked work counter underflow")?;
+    work.revision = draft.next.work_revision;
+    draft.writes.push(store::mutation("work", &work.id, &work)?);
+    Ok(())
+}
+
+/// Fixed document types are singletons per job.
+fn ensure_fixed_type_free(store: &Store, job: &Job, doc: &Document) -> Result<()> {
+    if !FIXED_DOCUMENTS.contains(&doc.r#type.as_str()) { return Ok(()); }
+    let mut collision = false;
+    store.for_each(&job.job_id, "documents", |v| { let existing: Document = decode(v)?; collision |= existing.r#type == doc.r#type; Ok(()) })?;
+    if collision { return Err(invalid(format!("Document type {} is already allocated", doc.r#type))); }
+    Ok(())
+}
+
+fn add_document_item(store: &Store, job: &Job, draft: &mut Draft, add: AddDocument) -> Result<()> {
+    reference(&add.r#ref)?;
+    text(&add.title, "title", 1024)?;
+    if let Some(parent) = &add.parent_document_id { let _: Document = existing(store, job, "documents", parent)?; }
+    // Requirement notes are allocated together with the stable requirement; never create a second owner.
+    if add.r#type == "requirement" { return Err(invalid("Requirement documents are allocated by addRequirements")); }
+    if add.requirement_id.is_some() { return Err(invalid("Only auto-allocated requirement documents may have requirementId")); }
+    let doc = document(&add.r#type, add.title, None, add.parent_document_id)?;
+    if !draft.new_paths.insert(doc.path.clone()) { return Err(invalid("Duplicate document path in checkpoint")); }
+    ensure_fixed_type_free(store, job, &doc)?;
+    if let Some(parent) = &doc.parent_document_id { link(store, job, &mut draft.writes, &doc.document_id, "parent", parent)?; }
+    checked_add(&mut draft.next.counts.documents, "documents")?;
+    draft.documents.push(json!({"ref":add.r#ref,"documentId":doc.document_id,"revisionId":doc.revision_id,"path":doc.path}));
+    draft.writes.push(store::mutation("documents", &doc.document_id, &doc)?);
+    Ok(())
+}
+
+/// Links a new requirement to `target` work and restamps that work's revision; reviewed work stays reviewed and no dependent document is rewritten.
+fn link_requirement_work(store: &Store, job: &Job, writes: &mut Vec<Mutation>, work_revision: u64, id: &str, target: &str) -> Result<()> {
+    link(store, job, writes, id, "work", target)?;
+    link(store, job, writes, target, "requirement", id)?;
+    if let Some(write) = writes.iter_mut().find(|write| write.table == "work" && write.id == target) {
+        write.value["revision"] = json!(work_revision);
+        return Ok(());
     }
-    for add in updates.add_requirements {
-        reference(&add.r#ref)?;
-        if !AREAS.contains(&add.area.as_str()) { return Err(invalid("Unknown requirement AREA")); }
-        text(&add.title, "title", 1024)?;
-        bounded(&add.work_ids, "workIds")?;
-        validate_evidence(&store.dir(&job.job_id)?, &add.evidence_ids)?;
-        for id in &add.work_ids { let _: Work = existing(store, job, "work", id)?; }
-        // next_requirement is the last allocated global ordinal, shared by every AREA.
-        checked_add(&mut next.next_requirement, "requirement ordinal")?;
-        let id = documents::requirement_id(&add.area, next.next_requirement)?;
-        let doc = document("requirement", add.title.clone(), Some(id.clone()), None)?;
-        let requirement = Requirement { id: id.clone(), area: add.area, title: add.title, document_id: doc.document_id.clone(), revision: job.revision.checked_add(1).ok_or("storage_error: Revision overflow")? };
-        for target in &add.work_ids {
-            link(store, job, &mut writes, &id, "work", target)?;
-            link(store, job, &mut writes, target, "requirement", &id)?;
-            // Linking a new requirement changes this obligation's review inputs, but
-            // does not reopen reviewed work or rewrite any dependent document.
-            if let Some(write) = writes.iter_mut().find(|write| write.table == "work" && write.id == *target) {
-                write.value["revision"] = json!(next.work_revision);
-            } else {
-                let mut work: Work = existing(store, job, "work", target)?;
-                work.revision = next.work_revision;
-                writes.push(store::mutation("work", target, &work)?);
-            }
-        }
-        for target in &add.evidence_ids { link(store, job, &mut writes, &id, "evidence", target)?; }
-        checked_add(&mut next.counts.requirements, "requirements")?;
-        checked_add(&mut next.counts.documents, "documents")?;
-        requirement_allocated.push(json!({"ref":add.r#ref,"id":id,"documentId":doc.document_id}));
-        writes.push(store::mutation("requirements", &id, &requirement)?);
-        writes.push(store::mutation("documents", &doc.document_id, &doc)?);
+    let mut work: Work = existing(store, job, "work", target)?;
+    work.revision = work_revision;
+    writes.push(store::mutation("work", target, &work)?);
+    Ok(())
+}
+
+fn add_requirement_item(store: &Store, job: &Job, draft: &mut Draft, add: AddRequirement) -> Result<()> {
+    reference(&add.r#ref)?;
+    if !AREAS.contains(&add.area.as_str()) { return Err(invalid("Unknown requirement AREA")); }
+    text(&add.title, "title", 1024)?;
+    bounded(&add.work_ids, "workIds")?;
+    validate_evidence(&store.dir(&job.job_id)?, &add.evidence_ids)?;
+    for id in &add.work_ids { let _: Work = existing(store, job, "work", id)?; }
+    // next_requirement is the last allocated global ordinal, shared by every AREA.
+    checked_add(&mut draft.next.next_requirement, "requirement ordinal")?;
+    let id = documents::requirement_id(&add.area, draft.next.next_requirement)?;
+    let doc = document("requirement", add.title.clone(), Some(id.clone()), None)?;
+    let requirement = Requirement { id: id.clone(), area: add.area, title: add.title, document_id: doc.document_id.clone(), revision: job.revision.checked_add(1).ok_or("storage_error: Revision overflow")? };
+    for target in &add.work_ids { link_requirement_work(store, job, &mut draft.writes, draft.next.work_revision, &id, target)?; }
+    for target in &add.evidence_ids { link(store, job, &mut draft.writes, &id, "evidence", target)?; }
+    checked_add(&mut draft.next.counts.requirements, "requirements")?;
+    checked_add(&mut draft.next.counts.documents, "documents")?;
+    draft.requirements.push(json!({"ref":add.r#ref,"id":id,"documentId":doc.document_id}));
+    draft.writes.push(store::mutation("requirements", &id, &requirement)?);
+    draft.writes.push(store::mutation("documents", &doc.document_id, &doc)?);
+    Ok(())
+}
+
+fn validate_question_options(options: &[QuestionOption]) -> Result<()> {
+    let mut labels = HashSet::new();
+    for option in options {
+        text(&option.label, "option label", 1024)?;
+        if !labels.insert(option.label.as_str()) { return Err(invalid("Question options must have unique labels")); }
+        if let Some(description) = &option.description { text(description, "option description", 4096)?; }
     }
-    for add in updates.add_questions {
-        reference(&add.r#ref)?;
-        text(&add.prompt, "prompt", 16_384)?;
-        bounded(&add.work_ids, "workIds")?;
-        bounded(&add.options, "options")?;
-        let mut labels = HashSet::new();
-        for option in &add.options {
-            text(&option.label, "option label", 1024)?;
-            if !labels.insert(option.label.as_str()) { return Err(invalid("Question options must have unique labels")); }
-            if let Some(description) = &option.description { text(description, "option description", 4096)?; }
-        }
-        for id in &add.work_ids { let _: Work = existing(store, job, "work", id)?; }
-        let id = store::id();
-        let question = Question { question_id: id.clone(), prompt: add.prompt, options: add.options, multi: add.multi, required: add.required, state: "open".into(), answer_receipt_id: None, live: false, invocation_id: None };
-        for target in &add.work_ids {
-            link(store, job, &mut writes, &id, "work", target)?;
-            link(store, job, &mut writes, target, "question", &id)?;
-        }
-        checked_add(&mut next.counts.questions, "questions")?;
-        checked_add(&mut next.counts.questions_open, "open questions")?;
-        question_allocated.push(json!({"ref":add.r#ref,"questionId":id}));
-        writes.push(store::mutation("questions", &id, &question)?);
+    Ok(())
+}
+
+fn add_question_item(store: &Store, job: &Job, draft: &mut Draft, add: AddQuestion) -> Result<()> {
+    reference(&add.r#ref)?;
+    text(&add.prompt, "prompt", 16_384)?;
+    bounded(&add.work_ids, "workIds")?;
+    bounded(&add.options, "options")?;
+    validate_question_options(&add.options)?;
+    for id in &add.work_ids { let _: Work = existing(store, job, "work", id)?; }
+    let id = store::id();
+    let question = Question { question_id: id.clone(), prompt: add.prompt, options: add.options, multi: add.multi, required: add.required, state: "open".into(), answer_receipt_id: None, live: false, invocation_id: None };
+    for target in &add.work_ids {
+        link(store, job, &mut draft.writes, &id, "work", target)?;
+        link(store, job, &mut draft.writes, target, "question", &id)?;
     }
+    checked_add(&mut draft.next.counts.questions, "questions")?;
+    checked_add(&mut draft.next.counts.questions_open, "open questions")?;
+    draft.questions.push(json!({"ref":add.r#ref,"questionId":id}));
+    draft.writes.push(store::mutation("questions", &id, &question)?);
+    Ok(())
+}
+
+fn finish_checkpoint(job: &mut Job, draft: Draft, summary: Option<String>, now: u64) -> Result<(Vec<Mutation>, Value)> {
+    let Draft { mut next, writes, work, documents, requirements, questions, .. } = draft;
     if !writes.is_empty() { next.completion = None; }
     next.updated_at = now;
-    next.checkpoint = Some(Checkpoint { revision: job.revision.checked_add(1).ok_or("storage_error: Revision overflow")?, at: now, summary: updates.summary.unwrap_or_else(|| "Checkpoint recorded".into()) });
-    let allocated = json!({"work":work_allocated,"documents":document_allocated,"requirements":requirement_allocated,"questions":question_allocated});
+    next.checkpoint = Some(Checkpoint { revision: job.revision.checked_add(1).ok_or("storage_error: Revision overflow")?, at: now, summary: summary.unwrap_or_else(|| "Checkpoint recorded".into()) });
+    let allocated = json!({"work":work,"documents":documents,"requirements":requirements,"questions":questions});
     // Store enforces its transaction bound as well. Fail before exposing a mutated in-memory job.
     let encoded = serde_json::to_vec(&json!({"job":next,"writes":writes,"activity":allocated})).map_err(|e| e.to_string())?;
     if encoded.len() as u64 > super::MAX_RECORD { return Err(invalid("Checkpoint exceeds the 1 MiB transaction bound; split it into smaller checkpoints")); }
@@ -297,50 +369,65 @@ fn validate_disposition(store: &Store, job: &Job, owner: &str, id: &str) -> Resu
     let record: Value = existing(store, job, "dispositions", id)?;
     let rationale = record["rationale"].as_str().ok_or_else(|| invalid("Human disposition has no rationale"))?;
     text(rationale, "human disposition rationale", 16_384)?;
-    if record["id"].as_str() != Some(id) || record["actor"].as_str() != Some("human")
-        || record["disposition"].as_str() != Some("excludeFromScope")
-        || !record["revision"].as_u64().is_some_and(|revision| revision > 0 && revision <= job.revision)
-        || record["at"].as_u64().is_none()
-        || record["jobId"].as_str() != Some(job.job_id.as_str()) {
+    if !disposition_provenance_valid(job, id, &record) {
         return Err(invalid("Human disposition has invalid provenance or job/revision binding"));
     }
     let item = record["itemId"].as_str().ok_or_else(|| invalid("Human disposition has no itemId"))?;
     store::safe_id(item)?;
     match record["kind"].as_str() {
-        Some("question") => {
-            let question: Question = existing(store, job, "questions", owner)?;
-            if item != owner || question.question_id != owner || question.state != "excluded"
-                || !matches!(record["previousState"].as_str(), Some("open" | "asked")) {
-                return Err(invalid("Human question disposition has an invalid owner/item/state binding"));
-            }
-            let work_ids = record["workIds"].as_array().ok_or_else(|| invalid("Human question disposition has no workIds"))?;
-            for value in work_ids {
-                let work_id = value.as_str().ok_or_else(|| invalid("Human disposition has an invalid workId"))?;
-                let _: Work = existing(store, job, "work", work_id)?;
-                if !store.relation_exists(&job.job_id, owner, "work", work_id)? {
-                    return Err(invalid("Human question disposition has an unrelated workId"));
-                }
-            }
-        }
-        Some(kind @ ("work" | "evidence")) => {
-            let work: Work = existing(store, job, "work", owner)?;
-            if record["workId"].as_str() != Some(owner) || work.id != owner || work.status != "excluded"
-                || work.rationale != format!("Human exclusion: {rationale}")
-                || !record["previousStatus"].as_str().is_some_and(|status| STATUSES.contains(&status))
-                || !record["previousRationale"].as_str().is_some_and(|value| !value.trim().is_empty()) {
-                return Err(invalid("Human work disposition has an invalid owner/status/rationale binding"));
-            }
-            if kind == "work" {
-                if item != owner { return Err(invalid("Human work disposition itemId does not match its owner")); }
-            } else {
-                if owner != format!("source-{item}") { return Err(invalid("Human evidence disposition does not own its source obligation")); }
-                let evidence = inventory::read_item(&store.dir(&job.job_id)?, item)?;
-                let expected = json!({"id":evidence.id,"path":evidence.path,"kind":evidence.kind,"state":evidence.state,"sha256":evidence.sha256});
-                if record["evidence"] != expected { return Err(invalid("Human evidence disposition does not match the immutable evidence")); }
-            }
-        }
-        _ => return Err(invalid("Human disposition has an invalid kind")),
+        Some("question") => validate_question_disposition(store, job, owner, item, &record),
+        Some(kind @ ("work" | "evidence")) => validate_work_disposition(store, job, owner, item, rationale, kind, &record),
+        _ => Err(invalid("Human disposition has an invalid kind")),
     }
+}
+
+fn disposition_provenance_valid(job: &Job, id: &str, record: &Value) -> bool {
+    record["id"].as_str() == Some(id) && record["actor"].as_str() == Some("human")
+        && record["disposition"].as_str() == Some("excludeFromScope")
+        && record["revision"].as_u64().is_some_and(|revision| revision > 0 && revision <= job.revision)
+        && record["at"].as_u64().is_some()
+        && record["jobId"].as_str() == Some(job.job_id.as_str())
+}
+
+fn validate_question_disposition(store: &Store, job: &Job, owner: &str, item: &str, record: &Value) -> Result<()> {
+    let question: Question = existing(store, job, "questions", owner)?;
+    if item != owner || question.question_id != owner || question.state != "excluded"
+        || !matches!(record["previousState"].as_str(), Some("open" | "asked")) {
+        return Err(invalid("Human question disposition has an invalid owner/item/state binding"));
+    }
+    let work_ids = record["workIds"].as_array().ok_or_else(|| invalid("Human question disposition has no workIds"))?;
+    for value in work_ids {
+        let work_id = value.as_str().ok_or_else(|| invalid("Human disposition has an invalid workId"))?;
+        let _: Work = existing(store, job, "work", work_id)?;
+        if !store.relation_exists(&job.job_id, owner, "work", work_id)? {
+            return Err(invalid("Human question disposition has an unrelated workId"));
+        }
+    }
+    Ok(())
+}
+
+fn work_disposition_bound(work: &Work, owner: &str, rationale: &str, record: &Value) -> bool {
+    record["workId"].as_str() == Some(owner) && work.id == owner && work.status == "excluded"
+        && work.rationale == format!("Human exclusion: {rationale}")
+        && record["previousStatus"].as_str().is_some_and(|status| STATUSES.contains(&status))
+        && record["previousRationale"].as_str().is_some_and(|value| !value.trim().is_empty())
+}
+
+fn validate_work_disposition(store: &Store, job: &Job, owner: &str, item: &str, rationale: &str, kind: &str, record: &Value) -> Result<()> {
+    let work: Work = existing(store, job, "work", owner)?;
+    if !work_disposition_bound(&work, owner, rationale, record) {
+        return Err(invalid("Human work disposition has an invalid owner/status/rationale binding"));
+    }
+    if kind != "work" { return validate_evidence_disposition(store, job, owner, item, record); }
+    if item != owner { return Err(invalid("Human work disposition itemId does not match its owner")); }
+    Ok(())
+}
+
+fn validate_evidence_disposition(store: &Store, job: &Job, owner: &str, item: &str, record: &Value) -> Result<()> {
+    if owner != format!("source-{item}") { return Err(invalid("Human evidence disposition does not own its source obligation")); }
+    let evidence = inventory::read_item(&store.dir(&job.job_id)?, item)?;
+    let expected = json!({"id":evidence.id,"path":evidence.path,"kind":evidence.kind,"state":evidence.state,"sha256":evidence.sha256});
+    if record["evidence"] != expected { return Err(invalid("Human evidence disposition does not match the immutable evidence")); }
     Ok(())
 }
 
@@ -362,105 +449,168 @@ pub fn validate_completion(store: &Store, job: &Job) -> Result<Vec<String>> {
     let mut reasons = Vec::new();
     if !job.inventory_complete { reason(&mut reasons, "Finish the durable evidence inventory before completion"); }
     if job.phase != Phase::Verify { reason(&mut reasons, "Complete the backend survey, specify and gapReview phases before final verification"); }
+    let sections = check_work_records(store, job, &mut reasons)?;
+    let dir = store.dir(&job.job_id)?;
+    check_relations(store, job, &dir, &mut reasons)?;
+    report_unfound(&mut reasons, &sections, TEMPLATE_SECTIONS, |title| format!("Create and review templateSection work for {title}"));
+    check_questions(store, job, &mut reasons)?;
+    let fixed = check_documents(store, job, &mut reasons)?;
+    report_unfound(&mut reasons, &fixed, FIXED_DOCUMENTS, |kind| format!("Allocate and commit the required {kind} document"));
+    check_requirements(store, job, &mut reasons)?;
+    check_inventory(store, job, &dir, &mut reasons)?;
+    Ok(reasons)
+}
+
+fn report_unfound(reasons: &mut Vec<String>, found: &[bool], names: &[&str], message: impl Fn(&str) -> String) {
+    for (name, _) in names.iter().zip(found).filter(|(_, found)| !**found) { reason(reasons, message(*name)); }
+}
+
+fn mark_template_section(work: &Work, sections: &mut [bool; 10]) {
+    if work.kind != "templateSection" { return; }
+    if let Some(index) = TEMPLATE_SECTIONS.iter().position(|title| *title == work.rationale.trim()) { sections[index] = true; }
+}
+
+fn check_work_records(store: &Store, job: &Job, reasons: &mut Vec<String>) -> Result<[bool; 10]> {
     let mut sections = [false; 10];
     store.for_each(&job.job_id, "work", |value| {
         let work: Work = decode(value)?;
-        if work.kind == "templateSection" {
-            if let Some(index) = TEMPLATE_SECTIONS.iter().position(|title| *title == work.rationale.trim()) { sections[index] = true; }
+        mark_template_section(&work, &mut sections);
+        check_work(store, job, &work, reasons)
+    })?;
+    Ok(sections)
+}
+
+fn check_work(store: &Store, job: &Job, work: &Work, reasons: &mut Vec<String>) -> Result<()> {
+    if !WORK_KINDS.contains(&work.kind.as_str()) { reason(reasons, format!("Work {} has invalid kind {}", work.id, work.kind)); }
+    if is_open(&work.status) { reason(reasons, format!("Review work {} ({}, status {})", work.id, work.rationale, work.status)); }
+    if work.status == "notApplicable" {
+        if let Err(e) = not_applicable(store, job, work, &[]) { reason(reasons, format!("Work {}: {e}", work.id)); }
+    }
+    if work.status == "reviewed" && matches!(work.kind.as_str(), "capability" | "scenario") && !requirement_covered(store, job, work)? {
+        reason(reasons, format!("Reviewed {} work {} must map to an existing stable requirement, or be evidence-backed notApplicable or human-excluded", work.kind, work.id));
+    }
+    if work.status == "excluded" { check_excluded_work(store, job, work, reasons)?; }
+    Ok(())
+}
+
+fn requirement_covered(store: &Store, job: &Job, work: &Work) -> Result<bool> {
+    let mut covered = false;
+    store.related(&job.job_id, &work.id, "requirement", |id| {
+        if let Ok(requirement) = store.get::<Requirement>(&job.job_id, "requirements", id) {
+            covered |= requirement.id == id;
         }
-        if !WORK_KINDS.contains(&work.kind.as_str()) { reason(&mut reasons, format!("Work {} has invalid kind {}", work.id, work.kind)); }
-        if is_open(&work.status) { reason(&mut reasons, format!("Review work {} ({}, status {})", work.id, work.rationale, work.status)); }
-        if work.status == "notApplicable" {
-            if let Err(e) = not_applicable(store, job, &work, &[]) { reason(&mut reasons, format!("Work {}: {e}", work.id)); }
-        }
-        if work.status == "reviewed" && matches!(work.kind.as_str(), "capability" | "scenario") {
-            let mut covered = false;
-            store.related(&job.job_id, &work.id, "requirement", |id| {
-                if let Ok(requirement) = store.get::<Requirement>(&job.job_id, "requirements", id) {
-                    covered |= requirement.id == id;
-                }
-                Ok(())
-            })?;
-            if !covered { reason(&mut reasons, format!("Reviewed {} work {} must map to an existing stable requirement, or be evidence-backed notApplicable or human-excluded", work.kind, work.id)); }
-        }
-        if work.status == "excluded" && !human_exclusion(store, job, &work.id)? {
-            reason(&mut reasons, format!("Work {} has no authenticated human exclusion disposition", work.id));
-        }
-        if work.status == "excluded" && work.kind == "templateSection" { reason(&mut reasons, format!("Template section {} must be reviewed or evidence-backed notApplicable, not excluded", work.rationale)); }
         Ok(())
     })?;
-    let dir = store.dir(&job.job_id)?;
+    Ok(covered)
+}
+
+fn check_excluded_work(store: &Store, job: &Job, work: &Work, reasons: &mut Vec<String>) -> Result<()> {
+    if !human_exclusion(store, job, &work.id)? {
+        reason(reasons, format!("Work {} has no authenticated human exclusion disposition", work.id));
+    }
+    if work.kind == "templateSection" { reason(reasons, format!("Template section {} must be reviewed or evidence-backed notApplicable, not excluded", work.rationale)); }
+    Ok(())
+}
+
+fn check_relations(store: &Store, job: &Job, dir: &Path, reasons: &mut Vec<String>) -> Result<()> {
     // One pass validates every durable link target without per-record relation scans or an all-job map.
     store.for_each_relation(&job.job_id, |owner, kind, target| {
-        let missing = match kind {
-            "evidence" => inventory::read_item(&dir, target).err(),
-            "requirement" => store.get::<Requirement>(&job.job_id, "requirements", target).err(),
-            "question" => store.get::<Question>(&job.job_id, "questions", target).err(),
-            "work" => store.get::<Work>(&job.job_id, "work", target).err(),
-            "reviewedWork" => match review_receipt_current(store, job, owner, target) {
-                Ok(true) => store.get::<Document>(&job.job_id, "documents", owner).err(),
-                Ok(false) => Some("document review does not bind the current work revision".into()),
-                Err(error) => Some(error),
-            },
-            "humanDisposition" => validate_disposition(store, job, owner, target).err(),
-            "parent" => store.get::<Document>(&job.job_id, "documents", target).err(),
-            "related" => store.get::<Document>(&job.job_id, "documents", target).err(),
-            _ => Some(format!("unknown relation kind {kind}")),
-        };
-        if let Some(error) = missing { reason(&mut reasons, format!("Relation {owner} -{kind}-> {target} is invalid: {error}")); }
+        if let Some(error) = relation_error(store, job, dir, owner, kind, target) {
+            reason(reasons, format!("Relation {owner} -{kind}-> {target} is invalid: {error}"));
+        }
         Ok(())
-    })?;
-    for (index, found) in sections.iter().enumerate() { if !found { reason(&mut reasons, format!("Create and review templateSection work for {}", TEMPLATE_SECTIONS[index])); } }
+    })
+}
+
+fn relation_error(store: &Store, job: &Job, dir: &Path, owner: &str, kind: &str, target: &str) -> Option<String> {
+    match kind {
+        "evidence" => inventory::read_item(dir, target).err(),
+        "requirement" => store.get::<Requirement>(&job.job_id, "requirements", target).err(),
+        "question" => store.get::<Question>(&job.job_id, "questions", target).err(),
+        "work" => store.get::<Work>(&job.job_id, "work", target).err(),
+        "reviewedWork" => match review_receipt_current(store, job, owner, target) {
+            Ok(true) => store.get::<Document>(&job.job_id, "documents", owner).err(),
+            Ok(false) => Some("document review does not bind the current work revision".into()),
+            Err(error) => Some(error),
+        },
+        "humanDisposition" => validate_disposition(store, job, owner, target).err(),
+        "parent" | "related" => store.get::<Document>(&job.job_id, "documents", target).err(),
+        _ => Some(format!("unknown relation kind {kind}")),
+    }
+}
+
+fn check_questions(store: &Store, job: &Job, reasons: &mut Vec<String>) -> Result<()> {
     store.for_each(&job.job_id, "questions", |value| {
         let question: Question = decode(value)?;
-        if !matches!(question.state.as_str(), "answered" | "excluded") { reason(&mut reasons, format!("Obtain a human answer or human exclusion for question {}: {}", question.question_id, question.prompt)); }
-        if question.state == "answered" && !matches!(super::questions::authenticated_answer(store, &job.job_id, &question), Ok(Some(_))) {
-            reason(&mut reasons, format!("Question {} has no authenticated durable human answer receipt", question.question_id));
-        }
-        if question.state == "excluded" && !human_exclusion(store, job, &question.question_id)? {
-            reason(&mut reasons, format!("Question {} has no authenticated human exclusion disposition", question.question_id));
-        }
-        if question.live { reason(&mut reasons, format!("Retire the live human invocation for question {}", question.question_id)); }
-        Ok(())
-    })?;
+        check_question(store, job, &question, reasons)
+    })
+}
+
+fn check_question(store: &Store, job: &Job, question: &Question, reasons: &mut Vec<String>) -> Result<()> {
+    if !matches!(question.state.as_str(), "answered" | "excluded") { reason(reasons, format!("Obtain a human answer or human exclusion for question {}: {}", question.question_id, question.prompt)); }
+    if question.state == "answered" && !matches!(super::questions::authenticated_answer(store, &job.job_id, question), Ok(Some(_))) {
+        reason(reasons, format!("Question {} has no authenticated durable human answer receipt", question.question_id));
+    }
+    if question.state == "excluded" && !human_exclusion(store, job, &question.question_id)? {
+        reason(reasons, format!("Question {} has no authenticated human exclusion disposition", question.question_id));
+    }
+    if question.live { reason(reasons, format!("Retire the live human invocation for question {}", question.question_id)); }
+    Ok(())
+}
+
+fn check_documents(store: &Store, job: &Job, reasons: &mut Vec<String>) -> Result<[bool; 7]> {
     let mut fixed = [false; 7];
     store.for_each(&job.job_id, "documents", |value| {
         let doc: Document = decode(value)?;
         if let Some(index) = FIXED_DOCUMENTS.iter().position(|kind| *kind == doc.r#type) { fixed[index] = true; }
-        if doc.state != "committed" || doc.bytes == 0 || !doc.hash.as_deref().map(valid_hash).unwrap_or(false) { reason(&mut reasons, format!("Commit document {} ({}) with its exact content hash", doc.document_id, doc.path)); }
-        match document_review_current(store, job, &doc) {
-            Ok(true) => {},
-            Ok(false) => reason(&mut reasons, format!("Review and recommit document {} ({}) against its affected work", doc.document_id, doc.path)),
-            Err(error) => reason(&mut reasons, format!("Document {} review is invalid: {error}", doc.document_id)),
-        }
-        match documents::document_path(&doc.r#type, &doc.document_id, doc.requirement_id.as_deref()) {
-            Ok(path) if path == doc.path => {},
-            _ => reason(&mut reasons, format!("Document {} has an invalid allocated type/path binding", doc.document_id)),
-        }
-        if let Some(parent) = &doc.parent_document_id { if store.get::<Document>(&job.job_id, "documents", parent).is_err() { reason(&mut reasons, format!("Document {} has missing parent {parent}", doc.document_id)); } }
+        check_document(store, job, &doc, reasons);
         Ok(())
     })?;
-    for (index, found) in fixed.iter().enumerate() { if !found { reason(&mut reasons, format!("Allocate and commit the required {} document", FIXED_DOCUMENTS[index])); } }
+    Ok(fixed)
+}
+
+fn check_document(store: &Store, job: &Job, doc: &Document, reasons: &mut Vec<String>) {
+    if doc.state != "committed" || doc.bytes == 0 || !doc.hash.as_deref().map(valid_hash).unwrap_or(false) { reason(reasons, format!("Commit document {} ({}) with its exact content hash", doc.document_id, doc.path)); }
+    match document_review_current(store, job, doc) {
+        Ok(true) => {},
+        Ok(false) => reason(reasons, format!("Review and recommit document {} ({}) against its affected work", doc.document_id, doc.path)),
+        Err(error) => reason(reasons, format!("Document {} review is invalid: {error}", doc.document_id)),
+    }
+    match documents::document_path(&doc.r#type, &doc.document_id, doc.requirement_id.as_deref()) {
+        Ok(path) if path == doc.path => {},
+        _ => reason(reasons, format!("Document {} has an invalid allocated type/path binding", doc.document_id)),
+    }
+    if let Some(parent) = &doc.parent_document_id {
+        if store.get::<Document>(&job.job_id, "documents", parent).is_err() { reason(reasons, format!("Document {} has missing parent {parent}", doc.document_id)); }
+    }
+}
+
+fn check_requirements(store: &Store, job: &Job, reasons: &mut Vec<String>) -> Result<()> {
     store.for_each(&job.job_id, "requirements", |value| {
         let req: Requirement = decode(value)?;
-        if !AREAS.contains(&req.area.as_str()) { reason(&mut reasons, format!("Requirement {} has invalid AREA {}", req.id, req.area)); }
+        if !AREAS.contains(&req.area.as_str()) { reason(reasons, format!("Requirement {} has invalid AREA {}", req.id, req.area)); }
         match store.get::<Document>(&job.job_id, "documents", &req.document_id) {
             Ok(doc) if doc.r#type == "requirement" && doc.requirement_id.as_deref() == Some(req.id.as_str()) && doc.state == "committed" => {},
-            _ => reason(&mut reasons, format!("Requirement {} needs its committed linked requirement document {}", req.id, req.document_id)),
+            _ => reason(reasons, format!("Requirement {} needs its committed linked requirement document {}", req.id, req.document_id)),
         }
         Ok(())
-    })?;
-    inventory::for_each(&dir, &mut |item| {
-        // A human scope exclusion is recorded on the item's survey obligation (`source-<evidenceId>`), never on the immutable inventory.
-        if item.state != "excluded" {
-            if let Ok(work) = store.get::<Work>(&job.job_id, "work", &format!("source-{}", item.id)) {
-                if work.status == "excluded" && human_exclusion(store, job, &work.id)? { return Ok(()); }
-            }
-        }
-        if let Some(pending) = evidence_requirement(item, &mut reasons) { check_coverage(store, job, pending, &mut reasons)?; }
+    })
+}
+
+/// A human scope exclusion is recorded on the item's survey obligation (`source-<evidenceId>`), never on the immutable inventory.
+fn human_excluded_source(store: &Store, job: &Job, item: &inventory::InventoryItem) -> Result<bool> {
+    if item.state == "excluded" { return Ok(false); }
+    let Ok(work) = store.get::<Work>(&job.job_id, "work", &format!("source-{}", item.id)) else { return Ok(false); };
+    if work.status != "excluded" { return Ok(false); }
+    human_exclusion(store, job, &work.id)
+}
+
+fn check_inventory(store: &Store, job: &Job, dir: &Path, reasons: &mut Vec<String>) -> Result<()> {
+    inventory::for_each(dir, &mut |item| {
+        if human_excluded_source(store, job, item)? { return Ok(()); }
+        if let Some(pending) = evidence_requirement(item, reasons) { check_coverage(store, job, pending, reasons)?; }
         Ok(())
-    })?;
-    Ok(reasons)
+    })
 }
 
 struct PendingEvidence { id: String, path: String, total: u64, hash: String }

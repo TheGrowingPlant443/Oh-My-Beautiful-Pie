@@ -93,11 +93,11 @@ class LuaRecipe(unittest.TestCase):
         calls = {s["raw"]: s for s in by(res["sites"], relation="calls")}
         fact = by(res["symbols"], name="fact")[0]
         self.assertEqual(calls["fact"]["callerId"], fact["id"])
-        self.assertTrue(calls["fact"]["conditional"] is False)
+        self.assertIs(calls["fact"]["conditional"], False)
         self.assertIsNone(calls["fact"]["targetId"])
         self.assertEqual(calls["obj.a.b"]["binding"]["receiver"], "obj.a")
         self.assertEqual(calls["M.f"]["binding"]["kind"], "member")
-        self.assertEqual(calls["M:meth"]["binding"]["method"], True)
+        self.assertTrue(calls["M:meth"]["binding"]["method"])
         self.assertEqual(calls["self:other"]["binding"]["receiverKind"], "self")
         self.assertEqual(calls["t[1]"]["resolution"], "dynamic")
         self.assertTrue(any(s["resolution"] == "dynamic" for s in res["sites"] if s["raw"] == "f()"))

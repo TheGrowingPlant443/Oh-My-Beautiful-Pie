@@ -9,8 +9,10 @@ import path from 'node:path';
 // src-tauri's browser::tests::native_tests::native_owned_browser_lifecycle is, with real leases and owned children.
 const ENDPOINT = /DevTools listening on (ws:\/\/127\.0\.0\.1:[1-9]\d{0,4}\/devtools\/browser\/[0-9A-Za-z-]+)/;
 const fail = (code, message) => Object.assign(new Error(message.startsWith(code) ? message : `${code}: ${message}`), { code });
+// Absolute path: a writable PATH entry must not substitute taskkill.
+const taskkill = path.win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe');
 const retireProcessTree = pid => {
-  if (process.platform === 'win32') return new Promise(resolve => execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve()));
+  if (process.platform === 'win32') return new Promise(resolve => execFile(taskkill, ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve()));
   try { process.kill(-pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') return Promise.reject(error); }
   return Promise.resolve();
 };
@@ -109,7 +111,10 @@ export class TestNativeHost {
   /** Resolves once the Chrome root of `pid` has exited (test observation, not a PID-authority check). */
   async waitForExit(pid, ms = 10000) {
     const deadline = Date.now() + ms;
-    while (alive(pid)) { if (Date.now() > deadline) throw new Error(`process ${pid} did not exit`); await new Promise(resolve => setTimeout(resolve, 50)); }
+    while (alive(pid)) {
+      if (Date.now() > deadline) throw new Error(`process ${pid} did not exit`);
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
   }
   isAlive(pid) { return alive(pid); }
 }

@@ -5,7 +5,7 @@ use super::secrets::MemorySecrets;
 use super::*;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -166,8 +166,58 @@ impl FakeSonar {
     }
 }
 
-/// Loopback SonarQube: `UP` status, `bad` tokens invalid, the default `admin:admin` login valid until its
-/// password is changed, then token generation for the admin login.
+fn fake_request_complete(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let Some(end) = text.find("\r\n\r\n") else { return false; };
+    let length = text[..end].lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|value| value.trim().parse::<usize>().ok())).unwrap_or(0);
+    bytes.len() >= end + 4 + length
+}
+fn read_fake_request(stream: &mut TcpStream) -> String {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 2048];
+    loop {
+        let n = stream.read(&mut buffer).unwrap_or(0);
+        if n == 0 { break; }
+        bytes.extend_from_slice(&buffer[..n]);
+        if fake_request_complete(&bytes) { break; }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+fn fake_password_change(request: &str, state: &FakeSonar, changed: bool) -> (u16, String) {
+    if state.fail_change.load(Ordering::Relaxed) || !request.contains("previousPassword=admin") || changed {
+        return (400, r#"{"errors":[{"msg":"rejected"}]}"#.to_string());
+    }
+    state.password_changed.store(true, Ordering::Relaxed);
+    (200, "{}".to_string())
+}
+fn fake_token_reply(request: &str, changed: bool, default_admin: bool) -> (u16, String) {
+    if request.contains("Basic YWRtaW46") && changed && !default_admin {
+        (200, r#"{"login":"admin","name":"omp","token":"squ_boot","type":"USER_TOKEN"}"#.to_string())
+    } else {
+        (401, r#"{"errors":[{"msg":"unauthorized"}]}"#.to_string())
+    }
+}
+fn fake_sonar_reply(request: &str, state: &FakeSonar) -> (u16, String) {
+    let default_admin = request.contains("YWRtaW46YWRtaW4="); // base64("admin:admin")
+    let changed = state.password_changed.load(Ordering::Relaxed);
+    if request.contains("/api/system/status") { return (200, r#"{"id":"x","version":"26.9","status":"UP"}"#.to_string()); }
+    if request.contains("/api/authentication/validate") {
+        let valid = if default_admin { !changed } else { !request.contains("YmFkOg==") }; // base64("bad:")
+        return (200, format!(r#"{{"valid":{valid}}}"#));
+    }
+    if request.contains("/api/users/change_password") { return fake_password_change(request, state, changed); }
+    if request.contains("/api/user_tokens/generate") { return fake_token_reply(request, changed, default_admin); }
+    (200, "{}".to_string())
+}
+fn serve_fake_sonar(mut stream: TcpStream, state: &FakeSonar) {
+    let request = read_fake_request(&mut stream);
+    state.calls.lock().push(request.lines().next().unwrap_or_default().to_string());
+    let (status, body) = fake_sonar_reply(&request, state);
+    let reason = match status { 200 => "OK", 400 => "Bad Request", _ => "Unauthorized" };
+    let _ = write!(stream, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+}
+/// Loopback SonarQube with the default admin login valid only until its password changes.
 fn fake_sonar() -> (u16, Arc<FakeSonar>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -175,55 +225,9 @@ fn fake_sonar() -> (u16, Arc<FakeSonar>) {
     let shared = state.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
+            let Ok(stream) = stream else { continue };
             let state = shared.clone();
-            std::thread::spawn(move || {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let mut bytes = Vec::new();
-                let mut buffer = [0u8; 2048];
-                loop {
-                    let n = stream.read(&mut buffer).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    bytes.extend_from_slice(&buffer[..n]);
-                    let text = String::from_utf8_lossy(&bytes).to_string();
-                    if let Some(end) = text.find("\r\n\r\n") {
-                        let length = text[..end].lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
-                        if bytes.len() >= end + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                let request = String::from_utf8_lossy(&bytes).to_string();
-                state.calls.lock().push(request.lines().next().unwrap_or_default().to_string());
-                let admin = request.contains("Basic YWRtaW46"); // base64("admin:")
-                let default_admin = request.contains("YWRtaW46YWRtaW4="); // base64("admin:admin")
-                let changed = state.password_changed.load(Ordering::Relaxed);
-                let (status, body) = if request.contains("/api/system/status") {
-                    (200, r#"{"id":"x","version":"26.9","status":"UP"}"#.to_string())
-                } else if request.contains("/api/authentication/validate") {
-                    let valid = if default_admin { !changed } else { !request.contains("YmFkOg==") }; // base64("bad:")
-                    (200, format!(r#"{{"valid":{valid}}}"#))
-                } else if request.contains("/api/users/change_password") {
-                    if state.fail_change.load(Ordering::Relaxed) || !request.contains("previousPassword=admin") || changed {
-                        (400, r#"{"errors":[{"msg":"rejected"}]}"#.to_string())
-                    } else {
-                        state.password_changed.store(true, Ordering::Relaxed);
-                        (200, "{}".to_string())
-                    }
-                } else if request.contains("/api/user_tokens/generate") {
-                    if admin && changed && !default_admin {
-                        (200, r#"{"login":"admin","name":"omp","token":"squ_boot","type":"USER_TOKEN"}"#.to_string())
-                    } else {
-                        (401, r#"{"errors":[{"msg":"unauthorized"}]}"#.to_string())
-                    }
-                } else {
-                    (200, "{}".to_string())
-                };
-                let reason = match status { 200 => "OK", 400 => "Bad Request", _ => "Unauthorized" };
-                let _ = write!(stream, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
-            });
+            std::thread::spawn(move || serve_fake_sonar(stream, &state));
         }
     });
     (port, state)

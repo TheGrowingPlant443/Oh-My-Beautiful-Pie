@@ -54,9 +54,20 @@ export const activeSrs = (job: SrsJob): boolean => ["inventory", "running", "wai
 export const resumableSrs = (job: SrsJob): boolean => ["paused", "interrupted", "uncertain"].includes(job.state);
 /** Completion is the native frozen manifest, never prose or a finished agent turn. */
 export const completedSrs = (job: SrsJob): boolean => job.state === "completed" && !!job.completion?.manifestHash && job.completion.scopeHash === job.scopeHash;
-export const srsStateLabel = (job: SrsJob): string => completedSrs(job) ? "SRS complete for the recorded evidence scope" : job.state === "completed" ? "Completion manifest unavailable — recheck" : ({ inventory: "Recording evidence inventory", running: "Running", waitingForHuman: "Waiting for you", paused: "Paused", interrupted: "Interrupted — needs attention", uncertain: "Delivery uncertain — inspect before resuming", reviewing: "Reviewing", cancelled: "Cancelled" } as Partial<Record<SrsState, string>>)[job.state] ?? job.state;
+const SRS_STATE_LABELS: Partial<Record<SrsState, string>> = {
+  inventory: "Recording evidence inventory", running: "Running", waitingForHuman: "Waiting for you", paused: "Paused", interrupted: "Interrupted — needs attention",
+  uncertain: "Delivery uncertain — inspect before resuming", reviewing: "Reviewing", cancelled: "Cancelled",
+};
+export function srsStateLabel(job: SrsJob): string {
+  if (completedSrs(job)) return "SRS complete for the recorded evidence scope";
+  if (job.state === "completed") return "Completion manifest unavailable — recheck";
+  return SRS_STATE_LABELS[job.state] ?? job.state;
+}
 export const srsPhaseLabel = (phase: SrsPhase | null): string => phase ? ({ survey: "Survey", specify: "Specify requirements", gapReview: "Gap review", verify: "Verification" })[phase] : "Inventory";
-export const srsDocumentLabel = (job: SrsJob): string => completedSrs(job) ? job.vaultMode === "obsidian" ? "Obsidian view" : "Documents view" : "View draft documents";
+export function srsDocumentLabel(job: SrsJob): string {
+  if (!completedSrs(job)) return "View draft documents";
+  return job.vaultMode === "obsidian" ? "Obsidian view" : "Documents view";
+}
 export const srsModelLabel = (model: string | null | undefined): string => model?.trim() ? `Architect model: ${model} — locality and provider charges are not inferred from its name` : "Model resolved by OMP; locality/cost unknown";
 
 export interface SrsTicket { jobId: string; attemptId: string | null; folder: string; scopeHash: string; producer: SrsJob["producer"]; navigationEpoch: number; eligible: boolean; lateResult: boolean; settled: boolean }
@@ -75,9 +86,10 @@ export interface SrsStore extends Readable<SrsStoreState> {
   rebindVault(jobId: string, vaultId: string): Promise<SrsJob>; noteNavigation(): void; invalidateAutoReturn(): void; openResult(jobId: string): boolean; disposeStore(): void;
 }
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+const systemClock: SrsClock = { setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms) as unknown as number, clearTimeout: timer => globalThis.clearTimeout(timer) };
 
 /** Parent-lived, passive observation. No total watch deadline; storage/provider pauses and failed reads are not completion. */
-export function createSrsStore(api: SrsApi = srsApi, clock: SrsClock = { setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms) as unknown as number, clearTimeout: timer => globalThis.clearTimeout(timer) }): SrsStore {
+export function createSrsStore(api: SrsApi = srsApi, clock: SrsClock = systemClock): SrsStore {
   let state: SrsStoreState = { jobs: new Map(), observationErrors: new Map(), connectionError: null, connected: false, tickets: [], navigationEpoch: 0, actionError: null };
   const store = writable(state);
   let hooks: SrsHooks | null = null;
@@ -171,8 +183,23 @@ export function createSrsStore(api: SrsApi = srsApi, clock: SrsClock = { setTime
     dispose: (jobId, revision, id, disposition, rationale, answer) => action(() => api.dispose(jobId, revision, id, disposition, rationale, answer)),
     rebindVault: (jobId, vaultId) => action(() => api.rebindVault(jobId, vaultId)),
     noteNavigation() { patch({ navigationEpoch: state.navigationEpoch + 1 }); invalidateAutoReturn(); }, invalidateAutoReturn,
-    openResult(jobId) { const ticket = state.tickets.find(item => item.jobId === jobId); const job = state.jobs.get(jobId); if (!ticket || !job || !completedSrs(job) || !hooks) return false; patch({ tickets: state.tickets.map(item => item === ticket ? { ...item, eligible: false, lateResult: false, settled: true } : item) }); hooks.returnToDocumentation(ticket); return true; },
-    disposeStore() { stopped = true; if (timer !== null) clock.clearTimeout(timer); timer = null; unlisten?.(); unlisten = null; connecting = null; observers.clear(); },
+    openResult(jobId) {
+      const ticket = state.tickets.find(item => item.jobId === jobId);
+      const job = state.jobs.get(jobId);
+      if (!ticket || !job || !completedSrs(job) || !hooks) return false;
+      patch({ tickets: state.tickets.map(item => item === ticket ? { ...item, eligible: false, lateResult: false, settled: true } : item) });
+      hooks.returnToDocumentation(ticket);
+      return true;
+    },
+    disposeStore() {
+      stopped = true;
+      if (timer !== null) clock.clearTimeout(timer);
+      timer = null;
+      unlisten?.();
+      unlisten = null;
+      connecting = null;
+      observers.clear();
+    },
   };
 }
 export const srs = createSrsStore();

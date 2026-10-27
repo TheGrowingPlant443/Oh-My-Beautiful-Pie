@@ -11,9 +11,9 @@ import {TestNativeHost} from './native-host.mjs';
 // agent browser.open yet) and opens tabs by hand: the agent must see them on its first browser.tabs().
 export default async function prelaunchedScenario(pi) {
   const root=process.env.BROWSER_TEST_ROOT;
-  let session;
+  const captured={};
   const originalInfos=pi.pi.AgentSession.prototype.getAllToolInfos;
-  function captureInfos(...args){session=this;return originalInfos.apply(this,args);}
+  function captureInfos(...args){captured.session=this;return originalInfos.apply(this,args);}
   pi.pi.AgentSession.prototype.getAllToolInfos=captureInfos;
   const host=new TestNativeHost(root);
   const helper=spawn(process.env.BUN_BIN||'bun',[fileURLToPath(new URL('../omp-browser-service.mjs',import.meta.url)),root,process.env.OMP_SDK_DIR],{env:process.env,stdio:['pipe','pipe','inherit']});
@@ -52,8 +52,8 @@ export default async function prelaunchedScenario(pi) {
     let exitCode=0;
     try {
       pi.getAllTools();
-      assert.ok(session,'Main native OMP session was not captured');
-      const tool=session.getToolByName('eval');
+      assert.ok(captured.session,'Main native OMP session was not captured');
+      const tool=captured.session.getToolByName('eval');
       async function cell(code){
         const result=await tool.execute('flow-'+crypto.randomUUID(),{language:'js',code,timeout:40});
         const text=result.content.filter(block=>block.type==='text').map(block=>block.text).join('\n');
@@ -71,7 +71,8 @@ export default async function prelaunchedScenario(pi) {
       assert.equal(row.state,'ready');
       const port=await chromePort();
       for(const title of ['Manual A','Manual B']){
-        const created=await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(`data:text/html,<title>${title}</title>${title}`)}`,{method:'PUT'});
+        const page=`data:text/html,<title>${title}</title>${title}`;
+        const created=await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(page)}`,{method:'PUT'});
         assert.equal(created.ok,true);
       }
       const seen=await cell('var rows=await browser.tabs();print("FLOW:"+JSON.stringify({rows:rows.map(t=>({name:t.name,title:t.title,kind:t.kind}))}));');
@@ -88,7 +89,7 @@ export default async function prelaunchedScenario(pi) {
       console.log('Pre-launched browser tabs are visible to the agent');
     } catch(error) {process.stderr.write(String(error.stack||error)+'\n');exitCode=1;}
     finally {
-      try {if(session)await session.dispose();}
+      try {if(captured.session)await captured.session.dispose();}
       finally {
         if(pi.pi.AgentSession.prototype.getAllToolInfos===captureInfos)pi.pi.AgentSession.prototype.getAllToolInfos=originalInfos;
         try{await control('shutdown');}catch{}

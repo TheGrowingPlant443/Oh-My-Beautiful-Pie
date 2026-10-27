@@ -274,44 +274,55 @@ pub(crate) fn open_loopback_url(url: &str) -> Result<()> {
 }
 
 /// Only a missing directory is absence. Enumeration and entry errors must remain diagnostic.
-pub(crate) fn cognee_version(folder: &Path) -> Result<Option<String>> {
-    fn entries(path: &Path) -> Result<Option<fs::ReadDir>> {
-        match fs::read_dir(path) {
-            Ok(entries) => Ok(Some(entries)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(err("Cannot inspect Cognee package metadata", error)),
-        }
+fn optional_entries(path: &Path) -> Result<Option<fs::ReadDir>> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(err("Cannot inspect Cognee package metadata", error)),
+    }
+}
+
+fn site_packages_dirs(folder: &Path) -> Result<Vec<PathBuf>> {
+    if cfg!(windows) {
+        return Ok(vec![folder.join("venv").join("Lib").join("site-packages")]);
     }
     let mut site_packages = Vec::new();
-    if cfg!(windows) {
-        site_packages.push(folder.join("venv").join("Lib").join("site-packages"));
-    } else if let Some(entries) = entries(&folder.join("venv").join("lib"))? {
-        for entry in entries {
-            let entry = entry.map_err(|error| err("Cannot enumerate Cognee Python environments", error))?;
-            if entry.file_name().to_str().is_some_and(|name| name.starts_with("python")) {
-                site_packages.push(entry.path().join("site-packages"));
-            }
+    let Some(entries) = optional_entries(&folder.join("venv").join("lib"))? else { return Ok(site_packages) };
+    for entry in entries {
+        let entry = entry.map_err(|error| err("Cannot enumerate Cognee Python environments", error))?;
+        if entry.file_name().to_str().is_some_and(|name| name.starts_with("python")) {
+            site_packages.push(entry.path().join("site-packages"));
         }
     }
+    Ok(site_packages)
+}
+
+/// The version of one `cognee-<version>.dist-info` entry; `None` for any other entry.
+fn dist_info_version(entry: &fs::DirEntry) -> Result<Option<String>> {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else { return Ok(None) };
+    let Some(version) = name.strip_prefix("cognee-").and_then(|name| name.strip_suffix(".dist-info")) else { return Ok(None) };
+    if !version.starts_with(|c: char| c.is_ascii_digit()) || !version.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '!' | '_' | '-')) {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    let directory = entry.file_type().map_err(|error| err("Cannot inspect Cognee package metadata entry", error))?.is_dir();
+    // Nix virtual environments link each installed dist-info directory to the immutable store.
+    #[cfg(unix)]
+    let directory = fs::metadata(entry.path()).map_err(|error| err("Cannot inspect Cognee package metadata entry", error))?.is_dir();
+    if !directory {
+        return Err("Cognee package metadata is not a folder".into());
+    }
+    Ok(Some(version.to_string()))
+}
+
+pub(crate) fn cognee_version(folder: &Path) -> Result<Option<String>> {
     let mut versions = BTreeSet::new();
-    for dir in site_packages {
-        let Some(entries) = entries(&dir)? else { continue };
+    for dir in site_packages_dirs(folder)? {
+        let Some(entries) = optional_entries(&dir)? else { continue };
         for entry in entries {
             let entry = entry.map_err(|error| err("Cannot enumerate Cognee package metadata", error))?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(version) = name.strip_prefix("cognee-").and_then(|name| name.strip_suffix(".dist-info")) else { continue };
-            if version.starts_with(|c: char| c.is_ascii_digit()) && version.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '!' | '_' | '-')) {
-                #[cfg(windows)]
-                let directory = entry.file_type().map_err(|error| err("Cannot inspect Cognee package metadata entry", error))?.is_dir();
-                // Nix virtual environments link each installed dist-info directory to the immutable store.
-                #[cfg(unix)]
-                let directory = fs::metadata(entry.path()).map_err(|error| err("Cannot inspect Cognee package metadata entry", error))?.is_dir();
-                if !directory {
-                    return Err("Cognee package metadata is not a folder".into());
-                }
-                versions.insert(version.to_string());
-            }
+            versions.extend(dist_info_version(&entry)?);
         }
     }
     Ok(versions.into_iter().next())

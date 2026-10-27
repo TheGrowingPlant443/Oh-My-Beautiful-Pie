@@ -2,8 +2,12 @@
   description = "OMP Manager: Linux and macOS packages and development shell (Windows does not use Nix)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs.fenix = {
+    url = "github:nix-community/fenix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, fenix }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
@@ -11,10 +15,26 @@
         let
           inherit (pkgs) lib stdenv;
           sdk = import ./nix/omp-sdk { inherit pkgs; };
+          sdkCommand = pkgs.writeShellScript "omp-manager-cli" ''
+            unset PI_COMPILED
+            exec "''${BUN_BIN:-${pkgs.bun}/bin/bun}" ${sdk}/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js "$@"
+          '';
+          # PHP needs both upstream entry points, not the generic single-grammar binding.
+          phpGrammar = pkgs.python3Packages.buildPythonPackage {
+            pname = "tree-sitter-php";
+            inherit (pkgs.tree-sitter-grammars.tree-sitter-php) version src;
+            pyproject = true;
+            build-system = with pkgs.python3Packages; [ setuptools wheel ];
+            nativeCheckInputs = with pkgs.python3Packages; [ tree-sitter pytestCheckHook ];
+            pytestFlags = [ "bindings/python/tests" ];
+            pythonImportsCheck = [ "tree_sitter_php" ];
+          };
           # Tree-sitter grammars used by the System overview parser worker (bridge/source-index).
           # Missing grammars are reported by the app as unavailable; they never break the build.
-          sourceIndexPython = pkgs.python3.withPackages (ps: [ ps.tree-sitter ] ++
-            map (name: ps.${name}) (lib.filter (name: builtins.hasAttr name ps) [
+          sourceIndexPythonWith = extra: pkgs.python3.withPackages (ps:
+            let grammarPackages = ps.tree-sitter-grammars // ps // { tree-sitter-php = phpGrammar; }; in
+            [ ps.tree-sitter ] ++ extra ps ++
+            map (name: grammarPackages.${name}) (lib.filter (name: builtins.hasAttr name grammarPackages) [
               "tree-sitter-python" "tree-sitter-javascript" "tree-sitter-typescript" "tree-sitter-go"
               "tree-sitter-rust" "tree-sitter-java" "tree-sitter-groovy" "tree-sitter-c" "tree-sitter-cpp"
               "tree-sitter-ruby" "tree-sitter-c-sharp" "tree-sitter-kotlin" "tree-sitter-scala"
@@ -22,6 +42,32 @@
               "tree-sitter-zig" "tree-sitter-elixir" "tree-sitter-objc" "tree-sitter-julia"
               "tree-sitter-fortran" "tree-sitter-verilog"
             ]));
+          sourceIndexPython = sourceIndexPythonWith (_: []);
+          coveragePython = sourceIndexPythonWith (ps: [ ps.coverage ]);
+          testNodeModules = pkgs.importNpmLock.buildNodeModules {
+            npmRoot = ./.;
+            nodejs = pkgs.nodejs_24;
+            derivationArgs = {
+              npmFlags = [ "--ignore-scripts" ];
+              npmRebuildFlags = [ "--ignore-scripts" ];
+            };
+          };
+          coverageCargoVendor = pkgs.rustPlatform.importCargoLock {
+            lockFile = ./src-tauri/Cargo.lock;
+          };
+          # Keep coverage's compiler, profiler runtime and readers from one upstream toolchain.
+          coverageRust = fenix.packages.${stdenv.hostPlatform.system}.stable.withComponents [
+            "cargo" "rustc" "rust-std" "rustfmt" "clippy" "llvm-tools-preview"
+          ];
+          coverageLlvm = "${coverageRust}/lib/rustlib/${stdenv.hostPlatform.rust.rustcTarget}/bin";
+          coverageTool = (pkgs.cargo-llvm-cov.override {
+            rustPlatform = pkgs.makeRustPlatform { cargo = coverageRust; rustc = coverageRust; };
+          }).overrideAttrs (old: {
+            env = (old.env or {}) // {
+              LLVM_COV = "${coverageLlvm}/llvm-cov";
+              LLVM_PROFDATA = "${coverageLlvm}/llvm-profdata";
+            };
+          });
           linuxLibs = with pkgs; [
             webkitgtk_4_1 gtk3 libsoup_3 glib cairo pango gdk-pixbuf atk harfbuzz
             librsvg openssl glib-networking libayatana-appindicator gsettings-desktop-schemas
@@ -118,6 +164,7 @@
                 --suffix PATH : ${lib.makeBinPath runtimeTools}
                 --set-default OMP_SYSTEM_OVERVIEW_PYTHON ${sourceIndexPython}/bin/python3
                 --set-default OMP_SDK_DIR ${sdk}/node_modules/@oh-my-pi/pi-coding-agent
+                --set-default OMP_BIN ${sdkCommand}
               )
             '' + lib.optionalString stdenv.hostPlatform.isLinux ''
               makeWrapperArgs+=( "''${gappsWrapperArgs[@]}" )
@@ -135,12 +182,19 @@
           inherit package frontend sdk;
           shell = pkgs.mkShell ({
             packages = [
-              pkgs.rustc pkgs.cargo pkgs.clippy pkgs.rustfmt pkgs.pkg-config pkgs.cmake
-              pkgs.nodejs_24 pkgs.bun pkgs.git sourceIndexPython
+              coverageRust pkgs.pkg-config pkgs.cmake
+              pkgs.nodejs_24 pkgs.bun pkgs.git coveragePython coverageTool
             ] ++ lib.optionals stdenv.hostPlatform.isLinux (linuxLibs ++ [ pkgs.patchelf pkgs.xdg-utils pkgs.libsecret ])
               ++ lib.optionals stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
             OMP_SYSTEM_OVERVIEW_PYTHON = "${sourceIndexPython}/bin/python3";
             OMP_SDK_DIR = "${sdk}/node_modules/@oh-my-pi/pi-coding-agent";
+            OMP_BIN = "${sdkCommand}";
+            OMP_COVERAGE_PYTHON = "${coveragePython}/bin/python3";
+            OMP_TEST_NODE_MODULES = "${testNodeModules}/node_modules";
+            LLVM_COV = "${coverageLlvm}/llvm-cov";
+            LLVM_PROFDATA = "${coverageLlvm}/llvm-profdata";
+            OMP_COVERAGE_CARGO = "${coverageRust}/bin/cargo";
+            OMP_COVERAGE_CARGO_VENDOR = "${coverageCargoVendor}";
           } // lib.optionalAttrs stdenv.hostPlatform.isLinux {
             LD_LIBRARY_PATH = lib.makeLibraryPath linuxLibs;
             GIO_MODULE_DIR = "${pkgs.glib-networking}/lib/gio/modules";

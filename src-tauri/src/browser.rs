@@ -1037,117 +1037,134 @@ impl BrowserSupervisor {
     ) {
         let mut reader = BufReader::new(output);
         let mut observed = HashMap::<String, BrowserInfo>::new();
-        loop {
-            let mut line = Vec::new();
-            let count = Read::by_ref(&mut reader)
-                .take((MAX_FRAME + 1) as u64)
-                .read_until(b'\n', &mut line);
-            let Ok(count) = count else { break };
-            if count == 0 || count > MAX_FRAME || line.last() != Some(&b'\n') {
+        while let Some(frame) = Self::read_frame(&mut reader) {
+            if !Self::dispatch_frame(&frame, &helper, &supervisor, &ready, &mut observed) {
                 break;
-            }
-            let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
-                break;
-            };
-            match frame["type"].as_str() {
-                Some("ready") => {
-                    // A helper that does not echo this run's session is not the process this reader was started for.
-                    if frame["helperSession"].as_str() != Some(helper.session.as_str()) {
-                        break;
-                    }
-                    let _ = ready.try_send(());
-                }
-                Some("response") => {
-                    if let Some(id) = frame["id"].as_str() {
-                        if let Some(tx) = helper.pending.lock().remove(id) {
-                            let result = if frame["ok"] == true {
-                                Ok(frame["data"].clone())
-                            } else {
-                                Err(frame["error"]
-                                    .as_str()
-                                    .unwrap_or("Browser helper failed")
-                                    .into())
-                            };
-                            let _ = tx.send(result);
-                        }
-                    }
-                }
-                Some("native_request") => {
-                    let Some(id) = frame["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 128).map(str::to_string) else {
-                        break;
-                    };
-                    let action = frame["action"].as_str().unwrap_or_default().to_string();
-                    let payload = frame["payload"].clone();
-                    let refusal = if helper.invalid.load(Ordering::SeqCst) || payload["helperSession"].as_str() != Some(helper.session.as_str()) {
-                        Some(NativeError::new("stale_helper_session", "stale_helper_session"))
-                    } else if helper.native_workers.fetch_add(1, Ordering::SeqCst) >= MAX_NATIVE_WORKERS {
-                        helper.native_workers.fetch_sub(1, Ordering::SeqCst);
-                        Some(NativeError::new("native_busy", "too many concurrent native browser actions"))
-                    } else {
-                        None
-                    };
-                    if let Some(error) = refusal {
-                        helper.respond_native(&id, Err(error));
-                        continue;
-                    }
-                    // A worker per request: spawning waits for Chrome's endpoint while retire/ready requests must
-                    // keep flowing through this reader.
-                    let (worker_helper, worker_supervisor) = (helper.clone(), supervisor.clone());
-                    std::thread::spawn(move || {
-                        let outcome = match worker_supervisor.upgrade() {
-                            Some(supervisor) => supervisor.native_action(&worker_helper, &action, &payload),
-                            None => Err(NativeError::new("browser_service_closed", "Browser service closed")),
-                        };
-                        worker_helper.native_workers.fetch_sub(1, Ordering::SeqCst);
-                        worker_helper.respond_native(&id, outcome);
-                    });
-                }
-                Some("state") => {
-                    if helper.invalid.load(Ordering::SeqCst) {
-                        continue;
-                    }
-                    if let (Some(supervisor), Ok(info)) = (
-                        supervisor.upgrade(),
-                        serde_json::from_value::<BrowserInfo>(frame["data"].clone()),
-                    ) {
-                        observed.insert(info.instance_id.clone(), info.clone());
-                        let mut state = supervisor.state.lock();
-                        if let Some(owner) = state.owners.get_mut(&info.instance_id) {
-                            if owner.generation == info.generation && info.epoch >= owner.info.epoch && owner.info != info
-                            {
-                                owner.info = info;
-                                owner.session = Some(helper.session.clone());
-                                supervisor.dirty.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-                _ => break,
             }
         }
+        Self::finish_helper(&helper, &supervisor, observed);
+    }
+    /// Next newline-terminated JSON frame; `None` ends the reader (I/O error, EOF, oversize, truncated or invalid frame).
+    fn read_frame(reader: &mut BufReader<std::process::ChildStdout>) -> Option<Value> {
+        let mut line = Vec::new();
+        let count = Read::by_ref(reader)
+            .take((MAX_FRAME + 1) as u64)
+            .read_until(b'\n', &mut line)
+            .ok()?;
+        if count == 0 || count > MAX_FRAME || line.last() != Some(&b'\n') {
+            return None;
+        }
+        serde_json::from_slice::<Value>(&line).ok()
+    }
+    /// Handles one frame; `false` stops the reader loop.
+    fn dispatch_frame(
+        frame: &Value,
+        helper: &Arc<Helper>,
+        supervisor: &Weak<Self>,
+        ready: &mpsc::SyncSender<()>,
+        observed: &mut HashMap<String, BrowserInfo>,
+    ) -> bool {
+        match frame["type"].as_str() {
+            Some("ready") => Self::accept_ready(frame, helper, ready),
+            Some("response") => {
+                Self::deliver_response(frame, helper);
+                true
+            }
+            Some("native_request") => Self::start_native_request(frame, helper, supervisor),
+            Some("state") => {
+                Self::record_state(frame, helper, supervisor, observed);
+                true
+            }
+            _ => false,
+        }
+    }
+    fn accept_ready(frame: &Value, helper: &Helper, ready: &mpsc::SyncSender<()>) -> bool {
+        // A helper that does not echo this run's session is not the process this reader was started for.
+        if frame["helperSession"].as_str() != Some(helper.session.as_str()) {
+            return false;
+        }
+        let _ = ready.try_send(());
+        true
+    }
+    fn deliver_response(frame: &Value, helper: &Helper) {
+        let Some(id) = frame["id"].as_str() else { return };
+        let Some(tx) = helper.pending.lock().remove(id) else { return };
+        let result = if frame["ok"] == true {
+            Ok(frame["data"].clone())
+        } else {
+            Err(frame["error"]
+                .as_str()
+                .unwrap_or("Browser helper failed")
+                .into())
+        };
+        let _ = tx.send(result);
+    }
+    /// `false` (stop the reader) only for a missing or oversized request id.
+    fn start_native_request(frame: &Value, helper: &Arc<Helper>, supervisor: &Weak<Self>) -> bool {
+        let Some(id) = frame["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 128).map(str::to_string) else {
+            return false;
+        };
+        let action = frame["action"].as_str().unwrap_or_default().to_string();
+        let payload = frame["payload"].clone();
+        if let Some(error) = Self::native_refusal(helper, &payload) {
+            helper.respond_native(&id, Err(error));
+            return true;
+        }
+        Self::spawn_native_worker(helper, supervisor, id, action, payload);
+        true
+    }
+    /// Refuses stale or over-limit requests; an accepted request leaves `native_workers` incremented.
+    fn native_refusal(helper: &Helper, payload: &Value) -> Option<NativeError> {
+        if helper.invalid.load(Ordering::SeqCst) || payload["helperSession"].as_str() != Some(helper.session.as_str()) {
+            Some(NativeError::new("stale_helper_session", "stale_helper_session"))
+        } else if helper.native_workers.fetch_add(1, Ordering::SeqCst) >= MAX_NATIVE_WORKERS {
+            helper.native_workers.fetch_sub(1, Ordering::SeqCst);
+            Some(NativeError::new("native_busy", "too many concurrent native browser actions"))
+        } else {
+            None
+        }
+    }
+    // A worker per request: spawning waits for Chrome's endpoint while retire/ready requests must
+    // keep flowing through the reader.
+    fn spawn_native_worker(helper: &Arc<Helper>, supervisor: &Weak<Self>, id: String, action: String, payload: Value) {
+        let (worker_helper, worker_supervisor) = (helper.clone(), supervisor.clone());
+        std::thread::spawn(move || {
+            let outcome = match worker_supervisor.upgrade() {
+                Some(supervisor) => supervisor.native_action(&worker_helper, &action, &payload),
+                None => Err(NativeError::new("browser_service_closed", "Browser service closed")),
+            };
+            worker_helper.native_workers.fetch_sub(1, Ordering::SeqCst);
+            worker_helper.respond_native(&id, outcome);
+        });
+    }
+    fn record_state(frame: &Value, helper: &Helper, supervisor: &Weak<Self>, observed: &mut HashMap<String, BrowserInfo>) {
+        if helper.invalid.load(Ordering::SeqCst) {
+            return;
+        }
+        if let (Some(supervisor), Ok(info)) = (
+            supervisor.upgrade(),
+            serde_json::from_value::<BrowserInfo>(frame["data"].clone()),
+        ) {
+            observed.insert(info.instance_id.clone(), info.clone());
+            supervisor.apply_state(helper, info);
+        }
+    }
+    fn apply_state(&self, helper: &Helper, info: BrowserInfo) {
+        let mut state = self.state.lock();
+        if let Some(owner) = state.owners.get_mut(&info.instance_id) {
+            if owner.generation == info.generation && info.epoch >= owner.info.epoch && owner.info != info {
+                owner.info = info;
+                owner.session = Some(helper.session.clone());
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    fn finish_helper(helper: &Arc<Helper>, supervisor: &Weak<Self>, observed: HashMap<String, BrowserInfo>) {
         match supervisor.upgrade() {
             Some(supervisor) => {
-                let outcome = supervisor.retire_helper(&helper);
-                let mut state = supervisor.state.lock();
-                for (id, last) in observed {
-                    if let Some(owner) = state.owners.get_mut(&id) {
-                        // Only the run that produced the current info may mark it disconnected.
-                        if owner.session.as_deref() == Some(helper.session.as_str())
-                            && owner.info.generation == last.generation
-                            && owner.info.epoch == last.epoch
-                            && owner.info.pid.is_some()
-                        {
-                            owner.info.pid = None;
-                            owner.info.state = "error".into();
-                            owner.info.error = Some(match &outcome {
-                                Ok(()) => "Browser helper disconnected".into(),
-                                Err(error) => format!("Browser helper disconnected; cleanup is blocked: {error}"),
-                            });
-                            supervisor.dirty.store(true, Ordering::Relaxed);
-                        }
-                    }
-                }
-                drop(state);
+                // Retirement runs before the state lock is taken.
+                let outcome = supervisor.retire_helper(helper);
+                supervisor.mark_disconnected(helper, observed, &outcome);
                 if let Err(error) = outcome {
                     supervisor.native_log(&format!("helper retirement blocked: {error}"));
                 }
@@ -1155,6 +1172,26 @@ impl BrowserSupervisor {
             None => {
                 helper.invalid.store(true, Ordering::SeqCst);
                 let _ = helper.stop_process();
+            }
+        }
+    }
+    fn mark_disconnected(&self, helper: &Helper, observed: HashMap<String, BrowserInfo>, outcome: &Result<()>) {
+        let mut state = self.state.lock();
+        for (id, last) in observed {
+            let Some(owner) = state.owners.get_mut(&id) else { continue };
+            // Only the run that produced the current info may mark it disconnected.
+            if owner.session.as_deref() == Some(helper.session.as_str())
+                && owner.info.generation == last.generation
+                && owner.info.epoch == last.epoch
+                && owner.info.pid.is_some()
+            {
+                owner.info.pid = None;
+                owner.info.state = "error".into();
+                owner.info.error = Some(match outcome {
+                    Ok(()) => "Browser helper disconnected".into(),
+                    Err(error) => format!("Browser helper disconnected; cleanup is blocked: {error}"),
+                });
+                self.dirty.store(true, Ordering::Relaxed);
             }
         }
     }

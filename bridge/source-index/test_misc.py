@@ -441,7 +441,7 @@ class VerilogRecipe(unittest.TestCase):
         c = by(syms, kind="class", name="C")[0]
         self.assertEqual(c["bindings"]["extends"], ["B"])
         self.assertEqual(by(syms, kind="constructor", name="new")[0]["ownerId"], c["id"])
-        self.assertEqual(by(syms, kind="macro", name="BAR")[0]["bindings"]["preprocessor"], True)
+        self.assertTrue(by(syms, kind="macro", name="BAR")[0]["bindings"]["preprocessor"])
         self.assertIn(("f", "import"), decls(top))
         unique_ids(self, res)
 

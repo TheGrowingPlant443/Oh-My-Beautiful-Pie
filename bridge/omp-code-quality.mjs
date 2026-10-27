@@ -24,6 +24,19 @@ export function codeQualityParameters(z) {
   }).strict();
 }
 
+function validatePagination(payload) {
+  if (payload.offset !== undefined && (!Number.isSafeInteger(payload.offset) || payload.offset < 0)) throw new Error('offset must be a nonnegative safe integer');
+  if (payload.limit !== undefined && (!Number.isSafeInteger(payload.limit) || payload.limit < 1 || payload.limit > 100)) throw new Error('limit must be an integer from 1 to 100');
+}
+
+function validateSelectors(payload) {
+  if (payload.scanId !== undefined && !(typeof payload.scanId === 'string' && UUID.test(payload.scanId))) throw new Error('scanId must be a scan id returned by section scans');
+  if (payload.tool !== undefined && (typeof payload.tool !== 'string' || !payload.tool || payload.tool.length > 200)) throw new Error('tool must be 1..200 characters');
+  if (payload.severity !== undefined && !SEVERITIES.includes(payload.severity)) throw new Error(`severity must be one of ${SEVERITIES.join(', ')}`);
+  if (payload.reportName !== undefined && (typeof payload.reportName !== 'string' || !payload.reportName || payload.reportName.length > 255 ||
+      /[\\/\0]/.test(payload.reportName) || payload.reportName.includes('..'))) throw new Error('reportName must be a report name listed by section scans');
+}
+
 // The one validation of the wire payload (the app validates again). Returns only the fields that were given.
 export function codeQualityPayload(params) {
   if (!object(params) || !SECTIONS.includes(params.section)) throw new Error(`section must be one of ${SECTIONS.join(', ')}`);
@@ -37,13 +50,8 @@ export function codeQualityPayload(params) {
   for (const field of REQUIRED[params.section] ?? []) {
     if (payload[field] === undefined) throw new Error(`section ${params.section} requires ${field}; get scan ids from section scans`);
   }
-  if (payload.scanId !== undefined && !(typeof payload.scanId === 'string' && UUID.test(payload.scanId))) throw new Error('scanId must be a scan id returned by section scans');
-  if (payload.offset !== undefined && (!Number.isSafeInteger(payload.offset) || payload.offset < 0)) throw new Error('offset must be a nonnegative safe integer');
-  if (payload.limit !== undefined && (!Number.isSafeInteger(payload.limit) || payload.limit < 1 || payload.limit > 100)) throw new Error('limit must be an integer from 1 to 100');
-  if (payload.tool !== undefined && (typeof payload.tool !== 'string' || !payload.tool || payload.tool.length > 200)) throw new Error('tool must be 1..200 characters');
-  if (payload.severity !== undefined && !SEVERITIES.includes(payload.severity)) throw new Error(`severity must be one of ${SEVERITIES.join(', ')}`);
-  if (payload.reportName !== undefined && (typeof payload.reportName !== 'string' || !payload.reportName || payload.reportName.length > 255 ||
-      /[\\/\0]/.test(payload.reportName) || payload.reportName.includes('..'))) throw new Error('reportName must be a report name listed by section scans');
+  validatePagination(payload);
+  validateSelectors(payload);
   return payload;
 }
 

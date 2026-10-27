@@ -309,17 +309,16 @@ fn resolve_npm(from: &Path, stop: &Path, name: &str) -> Option<PathBuf> {
     }
 }
 
-fn scan_npm(module: &Path, transitive: bool, b: &mut Builder) -> bool {
-    let manifest = module.join("package.json");
-    if !manifest.is_file() {
-        return false;
-    }
-    let Some(json) = read_json(&manifest) else { return true };
-    let modules_dir = module.join("node_modules");
-    let mut queue: VecDeque<(Occurrence, PathBuf)> = VecDeque::new();
-    let mut visited: HashSet<PathBuf> = HashSet::new();
+fn npm_direct_dependencies(
+    module: &Path,
+    json: &serde_json::Value,
+    transitive: bool,
+    b: &mut Builder,
+    queue: &mut VecDeque<(Occurrence, PathBuf)>,
+    visited: &mut HashSet<PathBuf>,
+) {
     for (key, dev) in [("dependencies", false), ("optionalDependencies", false), ("devDependencies", true)] {
-        for (name, range) in json_keys(&json, key) {
+        for (name, range) in json_keys(json, key) {
             let installed = resolve_npm(module, module, &name);
             let resolved = installed
                 .as_ref()
@@ -330,32 +329,26 @@ fn scan_npm(module: &Path, transitive: bool, b: &mut Builder) -> bool {
             b.link(None, Occurrence::new(&id, resolved.clone()));
             b.record_resolved(&id, resolved.as_deref());
             b.record_declared(&id, Some(&range));
-            if transitive {
-                if let Some(dir) = installed {
-                    let dir = canonical(&dir);
-                    if visited.insert(dir.clone()) {
-                        queue.push_back((Occurrence::new(&id, resolved.clone()), dir));
-                    }
-                }
+            let Some(dir) = installed.filter(|_| transitive) else { continue };
+            let dir = canonical(&dir);
+            if visited.insert(dir.clone()) {
+                queue.push_back((Occurrence::new(&id, resolved.clone()), dir));
             }
         }
     }
-    if !transitive {
-        return true;
-    }
-    if !modules_dir.is_dir() {
-        b.note(format!(
-            "node_modules was not found in {}: only direct npm dependencies are shown. Install the packages to see transitive dependencies.",
-            module.display()
-        ));
-        return true;
-    }
-    let stop = canonical(module);
+}
+
+fn npm_transitive_dependencies(
+    stop: &Path,
+    queue: &mut VecDeque<(Occurrence, PathBuf)>,
+    visited: &mut HashSet<PathBuf>,
+    b: &mut Builder,
+) {
     while let Some((parent, dir)) = queue.pop_front() {
         let Some(pkg) = read_json(&dir.join("package.json")) else { continue };
         let declarations = json_keys(&pkg, "dependencies").into_iter().chain(json_keys(&pkg, "optionalDependencies"));
         for (name, range) in declarations {
-            let Some(found) = resolve_npm(&dir, &stop, &name) else { continue };
+            let Some(found) = resolve_npm(&dir, stop, &name) else { continue };
             let dep_dir = canonical(&found);
             let version = read_json(&dep_dir.join("package.json")).and_then(|p| p["version"].as_str().map(String::from));
             let known = b.nodes.get(&format!("npm:{name}")).and_then(|node| node.version.clone());
@@ -372,6 +365,28 @@ fn scan_npm(module: &Path, transitive: bool, b: &mut Builder) -> bool {
             }
         }
     }
+}
+
+fn scan_npm(module: &Path, transitive: bool, b: &mut Builder) -> bool {
+    let manifest = module.join("package.json");
+    if !manifest.is_file() {
+        return false;
+    }
+    let Some(json) = read_json(&manifest) else { return true };
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::new();
+    npm_direct_dependencies(module, &json, transitive, b, &mut queue, &mut visited);
+    if !transitive {
+        return true;
+    }
+    if !module.join("node_modules").is_dir() {
+        b.note(format!(
+            "node_modules was not found in {}: only direct npm dependencies are shown. Install the packages to see transitive dependencies.",
+            module.display()
+        ));
+        return true;
+    }
+    npm_transitive_dependencies(&canonical(module), &mut queue, &mut visited, b);
     true
 }
 
@@ -440,6 +455,26 @@ fn proven_python_version(installed: &HashMap<String, Installed>, name: &str) -> 
     installed.get(name).filter(|pkg| !pkg.ambiguous).and_then(|pkg| pkg.version.clone())
 }
 
+/// The `Name`, `Version` and unconditional `Requires-Dist` names of a `METADATA` header.
+fn parse_python_metadata(text: &str) -> (Option<String>, Option<String>, Vec<String>) {
+    let (mut name, mut version, mut requires) = (None, None, Vec::new());
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Name:") {
+            name = requirement_name(value);
+        } else if let Some(value) = line.strip_prefix("Version:") {
+            version = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Requires-Dist:") {
+            if !value.contains("extra ==") && !value.contains("extra==") {
+                requires.extend(requirement_name(value));
+            }
+        }
+    }
+    (name, version, requires)
+}
+
 fn installed_python(site: &Path) -> HashMap<String, Installed> {
     let mut map = HashMap::new();
     for dir in subdirs(site) {
@@ -447,21 +482,7 @@ fn installed_python(site: &Path) -> HashMap<String, Installed> {
             continue;
         }
         let Some(text) = read_text(&dir.join("METADATA")) else { continue };
-        let (mut name, mut version, mut requires) = (None, None, Vec::new());
-        for line in text.lines() {
-            if line.trim().is_empty() {
-                break;
-            }
-            if let Some(value) = line.strip_prefix("Name:") {
-                name = requirement_name(value);
-            } else if let Some(value) = line.strip_prefix("Version:") {
-                version = Some(value.trim().to_string());
-            } else if let Some(value) = line.strip_prefix("Requires-Dist:") {
-                if !value.contains("extra ==") && !value.contains("extra==") {
-                    requires.extend(requirement_name(value));
-                }
-            }
-        }
+        let (name, version, requires) = parse_python_metadata(&text);
         if let Some(name) = name {
             let ambiguous = map.get(&name).is_some_and(|previous: &Installed| previous.ambiguous || previous.version != version);
             map.insert(name, Installed { version, requires, ambiguous });
@@ -492,27 +513,107 @@ fn poetry_dependencies(table: &toml::Table, found: &mut BTreeMap<String, PythonD
     }
 }
 
-fn pyproject_dependencies(table: &toml::Table, found: &mut BTreeMap<String, PythonDeclaration>) {
-    if let Some(project) = table.get("project").and_then(|v| v.as_table()) {
-        for spec in project.get("dependencies").and_then(|v| v.as_array()).into_iter().flatten() {
-            add_python_declaration(found, spec.as_str().and_then(requirement_name), spec.as_str(), false);
-        }
-        for group in project.get("optional-dependencies").and_then(|v| v.as_table()).into_iter().flat_map(|t| t.values()) {
-            for spec in group.as_array().into_iter().flatten() {
-                add_python_declaration(found, spec.as_str().and_then(requirement_name), spec.as_str(), true);
-            }
+fn project_dependencies(project: &toml::Table, found: &mut BTreeMap<String, PythonDeclaration>) {
+    for spec in project.get("dependencies").and_then(|v| v.as_array()).into_iter().flatten() {
+        add_python_declaration(found, spec.as_str().and_then(requirement_name), spec.as_str(), false);
+    }
+    for group in project.get("optional-dependencies").and_then(|v| v.as_table()).into_iter().flat_map(|t| t.values()) {
+        for spec in group.as_array().into_iter().flatten() {
+            add_python_declaration(found, spec.as_str().and_then(requirement_name), spec.as_str(), true);
         }
     }
-    if let Some(poetry) = table.get("tool").and_then(|v| v.get("poetry")).and_then(|v| v.as_table()) {
-        if let Some(deps) = poetry.get("dependencies").and_then(|v| v.as_table()) {
-            poetry_dependencies(deps, found, false);
-        }
-        if let Some(deps) = poetry.get("dev-dependencies").and_then(|v| v.as_table()) {
+}
+
+fn poetry_table_dependencies(poetry: &toml::Table, found: &mut BTreeMap<String, PythonDeclaration>) {
+    if let Some(deps) = poetry.get("dependencies").and_then(|v| v.as_table()) {
+        poetry_dependencies(deps, found, false);
+    }
+    if let Some(deps) = poetry.get("dev-dependencies").and_then(|v| v.as_table()) {
+        poetry_dependencies(deps, found, true);
+    }
+    for group in poetry.get("group").and_then(|v| v.as_table()).into_iter().flat_map(|t| t.values()) {
+        if let Some(deps) = group.get("dependencies").and_then(|v| v.as_table()) {
             poetry_dependencies(deps, found, true);
         }
-        for group in poetry.get("group").and_then(|v| v.as_table()).into_iter().flat_map(|t| t.values()) {
-            if let Some(deps) = group.get("dependencies").and_then(|v| v.as_table()) {
-                poetry_dependencies(deps, found, true);
+    }
+}
+
+fn pyproject_dependencies(table: &toml::Table, found: &mut BTreeMap<String, PythonDeclaration>) {
+    if let Some(project) = table.get("project").and_then(|v| v.as_table()) {
+        project_dependencies(project, found);
+    }
+    if let Some(poetry) = table.get("tool").and_then(|v| v.get("poetry")).and_then(|v| v.as_table()) {
+        poetry_table_dependencies(poetry, found);
+    }
+}
+
+fn requirement_files(module: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(module)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = file_name(path).to_lowercase();
+            path.is_file() && name.starts_with("requirements") && name.ends_with(".txt")
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn requirements_declarations(path: &Path, direct: &mut BTreeMap<String, PythonDeclaration>) {
+    let name = file_name(path).to_lowercase();
+    let dev = name.contains("dev") || name.contains("test");
+    for line in read_text(path).unwrap_or_default().lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('-') || line.contains("://") {
+            continue;
+        }
+        add_python_declaration(direct, requirement_name(line), Some(line), dev);
+    }
+}
+
+fn python_direct_nodes(
+    direct: &BTreeMap<String, PythonDeclaration>,
+    installed: &HashMap<String, Installed>,
+    transitive: bool,
+    b: &mut Builder,
+    queue: &mut VecDeque<String>,
+    visited: &mut HashSet<String>,
+) {
+    for (name, declaration) in direct {
+        let version = installed.get(name).and_then(|pkg| pkg.version.as_deref());
+        let legacy_version = if transitive { version.map(String::from) } else { None };
+        let Some(id) = b.direct("pypi", name, legacy_version, declaration.dev) else { continue };
+        b.link(None, Occurrence::new(&id, proven_python_version(installed, name)));
+        b.record_resolved(&id, version);
+        for version in &declaration.versions {
+            b.record_declared(&id, Some(version));
+        }
+        if transitive && visited.insert(name.clone()) {
+            queue.push_back(name.clone());
+        }
+    }
+}
+
+fn python_transitive_nodes(
+    installed: &HashMap<String, Installed>,
+    b: &mut Builder,
+    queue: &mut VecDeque<String>,
+    visited: &mut HashSet<String>,
+) {
+    while let Some(name) = queue.pop_front() {
+        let Some(package) = installed.get(&name) else { continue };
+        let from = Occurrence::new(&format!("pypi:{name}"), proven_python_version(installed, &name));
+        for required in &package.requires {
+            let version = installed.get(required).and_then(|pkg| pkg.version.clone());
+            let Some(id) = b.node("pypi", required, version.clone(), false, false) else { continue };
+            b.record_resolved(&id, version.as_deref());
+            b.edge(&from.id, &id);
+            b.link(Some(from.clone()), Occurrence::new(&id, proven_python_version(installed, required)));
+            if visited.insert(required.clone()) {
+                queue.push_back(required.clone());
             }
         }
     }
@@ -527,28 +628,9 @@ fn scan_pypi(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> b
             pyproject_dependencies(&table, &mut direct);
         }
     }
-    let mut requirement_files: Vec<PathBuf> = fs::read_dir(module)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            let name = file_name(path).to_lowercase();
-            path.is_file() && name.starts_with("requirements") && name.ends_with(".txt")
-        })
-        .collect();
-    requirement_files.sort();
-    for path in requirement_files {
+    for path in requirement_files(module) {
         found = true;
-        let name = file_name(&path).to_lowercase();
-        let dev = name.contains("dev") || name.contains("test");
-        for line in read_text(&path).unwrap_or_default().lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with('-') || line.contains("://") {
-                continue;
-            }
-            add_python_declaration(&mut direct, requirement_name(line), Some(line), dev);
-        }
+        requirements_declarations(&path, &mut direct);
     }
     if !found {
         return false;
@@ -557,36 +639,11 @@ fn scan_pypi(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> b
     let installed = site.as_deref().map(installed_python).unwrap_or_default();
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
-    for (name, declaration) in &direct {
-        let version = installed.get(name).and_then(|pkg| pkg.version.as_deref());
-        let legacy_version = if transitive { version.map(String::from) } else { None };
-        let Some(id) = b.direct("pypi", name, legacy_version, declaration.dev) else { continue };
-        b.link(None, Occurrence::new(&id, proven_python_version(&installed, name)));
-        b.record_resolved(&id, version);
-        for version in &declaration.versions {
-            b.record_declared(&id, Some(version));
-        }
-        if transitive && visited.insert(name.clone()) {
-            queue.push_back(name.clone());
-        }
-    }
+    python_direct_nodes(&direct, &installed, transitive, b, &mut queue, &mut visited);
     if transitive && site.is_none() {
         b.note("No virtual environment (.venv, venv, env) was found: only direct Python dependencies are shown.");
     }
-    while let Some(name) = queue.pop_front() {
-        let Some(package) = installed.get(&name) else { continue };
-        let from = Occurrence::new(&format!("pypi:{name}"), proven_python_version(&installed, &name));
-        for required in &package.requires {
-            let version = installed.get(required).and_then(|pkg| pkg.version.clone());
-            let Some(id) = b.node("pypi", required, version.clone(), false, false) else { continue };
-            b.record_resolved(&id, version.as_deref());
-            b.edge(&from.id, &id);
-            b.link(Some(from.clone()), Occurrence::new(&id, proven_python_version(&installed, required)));
-            if visited.insert(required.clone()) {
-                queue.push_back(required.clone());
-            }
-        }
-    }
+    python_transitive_nodes(&installed, b, &mut queue, &mut visited);
     true
 }
 
@@ -851,24 +908,58 @@ fn collect_poms(dir: &Path, depth: usize, visited: &mut HashSet<PathBuf>, seeds:
     }
 }
 
-fn scan_java(module: &Path, home: &Path, transitive: bool, b: &mut Builder) -> bool {
-    let mut seeds: Vec<(String, String, Option<String>, bool)> = Vec::new();
+type JavaSeed = (String, String, Option<String>, bool);
+
+/// POM and Gradle dependency seeds, whether any manifest was found, and whether a Gradle version catalog was seen.
+fn java_seeds(module: &Path) -> (Vec<JavaSeed>, bool, bool) {
+    let mut seeds: Vec<JavaSeed> = Vec::new();
     let mut found = false;
     collect_poms(module, 0, &mut HashSet::new(), &mut seeds, &mut found);
     let mut catalog = false;
     for name in ["build.gradle", "build.gradle.kts"] {
-        if let Some(text) = read_text(&module.join(name)) {
-            found = true;
-            let mut properties = HashMap::new();
-            if let Some(text) = read_text(&module.join("gradle.properties")) {
-                gradle_properties(&text, false, &mut properties);
+        let Some(text) = read_text(&module.join(name)) else { continue };
+        found = true;
+        let mut properties = HashMap::new();
+        if let Some(text) = read_text(&module.join("gradle.properties")) {
+            gradle_properties(&text, false, &mut properties);
+        }
+        gradle_properties(&text, true, &mut properties);
+        let (list, saw_catalog) = gradle_dependencies(&text, &properties);
+        seeds.extend(list);
+        catalog |= saw_catalog;
+    }
+    (seeds, found, catalog)
+}
+
+fn java_transitive(
+    roots: &[(PathBuf, Layout)],
+    queue: &mut VecDeque<(String, String, Option<String>)>,
+    visited: &mut HashSet<String>,
+    b: &mut Builder,
+) {
+    while let Some((group, artifact, version)) = queue.pop_front() {
+        let Some((pom, used)) = find_pom(roots, &group, &artifact, version.as_deref()) else { continue };
+        let from = format!("maven:{group}:{artifact}");
+        // The cached version only feeds the legacy `version`; it is neither resolved nor declared evidence.
+        b.node("maven", &format!("{group}:{artifact}"), Some(used), false, false);
+        let Some(text) = read_text(&pom) else { continue };
+        for dep in pom_dependencies(&text) {
+            if dep.optional || matches!(dep.scope.as_deref(), Some("test" | "provided" | "system")) {
+                continue;
             }
-            gradle_properties(&text, true, &mut properties);
-            let (list, saw_catalog) = gradle_dependencies(&text, &properties);
-            seeds.extend(list);
-            catalog |= saw_catalog;
+            let name = format!("{}:{}", dep.group, dep.artifact);
+            let Some(id) = b.node("maven", &name, dep.version.clone(), false, false) else { continue };
+            b.record_declared(&id, dep.version.as_deref());
+            b.edge(&from, &id);
+            if visited.insert(name) {
+                queue.push_back((dep.group, dep.artifact, dep.version));
+            }
         }
     }
+}
+
+fn scan_java(module: &Path, home: &Path, transitive: bool, b: &mut Builder) -> bool {
+    let (seeds, found, catalog) = java_seeds(module);
     if !found {
         return false;
     }
@@ -900,33 +991,14 @@ fn scan_java(module: &Path, home: &Path, transitive: bool, b: &mut Builder) -> b
         b.note("No local Maven or Gradle repository was found: only direct Java dependencies are shown.");
         return true;
     }
-    while let Some((group, artifact, version)) = queue.pop_front() {
-        let Some((pom, used)) = find_pom(&roots, &group, &artifact, version.as_deref()) else { continue };
-        let from = format!("maven:{group}:{artifact}");
-        // The cached version only feeds the legacy `version`; it is neither resolved nor declared evidence.
-        b.node("maven", &format!("{group}:{artifact}"), Some(used), false, false);
-        let Some(text) = read_text(&pom) else { continue };
-        for dep in pom_dependencies(&text) {
-            if dep.optional || matches!(dep.scope.as_deref(), Some("test" | "provided" | "system")) {
-                continue;
-            }
-            let name = format!("{}:{}", dep.group, dep.artifact);
-            let Some(id) = b.node("maven", &name, dep.version.clone(), false, false) else { continue };
-            b.record_declared(&id, dep.version.as_deref());
-            b.edge(&from, &id);
-            if visited.insert(name) {
-                queue.push_back((dep.group, dep.artifact, dep.version));
-            }
-        }
-    }
+    java_transitive(&roots, &mut queue, &mut visited, b);
     true
 }
 
 // ---- Cargo -----------------------------------------------------------------------------------------------------
 
-fn scan_cargo(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> bool {
-    let Some(text) = read_text(&module.join("Cargo.toml")) else { return false };
-    let Ok(manifest) = text.parse::<toml::Table>() else { return true };
+/// Declared Cargo dependencies, with `package = "…"` renames resolved to the real crate name.
+fn cargo_direct_dependencies(manifest: &toml::Table, b: &mut Builder) -> Vec<String> {
     let mut direct: Vec<String> = Vec::new();
     for (key, dev) in [("dependencies", false), ("build-dependencies", false), ("dev-dependencies", true)] {
         for (name, spec) in manifest.get(key).and_then(|v| v.as_table()).into_iter().flatten() {
@@ -937,6 +1009,91 @@ fn scan_cargo(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> 
             direct.push(name);
         }
     }
+    direct
+}
+
+struct CargoLock {
+    packages: HashMap<String, (String, Vec<String>)>,
+    versions: HashMap<String, Vec<String>>,
+    /// Every lock entry by (name, version): the dependency strings are `name[ version[ (source)]]`.
+    by_version: HashMap<(String, String), BTreeSet<(String, Option<String>)>>,
+}
+
+impl CargoLock {
+    fn parse(lock: &toml::Table) -> Self {
+        let mut parsed = CargoLock { packages: HashMap::new(), versions: HashMap::new(), by_version: HashMap::new() };
+        for package in lock.get("package").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(name) = package.get("name").and_then(|v| v.as_str()) else { continue };
+            let version = package.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Builder::record_version(parsed.versions.entry(name.to_string()).or_default(), Some(&version));
+            let entries: Vec<&str> =
+                package.get("dependencies").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|dep| dep.as_str()).collect();
+            if !version.is_empty() {
+                let pairs = entries.iter().filter_map(|text| cargo_dependency_pair(text));
+                parsed.by_version.entry((name.to_string(), version.clone())).or_default().extend(pairs);
+            }
+            let dependencies = entries.iter().filter_map(|text| text.split(' ').next()).map(String::from).collect();
+            parsed.packages.entry(name.to_string()).or_insert((version, dependencies));
+        }
+        parsed
+    }
+
+    fn sole_version(&self, name: &str) -> Option<String> {
+        self.versions.get(name).filter(|found| found.len() == 1).map(|found| found[0].clone())
+    }
+}
+
+fn cargo_dependency_pair(text: &str) -> Option<(String, Option<String>)> {
+    let mut parts = text.split(' ');
+    let name = parts.next().filter(|name| !name.is_empty())?;
+    Some((name.to_string(), parts.next().filter(|version| !version.starts_with('(')).map(String::from)))
+}
+
+fn cargo_collapsed_graph(direct: Vec<String>, lock: &CargoLock, transitive: bool, b: &mut Builder) {
+    let mut queue: VecDeque<String> = direct.iter().cloned().collect();
+    let mut visited: HashSet<String> = direct.into_iter().collect();
+    while let Some(name) = queue.pop_front() {
+        let from = format!("cargo:{name}");
+        for version in lock.versions.get(&name).into_iter().flatten() {
+            b.record_resolved(&from, Some(version));
+        }
+        if !transitive {
+            continue;
+        }
+        let Some((version, dependencies)) = lock.packages.get(&name) else { continue };
+        b.node("cargo", &name, Some(version.clone()), false, false);
+        for dependency in dependencies {
+            let version = lock.packages.get(dependency).map(|(version, _)| version.clone());
+            let Some(id) = b.node("cargo", dependency, version, false, false) else { continue };
+            b.edge(&from, &id);
+            if visited.insert(dependency.clone()) {
+                queue.push_back(dependency.clone());
+            }
+        }
+    }
+}
+
+fn cargo_occurrence_links(roots: Vec<(String, Option<String>)>, lock: &CargoLock, b: &mut Builder) {
+    let mut occurrences: VecDeque<(String, Option<String>)> = roots.iter().cloned().collect();
+    let mut seen: HashSet<(String, Option<String>)> = roots.into_iter().collect();
+    while let Some((name, version)) = occurrences.pop_front() {
+        let Some(version) = version else { continue };
+        let Some(dependencies) = lock.by_version.get(&(name.clone(), version.clone())) else { continue };
+        let from = Occurrence::new(&format!("cargo:{name}"), Some(version));
+        for (dependency, given) in dependencies {
+            let resolved = given.clone().or_else(|| lock.sole_version(dependency));
+            b.link(Some(from.clone()), Occurrence::new(&format!("cargo:{dependency}"), resolved.clone()));
+            if seen.insert((dependency.clone(), resolved.clone())) {
+                occurrences.push_back((dependency.clone(), resolved));
+            }
+        }
+    }
+}
+
+fn scan_cargo(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> bool {
+    let Some(text) = read_text(&module.join("Cargo.toml")) else { return false };
+    let Ok(manifest) = text.parse::<toml::Table>() else { return true };
+    let direct = cargo_direct_dependencies(&manifest, b);
     let lock = [module, root].iter().find_map(|dir| read_text(&dir.join("Cargo.lock")));
     let Some(lock) = lock.and_then(|text| text.parse::<toml::Table>().ok()) else {
         for name in &direct {
@@ -947,81 +1104,14 @@ fn scan_cargo(module: &Path, root: &Path, transitive: bool, b: &mut Builder) -> 
         }
         return true;
     };
-    let mut packages: HashMap<String, (String, Vec<String>)> = HashMap::new();
-    let mut versions: HashMap<String, Vec<String>> = HashMap::new();
-    // Every lock entry by (name, version): the dependency strings are `name[ version[ (source)]]`.
-    let mut by_version: HashMap<(String, String), BTreeSet<(String, Option<String>)>> = HashMap::new();
-    for package in lock.get("package").and_then(|v| v.as_array()).into_iter().flatten() {
-        let Some(name) = package.get("name").and_then(|v| v.as_str()) else { continue };
-        let version = package.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        Builder::record_version(versions.entry(name.to_string()).or_default(), Some(&version));
-        let pairs: Vec<(String, Option<String>)> = package
-            .get("dependencies")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|dep| dep.as_str())
-            .filter_map(|text| {
-                let mut parts = text.split(' ');
-                let name = parts.next().filter(|name| !name.is_empty())?;
-                Some((name.to_string(), parts.next().filter(|version| !version.starts_with('(')).map(String::from)))
-            })
-            .collect();
-        if !version.is_empty() {
-            by_version.entry((name.to_string(), version.clone())).or_default().extend(pairs);
-        }
-        let dependencies = package
-            .get("dependencies")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|dep| dep.as_str().and_then(|text| text.split(' ').next()).map(String::from))
-            .collect();
-        packages.entry(name.to_string()).or_insert((version, dependencies));
-    }
-    let sole_version = |name: &str| versions.get(name).filter(|found| found.len() == 1).map(|found| found[0].clone());
-    let roots: Vec<(String, Option<String>)> = direct.iter().map(|name| (name.clone(), sole_version(name))).collect();
+    let lock = CargoLock::parse(&lock);
+    let roots: Vec<(String, Option<String>)> = direct.iter().map(|name| (name.clone(), lock.sole_version(name))).collect();
     for (name, version) in &roots {
         b.link(None, Occurrence::new(&format!("cargo:{name}"), version.clone()));
     }
-    let mut queue: VecDeque<String> = direct.iter().cloned().collect();
-    let mut visited: HashSet<String> = direct.into_iter().collect();
-    while let Some(name) = queue.pop_front() {
-        let from = format!("cargo:{name}");
-        if let Some(found) = versions.get(&name) {
-            for version in found {
-                b.record_resolved(&from, Some(version));
-            }
-        }
-        if !transitive {
-            continue;
-        }
-        let Some((version, dependencies)) = packages.get(&name) else { continue };
-        b.node("cargo", &name, Some(version.clone()), false, false);
-        for dependency in dependencies {
-            let version = packages.get(dependency).map(|(version, _)| version.clone());
-            let Some(id) = b.node("cargo", dependency, version, false, false) else { continue };
-            b.edge(&from, &id);
-            if visited.insert(dependency.clone()) {
-                queue.push_back(dependency.clone());
-            }
-        }
-    }
+    cargo_collapsed_graph(direct, &lock, transitive, b);
     if transitive {
-        let mut occurrences: VecDeque<(String, Option<String>)> = roots.iter().cloned().collect();
-        let mut seen: HashSet<(String, Option<String>)> = roots.into_iter().collect();
-        while let Some((name, version)) = occurrences.pop_front() {
-            let Some(version) = version else { continue };
-            let Some(dependencies) = by_version.get(&(name.clone(), version.clone())) else { continue };
-            let from = Occurrence::new(&format!("cargo:{name}"), Some(version));
-            for (dependency, given) in dependencies {
-                let resolved = given.clone().or_else(|| sole_version(dependency));
-                b.link(Some(from.clone()), Occurrence::new(&format!("cargo:{dependency}"), resolved.clone()));
-                if seen.insert((dependency.clone(), resolved.clone())) {
-                    occurrences.push_back((dependency.clone(), resolved));
-                }
-            }
-        }
+        cargo_occurrence_links(roots, &lock, b);
     }
     true
 }

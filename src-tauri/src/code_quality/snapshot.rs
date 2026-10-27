@@ -112,51 +112,90 @@ pub(crate) struct SourceListing { pub paths: Vec<PathBuf>, pub directories: Vec<
 pub(crate) fn list_source_files(root: &Path, extra_exclusions: &[String], max_depth: Option<usize>, max_files: u64, ctl: &Ctl) -> Result<SourceListing> {
     list_source_tree(root, extra_exclusions, max_depth, max_files, false, ctl)
 }
-pub(crate) fn list_source_tree(root: &Path, extra_exclusions: &[String], max_depth: Option<usize>, max_files: u64, tolerate_special: bool, ctl: &Ctl) -> Result<SourceListing> {
-    let mut extra = GitignoreBuilder::new(root);
-    for pattern in extra_exclusions {
-        if pattern.starts_with('!') || pattern.starts_with('/') || pattern.contains('\\') || pattern.split('/').any(|p| p == "..") { return Err(format!("Exclusions must be relative exclusion globs: {pattern}")); }
-        extra.add_line(None, pattern).map_err(|e| err("Invalid project exclusion", e))?;
+fn invalid_exclusion(pattern: &str) -> bool {
+    pattern.starts_with(['!', '/']) || pattern.contains('\\') || pattern.split('/').any(|p| p == "..")
+}
+fn exclusion_matcher(root: &Path, patterns: &[String]) -> Result<ignore::gitignore::Gitignore> {
+    let mut builder = GitignoreBuilder::new(root);
+    for pattern in patterns {
+        if invalid_exclusion(pattern) { return Err(format!("Exclusions must be relative exclusion globs: {pattern}")); }
+        builder.add_line(None, pattern).map_err(|e| err("Invalid project exclusion", e))?;
     }
-    let extra = extra.build().map_err(|e| err("Invalid project exclusions", e))?;
+    builder.build().map_err(|e| err("Invalid project exclusions", e))
+}
+fn admit_entry(entry: &ignore::DirEntry, extra: &ignore::gitignore::Gitignore, warnings: &Mutex<Vec<String>>) -> bool {
+    if entry.depth() == 0 { return true; }
+    if fs::symlink_metadata(entry.path()).is_ok_and(|meta| is_link(&meta)) {
+        warnings.lock().push(format!("Skipped link/junction/reparse point: {}", entry.path().display()));
+        return false;
+    }
+    let name = entry.file_name().to_string_lossy();
+    let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+    !EXCLUDED.iter().any(|n| name.eq_ignore_ascii_case(n)) && !extra.matched_path_or_any_parents(entry.path(), is_dir).is_ignore()
+}
+/// Sorts one non-link entry into `listing`; sockets and devices are an error unless the caller tolerates them.
+fn record_entry(listing: &mut SourceListing, path: PathBuf, meta: &Metadata, max_files: u64, tolerate_special: bool) -> Result<()> {
+    if meta.is_file() {
+        listing.paths.push(path);
+        check_limits(listing.paths.len() as u64, 0, max_files, MAX_BYTES)
+    } else if meta.is_dir() {
+        listing.directories.push(path);
+        if listing.directories.len() as u64 > max_files { return Err(format!("Snapshot exceeds {max_files} directories; narrow the project exclusions.")); }
+        Ok(())
+    } else if tolerate_special {
+        listing.special.push(path);
+        Ok(())
+    } else {
+        Err("Snapshot contains an unsupported non-regular filesystem entry".into())
+    }
+}
+pub(crate) fn list_source_tree(root: &Path, extra_exclusions: &[String], max_depth: Option<usize>, max_files: u64, tolerate_special: bool, ctl: &Ctl) -> Result<SourceListing> {
+    let extra = exclusion_matcher(root, extra_exclusions)?;
     let warnings = Arc::new(Mutex::new(Vec::new()));
     let sink = warnings.clone();
     let mut walk = WalkBuilder::new(root);
     walk.hidden(false).follow_links(false).git_ignore(true).git_global(false).git_exclude(true).require_git(false).max_depth(max_depth);
-    walk.filter_entry(move |entry| {
-        if entry.depth() == 0 { return true; }
-        match fs::symlink_metadata(entry.path()) {
-            Ok(meta) if is_link(&meta) => {
-                sink.lock().push(format!("Skipped link/junction/reparse point: {}", entry.path().display())); return false;
-            }
-            _ => (),
-        }
-        let name = entry.file_name().to_string_lossy();
-        !EXCLUDED.iter().any(|n| name.eq_ignore_ascii_case(n)) && !extra.matched_path_or_any_parents(entry.path(), entry.file_type().map(|t| t.is_dir()).unwrap_or(false)).is_ignore()
-    });
-    let mut paths = Vec::new();
-    let mut directories = Vec::new();
-    let mut special = Vec::new();
+    walk.filter_entry(move |entry| admit_entry(entry, &extra, &sink));
+    let mut listing = SourceListing { paths: Vec::new(), directories: Vec::new(), special: Vec::new(), warnings: Vec::new() };
     for entry in walk.build() {
         if ctl.cancelled() { return Err("Scan cancelled while creating source snapshot".into()); }
         let entry = entry.map_err(|e| err("Cannot enumerate complete project snapshot", e))?;
         if entry.depth() == 0 { continue; }
         let meta = fs::symlink_metadata(entry.path()).map_err(|e| err("Cannot inspect source file", e))?;
         if is_link(&meta) { continue; }
-        if meta.is_file() {
-            paths.push(entry.into_path());
-            check_limits(paths.len() as u64, 0, max_files, MAX_BYTES)?;
-        } else if meta.is_dir() {
-            directories.push(entry.into_path());
-            if directories.len() as u64 > max_files { return Err(format!("Snapshot exceeds {max_files} directories; narrow the project exclusions.")); }
-        } else if tolerate_special {
-            special.push(entry.into_path());
-        } else { return Err("Snapshot contains an unsupported non-regular filesystem entry".into()); }
+        record_entry(&mut listing, entry.into_path(), &meta, max_files, tolerate_special)?;
     }
-    paths.sort();
-    directories.sort();
-    let warnings = warnings.lock().clone();
-    Ok(SourceListing { paths, directories, special, warnings })
+    listing.paths.sort();
+    listing.directories.sort();
+    listing.warnings = warnings.lock().clone();
+    Ok(listing)
+}
+
+// Explicit coverage inputs may be gitignored, but never bypass protected metadata paths or project exclusions.
+fn declared_report(root: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let relative = Path::new(name);
+    if name.is_empty() || name.contains(['*', '?', '\\', ':']) || name.chars().any(|c| c.is_control()) { return Ok(None); }
+    if relative.is_absolute() || relative.components().any(|c| !matches!(c, Component::Normal(_))) { return Ok(None); }
+    if relative.components().any(|part| part.as_os_str().to_str().is_some_and(|name| [".git", ".omp", ".ssh"].iter().any(|protected| name.eq_ignore_ascii_case(protected)))) { return Ok(None); }
+    if !matches!(relative.extension().and_then(|ext| ext.to_str()), Some("xml" | "lcov" | "info")) { return Ok(None); }
+    let path = root.join(relative);
+    ensure_plain_below(root, &path)?;
+    Ok(fs::symlink_metadata(&path).ok().filter(Metadata::is_file).map(|_| path))
+}
+fn declared_reports(root: &Path, listed: &[PathBuf], exclusions: &[String]) -> Result<Vec<PathBuf>> {
+    let Some(text) = super::scanners::read_config(&root.join("sonar-project.properties"))? else { return Ok(Vec::new()); };
+    let extra = exclusion_matcher(root, exclusions)?;
+    let mut found: Vec<PathBuf> = Vec::new();
+    super::scanners::visit_properties(&text, |key, value| {
+        if !matches!(key, "sonar.coverageReportPaths" | "sonar.javascript.lcov.reportPaths" | "sonar.python.coverage.reportPaths" | "sonar.rust.lcov.reportPaths" | "sonar.rust.cobertura.reportPaths") { return Ok(()); }
+        for name in super::scanners::unescape_property(value)?.split(',') {
+            let Some(path) = declared_report(root, name.trim())? else { continue; };
+            if extra.matched_path_or_any_parents(&path, false).is_ignore() { continue; }
+            if listed.binary_search(&path).is_err() && !found.contains(&path) { found.push(path); }
+        }
+        Ok(())
+    })?;
+    Ok(found)
 }
 
 pub fn create_snapshot(folder: &Path, extra_exclusions: &[String], job_dir: &Path, ctl: &Ctl) -> Result<Snapshot> {
@@ -167,7 +206,9 @@ pub fn create_snapshot(folder: &Path, extra_exclusions: &[String], job_dir: &Pat
     ensure_plain_path(job_dir)?;
     let canonical_job = fs::canonicalize(job_dir).map_err(|e| err("Cannot resolve job directory", e))?;
     if canonical_job.starts_with(&root) { return Err("Job storage must be outside the source folder".into()); }
-    let SourceListing { paths, warnings, .. } = list_source_files(&root, extra_exclusions, None, MAX_FILES, ctl)?;
+    let SourceListing { mut paths, warnings, .. } = list_source_files(&root, extra_exclusions, None, MAX_FILES, ctl)?;
+    paths.extend(declared_reports(&root, &paths, extra_exclusions)?);
+    paths.sort();
     let tar_path = job_dir.join("source.tar");
     let manifest_path = job_dir.join("manifest.json");
     let mut tar = tar::Builder::new(File::create(&tar_path).map_err(|e| err("Cannot create source archive", e))?);
@@ -199,6 +240,16 @@ pub fn create_snapshot(folder: &Path, extra_exclusions: &[String], job_dir: &Pat
 }
 
 pub struct TarStats { pub files: u64, pub bytes: u64 }
+fn count_member(kind: tar::EntryType, size: u64, stats: &mut TarStats, max_total_bytes: u64) -> Result<()> {
+    if kind.is_file() {
+        stats.files += 1;
+        stats.bytes = stats.bytes.checked_add(size).ok_or("Archive size overflow")?;
+        if stats.bytes > max_total_bytes { return Err(format!("Archive exceeds {max_total_bytes} bytes")); }
+    } else if size != 0 {
+        return Err("Archive directory has a nonzero payload".into());
+    }
+    Ok(())
+}
 fn walk_tar(tar_file: &Path, max_total_bytes: u64, mut accept: impl FnMut(&str, &mut tar::Entry<'_, File>) -> Result<()>) -> Result<TarStats> {
     let mut archive = tar::Archive::new(open_plain(tar_file)?);
     let mut stats = TarStats { files: 0, bytes: 0 }; let mut seen = HashSet::new();
@@ -209,11 +260,7 @@ fn walk_tar(tar_file: &Path, max_total_bytes: u64, mut accept: impl FnMut(&str, 
         let name = safe_name(&entry.path().map_err(|e| err("Invalid archive path", e))?)?;
         if name.is_empty() { if kind.is_dir() { continue; } return Err("Archive contains an empty file name".into()); }
         if !seen.insert(name.to_lowercase()) { return Err(format!("Archive contains duplicate/case-colliding member: {name}")); }
-        if kind.is_file() {
-            stats.files += 1;
-            stats.bytes = stats.bytes.checked_add(entry.size()).ok_or("Archive size overflow")?;
-            if stats.bytes > max_total_bytes { return Err(format!("Archive exceeds {max_total_bytes} bytes")); }
-        } else if entry.size() != 0 { return Err("Archive directory has a nonzero payload".into()); }
+        count_member(kind, entry.size(), &mut stats, max_total_bytes)?;
         accept(&name, &mut entry)?;
         // Consume every payload to detect truncated streams even for validation-only calls.
         std::io::copy(&mut entry, &mut std::io::sink()).map_err(|e| err("Truncated archive", e))?;
@@ -284,6 +331,45 @@ mod tests {
         assert!(paths.contains(&PathBuf::from("untracked ø.py"))); assert!(!paths.contains(&PathBuf::from("ignored.txt")));
         fs::write(source.join("untracked ø.py"), "changed dirty source").unwrap();
         assert_ne!(first.hash, create_snapshot(&source, &[], &t.0.join("job3"), &Ctl::silent()).unwrap().hash);
+    }
+    #[test]
+    fn declared_coverage_is_captured_without_other_ignored_data() {
+        let t = Temp::new(); let source = t.0.join("source");
+        fs::create_dir_all(source.join("coverage")).unwrap();
+        fs::write(source.join(".gitignore"), "coverage/\n").unwrap();
+        fs::write(source.join("sonar-project.properties"), "sonar.python.coverage.reportPaths=coverage/coverage.xml\nsonar.javascript.lcov.reportPaths=coverage/\\\n js.lcov\n").unwrap();
+        fs::write(source.join("coverage/coverage.xml"), "<coverage/>").unwrap();
+        fs::write(source.join("coverage/js.lcov"), "TN:\nSF:src/main.js\nDA:1,1\nend_of_record\n").unwrap();
+        fs::write(source.join("coverage/private.txt"), "not a report").unwrap();
+        let first = create_snapshot(&source, &[], &t.0.join("job1"), &Ctl::silent()).unwrap();
+        let destination = t.0.join("extracted");
+        let paths = extract_tar_safely(&first.tar_path, &destination, MAX_BYTES).unwrap();
+        assert!(paths.contains(&PathBuf::from("coverage/coverage.xml")));
+        assert!(paths.contains(&PathBuf::from("coverage/js.lcov")));
+        assert!(!paths.contains(&PathBuf::from("coverage/private.txt")));
+        assert_eq!(fs::read_to_string(destination.join("coverage/coverage.xml")).unwrap(), "<coverage/>");
+        fs::write(source.join("coverage/coverage.xml"), "<coverage changed='true'/>").unwrap();
+        assert_ne!(first.hash, create_snapshot(&source, &[], &t.0.join("job2"), &Ctl::silent()).unwrap().hash);
+        let excluded = create_snapshot(&source, &["coverage/**".into()], &t.0.join("job3"), &Ctl::silent()).unwrap();
+        assert_eq!(excluded.file_count, 2);
+    }
+    #[test]
+    fn declared_reports_do_not_escape_or_capture_metadata() {
+        let t = Temp::new(); let source = t.0.join("source");
+        fs::create_dir_all(source.join(".git")).unwrap();
+        fs::write(source.join(".git/token.xml"), "<private/>").unwrap();
+        for name in ["../outside.xml", "/outside.xml", ".git/token.xml", ".omp/private.xml", "coverage/auth.json", "coverage/*.xml"] {
+            assert!(declared_report(&source, name).unwrap().is_none(), "{name}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn declared_reports_reject_linked_parent_directories() {
+        let t = Temp::new(); let source = t.0.join("source"); let outside = t.0.join("outside");
+        fs::create_dir(&source).unwrap(); fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("private.xml"), "<private/>").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("coverage")).unwrap();
+        assert!(declared_report(&source, "coverage/private.xml").unwrap_err().contains("linked"));
     }
     #[test]
     fn limits_and_archive_size_are_explicit() {

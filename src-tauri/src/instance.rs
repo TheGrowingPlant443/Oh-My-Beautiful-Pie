@@ -218,6 +218,25 @@ enum PlanSource {
     Missing,
 }
 
+struct Runtime {
+    status: &'static str,
+    activity: &'static str,
+    cols: u16,
+    rows: u16,
+    exit_code: Option<u32>,
+}
+
+/// `(status, activity)` of a live process from the time of its last output (0 = nothing yet).
+fn output_state(last: u64) -> (&'static str, &'static str) {
+    if last == 0 {
+        ("starting", "starting")
+    } else if session::now_ms().saturating_sub(last) < 2000 {
+        ("running", "working")
+    } else {
+        ("running", "idle")
+    }
+}
+
 impl Record {
     fn new(definition: Definition) -> Self {
         let materialized = definition
@@ -289,38 +308,70 @@ impl Record {
             PlanSource::Completed | PlanSource::Missing => Ok(None),
         }
     }
-    fn view(&mut self) -> Instance {
-        let input = &self.definition.input;
-        let mut status = "stopped";
-        let mut activity = "stopped";
-        let mut cols = pty::DEFAULT_COLS;
-        let mut rows = pty::DEFAULT_ROWS;
-        let mut exit_code = None;
+    fn refresh_reader(&mut self) {
+        let Some(path) = &self.definition.session_path else { return; };
+        if !self.materialized && !path.is_file() {
+            return;
+        }
+        self.materialized = true;
+        match self.reader.update(path) {
+            Ok(()) => {
+                if self.error.as_deref().is_some_and(|e| e.starts_with("session read:")) {
+                    self.error = None;
+                }
+            }
+            Err(error) => self.error = Some(format!("session read: {error}")),
+        }
+    }
+    fn saved_plan_due(&self) -> bool {
+        self.definition.plan_target.is_none()
+            && self.definition.helper.is_none()
+            && self.reader.state.todo_total == 0
+            && self.reader.state.plan_path.is_none()
+            && (self.saved_for != self.definition.session_path
+                || self.saved_checked.is_none_or(|at| at.elapsed() >= SAVED_PLAN_RECHECK))
+    }
+    /// `(id, project, profile)` for the saved-plan scan when one is due; marks the scan as started.
+    fn take_saved_plan_job(&mut self) -> Option<(String, String, String)> {
+        if !self.saved_plan_due() {
+            return None;
+        }
+        self.saved_checked = Some(std::time::Instant::now());
+        self.saved_for = self.definition.session_path.clone();
+        Some((
+            self.definition.id.clone(),
+            self.definition.input.project_path.clone(),
+            self.definition.input.profile.clone(),
+        ))
+    }
+    fn poll_runtime(&mut self) -> Runtime {
+        let mut runtime = Runtime {
+            status: "stopped",
+            activity: "stopped",
+            cols: pty::DEFAULT_COLS,
+            rows: pty::DEFAULT_ROWS,
+            exit_code: None,
+        };
         if let Some(process) = self.process.as_mut() {
-            cols = process.cols;
-            rows = process.rows;
+            runtime.cols = process.cols;
+            runtime.rows = process.rows;
             match process.poll() {
                 Ok(Some(code)) => {
-                    exit_code = Some(code);
+                    runtime.exit_code = Some(code);
                     self.bridge_ready = false;
                 }
-                Ok(None) => {
-                    let last = process.last_output();
-                    status = if last == 0 { "starting" } else { "running" };
-                    activity = if last == 0 {
-                        "starting"
-                    } else if session::now_ms().saturating_sub(last) < 2000 {
-                        "working"
-                    } else {
-                        "idle"
-                    };
-                }
+                Ok(None) => (runtime.status, runtime.activity) = output_state(process.last_output()),
                 Err(error) => self.error = Some(error),
             }
         }
         if self.error.is_some() {
-            status = "error";
+            runtime.status = "error";
         }
+        runtime
+    }
+    fn view(&mut self) -> Instance {
+        let runtime = self.poll_runtime();
+        let input = &self.definition.input;
         let state = &self.reader.state;
         Instance {
             id: self.definition.id.clone(),
@@ -330,8 +381,8 @@ impl Record {
             agent_file: input.agent_file.clone(),
             configs: input.configs.clone(),
             model: input.model.clone(),
-            status: status.into(),
-            activity: activity.into(),
+            status: runtime.status.into(),
+            activity: runtime.activity.into(),
             task: state.task.clone(),
             subagents: state.subagents.clone(),
             plan_path: state.plan_path.clone(),
@@ -345,10 +396,10 @@ impl Record {
             last_error: self.error.clone(),
             todo_done: state.todo_done,
             todo_total: state.todo_total,
-            cols,
-            rows,
+            cols: runtime.cols,
+            rows: runtime.rows,
             generation: self.generation,
-            exit_code,
+            exit_code: runtime.exit_code,
             kind: self.definition.kind,
             manager_id: self.definition.manager_id.clone(),
             plan_target: self.definition.plan_target.clone(),
@@ -475,23 +526,110 @@ pub(crate) fn same_folder(left: &str, right: &str) -> bool {
     }
 }
 
+/// Component equality: ASCII case-insensitive for Windows paths, exact otherwise.
+fn component_eq(windows: bool, left: &str, right: &str) -> bool {
+    if windows { left.eq_ignore_ascii_case(right) } else { left == right }
+}
+
+fn join_ancestor(root: &str, common: &[String]) -> String {
+    let suffix = common.join("/");
+    if root == "/" { format!("/{suffix}") }
+    else if suffix.is_empty() { format!("{root}/") }
+    else { format!("{root}/{suffix}") }
+}
+
 pub fn common_ancestor_folder(roots: &[String]) -> Option<String> {
     let (root, mut common, windows) = folder_components(roots.first()?);
     if root.is_empty() { return None; }
     for folder in &roots[1..] {
         let (other_root, parts, other_windows) = folder_components(folder);
-        if windows != other_windows || !(if windows { root.eq_ignore_ascii_case(&other_root) } else { root == other_root }) {
+        if windows != other_windows || !component_eq(windows, &root, &other_root) {
             return None;
         }
-        let length = common.iter().zip(&parts).take_while(|(a,b)| {
-            if windows { a.eq_ignore_ascii_case(b) } else { a == b }
-        }).count();
+        let length = common.iter().zip(&parts).take_while(|(a, b)| component_eq(windows, a, b)).count();
         common.truncate(length);
     }
-    let suffix = common.join("/");
-    Some(if root == "/" { format!("/{suffix}") }
-        else if suffix.is_empty() { format!("{root}/") }
-        else { format!("{root}/{suffix}") })
+    Some(join_ancestor(&root, &common))
+}
+
+fn check_commit_identity(record: &Record, commit: &WorkspaceCommit) -> Result<(), String> {
+    if record.workspace_request.as_deref() != Some(commit.request_id.as_str())
+        || record.lease() != commit.expected || commit.workspace_epoch < record.workspace_epoch {
+        return Err("stale_workspace_identity".into());
+    }
+    if commit.expected.session_id.is_some() && commit.session_id != commit.expected.session_id {
+        return Err("stale_workspace_identity".into());
+    }
+    if record.definition.session_path.is_some() && commit.session_file.is_none() {
+        return Err("Workspace relocation cannot discard a saved session".into());
+    }
+    Ok(())
+}
+
+fn check_return_request(source: &Record, coordinator_id: &str, human_request_id: &str) -> Result<(), String> {
+    if source.definition.manager_id.as_deref() != Some(coordinator_id)
+        || source.human_request.as_ref().map(|h| h.id.as_str()) != Some(human_request_id) {
+        return Err("stale_human_request".into());
+    }
+    Ok(())
+}
+
+fn check_plan_target(records: &[Record], target: &str) -> Result<(), String> {
+    if !records.iter().any(|r| r.definition.id == target && r.definition.plan_target.is_none() && r.definition.helper.is_none()) {
+        return Err("unknown instance".into());
+    }
+    if records.iter().any(|r| r.definition.plan_target.as_deref() == Some(target)) {
+        return Err("A plan agent already exists for this session".into());
+    }
+    Ok(())
+}
+
+fn check_helper_link(records: &[Record], link: &HelperLink) -> Result<(), String> {
+    if !records.iter().any(|r| r.definition.id == link.target && r.definition.plan_target.is_none() && r.definition.helper.is_none()) {
+        return Err("unknown instance".into());
+    }
+    if records.iter().any(|r| r.definition.helper.as_ref().is_some_and(|h| h.target == link.target && h.purpose == link.purpose)) {
+        return Err(format!("A {} helper already exists for this session", link.purpose.name()));
+    }
+    Ok(())
+}
+
+/// Singleton, owner and link admission for a new definition, in the order the errors are reported.
+fn check_new_definition(records: &[Record], definition: &Definition) -> Result<(), String> {
+    let kind = definition.kind;
+    if kind != InstanceKind::Instance && records.iter().any(|r| r.definition.kind == kind) {
+        return Err(format!("{} already exists", if kind == InstanceKind::Manager { "The Manager" } else { "The Architect" }));
+    }
+    if let Some(owner) = &definition.manager_id {
+        if !records.iter().any(|r| r.definition.id == *owner && r.definition.kind == InstanceKind::Manager) {
+            return Err("not_controlled".into());
+        }
+    }
+    if let Some(target) = &definition.plan_target {
+        check_plan_target(records, target)?;
+    }
+    if let Some(link) = &definition.helper {
+        check_helper_link(records, link)?;
+    }
+    Ok(())
+}
+
+/// Display form of a path: Windows verbatim prefixes are dropped.
+fn display_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    if let Some(unc) = value.strip_prefix("\\\\?\\UNC\\") { format!("\\\\{unc}") }
+    else { value.trim_start_matches("\\\\?\\").to_string() }
+}
+
+/// App-owned temporary workspaces of the Manager and the Architect for the config root `root`.
+fn coordinator_temporary_paths(root: &Path) -> [PathBuf; 2] {
+    use sha2::{Digest, Sha256};
+    let normalized = root.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    let temporary_root = std::env::temp_dir().join("omp-manager")
+        .join(format!("{:x}", Sha256::digest(normalized.as_bytes())));
+    [temporary_root.join("manager"), temporary_root.join("architect")]
 }
 
 impl Registry {
@@ -637,6 +775,50 @@ impl Registry {
         }
     }
 
+    fn check_commit_scope(&self, record: &Record, commit: &WorkspaceCommit, target: &str) -> Result<(), String> {
+        if record.definition.kind != InstanceKind::Instance { return Ok(()); }
+        // Ordinary agents move their own cwd only: no coordinator source binding, never an app-managed target.
+        if !is_agent_definition(&record.definition) { return Err("Only agent working directories can be changed".into()); }
+        if commit.source.is_some() { return Err("invalid_workspace_binding".into()); }
+        if !self.is_real_project_folder(target) { return Err("An agent working directory cannot be an app-managed workspace".into()); }
+        Ok(())
+    }
+
+    /// Validates the source binding of a commit; `Some(index)` is the source record whose ownership moves.
+    fn validate_source_binding(
+        &self,
+        records: &[Record],
+        i: usize,
+        commit: &WorkspaceCommit,
+        binding: &WorkspaceSourceBinding,
+    ) -> Result<Option<usize>, String> {
+        let (id, path) = match binding {
+            WorkspaceSourceBinding::Path { source_id, canonical_path }
+            | WorkspaceSourceBinding::Grant { source_id, canonical_path, .. }
+            | WorkspaceSourceBinding::Return { source_id, canonical_path, .. } => (source_id, canonical_path),
+        };
+        let source = index(records, id)?;
+        if !same_folder(&self.source_path(&records[source].definition)?, path) {
+            return Err("Source repository changed; give repo again.".into());
+        }
+        match binding {
+            WorkspaceSourceBinding::Path { .. } => {
+                if records[i].definition.kind != InstanceKind::Architect { return Err("invalid_workspace_binding".into()); }
+                Ok(None)
+            }
+            WorkspaceSourceBinding::Grant { expected, .. }
+            | WorkspaceSourceBinding::Return { expected, .. } => {
+                if records[i].definition.kind != InstanceKind::Manager || records[source].lease() != *expected {
+                    return Err("stale_workspace_source".into());
+                }
+                if let WorkspaceSourceBinding::Return { human_request_id, .. } = binding {
+                    check_return_request(&records[source], &commit.coordinator_id, human_request_id)?;
+                }
+                Ok(Some(source))
+            }
+        }
+    }
+
     pub fn commit_workspace_change(&self, commit: &WorkspaceCommit) -> Result<ControlLease, String> {
         let target = crate::setup::canonical(Path::new(&commit.target_folder)).map_err(|e| e.to_string())?;
         if !target.is_dir() { return Err("project folder is not a directory".into()); }
@@ -647,52 +829,12 @@ impl Registry {
         if records[i].workspace_committed.as_deref() == Some(&commit.request_id) {
             return Ok(records[i].lease());
         }
-        if records[i].definition.kind == InstanceKind::Instance {
-            // Ordinary agents move their own cwd only: no coordinator source binding, never an app-managed target.
-            if !is_agent_definition(&records[i].definition) { return Err("Only agent working directories can be changed".into()); }
-            if commit.source.is_some() { return Err("invalid_workspace_binding".into()); }
-            if !self.is_real_project_folder(&target) { return Err("An agent working directory cannot be an app-managed workspace".into()); }
-        }
-        if records[i].workspace_request.as_deref() != Some(commit.request_id.as_str())
-            || records[i].lease() != commit.expected || commit.workspace_epoch < records[i].workspace_epoch {
-            return Err("stale_workspace_identity".into());
-        }
-        if commit.expected.session_id.is_some() && commit.session_id != commit.expected.session_id {
-            return Err("stale_workspace_identity".into());
-        }
-        if records[i].definition.session_path.is_some() && commit.session_file.is_none() {
-            return Err("Workspace relocation cannot discard a saved session".into());
-        }
-        let mut source_change = None;
-        if let Some(binding) = &commit.source {
-            let (id, path) = match binding {
-                WorkspaceSourceBinding::Path { source_id, canonical_path }
-                | WorkspaceSourceBinding::Grant { source_id, canonical_path, .. }
-                | WorkspaceSourceBinding::Return { source_id, canonical_path, .. } => (source_id, canonical_path),
-            };
-            let source = index(&records, id)?;
-            if !same_folder(&self.source_path(&records[source].definition)?, path) {
-                return Err("Source repository changed; give repo again.".into());
-            }
-            match binding {
-                WorkspaceSourceBinding::Path { .. } => {
-                    if records[i].definition.kind != InstanceKind::Architect { return Err("invalid_workspace_binding".into()); }
-                }
-                WorkspaceSourceBinding::Grant { expected, .. }
-                | WorkspaceSourceBinding::Return { expected, .. } => {
-                    if records[i].definition.kind != InstanceKind::Manager || records[source].lease() != *expected {
-                        return Err("stale_workspace_source".into());
-                    }
-                    if let WorkspaceSourceBinding::Return { human_request_id, .. } = binding {
-                        if records[source].definition.manager_id.as_deref() != Some(commit.coordinator_id.as_str())
-                            || records[source].human_request.as_ref().map(|h| &h.id) != Some(human_request_id) {
-                            return Err("stale_human_request".into());
-                        }
-                    }
-                    source_change = Some(source);
-                }
-            }
-        }
+        self.check_commit_scope(&records[i], commit, &target)?;
+        check_commit_identity(&records[i], commit)?;
+        let source_change = match &commit.source {
+            Some(binding) => self.validate_source_binding(&records, i, commit, binding)?,
+            None => None,
+        };
         let old_destination = records[i].definition.clone();
         let old_source = source_change.map(|s| (s, records[s].definition.manager_id.clone()));
         records[i].definition.input.project_path = target;
@@ -838,58 +980,67 @@ impl Registry {
     }
     /// Definitions only: provisioning never starts a process or replaces saved coordinator state.
     pub fn ensure_coordinators(&self, preferred_folders: &[String]) -> Result<CoordinatorBootstrap, String> {
-        use sha2::{Digest, Sha256};
         let root = fs::canonicalize(self.config_root()).or_else(|_| {
             fs::create_dir_all(self.config_root())?;
             fs::canonicalize(self.config_root())
         }).map_err(|e| e.to_string())?;
-        let normalized = root.to_string_lossy().replace('\\', "/");
-        #[cfg(windows)]
-        let normalized = normalized.to_lowercase();
-        let temporary_root = std::env::temp_dir().join("omp-manager")
-            .join(format!("{:x}", Sha256::digest(normalized.as_bytes())));
-        let temporary_paths = [temporary_root.join("manager"), temporary_root.join("architect")];
-        let display = |path: &Path| {
-            let value = path.to_string_lossy();
-            if let Some(unc) = value.strip_prefix("\\\\?\\UNC\\") { format!("\\\\{unc}") }
-            else { value.trim_start_matches("\\\\?\\").to_string() }
-        };
-        let temporary_folders: Vec<String> = temporary_paths.iter().map(|p| display(p)).collect();
-        let candidates = preferred_folders.iter().cloned().chain(self.snapshot().into_iter()
-            .filter(|row| row.kind == InstanceKind::Instance && row.plan_target.is_none() && row.helper.is_none())
-            .map(|row| row.project_path));
-        let excluded_temporary_root = fs::canonicalize(std::env::temp_dir()).map_err(|e| e.to_string())?.join("omp-manager");
-        let real_folder = candidates.filter_map(|folder| fs::canonicalize(folder).ok())
-            .find(|folder| folder.is_dir() && !folder.starts_with(&root)
-                && !folder.starts_with(&excluded_temporary_root));
+        let temporary_paths = coordinator_temporary_paths(&root);
+        let temporary_folders: Vec<String> = temporary_paths.iter().map(|p| display_path(p)).collect();
+        let real_folder = self.real_project_folder(preferred_folders, &root)?;
         let mut coordinators = Vec::new();
         for (offset, kind) in [InstanceKind::Manager, InstanceKind::Architect].into_iter().enumerate() {
-            if let Some(existing) = self.snapshot().into_iter().find(|row| row.kind == kind) {
-                // Only app-managed workspaces may be recreated. Missing real project folders remain untouched.
-                if existing.project_path == temporary_folders[offset] {
-                    fs::create_dir_all(&temporary_paths[offset]).map_err(|e| format!("Coordinator workspace: {e}"))?;
-                }
-                coordinators.push(existing);
-                continue;
-            }
-            let folder = if let Some(folder) = &real_folder { folder.clone() } else {
-                fs::create_dir_all(&temporary_paths[offset]).map_err(|e| format!("Coordinator workspace: {e}"))?;
-                temporary_paths[offset].clone()
-            };
-            let input = CreateInput { project_path: display(&folder), ..CreateInput::default() };
-            let created = match kind {
-                InstanceKind::Manager => self.create_manager(input),
-                _ => self.create_architect(input),
-            };
-            // A simultaneous provisioning/manual request may have won singleton creation.
-            coordinators.push(match created {
-                Ok(row) => row,
-                Err(error) => self.snapshot().into_iter().find(|row| row.kind == kind).ok_or(error)?,
-            });
+            coordinators.push(self.ensure_coordinator(
+                kind,
+                &temporary_paths[offset],
+                &temporary_folders[offset],
+                real_folder.as_deref(),
+            )?);
         }
         let architect = coordinators.pop().ok_or("Architect provisioning failed")?;
         let manager = coordinators.pop().ok_or("Manager provisioning failed")?;
         Ok(CoordinatorBootstrap { manager, architect, temporary_folders })
+    }
+    /// First existing real project folder outside the config root and the app-managed temporary root.
+    fn real_project_folder(&self, preferred_folders: &[String], root: &Path) -> Result<Option<PathBuf>, String> {
+        let candidates = preferred_folders.iter().cloned().chain(self.snapshot().into_iter()
+            .filter(|row| row.kind == InstanceKind::Instance && row.plan_target.is_none() && row.helper.is_none())
+            .map(|row| row.project_path));
+        let excluded_temporary_root = fs::canonicalize(std::env::temp_dir()).map_err(|e| e.to_string())?.join("omp-manager");
+        Ok(candidates.filter_map(|folder| fs::canonicalize(folder).ok())
+            .find(|folder| folder.is_dir() && !folder.starts_with(root)
+                && !folder.starts_with(&excluded_temporary_root)))
+    }
+    fn ensure_coordinator(
+        &self,
+        kind: InstanceKind,
+        temporary_path: &Path,
+        temporary_folder: &str,
+        real_folder: Option<&Path>,
+    ) -> Result<Instance, String> {
+        if let Some(existing) = self.snapshot().into_iter().find(|row| row.kind == kind) {
+            // Only app-managed workspaces may be recreated. Missing real project folders remain untouched.
+            if existing.project_path == temporary_folder {
+                fs::create_dir_all(temporary_path).map_err(|e| format!("Coordinator workspace: {e}"))?;
+            }
+            return Ok(existing);
+        }
+        let folder = match real_folder {
+            Some(folder) => folder,
+            None => {
+                fs::create_dir_all(temporary_path).map_err(|e| format!("Coordinator workspace: {e}"))?;
+                temporary_path
+            }
+        };
+        let input = CreateInput { project_path: display_path(folder), ..CreateInput::default() };
+        let created = match kind {
+            InstanceKind::Manager => self.create_manager(input),
+            _ => self.create_architect(input),
+        };
+        // A simultaneous provisioning/manual request may have won singleton creation.
+        match created {
+            Ok(row) => Ok(row),
+            Err(error) => self.snapshot().into_iter().find(|row| row.kind == kind).ok_or(error),
+        }
     }
     pub fn create_owned(&self, manager_id: &str, input: CreateInput) -> Result<Instance, String> {
         self.create_definition(input, InstanceKind::Instance, Some(manager_id.into()), None, None)
@@ -989,14 +1140,8 @@ impl Registry {
             _ => self.fallback_plan(id),
         })
     }
-    fn create_definition(
-        &self,
-        mut input: CreateInput,
-        kind: InstanceKind,
-        manager_id: Option<String>,
-        plan_target: Option<String>,
-        helper: Option<HelperLink>,
-    ) -> Result<Instance, String> {
+    /// Validates and normalizes `input`; returns the canonical project folder.
+    fn prepare_input(&self, input: &mut CreateInput, kind: InstanceKind) -> Result<PathBuf, String> {
         let cwd = crate::setup::canonical(Path::new(&input.project_path)).map_err(|e| e.to_string())?;
         if !cwd.is_dir() {
             return Err("project folder is not a directory".into());
@@ -1015,6 +1160,9 @@ impl Registry {
             let verified = crate::setup::verify_agent_file(self, &path, kind)?;
             input.agent_file = Some(verified);
         }
+        Ok(cwd)
+    }
+    fn resolve_configs(&self, input: &mut CreateInput, cwd: &Path) -> Result<(), String> {
         if input.use_global_config.unwrap_or(input.profile.is_empty()) {
             if let Some(path) = self.global_config.current_path()? {
                 if !input.configs.contains(&path) {
@@ -1030,16 +1178,31 @@ impl Registry {
                 return Err(format!("config not found: {}", config.display()));
             }
         }
-        let path = match &input.resume_session_id {
-            Some(target) => Some(
-                session::list(&self.home, &cwd, &input.profile)
+        Ok(())
+    }
+    fn resume_session_path(&self, input: &CreateInput, cwd: &Path) -> Result<Option<PathBuf>, String> {
+        match &input.resume_session_id {
+            Some(target) => Ok(Some(
+                session::list(&self.home, cwd, &input.profile)
                     .into_iter()
                     .find(|s| s.id == *target || s.path == Path::new(target))
                     .ok_or("session not found for this project/profile")?
                     .path,
-            ),
-            None => None,
-        };
+            )),
+            None => Ok(None),
+        }
+    }
+    fn create_definition(
+        &self,
+        mut input: CreateInput,
+        kind: InstanceKind,
+        manager_id: Option<String>,
+        plan_target: Option<String>,
+        helper: Option<HelperLink>,
+    ) -> Result<Instance, String> {
+        let cwd = self.prepare_input(&mut input, kind)?;
+        self.resolve_configs(&mut input, &cwd)?;
+        let path = self.resume_session_path(&input, &cwd)?;
         let definition = Definition {
             id: uuid::Uuid::new_v4().to_string(),
             input,
@@ -1050,33 +1213,7 @@ impl Registry {
             helper,
         };
         let mut records = self.records.lock().map_err(|e| e.to_string())?;
-        if kind != InstanceKind::Instance && records.iter().any(|r| r.definition.kind == kind) {
-            return Err(format!("{} already exists", if kind == InstanceKind::Manager { "The Manager" } else { "The Architect" }));
-        }
-        if let Some(owner) = &definition.manager_id {
-            if !records
-                .iter()
-                .any(|r| r.definition.id == *owner && r.definition.kind == InstanceKind::Manager)
-            {
-                return Err("not_controlled".into());
-            }
-        }
-        if let Some(target) = &definition.plan_target {
-            if !records.iter().any(|r| r.definition.id == *target && r.definition.plan_target.is_none() && r.definition.helper.is_none()) {
-                return Err("unknown instance".into());
-            }
-            if records.iter().any(|r| r.definition.plan_target.as_deref() == Some(target.as_str())) {
-                return Err("A plan agent already exists for this session".into());
-            }
-        }
-        if let Some(link) = &definition.helper {
-            if !records.iter().any(|r| r.definition.id == link.target && r.definition.plan_target.is_none() && r.definition.helper.is_none()) {
-                return Err("unknown instance".into());
-            }
-            if records.iter().any(|r| r.definition.helper.as_ref().is_some_and(|h| h.target == link.target && h.purpose == link.purpose)) {
-                return Err(format!("A {} helper already exists for this session", link.purpose.name()));
-            }
-        }
+        check_new_definition(&records, &definition)?;
         let mut record = Record::new(definition);
         if let Some(path) = &record.definition.session_path {
             record.reader.update(path)?;
@@ -1117,43 +1254,11 @@ impl Registry {
         let due: Vec<(String, String, String)> = {
             let mut records = self.records.lock().map_err(|e| e.to_string())?;
             for record in records.iter_mut() {
-                if let Some(path) = &record.definition.session_path {
-                    if !record.materialized && !path.is_file() {
-                        continue;
-                    }
-                    record.materialized = true;
-                    match record.reader.update(path) {
-                        Ok(()) => {
-                            if record
-                                .error
-                                .as_deref()
-                                .is_some_and(|e| e.starts_with("session read:"))
-                            {
-                                record.error = None;
-                            }
-                        }
-                        Err(error) => record.error = Some(format!("session read: {error}")),
-                    }
-                }
+                record.refresh_reader();
             }
             // The last saved plan is only needed while a session has neither a todo list nor a native plan; the
             // scan reads other sessions, so it runs outside the lock and at most every few seconds.
-            records
-                .iter_mut()
-                .filter(|r| {
-                    r.definition.plan_target.is_none()
-                        && r.definition.helper.is_none()
-                        && r.reader.state.todo_total == 0
-                        && r.reader.state.plan_path.is_none()
-                        && (r.saved_for != r.definition.session_path
-                            || r.saved_checked.is_none_or(|at| at.elapsed() >= SAVED_PLAN_RECHECK))
-                })
-                .map(|r| {
-                    r.saved_checked = Some(std::time::Instant::now());
-                    r.saved_for = r.definition.session_path.clone();
-                    (r.definition.id.clone(), r.definition.input.project_path.clone(), r.definition.input.profile.clone())
-                })
-                .collect()
+            records.iter_mut().filter_map(Record::take_saved_plan_job).collect()
         };
         for (id, project, profile) in due {
             let found = session::last_saved_plan(&session::list(&self.home, Path::new(&project), &profile));

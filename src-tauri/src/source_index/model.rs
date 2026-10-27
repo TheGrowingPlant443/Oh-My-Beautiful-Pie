@@ -303,66 +303,92 @@ impl SourceGraphIndex {
     /// Validates every fact against the inventory and builds the lookup tables. After success the index is
     /// internally consistent: every reference resolves, spans lie inside their file and the counts are derived.
     pub fn finish(&mut self, expected: &Expected) -> Result<()> {
+        self.check_header(expected)?;
+        let mut lookup = Lookup::default();
+        let mut ids: HashSet<&str> = HashSet::new();
+        self.index_files(expected, &mut lookup, &mut ids)?;
+        self.index_symbols(&mut lookup, &mut ids)?;
+        self.check_containment(&lookup)?;
+        self.index_sites(&mut lookup, &mut ids)?;
+        self.check_site_targets(&lookup)?;
+        self.index_edges(&mut lookup, &ids)?;
+        for limitation in &self.limitations { text_limit(limitation, "limitation", 8 * 1024)?; }
+        self.derive_coverage()?;
+        self.lookup = lookup;
+        Ok(())
+    }
+
+    fn check_header(&self, expected: &Expected) -> Result<()> {
         if self.schema_version != 1 { return Err(format!("Unsupported source index schema version {}", self.schema_version)); }
         if self.snapshot_id != expected.snapshot_id || self.folder != expected.folder || self.source_hash != expected.source_hash {
             return Err("The source index does not belong to this snapshot".into());
         }
         if self.files.len() != expected.files.len() { return Err(format!("The source index lists {} files but the snapshot admitted {}", self.files.len(), expected.files.len())); }
         if self.directories != expected.directories { return Err("The source index directory list differs from the snapshot inventory".into()); }
-        let mut lookup = Lookup::default();
-        let mut ids: HashSet<&str> = HashSet::new();
+        Ok(())
+    }
+
+    fn index_files<'a>(&'a self, expected: &Expected, lookup: &mut Lookup, ids: &mut HashSet<&'a str>) -> Result<()> {
         for (position, (file, wanted)) in self.files.iter().zip(expected.files).enumerate() {
-            if file.path != wanted.path || file.id != wanted.id || file.sha256 != wanted.sha256 || file.bytes != wanted.bytes {
-                return Err(format!("The source index file {} differs from the snapshot inventory", file.path));
-            }
-            if wanted.status == "skipped" && file.status != FileStatus::Skipped { return Err(format!("The source index re-labelled skipped file {}", file.path)); }
-            if file.language.as_ref().is_some_and(|l| l.len() > 64) { return Err("Source index language name is too long".into()); }
-            for line in &file.diagnostics { text_limit(line, "file diagnostic", 8 * 1024)?; }
+            check_file(file, wanted)?;
             ids.insert(&file.id);
             lookup.files.insert(file.id.clone(), position as u32);
             lookup.files_by_path.insert(file.path.clone(), position as u32);
         }
+        Ok(())
+    }
+
+    fn index_symbols<'a>(&'a self, lookup: &mut Lookup, ids: &mut HashSet<&'a str>) -> Result<()> {
         for (position, symbol) in self.symbols.iter().enumerate() {
             if !ids.insert(&symbol.id) { return Err(format!("Duplicate source index id {}", symbol.id)); }
             let Some(file_position) = lookup.files.get(&symbol.file_id) else { return Err(format!("Symbol {} names an unknown file", symbol.id)); };
-            let file = &self.files[*file_position as usize];
-            if file.path != symbol.path { return Err(format!("Symbol {} path differs from its file", symbol.id)); }
-            check_span(&symbol.span, file.bytes, &symbol.id)?;
-            if symbol.kind.is_empty() || symbol.kind.len() > 64 { return Err(format!("Symbol {} has an invalid kind", symbol.id)); }
-            text_limit(&symbol.name, "symbol name", 4 * 1024)?;
-            text_limit(&symbol.qualified_name, "qualified name", 8 * 1024)?;
+            check_symbol(symbol, &self.files[*file_position as usize])?;
             lookup.symbols.insert(symbol.id.clone(), position as u32);
             lookup.symbols_by_file.entry(symbol.file_id.clone()).or_default().push(position as u32);
         }
-        // Containment must be a forest: every owner exists, lives in the same file and never loops.
+        Ok(())
+    }
+
+    /// Containment must be a forest: every owner exists, lives in the same file and never loops.
+    fn check_containment(&self, lookup: &Lookup) -> Result<()> {
         let mut state = vec![0u8; self.symbols.len()];
-        for start in 0..self.symbols.len() {
-            let mut chain = Vec::new();
-            let mut current = start;
-            loop {
-                match state[current] {
-                    2 => break,
-                    1 => return Err(format!("Symbol containment cycle at {}", self.symbols[current].id)),
-                    _ => {}
-                }
-                state[current] = 1;
-                chain.push(current);
-                let symbol = &self.symbols[current];
-                let Some(owner) = &symbol.owner_id else { break };
-                let Some(next) = lookup.symbols.get(owner) else { return Err(format!("Symbol {} names an unknown owner", symbol.id)); };
-                if self.symbols[*next as usize].file_id != symbol.file_id { return Err(format!("Symbol {} is owned across files", symbol.id)); }
-                current = *next as usize;
+        for start in 0..self.symbols.len() { self.walk_owners(start, &mut state, lookup)?; }
+        Ok(())
+    }
+
+    fn walk_owners(&self, start: usize, state: &mut [u8], lookup: &Lookup) -> Result<()> {
+        let mut chain = Vec::new();
+        let mut current = start;
+        loop {
+            match state[current] {
+                2 => break,
+                1 => return Err(format!("Symbol containment cycle at {}", self.symbols[current].id)),
+                _ => {}
             }
-            for item in chain { state[item] = 2; }
+            state[current] = 1;
+            chain.push(current);
+            match self.owner_of(current, lookup)? {
+                Some(next) => current = next,
+                None => break,
+            }
         }
+        for item in chain { state[item] = 2; }
+        Ok(())
+    }
+
+    fn owner_of(&self, current: usize, lookup: &Lookup) -> Result<Option<usize>> {
+        let symbol = &self.symbols[current];
+        let Some(owner) = &symbol.owner_id else { return Ok(None) };
+        let Some(next) = lookup.symbols.get(owner) else { return Err(format!("Symbol {} names an unknown owner", symbol.id)); };
+        if self.symbols[*next as usize].file_id != symbol.file_id { return Err(format!("Symbol {} is owned across files", symbol.id)); }
+        Ok(Some(*next as usize))
+    }
+
+    fn index_sites<'a>(&'a self, lookup: &mut Lookup, ids: &mut HashSet<&'a str>) -> Result<()> {
         for (position, site) in self.sites.iter().enumerate() {
             if !ids.insert(&site.id) { return Err(format!("Duplicate source index id {}", site.id)); }
             let Some(file_position) = lookup.files.get(&site.file_id) else { return Err(format!("Site {} names an unknown file", site.id)); };
-            let file = &self.files[*file_position as usize];
-            if file.path != site.path { return Err(format!("Site {} path differs from its file", site.id)); }
-            check_span(&site.span, file.bytes, &site.id)?;
-            if site.relation.is_empty() || site.relation.len() > 64 { return Err(format!("Site {} has an invalid relation", site.id)); }
-            if let Some(raw) = &site.raw { text_limit(raw, "raw site text", 64 * 1024)?; }
+            check_site(site, &self.files[*file_position as usize])?;
             if let Some(caller) = &site.caller_id {
                 let Some(symbol) = lookup.symbols.get(caller) else { return Err(format!("Site {} names an unknown caller", site.id)); };
                 if self.symbols[*symbol as usize].file_id != site.file_id { return Err(format!("Site {} caller is in another file", site.id)); }
@@ -375,37 +401,39 @@ impl SourceGraphIndex {
             }
             lookup.sites.insert(site.id.clone(), position as u32);
         }
+        Ok(())
+    }
+
+    fn check_site_targets(&self, lookup: &Lookup) -> Result<()> {
         for site in &self.sites {
             for target in site.target_id.iter().chain(&site.candidate_ids) {
                 if lookup.node(target).is_none() { return Err(format!("Site {} names an unknown target", site.id)); }
             }
         }
+        Ok(())
+    }
+
+    fn index_edges(&self, lookup: &mut Lookup, ids: &HashSet<&str>) -> Result<()> {
         let mut edge_ids: HashSet<&str> = HashSet::new();
         for (position, edge) in self.edges.iter().enumerate() {
             if !edge_ids.insert(&edge.id) || ids.contains(edge.id.as_str()) { return Err(format!("Duplicate source index id {}", edge.id)); }
-            let (Some(source), Some(_)) = (lookup.node(&edge.source_id), lookup.node(&edge.target_id)) else { return Err(format!("Edge {} names a missing endpoint", edge.id)); };
-            if edge.relation.is_empty() || edge.relation.len() > 64 { return Err(format!("Edge {} has an invalid relation", edge.id)); }
-            if edge.evidence_ids.is_empty() { return Err(format!("Edge {} has no site evidence", edge.id)); }
-            let source_file = match source { Node::File(i) => i, Node::Symbol(i) => *lookup.files.get(&self.symbols[i as usize].file_id).unwrap_or(&u32::MAX) };
-            for evidence in &edge.evidence_ids {
-                let Some(site) = lookup.sites.get(evidence).map(|i| &self.sites[*i as usize]) else { return Err(format!("Edge {} cites unknown site {evidence}", edge.id)); };
-                if lookup.files.get(&site.file_id) != Some(&source_file) { return Err(format!("Edge {} cites a site outside its source file", edge.id)); }
-                match edge.resolution {
-                    Resolution::ResolvedStatic if site.resolution != Resolution::ResolvedStatic || site.target_id.as_deref() != Some(edge.target_id.as_str()) => {
-                        return Err(format!("Edge {} is not backed by a resolved site for its target", edge.id));
-                    }
-                    Resolution::Candidate if site.resolution != Resolution::Candidate || !site.candidate_ids.contains(&edge.target_id) => {
-                        return Err(format!("Edge {} is not backed by a candidate site for its target", edge.id));
-                    }
-                    _ => {}
-                }
-            }
+            self.check_edge(edge, lookup)?;
             lookup.edges_out.entry(edge.source_id.clone()).or_default().push(position as u32);
             lookup.edges_in.entry(edge.target_id.clone()).or_default().push(position as u32);
         }
-        for limitation in &self.limitations { text_limit(limitation, "limitation", 8 * 1024)?; }
-        self.derive_coverage()?;
-        self.lookup = lookup;
+        Ok(())
+    }
+
+    fn check_edge(&self, edge: &SourceEdge, lookup: &Lookup) -> Result<()> {
+        let (Some(source), Some(_)) = (lookup.node(&edge.source_id), lookup.node(&edge.target_id)) else { return Err(format!("Edge {} names a missing endpoint", edge.id)); };
+        if edge.relation.is_empty() || edge.relation.len() > 64 { return Err(format!("Edge {} has an invalid relation", edge.id)); }
+        if edge.evidence_ids.is_empty() { return Err(format!("Edge {} has no site evidence", edge.id)); }
+        let source_file = match source { Node::File(i) => i, Node::Symbol(i) => *lookup.files.get(&self.symbols[i as usize].file_id).unwrap_or(&u32::MAX) };
+        for evidence in &edge.evidence_ids {
+            let Some(site) = lookup.sites.get(evidence).map(|i| &self.sites[*i as usize]) else { return Err(format!("Edge {} cites unknown site {evidence}", edge.id)); };
+            if lookup.files.get(&site.file_id) != Some(&source_file) { return Err(format!("Edge {} cites a site outside its source file", edge.id)); }
+            check_evidence(edge, site)?;
+        }
         Ok(())
     }
 
@@ -437,6 +465,44 @@ impl SourceGraphIndex {
     }
 
     pub fn is_partial(&self) -> bool { self.coverage.get("partial").and_then(Value::as_bool).unwrap_or(false) }
+}
+
+fn check_file(file: &SourceFile, wanted: &ManifestFile) -> Result<()> {
+    if file.path != wanted.path || file.id != wanted.id || file.sha256 != wanted.sha256 || file.bytes != wanted.bytes {
+        return Err(format!("The source index file {} differs from the snapshot inventory", file.path));
+    }
+    if wanted.status == "skipped" && file.status != FileStatus::Skipped { return Err(format!("The source index re-labelled skipped file {}", file.path)); }
+    if file.language.as_ref().is_some_and(|l| l.len() > 64) { return Err("Source index language name is too long".into()); }
+    for line in &file.diagnostics { text_limit(line, "file diagnostic", 8 * 1024)?; }
+    Ok(())
+}
+
+fn check_symbol(symbol: &SourceSymbol, file: &SourceFile) -> Result<()> {
+    if file.path != symbol.path { return Err(format!("Symbol {} path differs from its file", symbol.id)); }
+    check_span(&symbol.span, file.bytes, &symbol.id)?;
+    if symbol.kind.is_empty() || symbol.kind.len() > 64 { return Err(format!("Symbol {} has an invalid kind", symbol.id)); }
+    text_limit(&symbol.name, "symbol name", 4 * 1024)?;
+    text_limit(&symbol.qualified_name, "qualified name", 8 * 1024)
+}
+
+fn check_site(site: &SourceSite, file: &SourceFile) -> Result<()> {
+    if file.path != site.path { return Err(format!("Site {} path differs from its file", site.id)); }
+    check_span(&site.span, file.bytes, &site.id)?;
+    if site.relation.is_empty() || site.relation.len() > 64 { return Err(format!("Site {} has an invalid relation", site.id)); }
+    if let Some(raw) = &site.raw { text_limit(raw, "raw site text", 64 * 1024)?; }
+    Ok(())
+}
+
+fn check_evidence(edge: &SourceEdge, site: &SourceSite) -> Result<()> {
+    match edge.resolution {
+        Resolution::ResolvedStatic if site.resolution != Resolution::ResolvedStatic || site.target_id.as_deref() != Some(edge.target_id.as_str()) => {
+            Err(format!("Edge {} is not backed by a resolved site for its target", edge.id))
+        }
+        Resolution::Candidate if site.resolution != Resolution::Candidate || !site.candidate_ids.contains(&edge.target_id) => {
+            Err(format!("Edge {} is not backed by a candidate site for its target", edge.id))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn check_span(span: &Span, file_bytes: u64, id: &str) -> Result<()> {

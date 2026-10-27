@@ -316,6 +316,19 @@ fn proposal_hash(title: &str, summary: &str, markdown: &str) -> String {
     format!("{:x}", hash.finalize())
 }
 
+/// Send the one draft prompt and report whether the Architect accepted it.
+fn prompt_admission(registry: &Registry, architect_id: &str, id: &str, generation: u64, message: &str) -> DependencyJobAdmission {
+    let outcome = match registry.manager_hub() {
+        Some(hub) => hub.prompt_human_generation(architect_id, generation, message),
+        None => Err("manager bridge not initialized".into()),
+    };
+    let (prompt_sent, error) = match outcome {
+        Ok(_) => (Some(true), None),
+        Err(error) => (None, Some(format!("Prompt admission outcome unknown: {error}. {UNKNOWN_ADMISSION}"))),
+    };
+    DependencyJobAdmission { request_id: id.to_string(), architect_id: Some(architect_id.to_string()), prompt_sent, error, disposition: JobDisposition::New }
+}
+
 impl DependencyUpdateService {
     pub fn new(config_root: PathBuf) -> Self {
         let service = Self {
@@ -358,6 +371,16 @@ impl DependencyUpdateService {
         self.workspace.get().ok_or_else(|| "dependency workspace service not initialized".into())
     }
 
+    /// The existing draft for this key that must be reported instead of creating a new one.
+    fn joined_draft(&self, registry: &Registry, index_key: &(String, String), regenerate: bool) -> Result<Option<String>> {
+        let Some(id) = self.index.lock().latest.get(index_key).cloned() else { return Ok(None) };
+        // A pending draft is always joined, even when regenerating; a finished one is reused unless regenerating.
+        let state = self.read(registry, &id)?;
+        if state.handoff.as_ref().is_some_and(|handoff| matches!(handoff.status, HandoffStatus::Pending | HandoffStatus::Attempting)) {
+            return Err("A handoff of this plan is pending; wait for its delivery result before regenerating.".into());
+        }
+        Ok((state.status == UpdatePlanStatus::Pending || !regenerate).then_some(id))
+    }
 
     /// Start, join or reuse the draft for `(project, source review)`. `planning` publishes the snapshot of the current
     /// authoritative scan and runs only when a fresh draft is created, so reuse performs no scan or model prompt.
@@ -369,16 +392,8 @@ impl DependencyUpdateService {
         }
         validate_source(&source)?;
         let index_key = (key.clone(), source.review_id.clone());
-        let existing = self.index.lock().latest.get(&index_key).cloned();
-        if let Some(id) = existing {
-            // A pending draft is always joined, even when regenerating; a finished one is reused unless regenerating.
-            let state = self.read(registry, &id)?;
-            if state.handoff.as_ref().is_some_and(|handoff| matches!(handoff.status, HandoffStatus::Pending | HandoffStatus::Attempting)) {
-                return Err("A handoff of this plan is pending; wait for its delivery result before regenerating.".into());
-            }
-            if state.status == UpdatePlanStatus::Pending || !regenerate {
-                return self.job_admission(registry, &id, false);
-            }
+        if let Some(id) = self.joined_draft(registry, &index_key, regenerate)? {
+            return self.job_admission(registry, &id, false);
         }
         let architect = registry.snapshot().into_iter().find(|row| row.kind == InstanceKind::Architect)
             .ok_or("Create The Architect first using its toolbar button.")?;
@@ -397,47 +412,41 @@ impl DependencyUpdateService {
         let (mut entry, claimed) = self.claim(index_key, request, regenerate);
         let id = entry.request.request_id.clone();
         if !claimed { return self.job_admission(registry, &entry.request.request_id, false); }
-        let prepared = (|| -> Result<String> {
-            let current = registry.inspect(&architect.id, Origin::Human)?;
-            if current.kind != InstanceKind::Architect { return Err("The Architect is no longer available".into()); }
-            if !is_running(&current) { (self.starter)(registry, &architect.id)?; }
-            let hub = registry.manager_hub().ok_or("manager bridge not initialized")?;
-            hub.wait_ready(&architect.id)?;
-            let ready = registry.inspect(&architect.id, Origin::Human)?;
-            if ready.kind != InstanceKind::Architect { return Err("The Architect is no longer available".into()); }
-            // The producer tuple (launch hash and native session) makes the binding restart-safe.
-            let producer = hub.dependency_producer(&architect.id, ready.generation)?;
-            {
-                let request = Arc::make_mut(&mut entry.request);
-                request.architect_generation = producer.generation;
-                request.architect_launch_id = Some(producer.launch_id);
-                request.architect_session_id = Some(producer.session_id);
-            }
-            validate_request(&entry.request, &id)?;
-            self.save_request(&entry.request)?;
-            self.index.lock().entries.insert(id.clone(), entry.clone());
-            Ok(draft_prompt(&entry.request, &source))
-        })();
+        let prepared = self.prepare_launch(registry, &architect.id, &source, &mut entry);
         let admission = match prepared {
             Err(error) => {
                 // Known not sent: keep a readable record, bound to nothing, so a deliberate regenerate can retry.
                 let _ = self.save_request(&entry.request);
                 DependencyJobAdmission { request_id: id.clone(), architect_id: Some(architect.id.clone()), prompt_sent: Some(false), error: Some(error), disposition: JobDisposition::Error }
             }
-            Ok(message) => {
-                let outcome = match registry.manager_hub() {
-                    Some(hub) => hub.prompt_human_generation(&architect.id, entry.request.architect_generation, &message),
-                    None => Err("manager bridge not initialized".into()),
-                };
-                match outcome {
-                    Ok(_) => DependencyJobAdmission { request_id: id.clone(), architect_id: Some(architect.id.clone()), prompt_sent: Some(true), error: None, disposition: JobDisposition::New },
-                    Err(error) => DependencyJobAdmission { request_id: id.clone(), architect_id: Some(architect.id.clone()), prompt_sent: None,
-                        error: Some(format!("Prompt admission outcome unknown: {error}. {UNKNOWN_ADMISSION}")), disposition: JobDisposition::New },
-                }
-            }
+            Ok(message) => prompt_admission(registry, &architect.id, &id, entry.request.architect_generation, &message),
         };
         self.finish_admission(&id, admission);
         self.job_admission(registry, &id, true)
+    }
+
+    /// Launch the Architect if needed, bind the draft to its producer identity and persist it; returns the prompt.
+    fn prepare_launch(&self, registry: &Arc<Registry>, architect_id: &str, source: &ReviewSource, entry: &mut Entry) -> Result<String> {
+        let id = entry.request.request_id.clone();
+        let current = registry.inspect(architect_id, Origin::Human)?;
+        if current.kind != InstanceKind::Architect { return Err("The Architect is no longer available".into()); }
+        if !is_running(&current) { (self.starter)(registry, architect_id)?; }
+        let hub = registry.manager_hub().ok_or("manager bridge not initialized")?;
+        hub.wait_ready(architect_id)?;
+        let ready = registry.inspect(architect_id, Origin::Human)?;
+        if ready.kind != InstanceKind::Architect { return Err("The Architect is no longer available".into()); }
+        // The producer tuple (launch hash and native session) makes the binding restart-safe.
+        let producer = hub.dependency_producer(architect_id, ready.generation)?;
+        {
+            let request = Arc::make_mut(&mut entry.request);
+            request.architect_generation = producer.generation;
+            request.architect_launch_id = Some(producer.launch_id);
+            request.architect_session_id = Some(producer.session_id);
+        }
+        validate_request(&entry.request, &id)?;
+        self.save_request(&entry.request)?;
+        self.index.lock().entries.insert(id, entry.clone());
+        Ok(draft_prompt(&entry.request, source))
     }
 
     pub fn read(&self, registry: &Registry, request_id: &str) -> Result<UpdatePlanState> {

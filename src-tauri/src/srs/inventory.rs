@@ -216,6 +216,27 @@ impl Utf8State {
         }
     }
 }
+/// Re-opens the source after copying and refuses any sign that it changed while being snapshotted.
+fn verify_unchanged(source: &Path, input: &File, before: &Metadata, identity_id: Option<&str>, bytes: u64) -> Result<()> {
+    let after = input.metadata().map_err(|e| io("Cannot inspect copied evidence", e))?;
+    plain_chain(source)?;
+    let current = open_plain(source)?;
+    let current_identity = handle_identity(&current)?;
+    let current_meta = current.metadata().map_err(|e| io("Cannot inspect source after snapshot", e))?;
+    if bytes != before.len() || before.len() != after.len() || modified(before) != modified(&after)
+        || identity_id != current_identity.id.as_deref() || current_identity.links != 1 || current_meta.len() != before.len()
+        || modified(&current_meta) != modified(before) {
+        return Err("Evidence changed during snapshot".into());
+    }
+    Ok(())
+}
+fn classify_content(item: &mut InventoryItem, bytes: u64, probe: &[u8], utf8: &Utf8State) {
+    if let Some(mime) = image_mime(probe) {
+        item.mime_type = Some(mime.into()); item.kind = "image".into();
+        if bytes > IMAGE_BYTES { block(item, "Image exceeds the bounded native image transport; a human-supplied textual description is required"); }
+    } else if utf8.valid && utf8.tail.is_empty() { item.kind = "text".into(); }
+    else { item.kind = "unsupported".into(); block(item, "Binary or non-UTF-8 evidence requires a human-readable description"); }
+}
 fn copy_file(source: &Path, destination: &Path, item: &mut InventoryItem, cancelled: &dyn Fn() -> bool) -> Result<()> {
     plain_chain(source)?;
     let mut input = open_plain(source)?;
@@ -239,23 +260,154 @@ fn copy_file(source: &Path, destination: &Path, item: &mut InventoryItem, cancel
         output.write_all(&buffer[..n]).map_err(|e| io("Cannot copy evidence snapshot", e))?;
     }
     output.sync_all().map_err(|e| io("Cannot persist evidence snapshot", e))?;
-    let after = input.metadata().map_err(|e| io("Cannot inspect copied evidence", e))?;
-    plain_chain(source)?;
-    let current = open_plain(source)?;
-    let current_identity = handle_identity(&current)?;
-    let current_meta = current.metadata().map_err(|e| io("Cannot inspect source after snapshot", e))?;
-    if bytes != before.len() || before.len() != after.len() || modified(&before) != modified(&after)
-        || identity.id != current_identity.id || current_identity.links != 1 || current_meta.len() != before.len()
-        || modified(&current_meta) != modified(&before) {
-        return Err("Evidence changed during snapshot".into());
-    }
+    verify_unchanged(source, &input, &before, identity.id.as_deref(), bytes)?;
     item.bytes = bytes; item.sha256 = Some(format!("{:x}", hash.finalize()));
-    if let Some(mime) = image_mime(&probe) {
-        item.mime_type = Some(mime.into()); item.kind = "image".into();
-        if bytes > IMAGE_BYTES { item.state = "blocked".into(); item.rationale = Some("Image exceeds the bounded native image transport; a human-supplied textual description is required".into()); }
-    } else if utf8.valid && utf8.tail.is_empty() { item.kind = "text".into(); }
-    else { item.kind = "unsupported".into(); item.state = "blocked".into(); item.rationale = Some("Binary or non-UTF-8 evidence requires a human-readable description".into()); }
+    classify_content(item, bytes, &probe, &utf8);
     Ok(())
+}
+
+fn block(item: &mut InventoryItem, rationale: &str) {
+    item.state = "blocked".into();
+    item.rationale = Some(rationale.into());
+}
+fn exclude(item: &mut InventoryItem, source: &str, reason: &str) {
+    item.kind = "excluded".into(); item.state = "excluded".into();
+    item.exclusion_source = Some(source.into()); item.rationale = Some(reason.into());
+}
+fn new_item(root: u64, relative: String) -> InventoryItem {
+    InventoryItem { id: item_id(root, &relative), root, path: relative, kind: "unsupported".into(), state: "ready".into(),
+        bytes: 0, sha256: None, rationale: None, exclusion_source: None, mime_type: None }
+}
+/// ReadDir cannot identify the failed child. A separate blocking record preserves the
+/// already-immutable area record and prevents false coverage.
+fn directory_error_item(parent: &Path, root: &Path, number: u64) -> Result<InventoryItem> {
+    let relative = parent.strip_prefix(root).map_err(|_| "Source escaped root")?;
+    let relative = if relative.as_os_str().is_empty() { ".".into() } else { relative_source_name(relative)? };
+    let mut item = new_item(number, relative.clone());
+    item.id = item_id(number, &format!("{relative}\0directory-error"));
+    block(&mut item, "Evidence area enumeration failed; coverage is incomplete");
+    Ok(item)
+}
+/// Do not expose absolute source paths or OS error strings in catalog DTOs.
+fn snapshot_failure(error: &str) -> &'static str {
+    if error.contains("changed during") { "Evidence changed during snapshot" }
+    else if error.contains("Hard-linked") { "Hard-linked evidence is blocked and was not copied" }
+    else { "Evidence is unreadable or unsafe and was not copied" }
+}
+
+struct Scan<'a> {
+    base: &'a Path, protected: Vec<PathBuf>, exclusions: Vec<(PathBuf, String, String)>,
+    cancelled: &'a dyn Fn() -> bool, summary: InventorySummary, first: Option<String>,
+}
+struct RootWalk<'a> { root: PathBuf, number: u64, selected: &'a InventoryRoot, stack: Vec<(PathBuf, ReadDir)> }
+
+impl Scan<'_> {
+    fn insert(&mut self, item: &InventoryItem) -> Result<()> { insert(self.base, item, &mut self.summary, &mut self.first) }
+
+    fn scan_root(&mut self, number: u64, selected: &InventoryRoot) -> Result<()> {
+        check_cancel(self.cancelled)?;
+        let root = canonical(&selected.path)?;
+        if !root.is_dir() { return Err("invalid_request: Evidence root is not a directory".into()); }
+        let mut walk = RootWalk { root: root.clone(), number, selected, stack: Vec::new() };
+        let mut pending = Some(root);
+        loop {
+            check_cancel(self.cancelled)?;
+            let next = match pending.take() { Some(path) => Some(path), None => self.next_path(&mut walk)? };
+            let Some(path) = next else { break };
+            self.visit(&mut walk, &path)?;
+        }
+        Ok(())
+    }
+
+    fn next_path(&mut self, walk: &mut RootWalk) -> Result<Option<PathBuf>> {
+        while let Some((parent, entries)) = walk.stack.last_mut() {
+            match entries.next() {
+                Some(Ok(entry)) => return Ok(Some(entry.path())),
+                Some(Err(_)) => {
+                    let item = directory_error_item(parent, &walk.root, walk.number)?;
+                    self.insert(&item)?;
+                    walk.stack.pop();
+                }
+                None => { walk.stack.pop(); }
+            }
+        }
+        Ok(None)
+    }
+
+    fn visit(&mut self, walk: &mut RootWalk, path: &Path) -> Result<()> {
+        let relative = path.strip_prefix(&walk.root).map_err(|_| "Source escaped root")?;
+        let relative = if relative.as_os_str().is_empty() { ".".into() } else {
+            // An unrepresentable name must block inventory, never disappear from coverage.
+            relative_source_name(relative).map_err(|e| format!("precondition_failed: Unsafe evidence name: {e}"))?
+        };
+        let mut item = new_item(walk.number, relative);
+        if plain_chain(path).is_err() {
+            block(&mut item, "Linked, reparse-point or unreadable source ancestry is never followed");
+            return self.insert(&item);
+        }
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            block(&mut item, "Evidence metadata is unreadable");
+            return self.insert(&item);
+        };
+        // Link safety takes precedence over exclusions, so links cannot be presented as read evidence.
+        if is_link(&metadata) {
+            block(&mut item, "Symlink, junction or reparse-point evidence is never followed");
+            return self.insert(&item);
+        }
+        self.classify(walk, path, &metadata, &mut item)?;
+        self.insert(&item)
+    }
+
+    fn classify(&self, walk: &mut RootWalk, path: &Path, metadata: &Metadata, item: &mut InventoryItem) -> Result<()> {
+        if self.protected.iter().any(|p| path.starts_with(p)) {
+            exclude(item, "app", "Private application configuration, job data or vault output is outside the evidence scope");
+        } else if let Some((_, reason, source)) = self.exclusions.iter().find(|(p, _, _)| path.starts_with(p)) {
+            exclude(item, source, reason);
+        } else if let Some(reason) = policy(&path.file_name().unwrap_or_default().to_string_lossy(), metadata.is_dir()) {
+            exclude(item, "app", reason);
+        } else if metadata.is_dir() {
+            Self::admit_directory(walk, path, item);
+        } else if metadata.is_file() {
+            self.snapshot(path, metadata.len(), item)?;
+        } else {
+            block(item, "Device, socket or other non-regular evidence is not readable");
+        }
+        Ok(())
+    }
+
+    fn admit_directory(walk: &mut RootWalk, path: &Path, item: &mut InventoryItem) {
+        item.kind = "area".into();
+        item.rationale = Some(if item.path == "." { format!("{}: {}", walk.selected.kind, walk.selected.rationale) } else { "Source evidence area".into() });
+        match fs::read_dir(path) {
+            Ok(entries) => walk.stack.push((path.to_path_buf(), entries)),
+            Err(_) => block(item, "Evidence area is unreadable; coverage is incomplete"),
+        }
+    }
+
+    fn snapshot(&self, path: &Path, length: u64, item: &mut InventoryItem) -> Result<()> {
+        let destination = self.base.join("objects").join(&item.id);
+        match copy_file(path, &destination, item, self.cancelled) {
+            Ok(()) => Ok(()),
+            Err(error) if error.starts_with("storage_error:") || (self.cancelled)() => Err(error),
+            Err(error) => {
+                if destination.exists() { fs::remove_file(&destination).map_err(|e| io("Cannot remove incomplete snapshot", e))?; }
+                item.kind = "unsupported".into();
+                block(item, snapshot_failure(&error));
+                item.bytes = length; item.sha256 = None;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn create_storage(job_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    plain_chain(job_dir)?;
+    fs::create_dir_all(job_dir).map_err(|e| io("Cannot create private job storage", e))?;
+    let job_dir = canonical(job_dir)?;
+    let base = job_dir.join("inventory");
+    fs::create_dir(&base).map_err(|e| io("Inventory already exists or cannot be created", e))?;
+    for directory in ["records", "index", "objects"] { fs::create_dir(base.join(directory)).map_err(|e| io("Cannot create inventory storage", e))?; }
+    Ok((job_dir, base))
 }
 
 /// The caller owns root selection. No model-provided absolute path is accepted by read helpers.
@@ -263,103 +415,13 @@ fn copy_file(source: &Path, destination: &Path, item: &mut InventoryItem, cancel
 /// protected automatically. Exclusions are literal paths, not globs or .gitignore interpretations.
 pub fn inventory(job_dir: &Path, roots: &[InventoryRoot], exclusions: &[InventoryExclusion], protected_paths: &[PathBuf], cancelled: &dyn Fn() -> bool) -> Result<InventorySummary> {
     if !job_dir.is_absolute() || roots.is_empty() { return Err("invalid_request: An absolute private job path and at least one root are required".into()); }
-    plain_chain(job_dir)?;
-    fs::create_dir_all(job_dir).map_err(|e| io("Cannot create private job storage", e))?;
-    let job_dir = canonical(job_dir)?;
-    let base = job_dir.join("inventory");
-    fs::create_dir(&base).map_err(|e| io("Inventory already exists or cannot be created", e))?;
-    for directory in ["records", "index", "objects"] { fs::create_dir(base.join(directory)).map_err(|e| io("Cannot create inventory storage", e))?; }
+    let (job_dir, base) = create_storage(job_dir)?;
     let mut protected = protected_paths.iter().map(|p| protected_path(p)).collect::<Result<Vec<_>>>()?;
-    protected.push(job_dir.clone());
+    protected.push(job_dir);
     let exclusions = exclusions.iter().map(|e| Ok((protected_path(&e.path)?, e.reason.clone(), e.source.clone()))).collect::<Result<Vec<_>>>()?;
-    let mut summary = InventorySummary::default();
-    let mut first = None;
-    for (root_number, selected) in roots.iter().enumerate() {
-        check_cancel(cancelled)?;
-        let root = canonical(&selected.path)?;
-        if !root.is_dir() { return Err("invalid_request: Evidence root is not a directory".into()); }
-        let mut pending = Some(root.clone());
-        let mut stack: Vec<(PathBuf, ReadDir)> = Vec::new();
-        loop {
-            check_cancel(cancelled)?;
-            let path = if let Some(path) = pending.take() { path } else {
-                loop {
-                    let Some((parent, entries)) = stack.last_mut() else { break };
-                    match entries.next() {
-                        Some(Ok(entry)) => { pending = Some(entry.path()); break; }
-                        Some(Err(_)) => {
-                            // ReadDir cannot identify the failed child. A separate blocking record
-                            // preserves the already-immutable area record and prevents false coverage.
-                            let relative = parent.strip_prefix(&root).map_err(|_| "Source escaped root")?;
-                            let relative = if relative.as_os_str().is_empty() { ".".into() } else { relative_source_name(relative)? };
-                            let item = InventoryItem {
-                                id: item_id(root_number as u64, &format!("{relative}\0directory-error")),
-                                root: root_number as u64, path: relative, kind: "unsupported".into(),
-                                state: "blocked".into(), bytes: 0, sha256: None,
-                                rationale: Some("Evidence area enumeration failed; coverage is incomplete".into()),
-                                exclusion_source: None, mime_type: None,
-                            };
-                            insert(&base, &item, &mut summary, &mut first)?;
-                            stack.pop();
-                        }
-                        None => { stack.pop(); }
-                    }
-                }
-                match pending.take() { Some(path) => path, None => break }
-            };
-            let relative = path.strip_prefix(&root).map_err(|_| "Source escaped root")?;
-            let relative = if relative.as_os_str().is_empty() { ".".into() } else {
-                // An unrepresentable name must block inventory, never disappear from coverage.
-                relative_source_name(relative).map_err(|e| format!("precondition_failed: Unsafe evidence name: {e}"))?
-            };
-            let mut item = InventoryItem { id: item_id(root_number as u64, &relative), root: root_number as u64, path: relative,
-                kind: "unsupported".into(), state: "ready".into(), bytes: 0, sha256: None, rationale: None, exclusion_source: None, mime_type: None };
-            if plain_chain(&path).is_err() {
-                item.state = "blocked".into(); item.rationale = Some("Linked, reparse-point or unreadable source ancestry is never followed".into());
-                insert(&base, &item, &mut summary, &mut first)?; continue;
-            }
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(meta) => meta,
-                Err(_) => { item.state = "blocked".into(); item.rationale = Some("Evidence metadata is unreadable".into()); insert(&base, &item, &mut summary, &mut first)?; continue; }
-            };
-            // Link safety takes precedence over exclusions, so links cannot be presented as read evidence.
-            if is_link(&metadata) {
-                item.state = "blocked".into(); item.rationale = Some("Symlink, junction or reparse-point evidence is never followed".into());
-                insert(&base, &item, &mut summary, &mut first)?; continue;
-            }
-            if protected.iter().any(|p| path.starts_with(p)) {
-                item.kind = "excluded".into(); item.state = "excluded".into(); item.exclusion_source = Some("app".into());
-                item.rationale = Some("Private application configuration, job data or vault output is outside the evidence scope".into());
-            } else if let Some((_, reason, source)) = exclusions.iter().find(|(p, _, _)| path.starts_with(p)) {
-                item.kind = "excluded".into(); item.state = "excluded".into(); item.exclusion_source = Some(source.clone()); item.rationale = Some(reason.clone());
-            } else if let Some(reason) = policy(&path.file_name().unwrap_or_default().to_string_lossy(), metadata.is_dir()) {
-                item.kind = "excluded".into(); item.state = "excluded".into(); item.exclusion_source = Some("app".into()); item.rationale = Some(reason.into());
-            } else if metadata.is_dir() {
-                item.kind = "area".into();
-                item.rationale = Some(if item.path == "." { format!("{}: {}", selected.kind, selected.rationale) } else { "Source evidence area".into() });
-                match fs::read_dir(&path) {
-                    Ok(entries) => stack.push((path.clone(), entries)),
-                    Err(_) => { item.state = "blocked".into(); item.rationale = Some("Evidence area is unreadable; coverage is incomplete".into()); }
-                }
-            } else if metadata.is_file() {
-                let destination = base.join("objects").join(&item.id);
-                match copy_file(&path, &destination, &mut item, cancelled) {
-                    Ok(()) => (),
-                    Err(error) if error.starts_with("storage_error:") || cancelled() => return Err(error),
-                    Err(error) => {
-                        if destination.exists() { fs::remove_file(&destination).map_err(|e| io("Cannot remove incomplete snapshot", e))?; }
-                        item.kind = "unsupported".into(); item.state = "blocked".into();
-                        // Do not expose absolute source paths or OS error strings in catalog DTOs.
-                        item.rationale = Some(if error.contains("changed during") { "Evidence changed during snapshot" } else if error.contains("Hard-linked") { "Hard-linked evidence is blocked and was not copied" } else { "Evidence is unreadable or unsafe and was not copied" }.into());
-                        item.bytes = metadata.len(); item.sha256 = None;
-                    }
-                }
-            } else {
-                item.state = "blocked".into(); item.rationale = Some("Device, socket or other non-regular evidence is not readable".into());
-            }
-            insert(&base, &item, &mut summary, &mut first)?;
-        }
-    }
+    let mut scan = Scan { base: &base, protected, exclusions, cancelled, summary: InventorySummary::default(), first: None };
+    for (number, selected) in roots.iter().enumerate() { scan.scan_root(number as u64, selected)?; }
+    let Scan { mut summary, first, .. } = scan;
     summary.source_hash = catalog_hash(&base, first.clone(), cancelled)?;
     write_json(&base.join("index-root.json"), &first, true)?;
     write_json(&base.join("summary.json"), &summary, true)?;

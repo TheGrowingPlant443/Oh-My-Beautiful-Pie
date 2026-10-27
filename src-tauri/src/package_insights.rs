@@ -247,33 +247,9 @@ impl PackageInsightsService {
             cached.unwrap().value
         } else {
             let Some(_permit) = self.registry_permit(deadline) else {
-                if let Some(old) = cached.filter(|entry| package_good(&entry.value)) {
-                    let mut value = old.value;
-                    value.notes.push(refresh_note("Package metadata lookup deadline exceeded.", old.saved_at));
-                    if let Some(repo) = value.repository_url.as_deref().and_then(normalize_repository) {
-                        value.repository = self.cached_repository(&repo.key()).map(|entry| entry.value);
-                        value.github_pending = value.repository.is_none();
-                    }
-                    return Ok(value);
-                }
-                return Ok(package.deadline_result(id, (self.clock)()));
+                return Ok(self.package_deadline_fallback(id, &package, cached));
             };
-            let cached = self.cached_package(id);
-            if !refresh && cached.as_ref().is_some_and(|entry| !entry_due(entry, (self.clock)())) {
-                cached.unwrap().value
-            } else {
-                let entry = self.registry(id, &package, deadline);
-                if let Some(old) = cached.filter(|old| package_good(&old.value) && !package_good(&entry.value)) {
-                    let mut value = old.value;
-                    value.notes.push(refresh_note(entry.value.notes.first().map(String::as_str).unwrap_or("registry metadata unavailable"), old.saved_at));
-                    value
-                } else {
-                    self.persist("packages", &entry);
-                    let value = entry.value.clone();
-                    self.cache.lock().packages.insert(id.into(), entry);
-                    value
-                }
-            }
+            self.refresh_package(id, &package, refresh, deadline)
         };
         if let Some(repo) = result.repository_url.as_deref().and_then(normalize_repository) {
             let entry = if github == GithubMode::Skip { self.cached_repository(&repo.key()) }
@@ -282,6 +258,33 @@ impl PackageInsightsService {
             result.repository = entry.map(|entry| entry.value);
         }
         Ok(result)
+    }
+
+    fn package_deadline_fallback(&self, id: &str, package: &Package, cached: Option<Entry<PackageInsights>>) -> PackageInsights {
+        let Some(old) = cached.filter(|entry| package_good(&entry.value)) else { return package.deadline_result(id, (self.clock)()); };
+        let mut value = old.value;
+        value.notes.push(refresh_note("Package metadata lookup deadline exceeded.", old.saved_at));
+        if let Some(repo) = value.repository_url.as_deref().and_then(normalize_repository) {
+            value.repository = self.cached_repository(&repo.key()).map(|entry| entry.value);
+            value.github_pending = value.repository.is_none();
+        }
+        value
+    }
+
+    /// Runs under a registry permit: a concurrent lookup may have refreshed the entry while this one waited.
+    fn refresh_package(&self, id: &str, package: &Package, refresh: bool, deadline: Instant) -> PackageInsights {
+        let cached = self.cached_package(id);
+        if !refresh && cached.as_ref().is_some_and(|entry| !entry_due(entry, (self.clock)())) { return cached.unwrap().value; }
+        let entry = self.registry(id, package, deadline);
+        if let Some(old) = cached.filter(|old| package_good(&old.value) && !package_good(&entry.value)) {
+            let mut value = old.value;
+            value.notes.push(refresh_note(entry.value.notes.first().map(String::as_str).unwrap_or("registry metadata unavailable"), old.saved_at));
+            return value;
+        }
+        self.persist("packages", &entry);
+        let value = entry.value.clone();
+        self.cache.lock().packages.insert(id.into(), entry);
+        value
     }
 
     pub fn status(&self) -> PackageInsightsStatus {
@@ -475,29 +478,16 @@ impl PackageInsightsService {
 
     fn fetch(&self, provider: Provider, segments: &[&str], query: &[(&str,&str)], deadline: Instant) -> Result<Response, Failure> {
         let now = (self.clock)();
-        if let Some(retry_at) = self.cache.lock().cooldowns.get(&provider).copied().filter(|at| *at > now) {
-            return Err(Failure { status: InsightStatus::RateLimited, reason: "Provider rate limit; retry after the cooldown.", retry_at: Some(retry_at), ttl: retry_at - now });
-        }
+        if let Some(failure) = self.cooldown_failure(provider, now) { return Err(failure); }
         let mut url = self.endpoint(provider, segments, query);
         let origin = url.clone();
-        let mut redirects = 0;
+        let mut redirects = 0u8;
         // Set once GitHub rejected the token: the same request is retried exactly once without credentials.
         let mut anonymous = false;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() { return Err(Failure::error("Package metadata lookup deadline exceeded.")); }
-            let mut request = self.client.get(url.clone()).timeout(self.request_timeout.min(remaining));
-            let mut sent_token = None;
-            if provider == Provider::Github {
-                request = request.header(header::ACCEPT, "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", "2026-03-10");
-                if !anonymous && (url.host_str() == Some("api.github.com") || self.fixture_credentials()) {
-                    if let Some(token) = self.credential(false).token {
-                        request = request.bearer_auth(&token);
-                        sent_token = Some(token);
-                    }
-                }
-            }
+            let (request, sent_token) = self.build_request(provider, &url, anonymous, remaining);
             let response = request.send().map_err(|e| if e.is_timeout() {
                 Failure::error("Package metadata request timed out.")
             } else { Failure::error("Package metadata request failed.") })?;
@@ -505,45 +495,70 @@ impl PackageInsightsService {
             let headers = response.headers().clone();
             if provider == Provider::Github { self.record_github_headers(&headers); }
             if status.is_redirection() {
-                let next = headers.get(header::LOCATION).and_then(|v| v.to_str().ok()).and_then(|s| url.join(s).ok())
-                    .ok_or_else(|| Failure::error("Invalid provider redirect."))?;
-                if redirects == 3 || !self.allowed_redirect(&origin, &next) {
-                    return Err(Failure::error("Provider redirect was blocked."));
-                }
+                url = self.redirect_target(&origin, &url, &headers, redirects)?;
                 redirects += 1;
-                url = next;
                 continue;
             }
-            if status == StatusCode::UNAUTHORIZED {
-                if let Some(token) = sent_token {
-                    self.reject_credential(&token);
-                    anonymous = true;
-                    continue;
-                }
+            if let Some(token) = sent_token.filter(|_| status == StatusCode::UNAUTHORIZED) {
+                self.reject_credential(&token);
+                anonymous = true;
+                continue;
             }
-            if response.content_length().is_some_and(|n| n > MAX_BODY as u64) {
-                return Err(Failure::error("Provider response exceeded 5 MiB."));
-            }
-            let mut body = Vec::with_capacity(response.content_length().unwrap_or(0).min(MAX_BODY as u64) as usize);
-            response.take((MAX_BODY + 1) as u64).read_to_end(&mut body)
-                .map_err(|_| Failure::error("Could not read provider response within its request deadline."))?;
-            if body.len() > MAX_BODY { return Err(Failure::error("Provider response exceeded 5 MiB.")); }
-            if Instant::now() >= deadline { return Err(Failure::error("Package metadata lookup deadline exceeded.")); }
-            if status == StatusCode::TOO_MANY_REQUESTS || (status == StatusCode::FORBIDDEN && rate_limit_403(&headers, &body)) {
-                let fallback = if provider == Provider::Github { HOUR } else { 60_000 };
-                let retry_at = retry_at(&headers, now).filter(|at| *at > now).unwrap_or_else(|| now.saturating_add(fallback));
-                let mut cache = self.cache.lock();
-                cache.cooldowns.insert(provider, retry_at);
-                self.persist_provider_state(&cache);
-                drop(cache);
-                return Err(Failure { status: InsightStatus::RateLimited, reason: "Provider rate limit; retry after the cooldown.", retry_at: Some(retry_at), ttl: retry_at.saturating_sub(now) });
-            }
-            if status == StatusCode::NOT_FOUND {
-                return Err(Failure { status: InsightStatus::Unavailable, reason: "Provider has no public metadata for this package or repository (404).", retry_at: None, ttl: HOUR });
-            }
-            if !status.is_success() { return Err(Failure::error("Provider returned an unsuccessful HTTP status.")); }
+            let body = read_provider_body(response, deadline)?;
+            self.check_provider_status(provider, status, &headers, &body, now)?;
             return Ok(Response { status, headers, body });
         }
+    }
+
+    fn cooldown_failure(&self, provider: Provider, now: u64) -> Option<Failure> {
+        let retry_at = self.cache.lock().cooldowns.get(&provider).copied().filter(|at| *at > now)?;
+        Some(Failure { status: InsightStatus::RateLimited, reason: "Provider rate limit; retry after the cooldown.", retry_at: Some(retry_at), ttl: retry_at - now })
+    }
+
+    /// The credential is attached only to GitHub requests and never after GitHub rejected it.
+    fn build_request(&self, provider: Provider, url: &Url, anonymous: bool, remaining: Duration) -> (reqwest::blocking::RequestBuilder, Option<String>) {
+        let request = self.client.get(url.clone()).timeout(self.request_timeout.min(remaining));
+        if provider != Provider::Github { return (request, None); }
+        let mut request = request.header(header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2026-03-10");
+        let mut sent_token = None;
+        if !anonymous && (url.host_str() == Some("api.github.com") || self.fixture_credentials()) {
+            if let Some(token) = self.credential(false).token {
+                request = request.bearer_auth(&token);
+                sent_token = Some(token);
+            }
+        }
+        (request, sent_token)
+    }
+
+    fn redirect_target(&self, origin: &Url, current: &Url, headers: &header::HeaderMap, redirects: u8) -> Result<Url, Failure> {
+        let next = headers.get(header::LOCATION).and_then(|v| v.to_str().ok()).and_then(|s| current.join(s).ok())
+            .ok_or_else(|| Failure::error("Invalid provider redirect."))?;
+        if redirects == 3 || !self.allowed_redirect(origin, &next) {
+            return Err(Failure::error("Provider redirect was blocked."));
+        }
+        Ok(next)
+    }
+
+    fn check_provider_status(&self, provider: Provider, status: StatusCode, headers: &header::HeaderMap, body: &[u8], now: u64) -> Result<(), Failure> {
+        if status == StatusCode::TOO_MANY_REQUESTS || (status == StatusCode::FORBIDDEN && rate_limit_403(headers, body)) {
+            return Err(self.start_cooldown(provider, headers, now));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(Failure { status: InsightStatus::Unavailable, reason: "Provider has no public metadata for this package or repository (404).", retry_at: None, ttl: HOUR });
+        }
+        if !status.is_success() { return Err(Failure::error("Provider returned an unsuccessful HTTP status.")); }
+        Ok(())
+    }
+
+    fn start_cooldown(&self, provider: Provider, headers: &header::HeaderMap, now: u64) -> Failure {
+        let fallback = if provider == Provider::Github { HOUR } else { 60_000 };
+        let retry_at = retry_at(headers, now).filter(|at| *at > now).unwrap_or_else(|| now.saturating_add(fallback));
+        let mut cache = self.cache.lock();
+        cache.cooldowns.insert(provider, retry_at);
+        self.persist_provider_state(&cache);
+        drop(cache);
+        Failure { status: InsightStatus::RateLimited, reason: "Provider rate limit; retry after the cooldown.", retry_at: Some(retry_at), ttl: retry_at.saturating_sub(now) }
     }
 
     fn fixture_credentials(&self) -> bool {
@@ -591,74 +606,64 @@ impl PackageInsightsService {
         if !refresh && cached.as_ref().is_some_and(|entry| !repository_due(entry, (self.clock)(), since)) { return cached; }
         let Some(_gate) = self.github_gate.try_lock_for(deadline.saturating_duration_since(Instant::now())) else {
             let error = Failure::error("Package metadata lookup deadline exceeded.");
-            if let Some(old) = cached.filter(|entry| repository_good(&entry.value)) {
-                notes.push(refresh_note(error.reason, old.saved_at));
-                return Some(old);
-            }
-            return Some(repository_failure(repo, &error, (self.clock)()));
+            return Some(self.stale_or_failure(repo, cached, &error, notes, (self.clock)()));
         };
         let cached = self.cached_repository(&key);
         let now = (self.clock)();
         let since = self.cache.lock().github_since;
         if !refresh && cached.as_ref().is_some_and(|entry| !repository_due(entry, now, since)) { return cached; }
-        let blocked = {
-            let cache = self.cache.lock();
-            if let Some(at) = cache.cooldowns.get(&Provider::Github).copied().filter(|at| *at > now) {
-                Some(Failure { status: InsightStatus::RateLimited, reason: "Provider rate limit; retry after the cooldown.",
-                    retry_at: Some(at), ttl: at - now })
-            } else if let Some(at) = cache.github.reset_at.filter(|at| *at > now)
-                .filter(|_| cache.github.remaining.is_some_and(|n| n < 2 + if mode == GithubMode::Bulk { 15 } else { 5 })) {
-                Some(Failure { status: InsightStatus::RateLimited, reason: "GitHub API budget reserved; resumes after the hourly reset.",
-                    retry_at: Some(at), ttl: at - now })
-            } else { None }
-        };
-        if let Some(error) = blocked {
-            if let Some(old) = cached.filter(|entry| repository_good(&entry.value)) {
-                notes.push(refresh_note(error.reason, old.saved_at));
-                return Some(old);
-            }
+        if let Some(error) = self.github_blocked(mode, now) {
             // A mode-specific reservation is not a provider failure: Demand may still use its smaller reserve.
-            return Some(repository_failure(repo, &error, now));
+            return Some(self.stale_or_failure(repo, cached, &error, notes, now));
         }
         let mut ttl = DAY;
         let mut result = RepositoryInsights { url: repo.url(), owner_login: repo.owner.clone(), owner_type: OwnerType::Unknown,
             stars: Failure::unavailable("GitHub star count unavailable.").metric("GitHub"),
             contributors: Failure::unavailable("GitHub contributor count unavailable.").metric("GitHub"), checked_at: now };
-        match self.json(Provider::Github, &["repos", &repo.owner, &repo.name], &[], deadline) {
-            Ok(value) => {
-                // Only accept a canonical identity with an exact GitHub URL and matching full_name.
-                let canonical = value["full_name"].as_str().and_then(Repo::from_pair)
-                    .zip(value["html_url"].as_str().and_then(normalize_repository))
-                    .filter(|(a,b)| a.key() == b.key()).map(|(a,_)| a);
-                if let Some(canonical) = canonical {
-                    result.url = canonical.url();
-                    result.owner_login = canonical.owner;
-                    result.owner_type = match value["owner"]["type"].as_str() {
-                        Some("User") => OwnerType::User, Some("Organization") => OwnerType::Organization, _ => OwnerType::Unknown,
-                    };
-                    result.stars = value["stargazers_count"].as_u64().map(|n| measured(n, "GitHub", None))
-                        .unwrap_or_else(|| { ttl = ttl.min(TRANSIENT); Failure::error("GitHub did not return a valid star count.").metric("GitHub") });
-                } else {
-                    ttl = ttl.min(TRANSIENT);
-                    result.stars = Failure::error("GitHub returned an invalid repository identity.").metric("GitHub");
-                }
-            }
-            Err(e) => { ttl = ttl.min(e.ttl); result.stars = e.metric("GitHub"); }
+        self.apply_github_repository(repo, &mut result, &mut ttl, deadline);
+        result.contributors = self.github_contributors(repo, &mut ttl, deadline);
+        Some(self.save_repository(key, cached, result, ttl, notes))
+    }
+
+    /// A good saved entry survives a failed refresh with a note; otherwise the failure itself is the entry.
+    fn stale_or_failure(&self, repo: &Repo, cached: Option<Entry<RepositoryInsights>>, error: &Failure, notes: &mut Vec<String>, now: u64) -> Entry<RepositoryInsights> {
+        if let Some(old) = cached.filter(|entry| repository_good(&entry.value)) {
+            notes.push(refresh_note(error.reason, old.saved_at));
+            return old;
         }
-        result.contributors = match self.fetch(Provider::Github, &["repos", &repo.owner, &repo.name, "contributors"],
-            &[("per_page", "1"), ("anon", "false")], deadline) {
-            Ok(response) => {
-                let count = if response.status == StatusCode::NO_CONTENT { Ok(0) } else {
-                    serde_json::from_slice::<Value>(&response.body).map_err(|_| Failure::error("GitHub returned invalid contributor JSON."))
-                        .and_then(|v| contributor_count(&response.headers, &v))
-                };
-                match count {
-                    Ok(n) => measured(n, "GitHub", Some("All-time linked contributor accounts".into())),
-                    Err(e) => { ttl = ttl.min(e.ttl); e.metric("GitHub") }
-                }
-            }
-            Err(e) => { ttl = ttl.min(e.ttl); e.metric("GitHub") }
-        };
+        repository_failure(repo, error, now)
+    }
+
+    fn github_blocked(&self, mode: GithubMode, now: u64) -> Option<Failure> {
+        let cache = self.cache.lock();
+        if let Some(at) = cache.cooldowns.get(&Provider::Github).copied().filter(|at| *at > now) {
+            return Some(Failure { status: InsightStatus::RateLimited, reason: "Provider rate limit; retry after the cooldown.",
+                retry_at: Some(at), ttl: at - now });
+        }
+        let reserve = 2 + if mode == GithubMode::Bulk { 15 } else { 5 };
+        let at = cache.github.reset_at.filter(|at| *at > now)
+            .filter(|_| cache.github.remaining.is_some_and(|n| n < reserve))?;
+        Some(Failure { status: InsightStatus::RateLimited, reason: "GitHub API budget reserved; resumes after the hourly reset.",
+            retry_at: Some(at), ttl: at - now })
+    }
+
+    fn apply_github_repository(&self, repo: &Repo, result: &mut RepositoryInsights, ttl: &mut u64, deadline: Instant) {
+        match self.json(Provider::Github, &["repos", &repo.owner, &repo.name], &[], deadline) {
+            Ok(value) => apply_repository_json(&value, result, ttl),
+            Err(e) => { *ttl = (*ttl).min(e.ttl); result.stars = e.metric("GitHub"); }
+        }
+    }
+
+    fn github_contributors(&self, repo: &Repo, ttl: &mut u64, deadline: Instant) -> CountMetric {
+        let counted = self.fetch(Provider::Github, &["repos", &repo.owner, &repo.name, "contributors"],
+            &[("per_page", "1"), ("anon", "false")], deadline).and_then(|response| response_contributors(&response));
+        match counted {
+            Ok(n) => measured(n, "GitHub", Some("All-time linked contributor accounts".into())),
+            Err(e) => { *ttl = (*ttl).min(e.ttl); e.metric("GitHub") }
+        }
+    }
+
+    fn save_repository(&self, key: String, cached: Option<Entry<RepositoryInsights>>, mut result: RepositoryInsights, ttl: u64, notes: &mut Vec<String>) -> Entry<RepositoryInsights> {
         let saved_at = (self.clock)();
         result.checked_at = saved_at;
         let retry_at = if repository_good(&result) { None } else {
@@ -668,29 +673,15 @@ impl PackageInsightsService {
         if let Some(old) = cached.filter(|old| repository_good(&old.value) && !repository_good(&entry.value)) {
             let reason = entry.value.stars.reason.as_deref().or(entry.value.contributors.reason.as_deref()).unwrap_or("GitHub metadata unavailable");
             notes.push(refresh_note(reason, old.saved_at));
-            return Some(old);
+            return old;
         }
         self.persist("repositories", &entry);
         self.cache.lock().repositories.insert(key, entry.clone());
-        Some(entry)
+        entry
     }
 
     fn maven(&self, group: &str, artifact: &str, result: &mut PackageInsights, ttl: &mut u64, deadline: Instant) -> Option<Repo> {
-        let path: Vec<&str> = std::iter::once("maven2").chain(group.split('.')).chain([artifact, "maven-metadata.xml"]).collect();
-        let metadata = match self.fetch(Provider::Maven, &path, &[], deadline).and_then(|r| xml_text(r.body)) {
-            Ok(value) => value,
-            Err(e) => { self.apply_metadata(Err(e), result, ttl, |_| (None,None,None)); return None; }
-        };
-        let doc = match roxmltree::Document::parse(&metadata) {
-            Ok(doc) => doc,
-            Err(_) => { self.apply_metadata(Err(Failure::error("Maven Central returned invalid XML.")), result, ttl, |_| (None,None,None)); return None; }
-        };
-        let versioning = child(doc.root_element(), "versioning");
-        let release = versioning.and_then(|n| text(n, "release")).filter(|v| valid_maven_part(v, false));
-        let latest = versioning.and_then(|n| text(n, "latest")).filter(|v| valid_maven_part(v, false) && !v.to_ascii_uppercase().contains("SNAPSHOT"));
-        let Some(version) = release.or(latest) else {
-            self.apply_metadata(Err(Failure::unavailable("Maven Central has no recommended non-SNAPSHOT release.")), result, ttl, |_| (None,None,None)); return None;
-        };
+        let version = self.maven_release(group, artifact, result, ttl, deadline)?;
         result.newest_version = Some(version.clone());
         result.newest_status = InsightStatus::Available;
         let mut coordinate = (group.to_string(), artifact.to_string(), version);
@@ -698,37 +689,62 @@ impl PackageInsightsService {
         seen.insert(coordinate.clone());
         // Initial release POM plus at most five distinct parent POMs.
         for depth in 0..=5 {
-            let (g,a,v) = &coordinate;
-            let filename = format!("{a}-{v}.pom");
-            let path: Vec<&str> = std::iter::once("maven2").chain(g.split('.')).chain([a.as_str(), v.as_str(), filename.as_str()]).collect();
-            let pom = match self.fetch(Provider::Maven, &path, &[], deadline).and_then(|r| xml_text(r.body)) {
-                Ok(pom) => pom,
-                Err(e) => { *ttl = (*ttl).min(e.ttl); result.repository_reason = Some(e.reason.into()); return None; }
-            };
-            let pom = match roxmltree::Document::parse(&pom) {
-                Ok(pom) if pom.root_element().tag_name().name() == "project" => pom,
-                _ => { *ttl = (*ttl).min(TRANSIENT); result.repository_reason = Some("Maven Central returned an invalid POM.".into()); return None; }
-            };
-            let project = pom.root_element();
-            if depth == 0 { result.description = one_line(child(project, "description").and_then(|n| n.text())); }
-            let props = pom_properties(project, &coordinate);
-            let scm = child(project, "scm").and_then(|n| text(n, "url"));
-            for candidate in [scm, text(project, "url")].into_iter().flatten() {
-                if let Some(repo) = expand(&candidate, &props).and_then(|s| normalize_repository(&s)) { return Some(repo); }
+            match self.maven_pom_step(&coordinate, depth, &mut seen, result, ttl, deadline) {
+                MavenStep::Done(repo) => return repo,
+                MavenStep::Parent(next) => coordinate = next,
             }
-            let Some(parent) = child(project, "parent") else { return None; };
-            let next = text(parent, "groupId").and_then(|s| expand(&s, &props))
-                .zip(text(parent, "artifactId").and_then(|s| expand(&s, &props)))
-                .zip(text(parent, "version").and_then(|s| expand(&s, &props)))
-                .map(|((g,a),v)| (g,a,v));
-            let Some(next) = next.filter(|(g,a,v)| valid_group(g) && valid_maven_part(a, true) && valid_maven_part(v, false)) else {
-                result.repository_reason = Some("Maven parent reference could not be resolved safely.".into()); return None;
-            };
-            if !seen.insert(next.clone()) { result.repository_reason = Some("Maven parent POM cycle detected.".into()); return None; }
-            if depth == 5 { result.repository_reason = Some("Maven parent POM lookup stopped after five parents.".into()); return None; }
-            coordinate = next;
         }
         None
+    }
+
+    fn maven_release(&self, group: &str, artifact: &str, result: &mut PackageInsights, ttl: &mut u64, deadline: Instant) -> Option<String> {
+        let path: Vec<&str> = std::iter::once("maven2").chain(group.split('.')).chain([artifact, "maven-metadata.xml"]).collect();
+        let metadata = match self.fetch(Provider::Maven, &path, &[], deadline).and_then(|r| xml_text(r.body)) {
+            Ok(value) => value,
+            Err(e) => { self.apply_metadata(Err(e), result, ttl, |_| (None,None,None)); return None; }
+        };
+        let Ok(doc) = roxmltree::Document::parse(&metadata) else {
+            self.apply_metadata(Err(Failure::error("Maven Central returned invalid XML.")), result, ttl, |_| (None,None,None));
+            return None;
+        };
+        let versioning = child(doc.root_element(), "versioning");
+        let release = versioning.and_then(|n| text(n, "release")).filter(|v| valid_maven_part(v, false));
+        let latest = versioning.and_then(|n| text(n, "latest")).filter(|v| valid_maven_part(v, false) && !v.to_ascii_uppercase().contains("SNAPSHOT"));
+        let version = release.or(latest);
+        if version.is_none() {
+            self.apply_metadata(Err(Failure::unavailable("Maven Central has no recommended non-SNAPSHOT release.")), result, ttl, |_| (None,None,None));
+        }
+        version
+    }
+
+    fn fetch_pom(&self, (g, a, v): &MavenCoordinate, deadline: Instant) -> Result<String, Failure> {
+        let filename = format!("{a}-{v}.pom");
+        let path: Vec<&str> = std::iter::once("maven2").chain(g.split('.')).chain([a.as_str(), v.as_str(), filename.as_str()]).collect();
+        self.fetch(Provider::Maven, &path, &[], deadline).and_then(|r| xml_text(r.body))
+    }
+
+    fn maven_pom_step(&self, coordinate: &MavenCoordinate, depth: usize, seen: &mut HashSet<MavenCoordinate>,
+        result: &mut PackageInsights, ttl: &mut u64, deadline: Instant) -> MavenStep {
+        let xml = match self.fetch_pom(coordinate, deadline) {
+            Ok(xml) => xml,
+            Err(e) => { *ttl = (*ttl).min(e.ttl); result.repository_reason = Some(e.reason.into()); return MavenStep::Done(None); }
+        };
+        let pom = match roxmltree::Document::parse(&xml) {
+            Ok(pom) if pom.root_element().tag_name().name() == "project" => pom,
+            _ => { *ttl = (*ttl).min(TRANSIENT); result.repository_reason = Some("Maven Central returned an invalid POM.".into()); return MavenStep::Done(None); }
+        };
+        let project = pom.root_element();
+        if depth == 0 { result.description = one_line(child(project, "description").and_then(|n| n.text())); }
+        let props = pom_properties(project, coordinate);
+        if let Some(repo) = maven_repository(project, &props) { return MavenStep::Done(Some(repo)); }
+        let Some(parent) = child(project, "parent") else { return MavenStep::Done(None); };
+        let Some(next) = maven_parent(parent, &props) else {
+            result.repository_reason = Some("Maven parent reference could not be resolved safely.".into());
+            return MavenStep::Done(None);
+        };
+        if !seen.insert(next.clone()) { result.repository_reason = Some("Maven parent POM cycle detected.".into()); return MavenStep::Done(None); }
+        if depth == 5 { result.repository_reason = Some("Maven parent POM lookup stopped after five parents.".into()); return MavenStep::Done(None); }
+        MavenStep::Parent(next)
     }
 
     fn cached_package(&self, key: &str) -> Option<Entry<PackageInsights>> {
@@ -774,6 +790,59 @@ impl PackageInsightsService {
     fn persist<T: Serialize>(&self, bucket: &str, entry: &Entry<T>) {
         persist_json(&self.entry_path(bucket, &entry.key), entry);
     }
+}
+
+type MavenCoordinate = (String, String, String);
+enum MavenStep { Done(Option<Repo>), Parent(MavenCoordinate) }
+
+fn maven_repository(project: roxmltree::Node<'_,'_>, props: &HashMap<String,String>) -> Option<Repo> {
+    let scm = child(project, "scm").and_then(|n| text(n, "url"));
+    [scm, text(project, "url")].into_iter().flatten()
+        .find_map(|candidate| expand(&candidate, props).and_then(|s| normalize_repository(&s)))
+}
+
+fn maven_parent(parent: roxmltree::Node<'_,'_>, props: &HashMap<String,String>) -> Option<MavenCoordinate> {
+    let field = |name: &str| text(parent, name).and_then(|s| expand(&s, props));
+    let next = (field("groupId")?, field("artifactId")?, field("version")?);
+    (valid_group(&next.0) && valid_maven_part(&next.1, true) && valid_maven_part(&next.2, false)).then_some(next)
+}
+
+fn read_provider_body(response: reqwest::blocking::Response, deadline: Instant) -> Result<Vec<u8>, Failure> {
+    let length = response.content_length();
+    if length.is_some_and(|n| n > MAX_BODY as u64) { return Err(Failure::error("Provider response exceeded 5 MiB.")); }
+    let mut body = Vec::with_capacity(length.unwrap_or(0).min(MAX_BODY as u64) as usize);
+    response.take((MAX_BODY + 1) as u64).read_to_end(&mut body)
+        .map_err(|_| Failure::error("Could not read provider response within its request deadline."))?;
+    if body.len() > MAX_BODY { return Err(Failure::error("Provider response exceeded 5 MiB.")); }
+    if Instant::now() >= deadline { return Err(Failure::error("Package metadata lookup deadline exceeded.")); }
+    Ok(body)
+}
+
+/// Accepts only a canonical identity with an exact GitHub URL and matching full_name.
+fn apply_repository_json(value: &Value, result: &mut RepositoryInsights, ttl: &mut u64) {
+    let canonical = value["full_name"].as_str().and_then(Repo::from_pair)
+        .zip(value["html_url"].as_str().and_then(normalize_repository))
+        .filter(|(a,b)| a.key() == b.key()).map(|(a,_)| a);
+    let Some(canonical) = canonical else {
+        *ttl = (*ttl).min(TRANSIENT);
+        result.stars = Failure::error("GitHub returned an invalid repository identity.").metric("GitHub");
+        return;
+    };
+    result.url = canonical.url();
+    result.owner_login = canonical.owner;
+    result.owner_type = match value["owner"]["type"].as_str() {
+        Some("User") => OwnerType::User, Some("Organization") => OwnerType::Organization, _ => OwnerType::Unknown,
+    };
+    result.stars = match value["stargazers_count"].as_u64() {
+        Some(n) => measured(n, "GitHub", None),
+        None => { *ttl = (*ttl).min(TRANSIENT); Failure::error("GitHub did not return a valid star count.").metric("GitHub") }
+    };
+}
+
+fn response_contributors(response: &Response) -> Result<u64, Failure> {
+    if response.status == StatusCode::NO_CONTENT { return Ok(0); }
+    let body = serde_json::from_slice::<Value>(&response.body).map_err(|_| Failure::error("GitHub returned invalid contributor JSON."))?;
+    contributor_count(&response.headers, &body)
 }
 
 fn read_json<T: DeserializeOwned>(path: &std::path::Path) -> Option<T> {
@@ -1051,33 +1120,35 @@ impl Package {
         if id.len() > 512 || id.chars().any(char::is_control) { return None; }
         let (ecosystem,name) = id.split_once(':')?;
         match ecosystem {
-            "npm" => {
-                if name.len() > 214 { return None; }
-                let valid = |s: &str| !s.is_empty() && s.len() <= 214 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') && !s.starts_with('.') && !s.starts_with('_');
-                if let Some(scoped) = name.strip_prefix('@') {
-                    let (scope,pkg) = scoped.split_once('/')?;
-                    (valid(scope) && valid(pkg)).then(|| Self::Npm(name.into()))
-                } else { valid(name).then(|| Self::Npm(name.into())) }
-            }
-            "pypi" => {
-                if name.is_empty() || name.len() > 214 || !name.as_bytes().first()?.is_ascii_alphanumeric()
-                    || !name.as_bytes().last()?.is_ascii_alphanumeric()
-                    || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) { return None; }
-                let mut normalized = String::new();
-                for c in name.chars() {
-                    if matches!(c, '.' | '_' | '-') { if !normalized.ends_with('-') { normalized.push('-'); } }
-                    else { normalized.push(c.to_ascii_lowercase()); }
-                }
-                Some(Self::Pypi(normalized))
-            }
-            "cargo" => (!name.is_empty() && name.len() <= 64 && name.as_bytes()[0].is_ascii_alphabetic()
-                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')).then(|| Self::Cargo(name.into())),
+            "npm" => Self::parse_npm(name),
+            "pypi" => Self::parse_pypi(name),
+            "cargo" => Self::parse_cargo(name),
             "maven" => {
                 let (group,artifact) = name.split_once(':')?;
                 (valid_group(group) && valid_maven_part(artifact, true)).then(|| Self::Maven(group.into(),artifact.into()))
             }
             _ => None,
         }
+    }
+    fn parse_npm(name: &str) -> Option<Self> {
+        if name.len() > 214 { return None; }
+        match name.strip_prefix('@') {
+            Some(scoped) => {
+                let (scope,pkg) = scoped.split_once('/')?;
+                (valid_npm_part(scope) && valid_npm_part(pkg)).then(|| Self::Npm(name.into()))
+            }
+            None => valid_npm_part(name).then(|| Self::Npm(name.into())),
+        }
+    }
+    fn parse_pypi(name: &str) -> Option<Self> {
+        if name.is_empty() || name.len() > 214 || !name.as_bytes().first()?.is_ascii_alphanumeric()
+            || !name.as_bytes().last()?.is_ascii_alphanumeric()
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) { return None; }
+        Some(Self::Pypi(normalize_pypi(name)))
+    }
+    fn parse_cargo(name: &str) -> Option<Self> {
+        (!name.is_empty() && name.len() <= 64 && name.as_bytes()[0].is_ascii_alphabetic()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')).then(|| Self::Cargo(name.into()))
     }
     fn source(&self) -> &'static str { match self { Self::Npm(_) => "npm", Self::Pypi(_) => "PyPI", Self::Cargo(_) => "crates.io", Self::Maven(..) => "Maven Central" } }
     fn page(&self) -> String { match self {
@@ -1093,6 +1164,18 @@ impl Package {
             downloads: Failure::error("Package metadata lookup deadline exceeded.").metric(self.source()), checked_at: now,
             notes: vec!["Package metadata lookup deadline exceeded.".into()] }
     }
+}
+fn valid_npm_part(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 214 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') && !s.starts_with('.') && !s.starts_with('_')
+}
+/// PEP 503 name: runs of `.`, `_` and `-` collapse to one `-`, ASCII letters are lowercased.
+fn normalize_pypi(name: &str) -> String {
+    let mut normalized = String::new();
+    for c in name.chars() {
+        if !matches!(c, '.' | '_' | '-') { normalized.push(c.to_ascii_lowercase()); }
+        else if !normalized.ends_with('-') { normalized.push('-'); }
+    }
+    normalized
 }
 fn valid_maven_part(s: &str, coordinate: bool) -> bool {
     !s.is_empty() && s.len() <= 200 && s != "." && s != ".." && !s.contains("..")
@@ -1148,47 +1231,50 @@ fn repository_field(value: &Value) -> Option<Repo> {
     value.as_str().or_else(|| value["url"].as_str()).and_then(normalize_repository)
 }
 fn pypi_repository(info: &Value) -> Option<Repo> {
-    if let Some(urls) = info["project_urls"].as_object() {
-        for preferred in ["source", "source code", "repository", "code"] {
-            for (key,value) in urls {
-                if key.eq_ignore_ascii_case(preferred) {
-                    if let Some(repo) = value.as_str().and_then(normalize_repository) { return Some(repo); }
-                }
-            }
-        }
-        for value in urls.values() { if let Some(repo) = value.as_str().and_then(normalize_repository) { return Some(repo); } }
-    }
-    info["home_page"].as_str().and_then(normalize_repository)
+    info["project_urls"].as_object().and_then(pypi_project_repository)
+        .or_else(|| info["home_page"].as_str().and_then(normalize_repository))
+}
+fn pypi_project_repository(urls: &serde_json::Map<String, Value>) -> Option<Repo> {
+    ["source", "source code", "repository", "code"].iter().find_map(|preferred| {
+        urls.iter().filter(|(key,_)| key.eq_ignore_ascii_case(preferred))
+            .find_map(|(_,value)| value.as_str().and_then(normalize_repository))
+    }).or_else(|| urls.values().find_map(|value| value.as_str().and_then(normalize_repository)))
 }
 
+fn invalid_pagination() -> Failure { Failure::error("GitHub returned invalid contributor pagination.") }
 fn contributor_count(headers: &header::HeaderMap, body: &Value) -> Result<u64, Failure> {
     let array = body.as_array().ok_or_else(|| Failure::error("GitHub returned invalid contributor data."))?;
     if array.len() > 1 { return Err(Failure::error("GitHub contributor page did not respect the requested page size.")); }
     let mut next = false;
     let mut last = None;
     for value in headers.get_all(header::LINK).iter() {
-        let value = value.to_str().map_err(|_| Failure::error("GitHub returned invalid contributor pagination."))?;
-        for link in value.split(',') {
-            let mut fields = link.trim().split(';');
-            let target = fields.next().unwrap_or("").trim();
-            let rel = fields.find_map(|p| p.trim().strip_prefix("rel=").map(|p| p.trim_matches('"')));
-            let Some(rel) = rel else { continue; };
-            if rel.split_whitespace().any(|s| s == "next") { next = true; }
-            if rel.split_whitespace().any(|s| s == "last") {
-                let url = target.strip_prefix('<').and_then(|s| s.strip_suffix('>')).and_then(|s| Url::parse(s).ok())
-                    .filter(|u| u.scheme() == "https" && u.host_str() == Some("api.github.com") && u.username().is_empty() && u.password().is_none() && u.port().is_none())
-                    .ok_or_else(|| Failure::error("GitHub returned invalid contributor pagination."))?;
-                let pages: Vec<_> = url.query_pairs().filter(|(k,_)| k == "page").map(|(_,v)| v.into_owned()).collect();
-                if pages.len() != 1 { return Err(Failure::error("GitHub returned invalid contributor pagination.")); }
-                let page = pages[0].bytes().all(|b| b.is_ascii_digit()).then(|| pages[0].parse::<u64>().ok()).flatten().filter(|p| *p > 0)
-                    .ok_or_else(|| Failure::error("GitHub returned invalid contributor pagination."))?;
-                if last.replace(page).is_some() { return Err(Failure::error("GitHub returned ambiguous contributor pagination.")); }
-            }
-        }
+        let value = value.to_str().map_err(|_| invalid_pagination())?;
+        for link in value.split(',') { scan_contributor_link(link, &mut next, &mut last)?; }
     }
     if let Some(last) = last { Ok(last) }
     else if next { Err(Failure::unavailable("GitHub contributor total is unknown: pagination has no calculable last page.")) }
     else { Ok(array.len() as u64) }
+}
+fn scan_contributor_link(link: &str, next: &mut bool, last: &mut Option<u64>) -> Result<(), Failure> {
+    let mut fields = link.trim().split(';');
+    let target = fields.next().unwrap_or("").trim();
+    let rel = fields.find_map(|p| p.trim().strip_prefix("rel=").map(|p| p.trim_matches('"')));
+    let Some(rel) = rel else { return Ok(()); };
+    if rel.split_whitespace().any(|s| s == "next") { *next = true; }
+    if rel.split_whitespace().any(|s| s == "last") && last.replace(last_link_page(target)?).is_some() {
+        return Err(Failure::error("GitHub returned ambiguous contributor pagination."));
+    }
+    Ok(())
+}
+/// Page number of a `rel="last"` link, accepted only for the fixed GitHub API origin.
+fn last_link_page(target: &str) -> Result<u64, Failure> {
+    let url = target.strip_prefix('<').and_then(|s| s.strip_suffix('>')).and_then(|s| Url::parse(s).ok())
+        .filter(|u| u.scheme() == "https" && u.host_str() == Some("api.github.com") && u.username().is_empty() && u.password().is_none() && u.port().is_none())
+        .ok_or_else(invalid_pagination)?;
+    let pages: Vec<_> = url.query_pairs().filter(|(k,_)| k == "page").map(|(_,v)| v.into_owned()).collect();
+    if pages.len() != 1 { return Err(invalid_pagination()); }
+    pages[0].bytes().all(|b| b.is_ascii_digit()).then(|| pages[0].parse::<u64>().ok()).flatten().filter(|p| *p > 0)
+        .ok_or_else(invalid_pagination)
 }
 fn rate_limit_403(headers: &header::HeaderMap, body: &[u8]) -> bool {
     headers.contains_key(header::RETRY_AFTER) || headers.get("x-ratelimit-remaining").is_some_and(|v| v.as_bytes() == b"0")
@@ -1337,31 +1423,9 @@ mod tests {
                 let mut workers = Vec::new();
                 while !worker_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
-                        Ok((mut stream,_)) => {
+                        Ok((stream,_)) => {
                             let (handler,requests) = (handler.clone(),worker_requests.clone());
-                            workers.push(thread::spawn(move || {
-                                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                                // Windows accepted sockets can inherit the listener's nonblocking mode.
-                                stream.set_nonblocking(false).unwrap();
-                                let mut bytes = Vec::new();
-                                let mut buffer = [0u8;1024];
-                                while bytes.len() < 16_384 && !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                                    match stream.read(&mut buffer) { Ok(0) | Err(_) => return, Ok(n) => bytes.extend_from_slice(&buffer[..n]) }
-                                }
-                                let request = String::from_utf8(bytes).unwrap();
-                                let path = request.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string();
-                                requests.lock().push(request);
-                                let reply = handler(&path);
-                                thread::sleep(reply.delay);
-                                let mut response = format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n",reply.status);
-                                if !reply.close_delimited { response.push_str(&format!("Content-Length: {}\r\n",reply.body.len())); }
-                                for (key,value) in reply.headers { response.push_str(&format!("{key}: {value}\r\n")); }
-                                response.push_str("\r\n");
-                                if stream.write_all(response.as_bytes()).is_ok() {
-                                    thread::sleep(reply.body_delay);
-                                    let _ = stream.write_all(&reply.body);
-                                }
-                            }));
+                            workers.push(thread::spawn(move || Self::serve(stream, &*handler, &requests)));
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(1)),
                         Err(e) => panic!("fixture accept: {e}"),
@@ -1371,6 +1435,29 @@ mod tests {
             });
             Self { base: format!("http://{address}/"), root: std::env::temp_dir().join(format!("omp-insights-{}",uuid::Uuid::new_v4())),
                 requests, now: Arc::new(AtomicU64::new(1_800_000_000_000)), stop, thread: Some(thread) }
+        }
+        fn serve(mut stream: std::net::TcpStream, handler: &dyn Fn(&str) -> Reply, requests: &Mutex<Vec<String>>) {
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            // Windows accepted sockets can inherit the listener's nonblocking mode.
+            stream.set_nonblocking(false).unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8;1024];
+            while bytes.len() < 16_384 && !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buffer) { Ok(0) | Err(_) => return, Ok(n) => bytes.extend_from_slice(&buffer[..n]) }
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            let path = request.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string();
+            requests.lock().push(request);
+            let reply = handler(&path);
+            thread::sleep(reply.delay);
+            let mut response = format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n",reply.status);
+            if !reply.close_delimited { response.push_str(&format!("Content-Length: {}\r\n",reply.body.len())); }
+            for (key,value) in reply.headers { response.push_str(&format!("{key}: {value}\r\n")); }
+            response.push_str("\r\n");
+            if stream.write_all(response.as_bytes()).is_ok() {
+                thread::sleep(reply.body_delay);
+                let _ = stream.write_all(&reply.body);
+            }
         }
         fn service(&self) -> PackageInsightsService {
             self.service_with(None,Duration::from_secs(2),Duration::from_secs(5))
@@ -1504,33 +1591,40 @@ mod tests {
         assert_eq!(f.paths().len(),5);
     }
 
+    fn maven_scenario_reply(scenario: &str, path: &str) -> Reply {
+        if path.ends_with("maven-metadata.xml") {
+            return if scenario == "snapshot" { Reply::xml("<metadata><versioning><latest>9-SNAPSHOT</latest></versioning></metadata>") }
+                else { Reply::xml("<metadata><versioning><latest>1</latest></versioning></metadata>") };
+        }
+        let parent: String = match scenario {
+            "cycle" => "lib".into(),
+            "unresolved" => "${unknown}".into(),
+            _ => {
+                let artifact = path.split('/').nth(5).unwrap();
+                if artifact == "lib" { "p1".into() } else { format!("p{}",artifact.trim_start_matches('p').parse::<u8>().unwrap()+1) }
+            }
+        };
+        Reply::xml(&format!("<project><parent><groupId>org.example</groupId><artifactId>{parent}</artifactId><version>1</version></parent></project>"))
+    }
+
+    fn assert_maven_bounded(case: &str, result: &PackageInsights, requests: usize) {
+        let reason = result.repository_reason.as_deref().unwrap_or("");
+        match case {
+            "snapshot" => { assert_eq!(result.newest_status,InsightStatus::Unavailable); assert_eq!(requests,1); }
+            "cycle" => { assert!(reason.contains("cycle")); assert_eq!(requests,2); }
+            "unresolved" => { assert!(reason.contains("resolved")); assert_eq!(requests,2); }
+            _ => { assert!(reason.contains("five")); assert_eq!(requests,7); }
+        }
+    }
+
     #[test]
     fn maven_cycle_unresolved_parent_and_latest_snapshot_are_bounded() {
         for case in ["cycle","unresolved","snapshot","limit"] {
             let scenario = case.to_string();
-            let f = Fixture::new(move |path| {
-                if path.ends_with("maven-metadata.xml") {
-                    return if scenario == "snapshot" { Reply::xml("<metadata><versioning><latest>9-SNAPSHOT</latest></versioning></metadata>") }
-                        else { Reply::xml("<metadata><versioning><latest>1</latest></versioning></metadata>") };
-                }
-                let parent = match scenario.as_str() {
-                    "cycle" => "lib".into(),
-                    "unresolved" => "${unknown}".into(),
-                    _ => {
-                        let artifact = path.split('/').nth(5).unwrap();
-                        if artifact == "lib" { "p1".into() } else { format!("p{}",artifact.trim_start_matches('p').parse::<u8>().unwrap()+1) }
-                    }
-                };
-                Reply::xml(&format!("<project><parent><groupId>org.example</groupId><artifactId>{parent}</artifactId><version>1</version></parent></project>"))
-            });
+            let f = Fixture::new(move |path| maven_scenario_reply(&scenario, path));
             let result = f.service().lookup("maven:org.example:lib", GithubMode::Demand, false).unwrap();
             assert!(result.repository.is_none());
-            match case {
-                "snapshot" => { assert_eq!(result.newest_status,InsightStatus::Unavailable); assert_eq!(f.paths().len(),1); }
-                "cycle" => { assert!(result.repository_reason.unwrap().contains("cycle")); assert_eq!(f.paths().len(),2); }
-                "unresolved" => { assert!(result.repository_reason.unwrap().contains("resolved")); assert_eq!(f.paths().len(),2); }
-                _ => { assert!(result.repository_reason.unwrap().contains("five")); assert_eq!(f.paths().len(),7); }
-            }
+            assert_maven_bounded(case, &result, f.paths().len());
         }
     }
 

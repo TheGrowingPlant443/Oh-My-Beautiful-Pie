@@ -5,17 +5,33 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-test('approval answers must be actual native labels, not truthy values', () => {
+test('select answers must be actual native labels, not truthy values', () => {
   const request = { method: 'select', options: ['Approve', 'Deny'] };
   assert.equal(nativeAnswer(request, 'Deny'), 'Deny');
   assert.equal(nativeAnswer(request, 'Approve'), 'Approve');
   assert.throws(() => nativeAnswer(request, true));
   assert.throws(() => nativeAnswer(request, 'approve'));
   assert.equal(nativeAnswer(request, { cancelled: true }), undefined);
-  assert.equal(nativeAnswer({ method: 'confirm' }, { cancelled: true }), false);
-  assert.equal(nativeAnswer({ method: 'approve' }, { cancelled: true }), false);
-  assert.equal(nativeAnswer({ method: 'approve' }, true), true);
-  assert.throws(() => nativeAnswer({ method: 'approve' }, 'Approve'), /boolean/);
+});
+test('remote approvals grant only this call while confirmations remain boolean', () => {
+  const approval = { method: 'approve' };
+  assert.equal(nativeAnswer(approval, true), 'once');
+  assert.equal(nativeAnswer(approval, false), 'deny');
+  assert.equal(nativeAnswer(approval, { cancelled: true }), 'deny');
+  for (const response of ['Approve', 'once', 'session', { grant: 'target', always: true }]) {
+    assert.throws(() => nativeAnswer(approval, response), /boolean/);
+  }
+  const confirmation = { method: 'confirm' };
+  assert.equal(nativeAnswer(confirmation, true), true);
+  assert.equal(nativeAnswer(confirmation, false), false);
+  assert.equal(nativeAnswer(confirmation, { cancelled: true }), false);
+  assert.throws(() => nativeAnswer(confirmation, 'deny'), /boolean/);
+});
+
+test('cancelled native text and Ask answers stay undefined rather than becoming negative confirmations', () => {
+  for (const method of ['input', 'editor', 'askDialog']) {
+    assert.equal(nativeAnswer({ method }, { cancelled: true }), undefined);
+  }
 });
 test('rich answers retain native question identity and enforce selection rules', () => {
   const request = { method: 'askDialog', questions: [{ id: 'design', question: 'Design?', options: [{label:'Simple'},{label:'Complex'}] }] };
@@ -32,6 +48,7 @@ test('disabled options and opaque native overlays cannot be auto-approved', () =
   assert.throws(() => nativeAnswer({method:'terminal'}, 'Approve and execute'), /native_terminal_decision/);
   assert.throws(() => nativeAnswer({method:'custom'}, true), /native_terminal_decision/);
   assert.throws(() => nativeAnswer({ method: 'custom' }, { cancelled: true }), /native_terminal_decision/);
+  assert.throws(() => nativeAnswer({ method: 'terminal' }, { cancelled: true }), /native_terminal_decision/);
 });
 test('app-originated abort and prompt reach any session; manager-originated control still needs an owned instance', () => {
   assert.equal(controlAllowed({ source: 'human', action: 'abort', role: 'manager', owner: null }), true);

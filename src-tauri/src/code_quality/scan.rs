@@ -58,6 +58,63 @@ fn clean(text: &str) -> bool {
     !text.chars().any(|c| c.is_control())
 }
 
+fn valid_entry_file(entry: &str) -> bool {
+    !entry.is_empty() && !Path::new(entry).is_absolute() && !entry.split(['/', '\\']).any(|part| part == "..") && clean(entry)
+}
+fn agent_report_section(req: &AgentReportRequest) -> Result<&'static str> {
+    let (section, allowed): (&str, &[&str]) = match req.section {
+        AgentReportSection::Scans => ("scans", &[]),
+        AgentReportSection::Summary => ("summary", &["scanId"]),
+        AgentReportSection::Findings => ("findings", &["scanId", "offset", "limit", "tool", "severity"]),
+        AgentReportSection::Artifact => ("artifact", &["scanId", "reportName", "offset"]),
+    };
+    for (name, present) in [
+        ("scanId", req.scan_id.is_some()), ("offset", req.offset.is_some()), ("limit", req.limit.is_some()),
+        ("tool", req.tool.is_some()), ("severity", req.severity.is_some()), ("reportName", req.report_name.is_some()),
+    ] {
+        if present && !allowed.contains(&name) { return Err(format!("section {section} does not accept {name}")); }
+    }
+    Ok(section)
+}
+fn agent_summary(scan: &QualityScan) -> Result<serde_json::Value> {
+    let mut by_severity = serde_json::Map::new();
+    let mut by_tool = std::collections::BTreeMap::<&str, u64>::new();
+    for severity in [Severity::Critical, Severity::High, Severity::Medium, Severity::Low, Severity::Info] {
+        let key = serde_json::to_value(severity).map_err(|error| error.to_string())?;
+        by_severity.insert(key.as_str().unwrap_or_default().to_string(), scan.findings.iter().filter(|finding| finding.severity == severity).count().into());
+    }
+    for finding in &scan.findings {
+        for tool in &finding.tools { *by_tool.entry(tool.as_str()).or_default() += 1; }
+    }
+    Ok(serde_json::json!({
+        "section": "summary", "scan": scan_summary(scan), "findingsBySeverity": by_severity,
+        "findingsByTool": by_tool, "hotspots": scan.findings.iter().filter(|finding| finding.hotspot).count(),
+    }))
+}
+fn agent_findings(scan: &QualityScan, req: &AgentReportRequest) -> Result<serde_json::Value> {
+    let (offset, limit) = page(req)?;
+    if req.tool.as_ref().is_some_and(|tool| tool.is_empty() || tool.len() > 200 || !clean(tool)) { return Err("tool must be 1..200 characters".into()); }
+    let selected: Vec<&QualityFinding> = scan.findings.iter()
+        .filter(|finding| req.tool.as_ref().is_none_or(|tool| finding.tools.iter().any(|candidate| candidate == tool)))
+        .filter(|finding| req.severity.is_none_or(|severity| finding.severity == severity))
+        .collect();
+    let mut items = Vec::new();
+    let mut size = 0usize;
+    for (index, finding) in selected.iter().enumerate().skip(offset) {
+        if items.len() >= limit { break; }
+        let item = serde_json::to_value(finding).map_err(|error| error.to_string())?;
+        let bytes = item.to_string().len();
+        if bytes > AGENT_OUTPUT_CAP - 4096 { return Err(format!("finding {index} is {bytes} bytes, larger than the {AGENT_OUTPUT_CAP}-byte output cap; it cannot be returned whole (continue with offset {})", index + 1)); }
+        if !items.is_empty() && size + bytes > AGENT_OUTPUT_CAP - 4096 { break; }
+        size += bytes;
+        items.push(item);
+    }
+    let next = offset + items.len();
+    Ok(serde_json::json!({
+        "section": "findings", "scanId": scan.id, "total": selected.len(), "offset": offset, "count": items.len(),
+        "nextOffset": (next < selected.len()).then_some(next), "items": items,
+    }))
+}
 pub(crate) fn validate_project(project: &QualityProject, folder: &Path) -> Result<QualityProject> {
     let mut project = project.clone();
     project.folder = folder_string(folder);
@@ -65,8 +122,7 @@ pub(crate) fn validate_project(project: &QualityProject, folder: &Path) -> Resul
         return Err("The SonarQube project key may contain letters, digits and _ . : - (and at least one non-digit).".into());
     }
     if let Some(entry) = &project.entry_file {
-        let path = Path::new(entry);
-        if entry.is_empty() || path.is_absolute() || entry.split(['/', '\\']).any(|c| c == "..") || !clean(entry) {
+        if !valid_entry_file(entry) {
             return Err("The entry file must be a relative path inside the project.".into());
         }
     }
@@ -261,115 +317,38 @@ impl CodeQualityService {
     /// Passive, read-only view of the saved results for `folder` (the caller's own repository, chosen by the hub from the
     /// authenticated agent, never by the agent). It never admits an operation, starts, probes or contacts an engine.
     pub fn agent_report(&self, folder: &str, req: &AgentReportRequest) -> Result<serde_json::Value> {
-        use serde_json::json;
         let canonical = folder_string(&canonical_folder(folder)?);
-        let scans: Vec<QualityScan> = self.list_scans(&canonical)?
-            .into_iter()
-            .filter(|scan| crate::instance::same_folder(&scan.folder, &canonical))
-            .collect();
-        let mut given: Vec<&str> = Vec::new();
-        for (name, present) in [
-            ("scanId", req.scan_id.is_some()), ("offset", req.offset.is_some()), ("limit", req.limit.is_some()),
-            ("tool", req.tool.is_some()), ("severity", req.severity.is_some()), ("reportName", req.report_name.is_some()),
-        ] {
-            if present {
-                given.push(name);
-            }
-        }
-        let section: &str = match req.section {
-            AgentReportSection::Scans => "scans",
-            AgentReportSection::Summary => "summary",
-            AgentReportSection::Findings => "findings",
-            AgentReportSection::Artifact => "artifact",
-        };
-        let allowed: &[&str] = match req.section {
-            AgentReportSection::Scans => &[],
-            AgentReportSection::Summary => &["scanId"],
-            AgentReportSection::Findings => &["scanId", "offset", "limit", "tool", "severity"],
-            AgentReportSection::Artifact => &["scanId", "reportName", "offset"],
-        };
-        if let Some(extra) = given.iter().find(|name| !allowed.contains(name)) {
-            return Err(format!("section {section} does not accept {extra}"));
-        }
+        let scans: Vec<QualityScan> = self.list_scans(&canonical)?.into_iter()
+            .filter(|scan| crate::instance::same_folder(&scan.folder, &canonical)).collect();
+        let section = agent_report_section(req)?;
         let result = if req.section == AgentReportSection::Scans {
-            json!({ "section": section, "total": scans.len(), "scans": scans.iter().map(scan_summary).collect::<Vec<_>>() })
+            serde_json::json!({ "section": section, "total": scans.len(), "scans": scans.iter().map(scan_summary).collect::<Vec<_>>() })
         } else {
             let id = req.scan_id.as_deref().ok_or_else(|| format!("section {section} requires scanId"))?;
             let id = uuid::Uuid::parse_str(id).map_err(|_| "scanId must be a scan id returned by section scans".to_string())?.to_string();
             let scan = scans.iter().find(|scan| scan.id == id).ok_or(NOT_THIS_REPOSITORY)?;
             match req.section {
-                AgentReportSection::Summary => {
-                    let mut by_severity = serde_json::Map::new();
-                    let mut by_tool = std::collections::BTreeMap::<&str, u64>::new();
-                    for severity in [Severity::Critical, Severity::High, Severity::Medium, Severity::Low, Severity::Info] {
-                        let key = serde_json::to_value(severity).map_err(|e| e.to_string())?;
-                        by_severity.insert(key.as_str().unwrap_or_default().to_string(), scan.findings.iter().filter(|f| f.severity == severity).count().into());
-                    }
-                    for finding in &scan.findings {
-                        for tool in &finding.tools {
-                            *by_tool.entry(tool.as_str()).or_default() += 1;
-                        }
-                    }
-                    json!({
-                        "section": section, "scan": scan_summary(scan), "findingsBySeverity": by_severity,
-                        "findingsByTool": by_tool, "hotspots": scan.findings.iter().filter(|f| f.hotspot).count(),
-                    })
-                }
-                AgentReportSection::Findings => {
-                    let (offset, limit) = page(req)?;
-                    if req.tool.as_ref().is_some_and(|tool| tool.is_empty() || tool.len() > 200 || !clean(tool)) {
-                        return Err("tool must be 1..200 characters".into());
-                    }
-                    let selected: Vec<&QualityFinding> = scan.findings.iter()
-                        .filter(|f| req.tool.as_ref().is_none_or(|tool| f.tools.iter().any(|t| t == tool)))
-                        .filter(|f| req.severity.is_none_or(|severity| f.severity == severity))
-                        .collect();
-                    let mut items = Vec::new();
-                    let mut size = 0usize;
-                    for (index, finding) in selected.iter().enumerate().skip(offset) {
-                        if items.len() >= limit {
-                            break;
-                        }
-                        let item = serde_json::to_value(finding).map_err(|e| e.to_string())?;
-                        let bytes = item.to_string().len();
-                        if bytes > AGENT_OUTPUT_CAP - 4096 {
-                            return Err(format!("finding {index} is {bytes} bytes, larger than the {AGENT_OUTPUT_CAP}-byte output cap; it cannot be returned whole (continue with offset {})", index + 1));
-                        }
-                        if !items.is_empty() && size + bytes > AGENT_OUTPUT_CAP - 4096 {
-                            break;
-                        }
-                        size += bytes;
-                        items.push(item);
-                    }
-                    let next = offset + items.len();
-                    json!({
-                        "section": section, "scanId": scan.id, "total": selected.len(), "offset": offset, "count": items.len(),
-                        "nextOffset": (next < selected.len()).then_some(next), "items": items,
-                    })
-                }
-                _ => {
-                    let name = req.report_name.as_deref().ok_or("section artifact requires reportName")?;
-                    let offset = req.offset.unwrap_or(0);
-                    let mut len = REPORT_SLICE_BYTES;
-                    loop {
-                        let slice = self.read_report_slice(&scan.id, name, offset, len)?;
-                        let value = json!({
-                            "section": section, "scanId": scan.id, "reportName": name, "offset": offset,
-                            "text": slice.text, "nextOffset": slice.next_offset, "totalBytes": slice.total,
-                        });
-                        // Escaped control characters can expand a slice; shrink it until the reply fits whole.
-                        if value.to_string().len() <= AGENT_OUTPUT_CAP - 4096 || len <= 1024 {
-                            break value;
-                        }
-                        len /= 2;
-                    }
-                }
+                AgentReportSection::Summary => agent_summary(scan)?,
+                AgentReportSection::Findings => agent_findings(scan, req)?,
+                _ => self.agent_artifact(scan, req)?,
             }
         };
-        if result.to_string().len() > AGENT_OUTPUT_CAP {
-            return Err(format!("The result is larger than the {AGENT_OUTPUT_CAP}-byte output cap; request a smaller limit."));
-        }
+        if result.to_string().len() > AGENT_OUTPUT_CAP { return Err(format!("The result is larger than the {AGENT_OUTPUT_CAP}-byte output cap; request a smaller limit.")); }
         Ok(result)
+    }
+    fn agent_artifact(&self, scan: &QualityScan, req: &AgentReportRequest) -> Result<serde_json::Value> {
+        let name = req.report_name.as_deref().ok_or("section artifact requires reportName")?;
+        let offset = req.offset.unwrap_or(0);
+        let mut len = REPORT_SLICE_BYTES;
+        loop {
+            let slice = self.read_report_slice(&scan.id, name, offset, len)?;
+            let value = serde_json::json!({
+                "section": "artifact", "scanId": scan.id, "reportName": name, "offset": offset,
+                "text": slice.text, "nextOffset": slice.next_offset, "totalBytes": slice.total,
+            });
+            if value.to_string().len() <= AGENT_OUTPUT_CAP - 4096 || len <= 1024 { return Ok(value); }
+            len /= 2;
+        }
     }
 
     pub fn open_dashboard(&self, scan_id: Option<String>) -> Result<()> {
@@ -694,6 +673,25 @@ impl CodeQualityService {
         })
     }
 
+    fn wait_scan_analysis(&self, gate: &Gate, id: &str, client: &SonarClient, task_id: &str, ctl: &Ctl) -> Result<Option<String>> {
+        let finished = match client.submit_wait_task(task_id, ctl, Duration::from_secs(30 * 60)) {
+            Ok(task) => task,
+            Err(_) if gate.cancelled() => {
+                self.cancel_remote_task(id, client, task_id);
+                return Ok(None);
+            }
+            Err(error) => return Err(format!("{error} The SonarQube task {task_id} stays recorded and is checked before the next scan.")),
+        };
+        if gate.cancelled() {
+            self.cancel_remote_task(id, client, task_id);
+            return Ok(None);
+        }
+        self.remove_pending_task(task_id)?;
+        if finished.status != "SUCCESS" {
+            return Err(format!("SonarQube's analysis task {}: {}", finished.status.to_lowercase(), finished.error_message.unwrap_or_else(|| "no further detail".into())));
+        }
+        finished.analysis_id.map(Some).ok_or_else(|| "SonarQube finished the task without an analysis id.".into())
+    }
     #[allow(clippy::too_many_arguments)]
     fn scan_sonar(&self, gate: &Gate, id: &str, engine: &dyn Engine, job: &JobContext, snapshot: &Snapshot, owner: &str, on_container: &dyn Fn(&str), ctl: &Ctl) -> Result<QualityScanStatus> {
         let config = &job.config;
@@ -728,28 +726,7 @@ impl CodeQualityService {
         let task = sonar::parse_report_task(&report, &scanner_url, &key)?;
         self.record_pending_task(PendingTask { scan_id: id.to_string(), task_id: task.task_id.clone(), config: config.clone(), project_key: key.clone() })?;
         self.scan_phase(id, "Waiting for the SonarQube analysis task");
-        let finished = match client.submit_wait_task(&task.task_id, ctl, Duration::from_secs(30 * 60)) {
-            Ok(task) => task,
-            Err(error) if gate.cancelled() => {
-                let _ = error;
-                self.cancel_remote_task(id, &client, &task.task_id);
-                return Ok(QualityScanStatus::Cancelled);
-            }
-            Err(error) => return Err(format!("{error} The SonarQube task {} stays recorded and is checked before the next scan.", task.task_id)),
-        };
-        if gate.cancelled() {
-            self.cancel_remote_task(id, &client, &task.task_id);
-            return Ok(QualityScanStatus::Cancelled);
-        }
-        self.remove_pending_task(&task.task_id)?;
-        if finished.status != "SUCCESS" {
-            return Err(format!(
-                "SonarQube's analysis task {}: {}",
-                finished.status.to_lowercase(),
-                finished.error_message.unwrap_or_else(|| "no further detail".into())
-            ));
-        }
-        let analysis = finished.analysis_id.ok_or("SonarQube finished the task without an analysis id.")?;
+        let Some(analysis) = self.wait_scan_analysis(gate, id, &client, &task.task_id, ctl)? else { return Ok(QualityScanStatus::Cancelled); };
         self.scan_phase(id, "Reading the quality gate and findings");
         let gate_result = client.quality_gate(&analysis).map_err(String::from)?;
         let issues = client.issues(&key, SONAR_ISSUE_CAP).map_err(String::from)?;

@@ -124,6 +124,34 @@ fn slug(raw: &str) -> Result<String> {
     Ok(name)
 }
 
+impl SetupItem {
+    fn normalize(&mut self) -> Result<()> {
+        self.description = self.description.trim().into();
+        if self.description.is_empty() {
+            return Err("Every selected item needs a description".into());
+        }
+        match self.kind {
+            SetupKind::Rules => self.name.clear(),
+            SetupKind::Agents if self.name.trim().is_empty() => self.name.clear(),
+            _ => {
+                self.name = slug(&self.name)?;
+                if self.kind == SetupKind::Profile
+                    && (self.name == "default" || !valid_profile_name(&self.name))
+                {
+                    return Err("Use a valid OMP profile name other than default".into());
+                }
+            }
+        }
+        if self.kind == SetupKind::Tool && self.language.is_none() {
+            return Err("Select Python, Bash, or TypeScript for each tool".into());
+        }
+        if self.kind != SetupKind::Tool {
+            self.language = None;
+        }
+        Ok(())
+    }
+}
+
 impl SetupRequest {
     pub fn normalize(mut self) -> Result<Self> {
         if self.items.is_empty() {
@@ -141,28 +169,7 @@ impl SetupRequest {
         }
         let mut targets = HashSet::new();
         for item in &mut self.items {
-            item.description = item.description.trim().into();
-            if item.description.is_empty() {
-                return Err("Every selected item needs a description".into());
-            }
-            match item.kind {
-                SetupKind::Rules => item.name.clear(),
-                SetupKind::Agents if item.name.trim().is_empty() => item.name.clear(),
-                _ => {
-                    item.name = slug(&item.name)?;
-                    if item.kind == SetupKind::Profile
-                        && (item.name == "default" || !valid_profile_name(&item.name))
-                    {
-                        return Err("Use a valid OMP profile name other than default".into());
-                    }
-                }
-            }
-            if item.kind == SetupKind::Tool && item.language.is_none() {
-                return Err("Select Python, Bash, or TypeScript for each tool".into());
-            }
-            if item.kind != SetupKind::Tool {
-                item.language = None;
-            }
+            item.normalize()?;
             if !targets.insert(format!("{:?}:{}", item.kind, item.name)) {
                 return Err("Setup items must have distinct target paths".into());
             }
@@ -327,6 +334,51 @@ fn discoverable_module(package: &Path, module: &Path) -> bool {
             && is_script(module))
 }
 
+fn validate_plugin_module(package: &Path, role: &str, name: &str, entry: &str) -> Result<()> {
+    let resolved = canonical(&package.join(entry))
+        .map_err(|_| format!("{role} plugin {name} declares a missing extension module: {entry}"))?;
+    if !resolved.starts_with(package) {
+        return Err(format!("{role} plugin {name} declares a module outside its package: {entry}"));
+    }
+    let module = if resolved.is_dir() {
+        ["index.ts", "index.js"]
+            .iter()
+            .map(|file| resolved.join(file))
+            .find(|file| file.is_file())
+            .ok_or_else(|| format!("{role} plugin {name} declares {entry} without an index module"))?
+    } else {
+        resolved
+    };
+    if !discoverable_module(package, &module) {
+        return Err(format!(
+            "{role} plugin {name} declares {entry}, which The {role} cannot load; use index.ts at the package root"
+        ));
+    }
+    Ok(())
+}
+
+fn scoped_plugin_package(folder: &Path, base: &Path, role: &str, name: &str) -> Result<Option<PathBuf>> {
+    let package = canonical(&folder.join(name)).map_err(|e| format!("{role} plugin {name} is unreadable: {e}"))?;
+    if !package.starts_with(base) {
+        return Err(format!("{role} plugin {name} resolves outside the extensions folder"));
+    }
+    let manifest = package.join("package.json");
+    if !package.is_dir() || !manifest.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&manifest).map_err(|e| format!("{role} plugin {name}: package.json is unreadable: {e}"))?;
+    let json: Value = serde_json::from_str(&text).map_err(|e| format!("{role} plugin {name}: package.json is invalid: {e}"))?;
+    let declared = ["omp", "pi"]
+        .iter()
+        .find_map(|key| json.get(*key).filter(|v| v.is_object()))
+        .and_then(|manifest| manifest.get("extensions"))
+        .and_then(Value::as_array);
+    for entry in declared.into_iter().flatten().filter_map(Value::as_str) {
+        validate_plugin_module(&package, role, name, entry)?;
+    }
+    Ok(Some(package))
+}
+
 /// Validated scoped packages loaded through native directory discovery.
 pub fn scoped_plugin_paths(root: &Path, role: &str) -> Result<Vec<PathBuf>> {
     let folder = root.join("extensions");
@@ -346,43 +398,9 @@ pub fn scoped_plugin_paths(root: &Path, role: &str) -> Result<Vec<PathBuf>> {
     names.sort();
     let mut packages = Vec::new();
     for name in names {
-        let package = canonical(&folder.join(&name)).map_err(|e| format!("{role} plugin {name} is unreadable: {e}"))?;
-        if !package.starts_with(&base) {
-            return Err(format!("{role} plugin {name} resolves outside the extensions folder"));
+        if let Some(package) = scoped_plugin_package(&folder, &base, role, &name)? {
+            packages.push(package);
         }
-        let manifest = package.join("package.json");
-        if !package.is_dir() || !manifest.is_file() {
-            continue;
-        }
-        let text = fs::read_to_string(&manifest).map_err(|e| format!("{role} plugin {name}: package.json is unreadable: {e}"))?;
-        let json: Value = serde_json::from_str(&text).map_err(|e| format!("{role} plugin {name}: package.json is invalid: {e}"))?;
-        let declared = ["omp", "pi"]
-            .iter()
-            .find_map(|key| json.get(*key).filter(|v| v.is_object()))
-            .and_then(|manifest| manifest.get("extensions"))
-            .and_then(Value::as_array);
-        for entry in declared.into_iter().flatten().filter_map(Value::as_str) {
-            let resolved = canonical(&package.join(entry))
-                .map_err(|_| format!("{role} plugin {name} declares a missing extension module: {entry}"))?;
-            if !resolved.starts_with(&package) {
-                return Err(format!("{role} plugin {name} declares a module outside its package: {entry}"));
-            }
-            let module = if resolved.is_dir() {
-                ["index.ts", "index.js"]
-                    .iter()
-                    .map(|file| resolved.join(file))
-                    .find(|file| file.is_file())
-                    .ok_or_else(|| format!("{role} plugin {name} declares {entry} without an index module"))?
-            } else {
-                resolved
-            };
-            if !discoverable_module(&package, &module) {
-                return Err(format!(
-                    "{role} plugin {name} declares {entry}, which The {role} cannot load; use index.ts at the package root"
-                ));
-            }
-        }
-        packages.push(package);
     }
     Ok(packages)
 }
@@ -591,6 +609,120 @@ pub(crate) fn open_editor_folder(folder: &Path) -> Result<()> {
     Ok(())
 }
 
+fn markdown_item_destination(item: &SetupItem, root: &Path) -> Option<String> {
+    let relative = match item.kind {
+        SetupKind::Agents if item.name.is_empty() => "AGENTS.md".into(),
+        SetupKind::Agents => format!("{AGENT_FILES_DIR}/{}/AGENTS.md", item.name),
+        SetupKind::Rules => "RULES.md".into(),
+        SetupKind::Skill => format!("skills/{}/SKILL.md", item.name),
+        SetupKind::Workflow => format!("rules/workflow-{}.md", item.name),
+        _ => return None,
+    };
+    let mut file = root.join(relative).display().to_string();
+    if item.kind == SetupKind::Skill {
+        file.push_str(&format!(" and {}", root.join("SKILLS.md").display()));
+    }
+    Some(file)
+}
+
+fn native_item_destination(item: &SetupItem, paths: &SetupPaths) -> String {
+    match item.kind {
+        SetupKind::Agents if item.name.is_empty() => "AGENTS.md".into(),
+        SetupKind::Agents => format!("{AGENT_FILES_DIR}/{}/AGENTS.md", item.name),
+        SetupKind::Rules => "RULES.md".into(),
+        SetupKind::Skill => format!("skills/{}/SKILL.md and SKILLS.md", item.name),
+        SetupKind::Tool => format!("tools/{}/index.ts", item.name),
+        SetupKind::Workflow => format!("rules/workflow-{}.md", item.name),
+        SetupKind::Plugin => format!("extensions/{0}/package.json and extensions/{0}/index.ts", item.name),
+        SetupKind::Profile => paths
+            .global_omp_folder
+            .join("profiles")
+            .join(&item.name)
+            .join("agent")
+            .join("config.yml")
+            .display()
+            .to_string(),
+    }
+}
+
+fn repository_item_destination(item: &SetupItem, paths: &SetupPaths, target: &Path) -> String {
+    match item.kind {
+        SetupKind::Skill => format!("{} and {}", target.join(format!("skills/{}/SKILL.md", item.name)).display(), target.join("SKILLS.md").display()),
+        SetupKind::Plugin => format!("{} and {}", target.join(format!("extensions/{}/package.json", item.name)).display(), target.join(format!("extensions/{}/index.ts", item.name)).display()),
+        SetupKind::Tool => {
+            let mut file = target.join(format!("tools/{}/index.ts", item.name)).display().to_string();
+            let script = match item.language {
+                Some(ScriptLanguage::Python) => Some("run.py"),
+                Some(ScriptLanguage::Bash) => Some("run.sh"),
+                _ => None,
+            };
+            if let Some(script) = script {
+                file.push_str(&format!(" and {}", target.join("tools").join(&item.name).join(script).display()));
+            }
+            file
+        }
+        _ => target.join(native_item_destination(item, paths)).display().to_string(),
+    }
+}
+
+fn item_destination(
+    item: &SetupItem,
+    scope: SetupScope,
+    paths: &SetupPaths,
+    target: &Path,
+    markdown_source: Option<&Path>,
+) -> String {
+    if let Some(root) = markdown_source {
+        if let Some(file) = markdown_item_destination(item, root) {
+            return file;
+        }
+    }
+    if scope == SetupScope::Repository {
+        repository_item_destination(item, paths, target)
+    } else {
+        native_item_destination(item, paths)
+    }
+}
+
+fn append_item_routes(
+    text: &mut String,
+    item: &SetupItem,
+    target: &Path,
+    markdown_source: Option<&Path>,
+    routes: &MarkdownRoutes,
+) {
+    if let (Some(root), true) = (markdown_source, matches!(item.kind, SetupKind::Agents | SetupKind::Rules | SetupKind::Skill | SetupKind::Workflow)) {
+        text.push_str(&format!("Markdown source folder: {}. OMP runtime folder: {}. Author requested .md assets ONLY at the Markdown source folder, at their unchanged runtime-relative paths. Never update their native deployed copies from this setup session. They become active only after the human reviews Apply to OMP. Keep tools, every companion script, plugin modules/manifests, configuration and credentials native; never copy them into the vault. Preserve script-relative references in skill Markdown: the deployed Markdown will have its original runtime-relative location. Report native-only dependencies, do not relocate them. Optional tool/plugin documentation uses the corresponding tools/{}/ or extensions/{}/ Markdown namespace here; executable content stays native.\n", root.display(), target.display(), item.name, item.name));
+    }
+    if let Some(profile) = routes.profiles.get(&item.name).filter(|_| item.kind == SetupKind::Profile) {
+        text.push_str(&format!("For this explicitly enabled profile, requested Markdown only goes to {} using original profile-runtime-relative paths, not {}. Its config.yml and all executable/tools/plugin files stay native. Only create profile Markdown actually requested in the description. Never copy credentials. Reviewed Apply to OMP is required before Markdown becomes active.\n", profile.source_root.display(), profile.native_root.display()));
+    }
+}
+
+fn append_item_instructions(
+    text: &mut String,
+    item: &SetupItem,
+    scope: SetupScope,
+    paths: &SetupPaths,
+    markdown_source: Option<&Path>,
+) {
+    match item.kind {
+        SetupKind::Agents if item.name.is_empty() => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
+        SetupKind::Rules => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
+        SetupKind::Agents if scope == SetupScope::LocalAi => text.push_str("Create a standalone named instruction file, not merged into AGENTS.md. It is not automatically loaded and is outside this GUI's unrestricted Persona catalog. Use it only inside an explicitly local-only guarded process; never append it to an unrestricted or hosted session. No frontmatter is required.\n"),
+        SetupKind::Agents if scope == SetupScope::Repository => text.push_str("Create a standalone named instruction file, not merged into AGENTS.md. It is not automatically loaded and is not in this GUI's Persona catalog. Use it through an explicit --append-system-prompt file argument. No frontmatter is required.\n"),
+        SetupKind::Agents => text.push_str("Create a standalone, named instruction file with plain Markdown instructions for an agent. Do not merge it into the scope's AGENTS.md. OMP does not load it automatically: the user selects it per dashboard instance, and OMP appends it to that session's system prompt. No frontmatter is required.\n"),
+        SetupKind::Profile => text.push_str(&format!("Create the native OMP profile `{name}` at {root}/profiles/{name}/agent/. This overrides the general rule against modifying config.yml: write that profile's config.yml with native OMP settings that implement the description (for example plan.enabled: true and plan.defaultOnStartup: true start sessions in plan mode; modelRoles select models). Validate that it loads with native Settings.loadReadOnly using that agent directory. Add AGENTS.md, rules, skills or tools inside that profile only if the description asks. Never create or copy credentials or agent.db and never modify the default profile; tell the human the profile has its own login (run /login inside it). If the profile already exists read it first and make only surgical changes.\n", name = item.name, root = paths.global_omp_folder.display())),
+        SetupKind::Skill if markdown_source.is_some() => text.push_str("Create SKILL.md at its requested Markdown source path with YAML name/description and concrete reusable steps. Update SKILLS.md in the same Markdown source root as a readable catalog pointing to the real deployed skill, preserving other entries. The catalog itself is not a native skill. Companion scripts stay in the OMP runtime folder; keep their original references unchanged and do not write them to the Markdown source folder.\n"),
+        SetupKind::Skill => text.push_str("Create native SKILL.md with YAML name/description and concrete reusable steps. Update SKILLS.md as a readable catalog pointing to the real skill, preserving other entries. The catalog itself is not a native skill.\n"),
+        SetupKind::Workflow => text.push_str("Use native rule frontmatter description, alwaysApply: true, agents: [main]. Describe semantic trigger, native delegation/reviewer steps, required evidence, completion/decision handling, and stop conditions. Use installed native agents; if a required reviewer is unavailable, request human guidance. No scheduler or automatic hooks.\n"),
+        SetupKind::Plugin => text.push_str(&format!("Create the native OMP plugin package `{name}` in the `extensions/{name}/` folder of the target above. package.json must be {{\"name\":\"{name}\",\"version\":\"0.1.0\",\"private\":true,\"type\":\"module\",\"description\":<one line from the request>,\"omp\":{{\"extensions\":[\"index.ts\"]}}}}; index.ts must export a default factory that receives the injected native ExtensionAPI and registers real behavior for the description (api.registerTool, api.registerCommand, api.on hooks as needed). Read the installed OMP's examples/extensions and its ExtensionAPI types first. ExtensionAPI registered tools use execute(toolCallId, params, signal, onUpdate, ctx), unlike tools/ native CustomTool factories. This overrides the general rule against editing bridge/index.ts entrypoints only for this plugin's own package.json and index.ts; never touch either coordinator setup root index.ts. Add package-local skills/ tools/ or rules/ folders only when the description needs them. No import-time side effects, no placeholder or no-op tools, no dependency installation or publishing, no `omp plugin link`/install, and do not edit the installed OMP. If the package already exists read it first and change only the requested behavior; never overwrite a different package. After approval validate that the package loads natively and exercise one harmless behavior with a fixture, then tell the human that running sessions need a native reload or an explicit reopen to load it.\n", name = item.name)),
+        SetupKind::Tool => {
+            text.push_str(&format!("Language: {:?}. Native default factory in index.ts uses injected api.zod, approval: 'exec', execute(toolCallId, params, onUpdate, ctx, signal). Validate arguments; return native content/details with true stdout/stderr/error/abort state. No import-time execution. Python/Bash code lives beside it as run.py/run.sh, invoked via api.exec(interpreter, argumentArray, {{cwd:ctx.sessionManager.getCwd(),signal}}). Missing interpreter must fail clearly, never install it. On Windows use installed Git Bash rather than System32/WindowsApps WSL launchers. TypeScript logic stays in the native tool module. Inspect local interpreter locations before selecting one. Validate using a harmless fixture operation after approval.\n", item.language));
+        }
+    }
+}
+
 #[cfg(test)]
 fn prompt(request: &SetupRequest, paths: &SetupPaths, repository_root: Option<&Path>) -> Result<String> {
     prompt_with_routes(request,paths,repository_root,&MarkdownRoutes::default())
@@ -610,79 +742,13 @@ fn prompt_with_routes(request: &SetupRequest, paths: &SetupPaths, repository_roo
     let markdown_source=routes.scope.as_ref().map(|r|r.source_root.as_path());
     let mut text = format!("Create the user-requested OMP Agent setup below in {}. Scope: {:?}. Platform: {}.\n\nREVIEW FIRST: You are in native plan mode. Read existing assets, preserve unrelated content, and write only your native plan until the human selects a native execution option. Propose the complete plan using write to xd://propose. Do this setup inline; do not use subagents or other models to generate it. The workflows being authored may describe future native delegation, but do not execute those workflows now.\n\nAfter human approval, implement real files and validate their native loading and behavior. Never modify config.yml/config.yaml, auth or credential databases, app default snapshots, bridge/index.ts entrypoints, installed OMP, or unrelated files. Never download or install dependencies/interpreters, add telemetry/updaters/autostart, or run unreviewed external code. Read existing targets before proposing changes. Report actual changed paths and verification; do not claim completion from merely writing files.\n\n", target.display(), request.scope, std::env::consts::OS);
     for item in &request.items {
-        let source_file=match item.kind {
-            SetupKind::Agents=>Some(if item.name.is_empty(){"AGENTS.md".into()}else{format!("{AGENT_FILES_DIR}/{}/AGENTS.md",item.name)}),
-            SetupKind::Rules=>Some("RULES.md".into()),
-            SetupKind::Skill=>Some(format!("skills/{}/SKILL.md",item.name)),
-            SetupKind::Workflow=>Some(format!("rules/workflow-{}.md",item.name)),
-            _=>None,
-        };
-        let file = match item.kind {
-            SetupKind::Agents if item.name.is_empty() => "AGENTS.md".into(),
-            SetupKind::Agents => format!("{AGENT_FILES_DIR}/{}/AGENTS.md", item.name),
-            SetupKind::Rules => "RULES.md".into(),
-            SetupKind::Skill => format!("skills/{}/SKILL.md and SKILLS.md", item.name),
-            SetupKind::Tool => format!("tools/{}/index.ts", item.name),
-            SetupKind::Workflow => format!("rules/workflow-{}.md", item.name),
-            SetupKind::Plugin => format!("extensions/{0}/package.json and extensions/{0}/index.ts", item.name),
-            SetupKind::Profile => paths
-                .global_omp_folder
-                .join("profiles")
-                .join(&item.name)
-                .join("agent")
-                .join("config.yml")
-                .display()
-                .to_string(),
-        };
-        let file = if request.scope == SetupScope::Repository {
-            match item.kind {
-                SetupKind::Skill => format!("{} and {}", target.join(format!("skills/{}/SKILL.md", item.name)).display(), target.join("SKILLS.md").display()),
-                SetupKind::Plugin => format!("{} and {}", target.join(format!("extensions/{}/package.json", item.name)).display(), target.join(format!("extensions/{}/index.ts", item.name)).display()),
-                SetupKind::Tool => {
-                    let mut file = target.join(&file).display().to_string();
-                    let script = match item.language {
-                        Some(ScriptLanguage::Python) => Some("run.py"),
-                        Some(ScriptLanguage::Bash) => Some("run.sh"),
-                        _ => None,
-                    };
-                    if let Some(script) = script {
-                        file.push_str(&format!(" and {}", target.join("tools").join(&item.name).join(script).display()));
-                    }
-                    file
-                }
-                _ => target.join(&file).display().to_string(),
-            }
-        } else { file };
-        let file=if let (Some(root),Some(relative))=(markdown_source,source_file.as_deref()) {
-            let mut file=root.join(relative).display().to_string();
-            if item.kind==SetupKind::Skill {file.push_str(&format!(" and {}",root.join("SKILLS.md").display()));}
-            file
-        }else{file};
+        let file = item_destination(item, request.scope, paths, target, markdown_source);
         text.push_str(&format!(
             "Requested {:?}: {file}\nDescription:\n{}\n",
             item.kind, item.description
         ));
-        if let (Some(root),true)=(markdown_source,matches!(item.kind,SetupKind::Agents|SetupKind::Rules|SetupKind::Skill|SetupKind::Workflow)) {
-            text.push_str(&format!("Markdown source folder: {}. OMP runtime folder: {}. Author requested .md assets ONLY at the Markdown source folder, at their unchanged runtime-relative paths. Never update their native deployed copies from this setup session. They become active only after the human reviews Apply to OMP. Keep tools, every companion script, plugin modules/manifests, configuration and credentials native; never copy them into the vault. Preserve script-relative references in skill Markdown: the deployed Markdown will have its original runtime-relative location. Report native-only dependencies, do not relocate them. Optional tool/plugin documentation uses the corresponding tools/{}/ or extensions/{}/ Markdown namespace here; executable content stays native.\n",root.display(),target.display(),item.name,item.name));
-        }
-        if let Some(profile)=routes.profiles.get(&item.name).filter(|_|item.kind==SetupKind::Profile) {
-            text.push_str(&format!("For this explicitly enabled profile, requested Markdown only goes to {} using original profile-runtime-relative paths, not {}. Its config.yml and all executable/tools/plugin files stay native. Only create profile Markdown actually requested in the description. Never copy credentials. Reviewed Apply to OMP is required before Markdown becomes active.\n",profile.source_root.display(),profile.native_root.display()));
-        }
-        match item.kind {
-            SetupKind::Agents if item.name.is_empty() => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
-            SetupKind::Rules => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
-            SetupKind::Agents if request.scope == SetupScope::LocalAi => text.push_str("Create a standalone named instruction file, not merged into AGENTS.md. It is not automatically loaded and is outside this GUI's unrestricted Persona catalog. Use it only inside an explicitly local-only guarded process; never append it to an unrestricted or hosted session. No frontmatter is required.\n"),
-            SetupKind::Agents if request.scope == SetupScope::Repository => text.push_str("Create a standalone named instruction file, not merged into AGENTS.md. It is not automatically loaded and is not in this GUI's Persona catalog. Use it through an explicit --append-system-prompt file argument. No frontmatter is required.\n"),
-            SetupKind::Agents => text.push_str("Create a standalone, named instruction file with plain Markdown instructions for an agent. Do not merge it into the scope's AGENTS.md. OMP does not load it automatically: the user selects it per dashboard instance, and OMP appends it to that session's system prompt. No frontmatter is required.\n"),
-            SetupKind::Profile => text.push_str(&format!("Create the native OMP profile `{name}` at {root}/profiles/{name}/agent/. This overrides the general rule against modifying config.yml: write that profile's config.yml with native OMP settings that implement the description (for example plan.enabled: true and plan.defaultOnStartup: true start sessions in plan mode; modelRoles select models). Validate that it loads with native Settings.loadReadOnly using that agent directory. Add AGENTS.md, rules, skills or tools inside that profile only if the description asks. Never create or copy credentials or agent.db and never modify the default profile; tell the human the profile has its own login (run /login inside it). If the profile already exists read it first and make only surgical changes.\n", name = item.name, root = paths.global_omp_folder.display())),
-            SetupKind::Skill if markdown_source.is_some() => text.push_str("Create SKILL.md at its requested Markdown source path with YAML name/description and concrete reusable steps. Update SKILLS.md in the same Markdown source root as a readable catalog pointing to the real deployed skill, preserving other entries. The catalog itself is not a native skill. Companion scripts stay in the OMP runtime folder; keep their original references unchanged and do not write them to the Markdown source folder.\n"),
-            SetupKind::Skill => text.push_str("Create native SKILL.md with YAML name/description and concrete reusable steps. Update SKILLS.md as a readable catalog pointing to the real skill, preserving other entries. The catalog itself is not a native skill.\n"),
-            SetupKind::Workflow => text.push_str("Use native rule frontmatter description, alwaysApply: true, agents: [main]. Describe semantic trigger, native delegation/reviewer steps, required evidence, completion/decision handling, and stop conditions. Use installed native agents; if a required reviewer is unavailable, request human guidance. No scheduler or automatic hooks.\n"),
-            SetupKind::Plugin => text.push_str(&format!("Create the native OMP plugin package `{name}` in the `extensions/{name}/` folder of the target above. package.json must be {{\"name\":\"{name}\",\"version\":\"0.1.0\",\"private\":true,\"type\":\"module\",\"description\":<one line from the request>,\"omp\":{{\"extensions\":[\"index.ts\"]}}}}; index.ts must export a default factory that receives the injected native ExtensionAPI and registers real behavior for the description (api.registerTool, api.registerCommand, api.on hooks as needed). Read the installed OMP's examples/extensions and its ExtensionAPI types first. ExtensionAPI registered tools use execute(toolCallId, params, signal, onUpdate, ctx), unlike tools/ native CustomTool factories. This overrides the general rule against editing bridge/index.ts entrypoints only for this plugin's own package.json and index.ts; never touch either coordinator setup root index.ts. Add package-local skills/ tools/ or rules/ folders only when the description needs them. No import-time side effects, no placeholder or no-op tools, no dependency installation or publishing, no `omp plugin link`/install, and do not edit the installed OMP. If the package already exists read it first and change only the requested behavior; never overwrite a different package. After approval validate that the package loads natively and exercise one harmless behavior with a fixture, then tell the human that running sessions need a native reload or an explicit reopen to load it.\n", name = item.name)),
-            SetupKind::Tool => {
-                text.push_str(&format!("Language: {:?}. Native default factory in index.ts uses injected api.zod, approval: 'exec', execute(toolCallId, params, onUpdate, ctx, signal). Validate arguments; return native content/details with true stdout/stderr/error/abort state. No import-time execution. Python/Bash code lives beside it as run.py/run.sh, invoked via api.exec(interpreter, argumentArray, {{cwd:ctx.sessionManager.getCwd(),signal}}). Missing interpreter must fail clearly, never install it. On Windows use installed Git Bash rather than System32/WindowsApps WSL launchers. TypeScript logic stays in the native tool module. Inspect local interpreter locations before selecting one. Validate using a harmless fixture operation after approval.\n", item.language));
-            }
-        }
+        append_item_routes(&mut text, item, target, markdown_source, routes);
+        append_item_instructions(&mut text, item, request.scope, paths, markdown_source);
         text.push('\n');
     }
     if request.scope == SetupScope::Repository {
@@ -879,6 +945,13 @@ mod tests {
         duplicate.items.push(good.items[0].clone());
         assert!(duplicate.normalize().is_err());
         assert!(request(SetupKind::Tool, "helper").normalize().is_err());
+        let mut duplicate_tool = requests(SetupScope::Global, vec![
+            SetupItem { language: Some(ScriptLanguage::Python), ..item(SetupKind::Tool, "helper") },
+            item(SetupKind::Tool, "HELPER"),
+        ]);
+        assert_eq!(duplicate_tool.clone().normalize().unwrap_err(), "Select Python, Bash, or TypeScript for each tool");
+        duplicate_tool.items[1].language = Some(ScriptLanguage::Bash);
+        assert_eq!(duplicate_tool.normalize().unwrap_err(), "Setup items must have distinct target paths");
         let empty = SetupRequest {
             scope: SetupScope::Global,
             items: vec![],
@@ -1112,12 +1185,13 @@ mod tests {
             item(SetupKind::Agents, ""), item(SetupKind::Agents, "reviewer"),
             item(SetupKind::Rules, ""), item(SetupKind::Skill, "review"),
             item(SetupKind::Workflow, "review"),
+            item(SetupKind::Plugin, "helper"),
             SetupItem { language: Some(ScriptLanguage::Python), ..item(SetupKind::Tool, "helper") },
         ]);
         request.project_instance_id = Some("source".into());
         let request = request.normalize().unwrap();
         let text = prompt(&request, &paths, Some(&root)).unwrap().replace('\\', "/");
-        for file in ["AGENTS.md", "agent-instructions/reviewer/AGENTS.md", "RULES.md", "skills/review/SKILL.md", "SKILLS.md", "rules/workflow-review.md", "tools/helper/index.ts", "tools/helper/run.py"] {
+        for file in ["AGENTS.md", "agent-instructions/reviewer/AGENTS.md", "RULES.md", "skills/review/SKILL.md", "SKILLS.md", "rules/workflow-review.md", "extensions/helper/package.json", "extensions/helper/index.ts", "tools/helper/index.ts", "tools/helper/run.py"] {
             assert!(text.contains(&canonical(&root).unwrap().join(".omp").join(file).display().to_string().replace('\\', "/")), "{file}");
         }
         assert!(!text.contains(&paths.global_agent_folder.display().to_string().replace('\\', "/")));
@@ -1125,6 +1199,25 @@ mod tests {
         assert!(prompt(&request, &paths, None).is_err());
         let manager = requests(SetupScope::Manager, vec![item(SetupKind::Rules, "")]);
         assert!(prompt(&manager, &paths, None).unwrap().contains(&paths.manager_folder.display().to_string()));
+        let runtime = canonical(&root).unwrap().join(".omp");
+        let source = root.join("markdown-source");
+        let routes = MarkdownRoutes {
+            scope: Some(crate::agent_markdown::MarkdownRoute { source_root: source.clone(), native_root: runtime.clone() }),
+            ..Default::default()
+        };
+        let routed = prompt_with_routes(&request, &paths, Some(&root), &routes).unwrap();
+        let destinations: Vec<_> = routed.lines().filter_map(|line| line.strip_prefix("Requested ")).collect();
+        assert_eq!(destinations, [
+            format!("Agents: {}", source.join("AGENTS.md").display()),
+            format!("Agents: {}", source.join("agent-instructions/reviewer/AGENTS.md").display()),
+            format!("Rules: {}", source.join("RULES.md").display()),
+            format!("Skill: {} and {}", source.join("skills/review/SKILL.md").display(), source.join("SKILLS.md").display()),
+            format!("Workflow: {}", source.join("rules/workflow-review.md").display()),
+            format!("Plugin: {} and {}", runtime.join("extensions/helper/package.json").display(), runtime.join("extensions/helper/index.ts").display()),
+            format!("Tool: {} and {}", runtime.join("tools/helper/index.ts").display(), runtime.join("tools").join("helper").join("run.py").display()),
+        ]);
+        assert!(!source.exists());
+        assert!(!runtime.exists());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1315,18 +1408,23 @@ mod tests {
         write("zeta/index.ts", "throw new Error('must never run')");
         write("alpha/package.json", r#"{"name":"p","omp":{"extensions":["./src"]}}"#);
         write("alpha/src/index.js", "");
+        write("omp-precedence/package.json", r#"{"omp":{},"pi":{"extensions":["missing.ts"]}}"#);
+        write("pi-fallback/package.json", r#"{"omp":null,"pi":{"extensions":["index.ts"]}}"#);
+        write("pi-fallback/index.ts", "throw new Error('must never run')");
         write(".hidden/package.json", "not json");
         write("loose/index.ts", "");
         write("note.txt", "");
         let names = |paths: Vec<PathBuf>| paths.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
         for label in ["Manager", "Architect", "Local AI models"] {
-            assert_eq!(names(scoped_plugin_paths(&root, label).unwrap()), ["alpha", "zeta"]);
+            assert_eq!(names(scoped_plugin_paths(&root, label).unwrap()), ["alpha", "omp-precedence", "pi-fallback", "zeta"]);
         }
         for (text, expected) in [
             ("{", "package.json is invalid"),
             (r#"{"omp":{"extensions":["missing.ts"]}}"#, "declares a missing extension module"),
             (r#"{"omp":{"extensions":["../zeta/index.ts"]}}"#, "outside its package"),
             (r#"{"omp":{"extensions":["src/main.ts"]}}"#, "cannot load; use index.ts"),
+            (r#"{"omp":{"extensions":["src"]}}"#, "without an index module"),
+            (r#"{"omp":{"extensions":["missing.ts"]},"pi":{"extensions":["index.ts"]}}"#, "declares a missing extension module: missing.ts"),
         ] {
             write("bad/package.json", text);
             write("bad/src/main.ts", "");

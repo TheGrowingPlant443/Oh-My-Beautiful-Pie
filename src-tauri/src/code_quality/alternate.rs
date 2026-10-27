@@ -26,9 +26,9 @@ const ASSETS: &[(&str, &str)] = &[
     ("validate-rules.mjs", include_str!("../../../bridge/code-quality/validate-rules.mjs")),
     ("rules/omp-quality.yml", OWN_RULES), ("rules/selected-manifest.json", MANIFEST),
     ("rules/LICENSE-opengrep-rules.txt", LICENSE),
-    ("rules/fixtures/quality.js", include_str!("../../../bridge/code-quality/rules/fixtures/quality.js")),
-    ("rules/fixtures/quality.ts", include_str!("../../../bridge/code-quality/rules/fixtures/quality.ts")),
-    ("rules/fixtures/quality.py", include_str!("../../../bridge/code-quality/rules/fixtures/quality.py")),
+    ("rules/fixtures/quality.js.fixture", include_str!("../../../bridge/code-quality/rules/fixtures/quality.js.fixture")),
+    ("rules/fixtures/quality.ts.fixture", include_str!("../../../bridge/code-quality/rules/fixtures/quality.ts.fixture")),
+    ("rules/fixtures/quality.py.fixture", include_str!("../../../bridge/code-quality/rules/fixtures/quality.py.fixture")),
     ("fallback/eslint.config.cjs", include_str!("../../../bridge/code-quality/fallback/eslint.config.cjs")),
     ("fallback/.ruff.toml", include_str!("../../../bridge/code-quality/fallback/.ruff.toml")),
     ("fallback/java-pmd-ruleset.xml", include_str!("../../../bridge/code-quality/fallback/java-pmd-ruleset.xml")),
@@ -121,28 +121,30 @@ fn download_verified(url: &str, expected: &str, path: &Path, max: u64, ctl: &Ctl
     if response.content_length().is_some_and(|size| size > max) { return Err("Pinned analyzer download exceeds its size limit.".into()); }
     let temp = path.with_extension(format!("download-{}", uuid::Uuid::new_v4()));
     if let Some(parent) = temp.parent() { fs::create_dir_all(parent).map_err(|e| io_error("create analyzer cache", e))?; }
-    let result = (|| -> Result<()> {
-        let mut output = fs::File::create(&temp).map_err(|e| io_error("create download", e))?;
-        let mut total = 0u64;
-        let mut digest = Sha256::new();
-        let mut buffer = [0u8; 65536];
-        loop {
-            cancelled(ctl)?;
-            let count = response.read(&mut buffer).map_err(|e| io_error("read analyzer download", e))?;
-            if count == 0 { break; }
-            total += count as u64;
-            if total > max { return Err("Pinned analyzer download exceeds its size limit.".into()); }
-            digest.update(&buffer[..count]);
-            output.write_all(&buffer[..count]).map_err(|e| io_error("save analyzer download", e))?;
-        }
-        if format!("{:x}", digest.finalize()) != expected { return Err("Pinned analyzer SHA-256 mismatch; no analyzer image was built. Retry setup or review the shipped lock file.".into()); }
-        output.sync_all().map_err(|e| io_error("flush analyzer download", e))?;
-        drop(output);
-        if path.exists() { fs::remove_file(path).map_err(|e| io_error("replace invalid cached download", e))?; }
-        fs::rename(&temp, path).map_err(|e| io_error("commit verified download", e))
-    })();
+    let result = commit_verified_download(&mut response, expected, &temp, path, max, ctl);
     if result.is_err() { let _ = fs::remove_file(&temp); }
     result
+}
+
+fn commit_verified_download(response: &mut reqwest::blocking::Response, expected: &str, temp: &Path, path: &Path, max: u64, ctl: &Ctl) -> Result<()> {
+    let mut output = fs::File::create(temp).map_err(|e| io_error("create download", e))?;
+    let mut total = 0u64;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        cancelled(ctl)?;
+        let count = response.read(&mut buffer).map_err(|e| io_error("read analyzer download", e))?;
+        if count == 0 { break; }
+        total += count as u64;
+        if total > max { return Err("Pinned analyzer download exceeds its size limit.".into()); }
+        digest.update(&buffer[..count]);
+        output.write_all(&buffer[..count]).map_err(|e| io_error("save analyzer download", e))?;
+    }
+    if format!("{:x}", digest.finalize()) != expected { return Err("Pinned analyzer SHA-256 mismatch; no analyzer image was built. Retry setup or review the shipped lock file.".into()); }
+    output.sync_all().map_err(|e| io_error("flush analyzer download", e))?;
+    drop(output);
+    if path.exists() { fs::remove_file(path).map_err(|e| io_error("replace invalid cached download", e))?; }
+    fs::rename(temp, path).map_err(|e| io_error("commit verified download", e))
 }
 
 fn safe_asset_path(text: &str) -> Result<PathBuf> {
@@ -176,6 +178,22 @@ fn validate_rule(bytes: &[u8], entry: &Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_rule_license(member: impl Read) -> Result<()> {
+    let mut bytes = Vec::new();
+    member.take(1024 * 1024).read_to_end(&mut bytes).map_err(|e| io_error("read rule license", e))?;
+    if bytes != LICENSE.as_bytes() { return Err("Pinned rules license differs from acknowledged license.".into()); }
+    Ok(())
+}
+
+fn materialize_selected_rule(member: impl Read, relative: &str, entry: &Value, context: &Path, found: &mut HashSet<String>) -> Result<()> {
+    if !found.insert(relative.to_owned()) { return Err("Duplicate selected rule in pinned archive.".into()); }
+    let mut bytes = Vec::new();
+    member.take(1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|e| io_error("read selected rule", e))?;
+    if bytes.len() > 1024 * 1024 { return Err("Selected rule exceeds 1 MiB.".into()); }
+    validate_rule(&bytes, entry)?;
+    write_file(&context.join("rules/selected").join(safe_asset_path(relative)?), &bytes)
+}
+
 fn materialize_rules(archive: &Path, context: &Path, ctl: &Ctl) -> Result<()> {
     let manifest = json(MANIFEST)?;
     let entries = manifest["rules"].as_array().ok_or("Frozen rules manifest has no rule entries.")?;
@@ -198,16 +216,10 @@ fn materialize_rules(archive: &Path, context: &Path, ctl: &Ctl) -> Result<()> {
         total = total.checked_add(member.size()).ok_or("Rules archive size overflow.")?;
         if total > 128 * 1024 * 1024 { return Err("Pinned rules archive exceeds 128 MiB expanded.".into()); }
         if relative == "LICENSE" {
-            let mut bytes = Vec::new(); member.take(1024 * 1024).read_to_end(&mut bytes).map_err(|e| io_error("read rule license", e))?;
-            if bytes != LICENSE.as_bytes() { return Err("Pinned rules license differs from acknowledged license.".into()); }
+            validate_rule_license(member)?;
             license_found = true;
         } else if let Some(entry) = wanted.get(relative) {
-            if !found.insert(relative.to_owned()) { return Err("Duplicate selected rule in pinned archive.".into()); }
-            let mut bytes = Vec::new();
-            member.take(1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|e| io_error("read selected rule", e))?;
-            if bytes.len() > 1024 * 1024 { return Err("Selected rule exceeds 1 MiB.".into()); }
-            validate_rule(&bytes, entry)?;
-            write_file(&context.join("rules/selected").join(safe_asset_path(relative)?), &bytes)?;
+            materialize_selected_rule(member, relative, entry, context, &mut found)?;
         }
     }
     if found.len() != wanted.len() || !license_found { return Err("Pinned rules archive is incomplete; missing selected rules or license. No empty-pack fallback is allowed.".into()); }
@@ -283,6 +295,39 @@ fn validate_profile_data(profile_text: &str, lock_text: &str) -> Result<()> {
 
 const BUILD_FILES: &[&str] = &["package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "eslint.config.js", "eslint.config.cjs", "eslint.config.mjs", "eslint.config.ts", ".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs", ".eslintrc.yml", ".eslintrc.yaml", "pyproject.toml", "ruff.toml", ".ruff.toml"];
 
+fn validate_preparation_config(metadata: &fs::Metadata, name: &str) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() { return Err(format!("Analysis preparation refuses linked/non-file configuration: {name}.")); }
+    #[cfg(windows)] {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 { return Err(format!("Analysis preparation refuses reparse-point configuration: {name}.")); }
+    }
+    Ok(())
+}
+
+fn lint_config_uses_dependencies(name: &str, bytes: &[u8]) -> bool {
+    if !name.starts_with("eslint.config") && !name.starts_with(".eslintrc") && name != "package.json" { return false; }
+    let text = String::from_utf8_lossy(bytes);
+    text.contains("plugin") || text.contains("eslint-config") || text.contains("extends") || text.contains("import ") || text.contains("require(")
+}
+
+fn hash_preparation_configs(folder: &Path, digest: &mut Sha256, warnings: &mut Vec<String>) -> Result<()> {
+    for name in BUILD_FILES {
+        let path = folder.join(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error(&format!("inspect configuration {name}"), error)),
+        };
+        validate_preparation_config(&metadata, name)?;
+        let bytes = read_bounded(&path, 1024 * 1024)?;
+        digest.update(name.as_bytes()); digest.update(&bytes);
+        if lint_config_uses_dependencies(name, &bytes) {
+            warnings.push(format!("{name} references lint plugins/config packages. Missing or incompatible dependencies are reported as tool failures, never replaced. If needed opt into Prepare npm dependencies; non-npm projects require an approved custom analysis image."));
+        }
+    }
+    Ok(())
+}
+
 pub fn prepare_scan(project: &QualityProject, folder: &Path) -> Result<QualityScanPreparation> {
     validate_profile()?;
     let mut project = project.clone();
@@ -303,29 +348,7 @@ pub fn prepare_scan(project: &QualityProject, folder: &Path) -> Result<QualitySc
     let mut digest = Sha256::new();
     digest.update(serde_json::to_vec(&project).map_err(|e| io_error("encode scan recipe", e))?);
     digest.update(MANIFEST.as_bytes()); digest.update(image_name().as_bytes());
-    for name in BUILD_FILES {
-        let path = folder.join(name);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(io_error(&format!("inspect configuration {name}"), error)),
-        };
-        {
-            if metadata.file_type().is_symlink() || !metadata.is_file() { return Err(format!("Analysis preparation refuses linked/non-file configuration: {name}.")); }
-            #[cfg(windows)] {
-                use std::os::windows::fs::MetadataExt;
-                if metadata.file_attributes() & 0x400 != 0 { return Err(format!("Analysis preparation refuses reparse-point configuration: {name}.")); }
-            }
-            let bytes = read_bounded(&path, 1024 * 1024)?;
-            digest.update(name.as_bytes()); digest.update(&bytes);
-            if name.starts_with("eslint.config") || name.starts_with(".eslintrc") || *name == "package.json" {
-                let text = String::from_utf8_lossy(&bytes);
-                if text.contains("plugin") || text.contains("eslint-config") || text.contains("extends") || text.contains("import ") || text.contains("require(") {
-                    warnings.push(format!("{name} references lint plugins/config packages. Missing or incompatible dependencies are reported as tool failures, never replaced. If needed opt into Prepare npm dependencies; non-npm projects require an approved custom analysis image."));
-                }
-            }
-        }
-    }
+    hash_preparation_configs(folder, &mut digest, &mut warnings)?;
     if project.prepare_npm_dependencies {
         if !folder.join("package-lock.json").is_file() { return Err("Prepare npm dependencies requires package-lock.json. Other package managers need an explicitly approved custom analysis image; no package scripts are run.".into()); }
         recipe.push("Separate temporary networked container: npm ci --ignore-scripts --no-audit --no-fund in /workspace; dependency downloads allowed, scripts disabled; validate node_modules tar (4 GiB maximum), copy dependencies only into MegaLinter, then delete prepared dependencies.".into());
@@ -418,104 +441,323 @@ fn canonicalize_grep_findings(findings: &mut [QualityFinding]) -> Result<()> {
     }
     Ok(())
 }
-fn parse_step(action: &str, files: &[PathBuf], staging: &Path, report_dir: &Path, exit: i64) -> Result<(Vec<QualityFinding>, Vec<String>, Vec<String>, Option<u64>, ToolStatus)> {
+struct ParsedStep {
+    findings: Vec<QualityFinding>,
+    warnings: Vec<String>,
+    report_names: Vec<String>,
+    analyzed_files: Option<u64>,
+    status: ToolStatus,
+}
+
+#[derive(Default)]
+struct MegaLinterReports {
+    statuses: Vec<reports::LinterStatus>,
+    findings: Vec<QualityFinding>,
+    warnings: Vec<String>,
+    report_names: Vec<String>,
+    warning_counts: BTreeMap<String, u64>,
+    config_failures: HashSet<String>,
+    report_failures: u32,
+    report_successes: u32,
+}
+
+impl MegaLinterReports {
+    fn report_error(&mut self, error: String) {
+        self.warnings.push(error);
+        self.report_failures += 1;
+    }
+
+    fn collect_diagnostics(&mut self, root: &Value) {
+        let Some(linters) = root["linters"].as_array() else { return; };
+        for linter in linters {
+            let Some(name) = linter["name"].as_str() else { continue; };
+            self.warning_counts.insert(name.to_string(), linter["total_number_warnings"].as_u64().unwrap_or(0));
+            let diagnostic = linter.to_string().to_ascii_lowercase();
+            if ["cannot find module", "cannot find package", "couldn't find plugin", "failed to load config", "eslint v10 migration required", "invalid configuration", "error parsing your config"].iter().any(|hint| diagnostic.contains(hint)) {
+                self.config_failures.insert(name.to_string());
+            }
+        }
+    }
+
+    fn load_json(&mut self, files: &[PathBuf], staging: &Path, report_dir: &Path) -> Result<()> {
+        let text = match locate_report(files, "mega-linter-report.json")
+            .and_then(|path| persisted_json(&staging.join(path), &report_dir.join("megalinter-report.json"))) {
+            Ok(text) => text,
+            Err(error) => { self.report_error(error); return Ok(()); }
+        };
+        self.report_names.push("megalinter-report.json".into());
+        let root: Value = serde_json::from_str(&text).map_err(|e| io_error("parse linter coverage", e))?;
+        self.collect_diagnostics(&root);
+        match reports::parse_megalinter_json(&text) {
+            Ok(statuses) => { self.statuses = statuses; self.report_successes += 1; }
+            Err(error) => self.report_error(error),
+        }
+        Ok(())
+    }
+
+    fn load_sarif(&mut self, files: &[PathBuf], staging: &Path, report_dir: &Path) {
+        let text = match locate_report(files, "megalinter.sarif")
+            .and_then(|path| persisted_json(&staging.join(path), &report_dir.join("megalinter.sarif"))) {
+            Ok(text) => text,
+            Err(error) => { self.report_error(error); return; }
+        };
+        self.report_names.push("megalinter.sarif".into());
+        match reports::parse_sarif("MegaLinter", &text, &["/workspace", "/tmp/lint", "/github/workspace"]) {
+            Ok(parsed) => {
+                if !parsed.warnings.is_empty() { self.report_failures += 1; }
+                self.findings = parsed.findings;
+                self.warnings.extend(parsed.warnings);
+                self.report_successes += 1;
+            }
+            Err(error) => self.report_error(error),
+        }
+    }
+
+    fn add_linter_summary(&mut self, name: &str, count: u64) {
+        self.warnings.push(format!("MegaLinter {name} reports {count} diagnostic(s); JSON counts may include diagnostics not represented by SARIF."));
+        if self.findings.iter().any(|finding| finding_matches_linter(finding, name)) { return; }
+        let message = format!("{name} reported {count} diagnostic(s). Review its sanitized JSON report; no source location is available for this tool-level summary.");
+        self.findings.push(QualityFinding { id: hash(message.as_bytes())[..16].into(), tools: vec!["MegaLinter".into()], rule_id: format!("megalinter.summary.{name}"), category: "Tool summary".into(), severity: Severity::Medium, message, path: None, line: None, column: None, end_line: None, help_url: None, hotspot: false });
+    }
+
+    fn linter_coverage(&mut self, linter: reports::LinterStatus) -> Option<(bool, u64)> {
+        let status = linter.status.to_ascii_lowercase();
+        let count = linter.found_errors + self.warning_counts.get(&linter.name).copied().unwrap_or(0);
+        let failed = megalinter_linter_failed(&linter, count, self.config_failures.contains(&linter.name));
+        if !failed && (matches!(status.as_str(), "skipped" | "disabled") || linter.file_count == Some(0)) {
+            self.warnings.push(format!("MegaLinter {}: skipped/no applicable files.", linter.name));
+            return None;
+        }
+        if failed {
+            self.warnings.push(linter.error.unwrap_or_else(|| format!("MegaLinter {} execution/configuration failed.", linter.name)));
+        }
+        if count > 0 && !failed { self.add_linter_summary(&linter.name, count); }
+        Some((failed, linter.file_count.unwrap_or(0)))
+    }
+
+    fn finish(mut self, exit: i64) -> ParsedStep {
+        let known_counts = !self.statuses.is_empty() && self.statuses.iter().all(|s| s.file_count.is_some());
+        let mut failures = 0;
+        let mut applicable = 0;
+        let mut analyzed = 0;
+        for linter in std::mem::take(&mut self.statuses) {
+            if let Some((failed, count)) = self.linter_coverage(linter) {
+                applicable += 1;
+                analyzed += count;
+                failures += usize::from(failed);
+            }
+        }
+        if !known_counts { self.warnings.push("MegaLinter did not report all per-linter file counts; coverage is unavailable for those linters.".into()); }
+        let status = megalinter_status(applicable, failures, &self.findings, self.report_failures, exit, known_counts);
+        ParsedStep { findings: self.findings, warnings: self.warnings, report_names: self.report_names, analyzed_files: if known_counts { Some(analyzed) } else { None }, status }
+    }
+}
+
+fn finding_matches_linter(finding: &QualityFinding, name: &str) -> bool {
+    if finding.tools.iter().any(|tool| tool.eq_ignore_ascii_case(name)) { return true; }
+    if name.is_empty() { return true; }
+    finding.rule_id.as_bytes().windows(name.len()).any(|part| part.eq_ignore_ascii_case(name.as_bytes()))
+}
+
+fn megalinter_linter_failed(linter: &reports::LinterStatus, count: u64, config_failed: bool) -> bool {
+    let findings_exit = matches!(linter.return_code, Some(0 | 1))
+        || linter.name == "JAVA_PMD" && linter.return_code == Some(4);
+    config_failed || linter.error.is_some() && (count == 0 || !findings_exit)
+}
+
+fn megalinter_status(applicable: usize, failures: usize, findings: &[QualityFinding], report_failures: u32, exit: i64, known_counts: bool) -> ToolStatus {
+    if applicable > 0 && failures == applicable && findings.is_empty() { ToolStatus::Error }
+    else if failures > 0 || report_failures > 0 || exit > 1 || !known_counts { ToolStatus::Partial }
+    else if applicable == 0 { ToolStatus::Skipped }
+    else { ToolStatus::Complete }
+}
+
+fn parse_megalinter_step(files: &[PathBuf], staging: &Path, report_dir: &Path, exit: i64) -> Result<ParsedStep> {
+    // Parse the two reports independently: SARIF covers only capable linters.
+    let mut reports = MegaLinterReports::default();
+    reports.load_json(files, staging, report_dir)?;
+    reports.load_sarif(files, staging, report_dir);
+    if reports.report_successes == 0 { return Err(reports.warnings.join(" ")); }
+    Ok(reports.finish(exit))
+}
+
+fn parse_grep_step(action: &str, files: &[PathBuf], staging: &Path, report_dir: &Path, exit: i64) -> Result<ParsedStep> {
     let mut warnings = Vec::new();
-    let mut names = Vec::new();
-    let bases = ["/workspace", "/tmp/lint", "/github/workspace"];
+    let name = format!("{action}.json");
+    let source = staging.join(locate_report(files, &name)?);
+    let text = persisted_json(&source, &report_dir.join(&name))?;
+    let mut parsed = reports::parse_grep_json(if action == "opengrep" { "Opengrep" } else { "Semgrep CE" }, &text, &["/workspace", "/tmp/lint", "/github/workspace"])?;
+    canonicalize_grep_findings(&mut parsed.findings)?;
+    // The parser's zero-result note is informational; actual coverage is judged from scanned paths below.
+    parsed.warnings.retain(|warning| !warning.contains("no findings were reported"));
+    let value: Value = serde_json::from_str(&text).map_err(|e| io_error("parse grep coverage", e))?;
+    let scanned = value["paths"]["scanned"].as_array().map(|p| p.len() as u64);
+    let mut status = if scanned == Some(0) { ToolStatus::Skipped } else { ToolStatus::Complete };
+    if !parsed.warnings.is_empty() || exit > 1 { status = ToolStatus::Partial; }
+    if scanned.is_none() { warnings.push(format!("{action} did not report its scanned-file count; coverage is unavailable.")); status = ToolStatus::Partial; }
+    warnings.extend(parsed.warnings);
+    Ok(ParsedStep { findings: parsed.findings, warnings, report_names: vec![name], analyzed_files: scanned, status })
+}
+
+fn parse_step(action: &str, files: &[PathBuf], staging: &Path, report_dir: &Path, exit: i64) -> Result<ParsedStep> {
+    if action == "megalinter" { parse_megalinter_step(files, staging, report_dir, exit) }
+    else { parse_grep_step(action, files, staging, report_dir, exit) }
+}
+
+struct AlternatePipeline<'a, 'r> {
+    engine: &'a dyn Engine,
+    run: &'a AlternateRun<'r>,
+    on_container: &'a dyn Fn(&str),
+    ctl: &'a Ctl,
+    image: String,
+    report_dir: PathBuf,
+    started: std::time::Instant,
+    dependencies: Option<PathBuf>,
+    dependency_failed: bool,
+    cleanup_blocked: bool,
+    result: AlternateResult,
+}
+
+impl AlternatePipeline<'_, '_> {
+    fn execute(mut self) -> Result<AlternateResult> {
+        let lock = json(LOCK)?;
+        self.prepare_dependencies();
+        for (action, tool, version) in [("megalinter", "MegaLinter", string(&lock["megalinter"], "version")?), ("opengrep", "Opengrep", string(&lock["opengrep"], "version")?), ("semgrep", "Semgrep CE", string(&lock["semgrep"], "version")?)] {
+            self.run_tool(action, tool, version)?;
+        }
+        self.result.findings = reports::merge_findings(self.result.findings);
+        Ok(self.result)
+    }
+
+    fn prepare_dependencies(&mut self) {
+        if !self.run.project.prepare_npm_dependencies || self.ctl.cancelled() { return; }
+        match npm_dependencies(self.engine, self.run, &self.image, self.on_container, self.ctl) {
+            Ok(path) => self.dependencies = Some(path),
+            Err(error) => {
+                if !self.ctl.cancelled() { self.result.warnings.push(format!("Dependency preparation failed: {error}. Independent analyzers will still run, but MegaLinter coverage is incomplete.")); }
+                self.cleanup_blocked = error.contains("needs reconciliation");
+                self.dependency_failed = true;
+            }
+        }
+    }
+
+    fn remaining_secs(&self, outcome: &mut QualityToolOutcome) -> Option<u64> {
+        if self.ctl.cancelled() {
+            outcome.status = ToolStatus::Skipped;
+            outcome.error = Some("Cancelled before it started".into());
+            return None;
+        }
+        if self.cleanup_blocked {
+            outcome.status = ToolStatus::Skipped;
+            outcome.error = Some("Blocked by an unresolved prior scanner container; use Start / retry reconciliation.".into());
+            return None;
+        }
+        let remaining = (60 * 60u64).saturating_sub(self.started.elapsed().as_secs());
+        if remaining == 0 {
+            outcome.error = Some("The job's 60 minute wall-clock limit expired before this tool could start.".into());
+            return None;
+        }
+        Some(remaining)
+    }
+
+    fn scanner_step(&self, action: &str, tar: &Path, remaining: u64) -> job::JobStep {
+        let mut copies = vec![("/workspace".into(), self.run.snapshot_tar.into())];
+        if action == "megalinter" {
+            if let Some(dependencies) = &self.dependencies { copies.push(("/workspace".into(), dependencies.clone())); }
+        }
+        job::JobStep { spec: spec(self.run, action, &self.image, Some("none")), copy_in: copies, copy_out: vec![("/out/.".into(), tar.into())], timeout_secs: (20 * 60).min(remaining) }
+    }
+
+    fn persist_exit_summary(&self, action: &str, tool: &str, execution: &job::JobResult, outcome: &mut QualityToolOutcome) -> Result<()> {
+        // Raw output can include source/secret snippets. Persist only sanitized JSON and this
+        // fixed exit summary; the bounded raw tail is deliberately discarded.
+        let log_name = format!("{action}.log");
+        write_file(&self.report_dir.join(&log_name), format!("{tool} exited {}; timed out: {}. Raw stdout/stderr is not persisted because tools may include detected secrets.\n", execution.exit_code, execution.timed_out).as_bytes())?;
+        outcome.report_names.push(log_name);
+        Ok(())
+    }
+
+    fn record_tool_result(&mut self, action: &str, tool: &str, parsed: Result<ParsedStep>, outcome: &mut QualityToolOutcome) {
+        match parsed {
+            Ok(mut parsed) => {
+                if action == "megalinter" && self.dependency_failed && parsed.status != ToolStatus::Error { parsed.status = ToolStatus::Partial; }
+                outcome.status = parsed.status;
+                outcome.analyzed_files = parsed.analyzed_files;
+                outcome.finding_count = parsed.findings.len() as u64;
+                outcome.report_names.extend(parsed.report_names);
+                self.result.findings.append(&mut parsed.findings);
+                self.result.warnings.append(&mut parsed.warnings);
+                if matches!(parsed.status, ToolStatus::Partial | ToolStatus::Error) { outcome.error = Some("Analysis/report coverage is incomplete; review warnings and the sanitized reports.".into()); }
+            }
+            Err(error) => {
+                let diagnostic = reports::preview_text(&reports::redact(&error, &[]), 4096).text;
+                outcome.error = Some(format!("{tool}: {diagnostic}"));
+                self.result.warnings.push(format!("{tool} did not complete; remaining independent tools were still attempted."));
+                collect_existing_step_reports(action, &self.report_dir, &mut outcome.report_names);
+            }
+        }
+    }
+
+    fn run_tool(&mut self, action: &str, tool: &str, version: &str) -> Result<()> {
+        let mut outcome = QualityToolOutcome { tool: tool.into(), version: version.into(), status: ToolStatus::Error, exit_code: None, analyzed_files: None, finding_count: 0, error: None, report_names: Vec::new() };
+        let Some(remaining) = self.remaining_secs(&mut outcome) else { self.result.tools.push(outcome); return Ok(()); };
+        self.ctl.say(&format!("Running {tool} in a disposable network-disabled container."));
+        let tar = self.run.job_dir.join(format!("{action}-reports.tar"));
+        let staging = self.run.job_dir.join(format!("{action}-untrusted-reports"));
+        let step = self.scanner_step(action, &tar, remaining);
+        let executed = job::run_job(self.engine, &step, self.on_container, self.ctl);
+        if executed.as_ref().err().is_some_and(|error| error.contains("needs reconciliation")) { self.cleanup_blocked = true; }
+        if self.ctl.cancelled() || executed.as_ref().is_ok_and(|r| r.cancelled) {
+            let _ = fs::remove_file(&tar); let _ = fs::remove_dir_all(&staging);
+            cancelled_tool_outcome(&mut outcome, executed);
+            self.result.tools.push(outcome);
+            return Ok(());
+        }
+        let parsed = match executed {
+            Err(error) => Err(error),
+            Ok(execution) => {
+                outcome.exit_code = Some(execution.exit_code);
+                if execution.timed_out { self.result.warnings.push(format!("{tool} exceeded its wall-clock limit; remaining independent tools will run only while the overall job deadline permits.")); }
+                self.persist_exit_summary(action, tool, &execution, &mut outcome)?;
+                parse_execution_reports(action, &tar, &staging, &self.report_dir, &execution)
+            }
+        };
+        let _ = fs::remove_file(&tar); let _ = fs::remove_dir_all(&staging);
+        self.record_tool_result(action, tool, parsed, &mut outcome);
+        self.result.tools.push(outcome);
+        Ok(())
+    }
+}
+
+fn cancelled_tool_outcome(outcome: &mut QualityToolOutcome, executed: Result<job::JobResult>) {
+    outcome.exit_code = executed.as_ref().ok().map(|r| r.exit_code);
+    match executed {
+        Ok(_) => {
+            outcome.status = ToolStatus::Partial;
+            outcome.error = Some("Cancelled during analysis; its disposable container has been stopped and removed.".into());
+        }
+        Err(error) => {
+            outcome.status = ToolStatus::Error;
+            outcome.error = Some(format!("Cancellation cleanup could not be confirmed: {error}"));
+        }
+    }
+}
+
+fn parse_execution_reports(action: &str, tar: &Path, staging: &Path, report_dir: &Path, execution: &job::JobResult) -> Result<ParsedStep> {
+    let files = snapshot::extract_tar_safely(tar, staging, MAX_REPORT)?;
+    let mut parsed = parse_step(action, &files, staging, report_dir, execution.exit_code)?;
+    if execution.timed_out && parsed.status != ToolStatus::Error { parsed.status = ToolStatus::Partial; }
+    Ok(parsed)
+}
+
+fn collect_existing_step_reports(action: &str, report_dir: &Path, names: &mut Vec<String>) {
     if action == "megalinter" {
-        // Parse the two reports independently: SARIF covers only capable linters.
-        let json_report = locate_report(files, "mega-linter-report.json")
-            .and_then(|path| persisted_json(&staging.join(path), &report_dir.join("megalinter-report.json")));
-        let mut statuses = Vec::new();
-        let mut report_failures = 0;
-        let mut report_successes = 0;
-        let mut warning_counts = BTreeMap::new();
-        let mut config_failures = HashSet::new();
-        match json_report {
-            Ok(text) => {
-                names.push("megalinter-report.json".into());
-                let root: Value = serde_json::from_str(&text).map_err(|e| io_error("parse linter coverage", e))?;
-                if let Some(linters) = root["linters"].as_array() {
-                    for linter in linters {
-                        if let Some(name) = linter["name"].as_str() {
-                            warning_counts.insert(name.to_string(), linter["total_number_warnings"].as_u64().unwrap_or(0));
-                            let diagnostic = linter.to_string().to_ascii_lowercase();
-                            if ["cannot find module", "cannot find package", "couldn't find plugin", "failed to load config", "eslint v10 migration required", "invalid configuration", "error parsing your config"].iter().any(|hint| diagnostic.contains(hint)) {
-                                config_failures.insert(name.to_string());
-                            }
-                        }
-                    }
-                }
-                match reports::parse_megalinter_json(&text) {
-                    Ok(value) => { statuses = value; report_successes += 1; }
-                    Err(error) => { warnings.push(error); report_failures += 1; }
-                }
-            }
-            Err(error) => { warnings.push(error); report_failures += 1; }
+        for name in ["megalinter-report.json", "megalinter.sarif"] {
+            if report_dir.join(name).is_file() { names.push(name.into()); }
         }
-        let mut findings = Vec::new();
-        let sarif = locate_report(files, "megalinter.sarif")
-            .and_then(|path| persisted_json(&staging.join(path), &report_dir.join("megalinter.sarif")));
-        match sarif {
-            Ok(text) => {
-                names.push("megalinter.sarif".into());
-                match reports::parse_sarif("MegaLinter", &text, &bases) {
-                    Ok(parsed) => {
-                        if !parsed.warnings.is_empty() { report_failures += 1; }
-                        findings = parsed.findings; warnings.extend(parsed.warnings); report_successes += 1;
-                    }
-                    Err(error) => { warnings.push(error); report_failures += 1; }
-                }
-            }
-            Err(error) => { warnings.push(error); report_failures += 1; }
-        }
-        if report_successes == 0 { return Err(warnings.join(" ")); }
-        let mut failures = 0; let mut applicable = 0; let mut analyzed = 0;
-        let known_counts = !statuses.is_empty() && statuses.iter().all(|s| s.file_count.is_some());
-        for linter in statuses {
-            let status = linter.status.to_ascii_lowercase();
-            let count = linter.found_errors + warning_counts.get(&linter.name).copied().unwrap_or(0);
-            let findings_exit = matches!(linter.return_code, Some(0 | 1))
-                || linter.name == "JAVA_PMD" && linter.return_code == Some(4);
-            let failed = config_failures.contains(&linter.name) || linter.error.is_some() && (count == 0 || !findings_exit);
-            if !failed && (matches!(status.as_str(), "skipped" | "disabled") || linter.file_count == Some(0)) {
-                warnings.push(format!("MegaLinter {}: skipped/no applicable files.", linter.name)); continue;
-            }
-            applicable += 1; analyzed += linter.file_count.unwrap_or(0);
-            if failed {
-                failures += 1;
-                warnings.push(linter.error.clone().unwrap_or_else(|| format!("MegaLinter {} execution/configuration failed.", linter.name)));
-            }
-            if count > 0 && !failed {
-                warnings.push(format!("MegaLinter {} reports {count} diagnostic(s); JSON counts may include diagnostics not represented by SARIF.", linter.name));
-                if !findings.iter().any(|f| f.tools.iter().any(|t| t.eq_ignore_ascii_case(&linter.name)) || f.rule_id.to_ascii_lowercase().contains(&linter.name.to_ascii_lowercase())) {
-                    let message = format!("{} reported {count} diagnostic(s). Review its sanitized JSON report; no source location is available for this tool-level summary.", linter.name);
-                    findings.push(QualityFinding { id: hash(message.as_bytes())[..16].into(), tools: vec!["MegaLinter".into()], rule_id: format!("megalinter.summary.{}", linter.name), category: "Tool summary".into(), severity: Severity::Medium, message, path: None, line: None, column: None, end_line: None, help_url: None, hotspot: false });
-                }
-            }
-        }
-        if !known_counts { warnings.push("MegaLinter did not report all per-linter file counts; coverage is unavailable for those linters.".into()); }
-        let status = if applicable > 0 && failures == applicable && findings.is_empty() { ToolStatus::Error }
-            else if failures > 0 || report_failures > 0 || exit > 1 || !known_counts { ToolStatus::Partial }
-            else if applicable == 0 { ToolStatus::Skipped }
-            else { ToolStatus::Complete };
-        Ok((findings, warnings, names, if known_counts { Some(analyzed) } else { None }, status))
     } else {
         let name = format!("{action}.json");
-        let source = staging.join(locate_report(files, &name)?);
-        let text = persisted_json(&source, &report_dir.join(&name))?;
-        names.push(name);
-        let mut parsed = reports::parse_grep_json(if action == "opengrep" { "Opengrep" } else { "Semgrep CE" }, &text, &bases)?;
-        canonicalize_grep_findings(&mut parsed.findings)?;
-        // The parser's zero-result note is informational; actual coverage is judged from scanned paths below.
-        parsed.warnings.retain(|warning| !warning.contains("no findings were reported"));
-        let value: Value = serde_json::from_str(&text).map_err(|e| io_error("parse grep coverage", e))?;
-        let scanned = value["paths"]["scanned"].as_array().map(|p| p.len() as u64);
-        let mut status = if scanned == Some(0) { ToolStatus::Skipped } else { ToolStatus::Complete };
-        if !parsed.warnings.is_empty() || exit > 1 { status = ToolStatus::Partial; }
-        if scanned.is_none() { warnings.push(format!("{action} did not report its scanned-file count; coverage is unavailable.")); status = ToolStatus::Partial; }
-        warnings.extend(parsed.warnings);
-        Ok((parsed.findings, warnings, names, scanned, status))
+        if report_dir.join(&name).is_file() { names.push(name); }
     }
 }
 
@@ -526,95 +768,12 @@ pub fn run_alternate(engine: &dyn Engine, run: &AlternateRun<'_>, on_container: 
     let report_dir = run.job_dir.join("reports");
     fs::create_dir_all(&report_dir).map_err(|e| io_error("create report directory", e))?;
     let dependency_path = run.job_dir.join("prepared-dependencies.tar");
-    let result = (|| -> Result<AlternateResult> {
-        let lock = json(LOCK)?;
-        let mut tools = Vec::new(); let mut findings = Vec::new(); let mut warnings = Vec::new();
-        let mut dependency_error = None;
-        let mut cleanup_blocked = false;
-        let dependencies = if run.project.prepare_npm_dependencies && !ctl.cancelled() {
-            match npm_dependencies(engine, run, &image, on_container, ctl) {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    if !ctl.cancelled() { warnings.push(format!("Dependency preparation failed: {error}. Independent analyzers will still run, but MegaLinter coverage is incomplete.")); }
-                    cleanup_blocked = error.contains("needs reconciliation");
-                    dependency_error = Some(error); None
-                }
-            }
-        } else { None };
-        for (action, tool, version) in [("megalinter", "MegaLinter", string(&lock["megalinter"], "version")?), ("opengrep", "Opengrep", string(&lock["opengrep"], "version")?), ("semgrep", "Semgrep CE", string(&lock["semgrep"], "version")?)] {
-            let mut outcome = QualityToolOutcome { tool: tool.into(), version: version.into(), status: ToolStatus::Error, exit_code: None, analyzed_files: None, finding_count: 0, error: None, report_names: Vec::new() };
-            if ctl.cancelled() {
-                outcome.status = ToolStatus::Skipped; outcome.error = Some("Cancelled before it started".into()); tools.push(outcome); continue;
-            }
-            if cleanup_blocked {
-                outcome.status = ToolStatus::Skipped;
-                outcome.error = Some("Blocked by an unresolved prior scanner container; use Start / retry reconciliation.".into());
-                tools.push(outcome); continue;
-            }
-            let remaining = (60 * 60u64).saturating_sub(started.elapsed().as_secs());
-            if remaining == 0 {
-                outcome.error = Some("The job's 60 minute wall-clock limit expired before this tool could start.".into());
-                tools.push(outcome); continue;
-            }
-            ctl.say(&format!("Running {tool} in a disposable network-disabled container."));
-            let tar = run.job_dir.join(format!("{action}-reports.tar"));
-            let staging = run.job_dir.join(format!("{action}-untrusted-reports"));
-            let mut copies = vec![("/workspace".into(), run.snapshot_tar.into())];
-            if action == "megalinter" { if let Some(dependencies) = &dependencies { copies.push(("/workspace".into(), dependencies.clone())); } }
-            let step = job::JobStep { spec: spec(run, action, &image, Some("none")), copy_in: copies, copy_out: vec![("/out/.".into(), tar.clone())], timeout_secs: (20 * 60).min(remaining) };
-            let executed = job::run_job(engine, &step, on_container, ctl);
-            if executed.as_ref().err().is_some_and(|error| error.contains("needs reconciliation")) { cleanup_blocked = true; }
-            if ctl.cancelled() || executed.as_ref().is_ok_and(|r| r.cancelled) {
-                let _ = fs::remove_file(&tar); let _ = fs::remove_dir_all(&staging);
-                outcome.exit_code = executed.as_ref().ok().map(|r| r.exit_code);
-                match executed {
-                    Ok(_) => {
-                        outcome.status = ToolStatus::Partial;
-                        outcome.error = Some("Cancelled during analysis; its disposable container has been stopped and removed.".into());
-                    }
-                    Err(error) => {
-                        outcome.status = ToolStatus::Error;
-                        outcome.error = Some(format!("Cancellation cleanup could not be confirmed: {error}"));
-                    }
-                }
-                tools.push(outcome); continue;
-            }
-            let parsed = match executed {
-                Err(error) => Err(error),
-                Ok(execution) => {
-                    outcome.exit_code = Some(execution.exit_code);
-                    if execution.timed_out { warnings.push(format!("{tool} exceeded its wall-clock limit; remaining independent tools will run only while the overall job deadline permits.")); }
-                    // Raw output can include source/secret snippets. Only sanitized JSON and a
-                    // fixed exit summary are persisted; the bounded raw tail is deliberately discarded.
-                    let log_name = format!("{action}.log");
-                    write_file(&report_dir.join(&log_name), format!("{tool} exited {}; timed out: {}. Raw stdout/stderr is not persisted because tools may include detected secrets.\n", execution.exit_code, execution.timed_out).as_bytes())?;
-                    outcome.report_names.push(log_name);
-                    snapshot::extract_tar_safely(&tar, &staging, MAX_REPORT)
-                        .and_then(|files| parse_step(action, &files, &staging, &report_dir, execution.exit_code))
-                        .map(|mut parsed| { if execution.timed_out && parsed.4 != ToolStatus::Error { parsed.4 = ToolStatus::Partial; } parsed })
-                }
-            };
-            let _ = fs::remove_file(&tar); let _ = fs::remove_dir_all(&staging);
-            match parsed {
-                Ok((mut found, mut notes, names, analyzed, mut status)) => {
-                    if action == "megalinter" && dependency_error.is_some() && status != ToolStatus::Error { status = ToolStatus::Partial; }
-                    outcome.status = status; outcome.analyzed_files = analyzed; outcome.finding_count = found.len() as u64;
-                    outcome.report_names.extend(names); findings.append(&mut found); warnings.append(&mut notes);
-                    if matches!(status, ToolStatus::Partial | ToolStatus::Error) { outcome.error = Some("Analysis/report coverage is incomplete; review warnings and the sanitized reports.".into()); }
-                }
-                Err(error) => {
-                    let diagnostic = reports::preview_text(&reports::redact(&error, &[]), 4096).text;
-                    outcome.error = Some(format!("{tool}: {diagnostic}"));
-                    warnings.push(format!("{tool} did not complete; remaining independent tools were still attempted."));
-                    for name in if action == "megalinter" { vec!["megalinter-report.json".to_string(), "megalinter.sarif".to_string()] } else { vec![format!("{action}.json")] } {
-                        if report_dir.join(&name).is_file() { outcome.report_names.push(name); }
-                    }
-                }
-            }
-            tools.push(outcome);
-        }
-        Ok(AlternateResult { tools, findings: reports::merge_findings(findings), warnings, rules_hash: hash(MANIFEST.as_bytes()) })
-    })();
+    let pipeline = AlternatePipeline {
+        engine, run, on_container, ctl, image, report_dir, started,
+        dependencies: None, dependency_failed: false, cleanup_blocked: false,
+        result: AlternateResult { tools: Vec::new(), findings: Vec::new(), warnings: Vec::new(), rules_hash: hash(MANIFEST.as_bytes()) },
+    };
+    let result = pipeline.execute();
     let _ = fs::remove_file(dependency_path);
     result
 }
@@ -661,6 +820,22 @@ mod tests {
     impl Fake {
         fn new(mode: &str) -> Self { Self { runtime: QualityRuntime::Podman { connection: "fixture-rootless".into() }, calls: Mutex::new(Vec::new()), containers: Mutex::new(HashMap::new()), mode: mode.into() } }
         fn action(id: &str) -> &str { id.strip_suffix("-id").unwrap() }
+        fn write_megalinter_reports(&self, path: &Path) {
+            let skipped = self.mode == "skipped";
+            let failed = self.mode == "linter-error";
+            let count = if self.mode == "findings" { 2 } else { 0 };
+            let report = json!({"linters":[{"name":"PYTHON_RUFF","is_active":true,"status":if failed {"error"} else {"success"},"return_code":if failed {2} else if count>0 {1} else {0},"files_number":if skipped {0} else {1},"total_number_errors":count}]});
+            let mut files = vec![("mega-linter-report.json", report.to_string())];
+            if self.mode != "missing-sarif" { files.push(("megalinter.sarif", json!({"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fixture"}},"results":[]}]}).to_string())); }
+            archive(path, &files);
+        }
+        fn write_grep_report(&self, action: &str, path: &Path) {
+            let findings = if self.mode == "findings" { vec![json!({"check_id":"omp-quality.javascript.eval","path":"/workspace/quality.js","start":{"line":2,"col":1},"end":{"line":2,"col":12},"extra":{"message":"Review dynamic eval.","severity":"WARNING","lines":"never-persisted-secret","metavars":{"$X":{"abstract_content":"never-persisted-secret"}}}})] } else { Vec::new() };
+            let scanned = if self.mode == "skipped" { Vec::new() } else { vec!["/workspace/quality.js"] };
+            let report = json!({"results":findings,"errors":[],"paths":{"scanned":scanned}});
+            let text = if self.mode == "malformed-opengrep" && action == "opengrep" { "{".into() } else { report.to_string() };
+            archive(path, &[(if action == "opengrep" {"opengrep.json"} else {"semgrep.json"}, text)]);
+        }
     }
     impl Engine for Fake {
         fn runtime(&self) -> &QualityRuntime { &self.runtime }
@@ -697,22 +872,12 @@ mod tests {
             self.calls.lock().push(format!("copy:{id}")); Ok(())
         }
         fn copy_out(&self, id: &str, _: &str, path: &Path, _: &Ctl) -> Result<()> {
-            let action = Self::action(id);
-            if action == "npm" { archive(path, &[("node_modules/fixture/index.js", "module.exports = 1;".into())]); return Ok(()); }
-            if action == "megalinter" {
-                let skipped = self.mode == "skipped";
-                let failed = self.mode == "linter-error";
-                let count = if self.mode == "findings" { 2 } else { 0 };
-                let report = json!({"linters":[{"name":"PYTHON_RUFF","is_active":true,"status":if failed {"error"} else {"success"},"return_code":if failed {2} else if count>0 {1} else {0},"files_number":if skipped {0} else {1},"total_number_errors":count}]});
-                let mut files = vec![("mega-linter-report.json", report.to_string())];
-                if self.mode != "missing-sarif" { files.push(("megalinter.sarif", json!({"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fixture"}},"results":[]}]}).to_string())); }
-                archive(path, &files); return Ok(());
+            match Self::action(id) {
+                "npm" => archive(path, &[("node_modules/fixture/index.js", "module.exports = 1;".into())]),
+                "megalinter" => self.write_megalinter_reports(path),
+                action => self.write_grep_report(action, path),
             }
-            let findings = if self.mode == "findings" { vec![json!({"check_id":"omp-quality.javascript.eval","path":"/workspace/quality.js","start":{"line":2,"col":1},"end":{"line":2,"col":12},"extra":{"message":"Review dynamic eval.","severity":"WARNING","lines":"never-persisted-secret","metavars":{"$X":{"abstract_content":"never-persisted-secret"}}}})] } else { Vec::new() };
-            let scanned = if self.mode == "skipped" { Vec::new() } else { vec!["/workspace/quality.js"] };
-            let report = json!({"results":findings,"errors":[],"paths":{"scanned":scanned}});
-            let text = if self.mode == "malformed-opengrep" && action == "opengrep" { "{".into() } else { report.to_string() };
-            archive(path, &[(if action == "opengrep" {"opengrep.json"} else {"semgrep.json"}, text)]); Ok(())
+            Ok(())
         }
         fn remove(&self, id: &str, force: bool, ctl: &Ctl) -> Result<()> {
             assert!(force); assert!(!ctl.cancelled());
@@ -869,5 +1034,70 @@ mod tests {
         assert_eq!(actions(&engine), ["npm", "megalinter", "opengrep", "semgrep"]);
         assert_eq!(result.tools[0].status, ToolStatus::Partial);
         assert_eq!(result.tools[1].status, ToolStatus::Complete);
+    }
+
+    fn megalinter_report_fixture(json_report: Option<&Value>, sarif_report: Option<&Value>, exit: i64) -> Result<ParsedStep> {
+        let scratch = Scratch::new();
+        let staging = scratch.0.join("staging");
+        let report_dir = scratch.0.join("reports");
+        let mut files = Vec::new();
+        for (name, report) in [("mega-linter-report.json", json_report), ("megalinter.sarif", sarif_report)] {
+            let Some(report) = report else { continue; };
+            write_file(&staging.join(name), report.to_string().as_bytes()).unwrap();
+            files.push(PathBuf::from(name));
+        }
+        parse_step("megalinter", &files, &staging, &report_dir, exit)
+    }
+
+    #[test]
+    fn megalinter_reports_remain_independently_useful() {
+        let coverage = json!({"linters":[{"name":"PYTHON_RUFF","is_active":true,"status":"success","return_code":1,"files_number":3,"total_number_errors":2}]});
+        let sarif = json!({"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fixture","rules":[{"id":"PYTHON_RUFF.F401"}]}},"results":[{"ruleId":"PYTHON_RUFF.F401","ruleIndex":0,"level":"warning","message":{"text":"Unused import"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"/workspace/main.py"},"region":{"startLine":7}}}]}]}]});
+        let invalid = json!({});
+        let both = megalinter_report_fixture(Some(&coverage), Some(&sarif), 1).unwrap();
+        assert_eq!(both.status, ToolStatus::Complete);
+        assert_eq!(both.analyzed_files, Some(3));
+        assert_eq!(both.findings.len(), 1);
+        assert_eq!(both.findings[0].rule_id, "PYTHON_RUFF.F401");
+        for missing_or_invalid in [None, Some(&invalid)] {
+            let json_only = megalinter_report_fixture(Some(&coverage), missing_or_invalid, 1).unwrap();
+            assert_eq!(json_only.status, ToolStatus::Partial);
+            assert_eq!(json_only.analyzed_files, Some(3));
+            assert_eq!(json_only.findings.len(), 1);
+            assert_eq!(json_only.findings[0].rule_id, "megalinter.summary.PYTHON_RUFF");
+            assert_eq!(json_only.findings[0].path, None);
+
+            let sarif_only = megalinter_report_fixture(missing_or_invalid, Some(&sarif), 1).unwrap();
+            assert_eq!(sarif_only.status, ToolStatus::Partial);
+            assert_eq!(sarif_only.analyzed_files, None);
+            assert_eq!(sarif_only.findings.len(), 1);
+            assert_eq!(sarif_only.findings[0].path.as_deref(), Some("main.py"));
+            assert_eq!(sarif_only.findings[0].line, Some(7));
+        }
+        assert!(megalinter_report_fixture(Some(&invalid), Some(&invalid), 1).is_err());
+    }
+
+    #[test]
+    fn megalinter_configuration_errors_override_skipped_and_findings_only_exits() {
+        let sarif = json!({"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fixture"}},"results":[]}]});
+        for (status, files, code) in [("skipped", 0, 0), ("success", 2, 1)] {
+            let coverage = json!({"linters":[{"name":"JAVASCRIPT_ES","is_active":true,"status":status,"return_code":code,"files_number":files,"total_number_errors":1,"message":"Cannot find module 'eslint-plugin-fixture'"}]});
+            let parsed = megalinter_report_fixture(Some(&coverage), Some(&sarif), 1).unwrap();
+            assert_eq!(parsed.status, ToolStatus::Error);
+            assert_eq!(parsed.analyzed_files, Some(files));
+            assert!(parsed.findings.is_empty());
+        }
+    }
+
+    #[test]
+    fn megalinter_pmd_findings_exit_keeps_diagnostics_without_sarif_locations() {
+        let coverage = json!({"linters":[{"name":"JAVA_PMD","is_active":true,"status":"error","return_code":4,"files_number":2,"total_number_errors":1}]});
+        let sarif = json!({"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fixture"}},"results":[]}]});
+        let parsed = megalinter_report_fixture(Some(&coverage), Some(&sarif), 1).unwrap();
+        assert_eq!(parsed.status, ToolStatus::Complete);
+        assert_eq!(parsed.analyzed_files, Some(2));
+        assert_eq!(parsed.findings.len(), 1);
+        assert_eq!(parsed.findings[0].rule_id, "megalinter.summary.JAVA_PMD");
+        assert_eq!(parsed.findings[0].path, None);
     }
 }

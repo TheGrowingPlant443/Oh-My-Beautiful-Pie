@@ -212,6 +212,66 @@ fn tail(text: String, max: usize) -> String {
     text[start..].to_string()
 }
 
+/// When a journaled tool call ended, whether it failed, its exit code and (failed only) its result text.
+type JournalResult = (u64, bool, Option<i64>, Option<String>);
+
+fn journal_result(message: &Value, stamp: u64, results: &mut HashMap<String, JournalResult>) {
+    let Some(call_id) = message["toolCallId"].as_str() else { return };
+    let failed = message["isError"].as_bool() == Some(true);
+    let text = message["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
+    let output = (failed && !text.is_empty()).then(|| tail(text, MAX_FAILURE_TEXT));
+    results.insert(call_id.into(), (stamp, failed, message["details"]["exitCode"].as_i64(), output));
+}
+
+fn journal_call(block: &Value, stamp: u64, default_cwd: &str, session_id: &str) -> Option<Journaled> {
+    let name = block["name"].as_str().unwrap_or("");
+    if block["type"] != "toolCall" || !["bash", "eval"].contains(&name) {
+        return None;
+    }
+    let call_id = block["id"].as_str()?;
+    let arguments = &block["arguments"];
+    let script = arguments[if name == "bash" { "command" } else { "code" }].as_str()?;
+    let kind = if name == "bash" {
+        "bash"
+    } else if matches!(arguments["language"].as_str(), Some("py" | "python")) {
+        "py"
+    } else {
+        "js"
+    };
+    let description = block["intent"]
+        .as_str()
+        .or_else(|| arguments["i"].as_str())
+        .or_else(|| arguments["title"].as_str())
+        .map(|d| d.chars().take(500).collect::<String>())
+        .filter(|d| !d.is_empty());
+    let cwd = match arguments["cwd"].as_str() {
+        Some(cwd) if !cwd.is_empty() => Path::new(default_cwd).join(cwd).to_string_lossy().into_owned(),
+        _ => default_cwd.to_string(),
+    };
+    Some(Journaled {
+        summary: CommandSummary {
+            execution_id: format!("import-{}", digest(&format!("{session_id}:{call_id}"))),
+            session_id: session_id.into(),
+            source_session_id: session_id.into(),
+            tool_call_id: call_id.into(),
+            agent_id: "main".into(),
+            kind: kind.into(),
+            description,
+            preview: flatten(script),
+            cwd,
+            started_at: stamp,
+            ended_at: None,
+            status: "interrupted".into(),
+            exit_code: None,
+            tab: None,
+            historical: true,
+            has_output: false,
+        },
+        script: script.into(),
+        output: None,
+    })
+}
+
 pub struct TerminalService {
     root: PathBuf,
     registry: OnceLock<Weak<Registry>>,
@@ -612,78 +672,11 @@ impl TerminalService {
         let default_cwd = crate::session::header(path).and_then(|(h, _)| h["cwd"].as_str().map(String::from)).unwrap_or_default();
         let mut calls: Vec<Journaled> = Vec::new();
         // Per tool call: when it ended, whether it failed, its exit code and (failed only) its result text.
-        let mut results: HashMap<String, (u64, bool, Option<i64>, Option<String>)> = HashMap::new();
+        let mut results: HashMap<String, JournalResult> = HashMap::new();
         for line in BufReader::new(file).split(b'\n') {
             let line = line.map_err(|e| format!("Conversation journal unavailable: {e}"))?;
             let Ok(text) = std::str::from_utf8(&line) else { continue };
-            let call = text.contains("\"toolCall\"") && (text.contains("\"bash\"") || text.contains("\"eval\""));
-            let result = text.contains("\"toolResult\"") && (text.contains("\"bash\"") || text.contains("\"eval\""));
-            if !call && !result {
-                continue;
-            }
-            let Ok(entry) = serde_json::from_str::<Value>(text) else { continue };
-            if entry["type"] != "message" {
-                continue;
-            }
-            let message = &entry["message"];
-            let stamp = message["timestamp"].as_u64().or_else(|| entry["timestamp"].as_str().and_then(iso_ms)).unwrap_or(0);
-            if message["role"] == "toolResult" && ["bash", "eval"].contains(&message["toolName"].as_str().unwrap_or("")) {
-                if let Some(call_id) = message["toolCallId"].as_str() {
-                    let failed = message["isError"].as_bool() == Some(true);
-                    let text = message["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
-                    let output = (failed && !text.is_empty()).then(|| tail(text, MAX_FAILURE_TEXT));
-                    results.insert(call_id.into(), (stamp, failed, message["details"]["exitCode"].as_i64(), output));
-                }
-            } else if message["role"] == "assistant" {
-                for block in message["content"].as_array().into_iter().flatten() {
-                    let name = block["name"].as_str().unwrap_or("");
-                    if block["type"] != "toolCall" || !["bash", "eval"].contains(&name) {
-                        continue;
-                    }
-                    let (Some(call_id), arguments) = (block["id"].as_str(), &block["arguments"]) else { continue };
-                    let script = if name == "bash" { arguments["command"].as_str() } else { arguments["code"].as_str() };
-                    let Some(script) = script else { continue };
-                    let kind = if name == "bash" {
-                        "bash"
-                    } else if matches!(arguments["language"].as_str(), Some("py" | "python")) {
-                        "py"
-                    } else {
-                        "js"
-                    };
-                    let description = block["intent"]
-                        .as_str()
-                        .or_else(|| arguments["i"].as_str())
-                        .or_else(|| arguments["title"].as_str())
-                        .map(|d| d.chars().take(500).collect::<String>())
-                        .filter(|d| !d.is_empty());
-                    let cwd = match arguments["cwd"].as_str() {
-                        Some(cwd) if !cwd.is_empty() => Path::new(&default_cwd).join(cwd).to_string_lossy().into_owned(),
-                        _ => default_cwd.clone(),
-                    };
-                    calls.push(Journaled {
-                        summary: CommandSummary {
-                            execution_id: format!("import-{}", digest(&format!("{session_id}:{call_id}"))),
-                            session_id: session_id.into(),
-                            source_session_id: session_id.into(),
-                            tool_call_id: call_id.into(),
-                            agent_id: "main".into(),
-                            kind: kind.into(),
-                            description,
-                            preview: flatten(script),
-                            cwd,
-                            started_at: stamp,
-                            ended_at: None,
-                            status: "interrupted".into(),
-                            exit_code: None,
-                            tab: None,
-                            historical: true,
-                            has_output: false,
-                        },
-                        script: script.into(),
-                        output: None,
-                    });
-                }
-            }
+            Self::journal_line(text, &default_cwd, session_id, &mut calls, &mut results);
         }
         for call in &mut calls {
             if let Some((ended, failed, code, output)) = results.remove(&call.summary.tool_call_id) {
@@ -695,6 +688,25 @@ impl TerminalService {
             }
         }
         Ok(calls)
+    }
+
+    fn journal_line(text: &str, default_cwd: &str, session_id: &str, calls: &mut Vec<Journaled>, results: &mut HashMap<String, JournalResult>) {
+        let tool = text.contains("\"bash\"") || text.contains("\"eval\"");
+        if !tool || !(text.contains("\"toolCall\"") || text.contains("\"toolResult\"")) {
+            return;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(text) else { return };
+        if entry["type"] != "message" {
+            return;
+        }
+        let message = &entry["message"];
+        let stamp = message["timestamp"].as_u64().or_else(|| entry["timestamp"].as_str().and_then(iso_ms)).unwrap_or(0);
+        if message["role"] == "toolResult" && ["bash", "eval"].contains(&message["toolName"].as_str().unwrap_or("")) {
+            journal_result(message, stamp, results);
+        } else if message["role"] == "assistant" {
+            let blocks = message["content"].as_array().into_iter().flatten();
+            calls.extend(blocks.filter_map(|block| journal_call(block, stamp, default_cwd, session_id)));
+        }
     }
 
     fn imported(&self, path: &Path, session_id: &str) -> Result<Arc<Vec<CommandSummary>>> {

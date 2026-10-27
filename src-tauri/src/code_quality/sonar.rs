@@ -204,22 +204,7 @@ impl SonarClient {
         };
         let response = request.send().map_err(transport_error)?;
         let status = response.status();
-        if status.is_redirection() {
-            // The destination is untrusted and may contain SSO state or reflected credentials.
-            return Err(SonarError::Redirect { location: "[redirect not followed]".into() });
-        }
-        if status.as_u16() == 401 { return Err(SonarError::Unauthorized); }
-        if status.as_u16() == 403 {
-            let permission = match path {
-                "api/projects/create" => "Grant this user Create Projects, Browse and Execute Analysis permissions for the local project.",
-                "api/ce/cancel" => "Task cancellation requires project Administer or Administer System; in-progress tasks cannot be cancelled. Keep waiting for this exact task to finish.",
-                "api/ce/task" => "Grant the user Execute Analysis on this project (or project/global administration).",
-                "api/users/change_password" | "api/user_tokens/generate" | "api/user_tokens/revoke" => "The SonarQube account is not allowed to manage this user's password or tokens.",
-                _ => "Grant the user Browse and Execute Analysis on the selected project; use a user token, not an analysis-only token.",
-            };
-            return Err(SonarError::Forbidden(permission.into()));
-        }
-        if status.as_u16() == 404 { return Err(SonarError::NotFound("Verify the project/task identifier and Browse permission; private projects can be hidden from this user.".into())); }
+        check_response_status(status, path)?;
         let is_html = response.headers().get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok()).is_some_and(|v| v.to_ascii_lowercase().contains("text/html"));
         let mut bytes = Vec::new();
@@ -322,12 +307,7 @@ impl SonarClient {
             }
             let task = self.task_status(task_id)?;
             if matches!(task.status.as_str(), "SUCCESS" | "FAILED" | "CANCELED") { return Ok(task); }
-            let delay = Duration::from_secs(1).min(timeout.saturating_sub(started.elapsed()));
-            let until = Instant::now() + delay;
-            while Instant::now() < until {
-                if ctl.cancelled() && !cancellation_attempted { break; }
-                std::thread::sleep(Duration::from_millis(50).min(until.saturating_duration_since(Instant::now())));
-            }
+            wait_poll_delay(ctl, cancellation_attempted, started, timeout);
         }
     }
     pub fn quality_gate(&self, analysis_id: &str) -> SonarResult<QualityGate> {
@@ -372,13 +352,7 @@ impl SonarClient {
                 ("api/issues/search", [("componentKeys", key), ("resolved", "false"), ("ps", page_size.as_str()), ("p", page_text.as_str())], "issues")
             };
             let data = self.request(Method::GET, endpoint, &params, false)?;
-            let rows = data.get(field).and_then(Value::as_array).ok_or_else(|| malformed("Missing findings array."))?;
-            let paging = &data["paging"];
-            let reported_total = required_usize(paging, "total")?;
-            let actual_size = required_usize(paging, "pageSize")?;
-            if required_usize(paging, "pageIndex")? != page || actual_size == 0 || actual_size > 500 || rows.len() > actual_size {
-                return Err(malformed("Inconsistent findings pagination."));
-            }
+            let (rows, reported_total) = findings_page(&data, field, page, consumed)?;
             total = total.max(reported_total);
             let components = component_paths(&data, key)?;
             if rows.is_empty() && consumed < reported_total { return Err(malformed("Findings page is empty before the advertised total.")); }
@@ -397,6 +371,45 @@ impl SonarClient {
 }
 
 fn malformed(message: &str) -> SonarError { SonarError::BadResponse(message.into()) }
+fn check_response_status(status: reqwest::StatusCode, path: &str) -> SonarResult<()> {
+    if status.is_redirection() {
+        return Err(SonarError::Redirect { location: "[redirect not followed]".into() });
+    }
+    match status.as_u16() {
+        401 => Err(SonarError::Unauthorized),
+        403 => Err(SonarError::Forbidden(forbidden_permission(path).into())),
+        404 => Err(SonarError::NotFound("Verify the project/task identifier and Browse permission; private projects can be hidden from this user.".into())),
+        _ => Ok(()),
+    }
+}
+fn forbidden_permission(path: &str) -> &'static str {
+    match path {
+        "api/projects/create" => "Grant this user Create Projects, Browse and Execute Analysis permissions for the local project.",
+        "api/ce/cancel" => "Task cancellation requires project Administer or Administer System; in-progress tasks cannot be cancelled. Keep waiting for this exact task to finish.",
+        "api/ce/task" => "Grant the user Execute Analysis on this project (or project/global administration).",
+        "api/users/change_password" | "api/user_tokens/generate" | "api/user_tokens/revoke" => "The SonarQube account is not allowed to manage this user's password or tokens.",
+        _ => "Grant the user Browse and Execute Analysis on the selected project; use a user token, not an analysis-only token.",
+    }
+}
+fn wait_poll_delay(ctl: &Ctl, cancellation_attempted: bool, started: Instant, timeout: Duration) {
+    let delay = Duration::from_secs(1).min(timeout.saturating_sub(started.elapsed()));
+    let until = Instant::now() + delay;
+    while Instant::now() < until {
+        if ctl.cancelled() && !cancellation_attempted { break; }
+        std::thread::sleep(Duration::from_millis(50).min(until.saturating_duration_since(Instant::now())));
+    }
+}
+fn findings_page<'a>(data: &'a Value, field: &str, page: usize, consumed: usize) -> SonarResult<(&'a [Value], usize)> {
+    let rows = data.get(field).and_then(Value::as_array).ok_or_else(|| malformed("Missing findings array."))?;
+    let paging = &data["paging"];
+    let total = required_usize(paging, "total")?;
+    let size = required_usize(paging, "pageSize")?;
+    if required_usize(paging, "pageIndex")? != page || size == 0 || size > 500 || rows.len() > size {
+        return Err(malformed("Inconsistent findings pagination."));
+    }
+    if rows.is_empty() && consumed < total { return Err(malformed("Findings page is empty before the advertised total.")); }
+    Ok((rows, total))
+}
 fn required_str<'a>(data: &'a Value, key: &str) -> SonarResult<&'a str> {
     data.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| malformed(&format!("Missing or invalid {key} field.")))
 }
@@ -431,16 +444,19 @@ fn transport_error(error: reqwest::Error) -> SonarError {
     else { SonarError::Unreachable("The connection could not be completed.".into()) }
 }
 
+fn redact_api_field(key: &str, value: &mut Value, token: &str) {
+    if matches!(key, "message" | "errorMessage") {
+        if let Value::String(text) = value {
+            if text.contains(token) { *text = text.replace(token, "[redacted]"); }
+        }
+    } else {
+        redact_api_messages(value, token);
+    }
+}
 fn redact_api_messages(value: &mut Value, token: &str) {
     match value {
         Value::Object(fields) => {
-            for (key, value) in fields {
-                if matches!(key.as_str(), "message" | "errorMessage") {
-                    if let Value::String(text) = value {
-                        if text.contains(token) { *text = text.replace(token, "[redacted]"); }
-                    }
-                } else { redact_api_messages(value, token); }
-            }
+            for (key, value) in fields { redact_api_field(key, value, token); }
         }
         Value::Array(values) => { for value in values { redact_api_messages(value, token); } }
         _ => {}
@@ -560,7 +576,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use parking_lot::Mutex;
     use std::thread::{self, JoinHandle};
@@ -575,6 +591,57 @@ mod tests {
         requests: Arc<Mutex<Vec<String>>>,
         worker: Option<JoinHandle<()>>,
     }
+    fn request_complete(bytes: &[u8]) -> bool {
+        let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") else { return false; };
+        let head = String::from_utf8_lossy(&bytes[..end]);
+        let length = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+        }).unwrap_or(0);
+        bytes.len() >= end + 4 + length
+    }
+    fn accept_socket(listener: &TcpListener, deadline: Instant) -> Option<TcpStream> {
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => return Some(socket),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline { return None; }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("fake server accept: {e}"),
+            }
+        }
+    }
+    fn read_fake_request(socket: &mut TcpStream) -> Vec<u8> {
+        socket.set_nonblocking(false).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let n = socket.read(&mut buffer).unwrap_or(0);
+            if n == 0 { break; }
+            bytes.extend_from_slice(&buffer[..n]);
+            if request_complete(&bytes) { break; }
+            assert!(bytes.len() < 64 * 1024);
+        }
+        bytes
+    }
+    fn accept_request(listener: &TcpListener) -> Option<(TcpStream, Vec<u8>)> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut socket = accept_socket(listener, deadline)?;
+            let bytes = read_fake_request(&mut socket);
+            if !bytes.is_empty() { return Some((socket, bytes)); }
+        }
+    }
+    fn send_reply(socket: &mut TcpStream, reply: Reply) {
+        let reason = match reply.status { 200 => "OK", 204 => "No Content", 302 => "Found", 401 => "Unauthorized", 403 => "Forbidden", 404 => "Not Found", _ => "Error" };
+        let mut response = format!("HTTP/1.1 {} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n", reply.status, reply.body.len());
+        for (name, value) in reply.headers { response.push_str(&format!("{name}: {value}\r\n")); }
+        response.push_str("\r\n");
+        response.push_str(&reply.body);
+        let _ = socket.write_all(response.as_bytes());
+    }
     impl Fake {
         fn new(replies: Vec<Reply>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -585,47 +652,9 @@ mod tests {
                 // Nonblocking admission prevents an assertion failure from leaving a stuck test thread.
                 listener.set_nonblocking(true).unwrap();
                 for reply in replies {
-                    let deadline = Instant::now() + Duration::from_secs(10);
-                    let (mut socket, bytes) = 'conn: loop {
-                        let mut socket = loop {
-                            match listener.accept() {
-                                Ok((socket, _)) => break socket,
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    if Instant::now() >= deadline { return; }
-                                    thread::sleep(Duration::from_millis(5));
-                                }
-                                Err(e) => panic!("fake server accept: {e}"),
-                            }
-                        };
-                        socket.set_nonblocking(false).unwrap();
-                        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                        let mut bytes = Vec::new();
-                        let mut buffer = [0u8; 1024];
-                        loop {
-                            // A reset or empty connection (pooled/aborted client socket) is not a request.
-                            let n = socket.read(&mut buffer).unwrap_or(0);
-                            if n == 0 { break; }
-                            bytes.extend_from_slice(&buffer[..n]);
-                            if let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
-                                let head = String::from_utf8_lossy(&bytes[..end]);
-                                let length = head.lines().find_map(|line| {
-                                    let (name, value) = line.split_once(':')?;
-                                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
-                                }).unwrap_or(0);
-                                if bytes.len() >= end + 4 + length { break; }
-                            }
-                            assert!(bytes.len() < 64 * 1024);
-                        }
-                        if bytes.is_empty() { continue 'conn; }
-                        break (socket, bytes);
-                    };
+                    let Some((mut socket, bytes)) = accept_request(&listener) else { return; };
                     saved.lock().push(String::from_utf8(bytes).unwrap());
-                    let reason = match reply.status { 200 => "OK", 204 => "No Content", 302 => "Found", 401 => "Unauthorized", 403 => "Forbidden", 404 => "Not Found", _ => "Error" };
-                    let mut response = format!("HTTP/1.1 {} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n", reply.status, reply.body.len());
-                    for (name, value) in reply.headers { response.push_str(&format!("{name}: {value}\r\n")); }
-                    response.push_str("\r\n");
-                    response.push_str(&reply.body);
-                    let _ = socket.write_all(response.as_bytes());
+                    send_reply(&mut socket, reply);
                 }
             });
             Self { url, requests, worker: Some(worker) }

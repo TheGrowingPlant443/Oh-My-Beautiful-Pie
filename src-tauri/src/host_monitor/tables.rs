@@ -310,30 +310,32 @@ fn proc_row(line: &str, family: Family, protocol: Protocol) -> Option<ProcSocket
     })
 }
 
+/// `Ok(None)` is end of input; an over-long line yields `Some(None)` after its remainder was discarded.
+#[cfg(any(target_os = "linux", test))]
+fn next_line(reader: &mut impl std::io::BufRead, buffer: &mut Vec<u8>) -> Result<Option<Option<()>>, String> {
+    use std::io::{BufRead, Read};
+    buffer.clear();
+    let read = reader.by_ref().take(PROC_LINE_LIMIT as u64 + 1).read_until(b'\n', buffer).map_err(|e| e.to_string())?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if buffer.last() == Some(&b'\n') || buffer.len() <= PROC_LINE_LIMIT {
+        return Ok(Some(Some(())));
+    }
+    // Discard the rest of an over-long line without keeping it.
+    loop {
+        let mut sink = Vec::new();
+        let read = reader.by_ref().take(PROC_LINE_LIMIT as u64).read_until(b'\n', &mut sink).map_err(|e| e.to_string())?;
+        if read == 0 || sink.last() == Some(&b'\n') {
+            break;
+        }
+    }
+    Ok(Some(None))
+}
+
 /// Reads one `/proc/net` table. The first line must be the column header; rows that do not decode are counted.
 #[cfg(any(target_os = "linux", test))]
 pub fn parse_proc_net(mut reader: impl std::io::BufRead, family: Family, protocol: Protocol) -> Result<ParsedProcTable, String> {
-    use std::io::{BufRead, Read};
-    // `Ok(None)` is end of input; an over-long line yields `Some(None)` after its remainder was discarded.
-    fn next_line(reader: &mut impl std::io::BufRead, buffer: &mut Vec<u8>) -> Result<Option<Option<()>>, String> {
-        buffer.clear();
-        let read = reader.by_ref().take(PROC_LINE_LIMIT as u64 + 1).read_until(b'\n', buffer).map_err(|e| e.to_string())?;
-        if read == 0 {
-            return Ok(None);
-        }
-        if buffer.last() == Some(&b'\n') || buffer.len() <= PROC_LINE_LIMIT {
-            return Ok(Some(Some(())));
-        }
-        // Discard the rest of an over-long line without keeping it.
-        loop {
-            let mut sink = Vec::new();
-            let read = reader.by_ref().take(PROC_LINE_LIMIT as u64).read_until(b'\n', &mut sink).map_err(|e| e.to_string())?;
-            if read == 0 || sink.last() == Some(&b'\n') {
-                break;
-            }
-        }
-        Ok(Some(None))
-    }
     let mut buffer = Vec::with_capacity(256);
     match next_line(&mut reader, &mut buffer)? {
         Some(Some(())) if buffer.trim_ascii_start().starts_with(b"sl") => {}

@@ -199,37 +199,62 @@ impl WorkspaceService {
         }
     }
     fn dispatch(&self, request: &str) -> Result<()> {
-        let mut job = self.job(request)?; if job.change.status.terminal() {return Ok(())}
+        let mut job = self.job(request)?;
+        if job.change.status.terminal() {return Ok(())}
         let metadata = self.registry.workspace_metadata(&job.change.coordinator_id)?;
         if let (Some(handoff),Some(service))=(&job.dependency,self.dependency_updates.get().and_then(Weak::upgrade)) {service.validate_workspace_handoff(handoff)?;}
         if metadata.lease != job.expected { return Err("Coordinator session changed; submit workspace request again".into()); }
-        if matches!(job.change.kind,WorkspaceKind::ManagerHandover|WorkspaceKind::ManagerReturn) { let source_id = job.change.source_instance_id.as_deref().ok_or("Missing source")?; let source = self.source(source_id)?; let context=self.prepare_ownership(&job.change.coordinator_id,source_id,&source.definition.input.project_path)?; job.change.target_folder=context.target;job.repositories=context.repositories; self.state.lock().jobs.insert(request.into(),job.clone()); self.publish(); }
-        if !metadata.running {
-            self.offline(&job)?;
-            if self.state.lock().closing {
-                if let (Some(handoff),Some(service))=(&job.dependency,self.dependency_updates.get().and_then(Weak::upgrade)) {
-                    if let Err(error)=service.fail_workspace_handoff(handoff,"Application closed before Manager startup") {eprintln!("Persisting cancelled handoff: {error}");}
-                }
-                self.terminal(request,WorkspaceStatus::Applied,None);
-                return Ok(());
-            }
-            if matches!(job.change.kind,WorkspaceKind::ManagerHandover|WorkspaceKind::ManagerReturn|WorkspaceKind::DependencyPlan) {
-                self.registry.start(&job.change.coordinator_id,Origin::Human)?;
-                self.hub.wait_ready(&job.change.coordinator_id)?;
-                let resulting = self.registry.workspace_metadata(&job.change.coordinator_id)?.lease;
-                self.rebase(&job, &resulting);
-                if job.dependency.is_some() {
-                    job.expected = resulting;
-                    job.source = None;
-                    job.change.status=WorkspaceStatus::Pending;
-                    self.state.lock().jobs.insert(request.into(),job.clone());
-                    self.hub.workspace_control(&job.change.coordinator_id,&job.expected,"workspace_change",json!({"requestId":request,"targetFolder":job.change.target_folder,"kind":job.change.kind,"repositoryFolders":job.repositories}))?;
-                    return Ok(());
-                }
-            } else { let resulting=self.registry.workspace_metadata(&job.change.coordinator_id)?.lease; self.rebase(&job,&resulting); }
-            self.terminal(request, WorkspaceStatus::Applied,None);return Ok(())
+        if matches!(job.change.kind,WorkspaceKind::ManagerHandover|WorkspaceKind::ManagerReturn) { self.refresh_ownership(request, &mut job)?; }
+        if !metadata.running { return self.dispatch_offline(request, job); }
+        self.send_workspace_change(request, &job)
+    }
+    fn refresh_ownership(&self, request: &str, job: &mut Job) -> Result<()> {
+        let source_id = job.change.source_instance_id.as_deref().ok_or("Missing source")?;
+        let source = self.source(source_id)?;
+        let context=self.prepare_ownership(&job.change.coordinator_id,source_id,&source.definition.input.project_path)?;
+        job.change.target_folder=context.target;job.repositories=context.repositories;
+        self.state.lock().jobs.insert(request.into(),job.clone());
+        self.publish();
+        Ok(())
+    }
+    fn send_workspace_change(&self, request: &str, job: &Job) -> Result<()> {
+        self.hub.workspace_control(&job.change.coordinator_id,&job.expected,"workspace_change",json!({"requestId":request,"targetFolder":job.change.target_folder,"kind":job.change.kind,"repositoryFolders":job.repositories}))?;
+        Ok(())
+    }
+    fn dispatch_offline(&self, request: &str, mut job: Job) -> Result<()> {
+        self.offline(&job)?;
+        if self.state.lock().closing {
+            self.cancel_closed_handoff(&job);
+            self.terminal(request,WorkspaceStatus::Applied,None);
+            return Ok(());
         }
-        self.hub.workspace_control(&job.change.coordinator_id,&job.expected,"workspace_change",json!({"requestId":request,"targetFolder":job.change.target_folder,"kind":job.change.kind,"repositoryFolders":job.repositories}))?; Ok(())
+        if self.restart_coordinator(request, &mut job)? { return Ok(()); }
+        self.terminal(request, WorkspaceStatus::Applied,None);
+        Ok(())
+    }
+    fn cancel_closed_handoff(&self, job: &Job) {
+        if let (Some(handoff),Some(service))=(&job.dependency,self.dependency_updates.get().and_then(Weak::upgrade)) {
+            if let Err(error)=service.fail_workspace_handoff(handoff,"Application closed before Manager startup") {eprintln!("Persisting cancelled handoff: {error}");}
+        }
+    }
+    /// Rebases queued requests onto the offline-applied lease; true when a dependency handoff was re-sent and still awaits the native ready.
+    fn restart_coordinator(&self, request: &str, job: &mut Job) -> Result<bool> {
+        if !matches!(job.change.kind,WorkspaceKind::ManagerHandover|WorkspaceKind::ManagerReturn|WorkspaceKind::DependencyPlan) {
+            let resulting=self.registry.workspace_metadata(&job.change.coordinator_id)?.lease;
+            self.rebase(job,&resulting);
+            return Ok(false);
+        }
+        self.registry.start(&job.change.coordinator_id,Origin::Human)?;
+        self.hub.wait_ready(&job.change.coordinator_id)?;
+        let resulting = self.registry.workspace_metadata(&job.change.coordinator_id)?.lease;
+        self.rebase(job, &resulting);
+        if job.dependency.is_none() { return Ok(false); }
+        job.expected = resulting;
+        job.source = None;
+        job.change.status=WorkspaceStatus::Pending;
+        self.state.lock().jobs.insert(request.into(),job.clone());
+        self.send_workspace_change(request, job)?;
+        Ok(true)
     }
     fn offline(&self, job:&Job)->Result<()> {
         {

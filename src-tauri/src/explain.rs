@@ -93,30 +93,35 @@ fn instruction(kind: &str) -> &'static str {
     }
 }
 
+/// Consumes the rest of an escape sequence whose ESC byte was just read.
+fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.next() {
+        Some('[') => {
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+        Some(']') => {
+            while let Some(next) = chars.next() {
+                if next == '\u{7}' || (next == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
+        if c == '\u{1b}' {
+            skip_escape(&mut chars);
+        } else {
             out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('[') => {
-                for next in chars.by_ref() {
-                    if ('@'..='~').contains(&next) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                while let Some(next) = chars.next() {
-                    if next == '\u{7}' || (next == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
-                        break;
-                    }
-                }
-            }
-            _ => {}
         }
     }
     out

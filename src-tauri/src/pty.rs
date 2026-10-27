@@ -90,24 +90,43 @@ pub struct Pty {
 
 impl Pty {
     pub fn spawn(definition: &Definition, bridge: &BridgeLaunch) -> Result<Self, String> {
-        let input = &definition.input;
         let app_root = bridge.extension_path.parent().ok_or("invalid bridge directory")?;
+        let local = Self::local_setup(definition, bridge, app_root)?;
+        let local_enabled = local["local"] == true;
+
+        let mut cmd = CommandBuilder::new(crate::toolchain::omp_program());
+        cmd.cwd(&definition.input.project_path);
+        Self::add_session_args(&mut cmd, definition, &local, local_enabled)?;
+        Self::add_extensions(&mut cmd, definition, bridge, app_root, local_enabled)?;
+        Self::add_bridge_env(&mut cmd, definition, bridge);
+        Self::start(cmd)
+    }
+    fn local_setup(
+        definition: &Definition,
+        bridge: &BridgeLaunch,
+        app_root: &std::path::Path,
+    ) -> Result<serde_json::Value, String> {
+        let input = &definition.input;
         // Read-only helpers keep their restricted tool surface, regardless of their model.
         let has_local_assets = definition.helper.is_none()
             && ["AGENTS.md", "RULES.md", "SKILLS.md", "agent-instructions", "rules", "skills", "tools", "extensions"]
                 .iter().any(|name| bridge.local_ai_setup_dir.join(name).exists());
-        let local = if has_local_assets {
-            crate::config::native_request(app_root, &bridge.home_dir, serde_json::json!({
-                "action": "local_setup", "cwd": input.project_path, "profile": input.profile,
-                "configFiles": input.configs, "model": input.model,
-                "sessionPath": definition.session_path.as_ref().filter(|p| p.is_file())
-            }))?
-        } else { serde_json::json!({"local": false}) };
-        let local_enabled = local["local"] == true;
-
-        let program = crate::toolchain::omp_program();
-        let mut cmd = CommandBuilder::new(program);
-        cmd.cwd(&input.project_path);
+        if !has_local_assets {
+            return Ok(serde_json::json!({"local": false}));
+        }
+        crate::config::native_request(app_root, &bridge.home_dir, serde_json::json!({
+            "action": "local_setup", "cwd": input.project_path, "profile": input.profile,
+            "configFiles": input.configs, "model": input.model,
+            "sessionPath": definition.session_path.as_ref().filter(|p| p.is_file())
+        }))
+    }
+    fn add_session_args(
+        cmd: &mut CommandBuilder,
+        definition: &Definition,
+        local: &serde_json::Value,
+        local_enabled: bool,
+    ) -> Result<(), String> {
+        let input = &definition.input;
         cmd.args(["--cwd", &input.project_path]);
         cmd.args([
             "--profile",
@@ -140,10 +159,18 @@ impl Pty {
             cmd.arg(path);
         }
         // A helper agent (Code diff / Git tree) has no built-in tools at all; its tools are the bridge's repo_inspect and code_quality_report.
-        let helper = definition.helper.as_ref();
-        if helper.is_some() {
+        if definition.helper.is_some() {
             cmd.arg("--no-tools");
         }
+        Ok(())
+    }
+    fn add_extensions(
+        cmd: &mut CommandBuilder,
+        definition: &Definition,
+        bridge: &BridgeLaunch,
+        app_root: &std::path::Path,
+        local_enabled: bool,
+    ) -> Result<(), String> {
         cmd.env("OMP_MANAGER_LOCAL_AI_SETUP_DIR", &bridge.local_ai_setup_dir);
         cmd.env("OMP_MANAGER_LOCAL_AI_SETUP_MODE", if local_enabled { "local" } else { "ordinary" });
         cmd.arg("--extension");
@@ -151,32 +178,35 @@ impl Pty {
         if local_enabled {
             cmd.arg("--extension");
             cmd.arg(&bridge.local_ai_setup_dir);
-            for package in crate::setup::scoped_plugin_paths(&bridge.local_ai_setup_dir, "Local AI models")? {
-                cmd.arg("--extension");
-                cmd.arg(package);
-            }
+            Self::add_scoped_packages(cmd, &bridge.local_ai_setup_dir, "Local AI models")?;
         }
         cmd.arg("--extension");
         cmd.arg(&bridge.extension_path);
         cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_DIR");
         cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_ROLE");
         let private_setup = match definition.kind {
-            InstanceKind::Manager => Some((&bridge.manager_setup_dir, "manager")),
-            InstanceKind::Architect => Some((&bridge.architect_setup_dir, "architect")),
+            InstanceKind::Manager => Some((&bridge.manager_setup_dir, "manager", "Manager")),
+            InstanceKind::Architect => Some((&bridge.architect_setup_dir, "architect", "Architect")),
             _ => None,
         };
-        if let Some((root, role)) = private_setup {
+        let Some((root, role, label)) = private_setup else {
+            return Ok(());
+        };
+        cmd.arg("--extension");
+        cmd.arg(root);
+        cmd.env("OMP_MANAGER_PRIVATE_SETUP_DIR", root);
+        cmd.env("OMP_MANAGER_PRIVATE_SETUP_ROLE", role);
+        // Private packages remain confined to their coordinator's directory.
+        Self::add_scoped_packages(cmd, root, label)
+    }
+    fn add_scoped_packages(cmd: &mut CommandBuilder, root: &std::path::Path, label: &str) -> Result<(), String> {
+        for package in crate::setup::scoped_plugin_paths(root, label)? {
             cmd.arg("--extension");
-            cmd.arg(root);
-            cmd.env("OMP_MANAGER_PRIVATE_SETUP_DIR", root);
-            cmd.env("OMP_MANAGER_PRIVATE_SETUP_ROLE", role);
-            // Private packages remain confined to their coordinator's directory.
-            let label = if definition.kind == InstanceKind::Manager { "Manager" } else { "Architect" };
-            for package in crate::setup::scoped_plugin_paths(root, label)? {
-                cmd.arg("--extension");
-                cmd.arg(package);
-            }
+            cmd.arg(package);
         }
+        Ok(())
+    }
+    fn add_bridge_env(cmd: &mut CommandBuilder, definition: &Definition, bridge: &BridgeLaunch) {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("WT_SESSION", &definition.id);
@@ -199,7 +229,7 @@ impl Pty {
         if definition.kind == InstanceKind::Architect {
             cmd.env("OMP_MANAGER_ARCHITECT_DIR", &bridge.architect_dir);
         }
-        if let Some(link) = helper {
+        if let Some(link) = definition.helper.as_ref() {
             cmd.env("OMP_MANAGER_HELPER_REPO", &link.repo);
         } else {
             cmd.env("OMP_MANAGER_BROWSER_REQUIRED", "1");
@@ -215,7 +245,6 @@ impl Pty {
         cmd.env("PI_BROWSER_RELAY", "0");
         cmd.env("PI_BROWSER_TERN", "0");
         cmd.env("PI_BROWSER_CMUX", "0");
-        Self::start(cmd)
     }
     /// The user's own shell: no OMP arguments, no bridge credentials, nothing from the manager environment.
     pub fn spawn_shell(cwd: &str) -> Result<Self, String> {

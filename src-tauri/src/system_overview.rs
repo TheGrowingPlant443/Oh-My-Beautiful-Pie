@@ -410,6 +410,10 @@ fn assigns_secret(lower: &str) -> bool {
 pub(crate) fn sensitive(value: &str) -> bool {
     if value.contains("://") || value.contains("-----BEGIN ") { return true; }
     let lower = value.to_ascii_lowercase();
+    has_token_prefix(value, &lower) || has_aws_key(value) || assigns_secret(&lower)
+}
+
+fn has_token_prefix(value: &str, lower: &str) -> bool {
     for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "github_pat_", "sk-"] {
         for (at, _) in lower.match_indices(prefix) {
             if lower[..at].chars().next_back().is_some_and(|before| before.is_alphanumeric()) { continue; }
@@ -417,11 +421,12 @@ pub(crate) fn sensitive(value: &str) -> bool {
             if tail.chars().take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')).count() >= 20 { return true; }
         }
     }
+    false
+}
+
+fn has_aws_key(value: &str) -> bool {
     let bytes = value.as_bytes();
-    for at in 0..bytes.len().saturating_sub(19) {
-        if bytes[at..].starts_with(b"AKIA") && bytes[at + 4..at + 20].iter().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()) { return true; }
-    }
-    assigns_secret(&lower)
+    (0..bytes.len().saturating_sub(19)).any(|at| bytes[at..].starts_with(b"AKIA") && bytes[at + 4..at + 20].iter().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()))
 }
 
 fn check_text(what: &str, value: &str, maximum: usize, required: bool) -> Result<()> {
@@ -460,25 +465,33 @@ fn check_evidence<'a>(evidence: &'a [EvidenceRef], snapshot: Option<&Snapshot>) 
     for record in evidence {
         check_id("Evidence", &record.id)?;
         if !ids.insert(record.id.as_str()) { return Err(format!("Duplicate evidence id '{}'", record.id)); }
-        let mut parts: Vec<&str> = record.path.split('/').collect();
-        let leaf = parts.pop().unwrap_or_default();
-        if !safe_relative_path(&record.path) || record.path.contains('\\') || parts.iter().any(|part| evidence_excluded(part, true)) || evidence_excluded(leaf, false) {
-            return Err(format!("Evidence '{}' has an invalid or excluded path", record.id));
-        }
-        if !sha256_hex(&record.content_hash) { return Err(format!("Evidence '{}' content hash must be 64 lowercase hex characters", record.id)); }
-        if record.line_start == 0 || record.line_end < record.line_start || record.line_end > MAX_SAFE_INTEGER {
-            return Err(format!("Evidence '{}' has an invalid line window", record.id));
-        }
-        if let Some(snapshot) = snapshot {
-            let position = *snapshot.by_path.get(&record.path).ok_or_else(|| format!("Evidence '{}' cites '{}', which is not an inventoried file of this snapshot", record.id, record.path))?;
-            if snapshot.index.files[position].sha256.to_lowercase() != record.content_hash {
-                return Err(format!("Evidence '{}' content hash does not match the indexed file '{}'", record.id, record.path));
-            }
-            let lines = snapshot.line_count(&record.path).map_err(|error| format!("Evidence '{}': {error}", record.id))?;
-            if record.line_end > lines { return Err(format!("Evidence '{}' lines {}-{} exceed the {lines} lines of '{}'", record.id, record.line_start, record.line_end, record.path)); }
-        }
+        check_evidence_fields(record)?;
+        if let Some(snapshot) = snapshot { check_evidence_in_snapshot(record, snapshot)?; }
     }
     Ok(ids)
+}
+
+fn check_evidence_fields(record: &EvidenceRef) -> Result<()> {
+    let mut parts: Vec<&str> = record.path.split('/').collect();
+    let leaf = parts.pop().unwrap_or_default();
+    if !safe_relative_path(&record.path) || record.path.contains('\\') || parts.iter().any(|part| evidence_excluded(part, true)) || evidence_excluded(leaf, false) {
+        return Err(format!("Evidence '{}' has an invalid or excluded path", record.id));
+    }
+    if !sha256_hex(&record.content_hash) { return Err(format!("Evidence '{}' content hash must be 64 lowercase hex characters", record.id)); }
+    if record.line_start == 0 || record.line_end < record.line_start || record.line_end > MAX_SAFE_INTEGER {
+        return Err(format!("Evidence '{}' has an invalid line window", record.id));
+    }
+    Ok(())
+}
+
+fn check_evidence_in_snapshot(record: &EvidenceRef, snapshot: &Snapshot) -> Result<()> {
+    let position = *snapshot.by_path.get(&record.path).ok_or_else(|| format!("Evidence '{}' cites '{}', which is not an inventoried file of this snapshot", record.id, record.path))?;
+    if snapshot.index.files[position].sha256.to_lowercase() != record.content_hash {
+        return Err(format!("Evidence '{}' content hash does not match the indexed file '{}'", record.id, record.path));
+    }
+    let lines = snapshot.line_count(&record.path).map_err(|error| format!("Evidence '{}': {error}", record.id))?;
+    if record.line_end > lines { return Err(format!("Evidence '{}' lines {}-{} exceed the {lines} lines of '{}'", record.id, record.line_start, record.line_end, record.path)); }
+    Ok(())
 }
 
 /// Follows every parent chain; a chain that revisits a node is a containment cycle.
@@ -501,6 +514,16 @@ fn check_containment(ids: &[(&str, Option<&str>)]) -> Result<()> {
 // ---- system overview validation ----------------------------------------------------------------------------------
 
 pub fn validate_system(payload: SystemOverviewPayload, expected_snapshot: &str, snapshot: Option<&Snapshot>) -> Result<SystemOverviewPayload> {
+    check_system_header(&payload, expected_snapshot)?;
+    let evidence_ids = check_evidence(&payload.evidence, snapshot)?;
+    let node_ids = check_system_nodes(&payload.nodes, &evidence_ids)?;
+    check_containment(&payload.nodes.iter().map(|node| (node.id.as_str(), node.parent_id.as_deref())).collect::<Vec<_>>())?;
+    check_system_edges(&payload.edges, &node_ids, &evidence_ids, snapshot)?;
+    check_coverage(&payload.coverage, &evidence_ids)?;
+    Ok(payload)
+}
+
+fn check_system_header(payload: &SystemOverviewPayload, expected_snapshot: &str) -> Result<()> {
     if payload.schema_version != SCHEMA { return Err("Unsupported system overview schema version".into()); }
     if payload.snapshot_id != expected_snapshot { return Err("The system overview was produced for a different source snapshot".into()); }
     if payload.nodes.len() > MAX_NODES { return Err(format!("At most {MAX_NODES} nodes are allowed")); }
@@ -508,37 +531,39 @@ pub fn validate_system(payload: SystemOverviewPayload, expected_snapshot: &str, 
     if payload.coverage.len() > MAX_COVERAGE { return Err(format!("At most {MAX_COVERAGE} coverage entries are allowed")); }
     check_list("Limitation", &payload.limitations, MAX_LIMITATIONS, NOTE_LIMIT)?;
     if payload.nodes.is_empty() && payload.limitations.is_empty() { return Err("A system overview without nodes must explain why in limitations".into()); }
-    let evidence_ids = check_evidence(&payload.evidence, snapshot)?;
+    Ok(())
+}
 
+fn check_system_nodes<'a>(nodes: &'a [SystemNode], evidence_ids: &HashSet<&str>) -> Result<HashSet<&'a str>> {
     let mut node_ids: HashSet<&str> = HashSet::new();
-    for node in &payload.nodes {
+    for node in nodes {
         check_id("Node", &node.id)?;
         if !node_ids.insert(node.id.as_str()) { return Err(format!("Duplicate node id '{}'", node.id)); }
         check_text(&format!("Node '{}' label", node.id), &node.label, LABEL_LIMIT, true)?;
         check_text(&format!("Node '{}' description", node.id), &node.description, NOTE_LIMIT, false)?;
-        check_refs(&format!("Node '{}'", node.id), &node.evidence_ids, &evidence_ids)?;
+        check_refs(&format!("Node '{}'", node.id), &node.evidence_ids, evidence_ids)?;
     }
-    for node in &payload.nodes {
-        if let Some(parent) = &node.parent_id {
-            if parent == &node.id { return Err(format!("Node '{}' cannot contain itself", node.id)); }
-            if !node_ids.contains(parent.as_str()) { return Err(format!("Node '{}' has unknown parent '{parent}'", node.id)); }
-        }
+    for node in nodes {
+        let Some(parent) = &node.parent_id else { continue; };
+        if parent == &node.id { return Err(format!("Node '{}' cannot contain itself", node.id)); }
+        if !node_ids.contains(parent.as_str()) { return Err(format!("Node '{}' has unknown parent '{parent}'", node.id)); }
     }
-    check_containment(&payload.nodes.iter().map(|node| (node.id.as_str(), node.parent_id.as_deref())).collect::<Vec<_>>())?;
+    Ok(node_ids)
+}
 
+fn check_system_edges(edges: &[SystemEdge], node_ids: &HashSet<&str>, evidence_ids: &HashSet<&str>, snapshot: Option<&Snapshot>) -> Result<()> {
     let mut edge_ids: HashSet<&str> = HashSet::new();
-    for edge in &payload.edges {
+    for edge in edges {
         check_id("Edge", &edge.id)?;
         if !edge_ids.insert(edge.id.as_str()) { return Err(format!("Duplicate edge id '{}'", edge.id)); }
         for (side, end) in [("source", &edge.source_id), ("target", &edge.target_id)] {
             if !node_ids.contains(end.as_str()) { return Err(format!("Edge '{}' has a dangling {side} '{end}'", edge.id)); }
         }
         check_text(&format!("Edge '{}' label", edge.id), &edge.label, LABEL_LIMIT, false)?;
-        check_refs(&format!("Edge '{}'", edge.id), &edge.evidence_ids, &evidence_ids)?;
+        check_refs(&format!("Edge '{}'", edge.id), &edge.evidence_ids, evidence_ids)?;
         check_certainty(edge, snapshot)?;
     }
-    check_coverage(&payload.coverage, &evidence_ids)?;
-    Ok(payload)
+    Ok(())
 }
 
 fn check_coverage(coverage: &[CoverageEntry], evidence_ids: &HashSet<&str>) -> Result<()> {
@@ -597,23 +622,32 @@ const PATH_ROOTS: [&str; 8] = ["src/", "lib/", "app/", "docs/", "test/", "tests/
 pub(crate) fn technical_marker(value: &str) -> Option<&'static str> {
     if value.contains('`') { return Some("inline code"); }
     if ["::", "=>", "->", "()"].iter().any(|syntax| value.contains(syntax)) { return Some("code syntax"); }
-    for raw in value.split_whitespace() {
+    value.split_whitespace().find_map(|raw| {
         let token = raw.trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '[' | ']' | '"' | '\''));
-        if token.len() < 2 { continue; }
-        let bytes = token.as_bytes();
-        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/') { return Some("a file path"); }
-        if token.contains('/') || token.contains('\\') {
-            let rooted = token.starts_with(['/', '\\']) || token.starts_with("./") || token.starts_with("../") || token.starts_with("~/") || PATH_ROOTS.iter().any(|root| token.starts_with(root));
-            let last = token.rsplit(['/', '\\']).next().unwrap_or_default();
-            let extension = last.rsplit_once('.').map(|(_, extension)| extension).is_some_and(|extension| (1..=5).contains(&extension.len()) && extension.chars().all(|ch| ch.is_ascii_alphanumeric()) && !extension.chars().all(|ch| ch.is_ascii_digit()));
-            if rooted || extension { return Some("a file path"); }
-        } else if let Some((stem, extension)) = token.rsplit_once('.') {
-            if !stem.is_empty() && SOURCE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) { return Some("a source file name"); }
-        }
-        let underscore = token.char_indices().any(|(at, ch)| ch == '_' && token[..at].chars().next_back().is_some_and(char::is_alphanumeric) && token[at + 1..].chars().next().is_some_and(char::is_alphanumeric));
-        if underscore { return Some("a code identifier"); }
+        if token.len() < 2 { None } else { token_marker(token) }
+    })
+}
+
+fn token_marker(token: &str) -> Option<&'static str> {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/') { return Some("a file path"); }
+    if token.contains('/') || token.contains('\\') {
+        if slashed_token_is_path(token) { return Some("a file path"); }
+    } else if let Some((stem, extension)) = token.rsplit_once('.') {
+        if !stem.is_empty() && SOURCE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) { return Some("a source file name"); }
     }
-    None
+    has_inner_underscore(token).then_some("a code identifier")
+}
+
+fn slashed_token_is_path(token: &str) -> bool {
+    let rooted = token.starts_with(['/', '\\']) || token.starts_with("./") || token.starts_with("../") || token.starts_with("~/") || PATH_ROOTS.iter().any(|root| token.starts_with(root));
+    let last = token.rsplit(['/', '\\']).next().unwrap_or_default();
+    let extension = last.rsplit_once('.').map(|(_, extension)| extension).is_some_and(|extension| (1..=5).contains(&extension.len()) && extension.chars().all(|ch| ch.is_ascii_alphanumeric()) && !extension.chars().all(|ch| ch.is_ascii_digit()));
+    rooted || extension
+}
+
+fn has_inner_underscore(token: &str) -> bool {
+    token.char_indices().any(|(at, ch)| ch == '_' && token[..at].chars().next_back().is_some_and(char::is_alphanumeric) && token[at + 1..].chars().next().is_some_and(char::is_alphanumeric))
 }
 
 fn business_text(what: &str, value: &str, maximum: usize, required: bool) -> Result<()> {
@@ -625,6 +659,17 @@ fn business_text(what: &str, value: &str, maximum: usize, required: bool) -> Res
 }
 
 pub fn validate_helicopter(payload: HelicopterPayload, expected_snapshot: &str, snapshot: Option<&Snapshot>) -> Result<HelicopterPayload> {
+    check_helicopter_header(&payload, expected_snapshot)?;
+    let evidence_ids = check_evidence(&payload.evidence, snapshot)?;
+    let kinds = check_helicopter_nodes(&payload.nodes, &evidence_ids)?;
+    check_containment(&payload.nodes.iter().map(|node| (node.id.as_str(), node.parent_id.as_deref())).collect::<Vec<_>>())?;
+    check_helicopter_edges(&payload.edges, &kinds, &evidence_ids)?;
+    check_capabilities(&payload.capabilities, &kinds, &evidence_ids)?;
+    check_coverage(&payload.coverage, &evidence_ids)?;
+    Ok(payload)
+}
+
+fn check_helicopter_header(payload: &HelicopterPayload, expected_snapshot: &str) -> Result<()> {
     if payload.schema_version != SCHEMA { return Err("Unsupported helicopter schema version".into()); }
     if payload.snapshot_id != expected_snapshot { return Err("The helicopter view was produced for a different source snapshot".into()); }
     if payload.nodes.len() > MAX_NODES { return Err(format!("At most {MAX_NODES} nodes are allowed")); }
@@ -635,20 +680,30 @@ pub fn validate_helicopter(payload: HelicopterPayload, expected_snapshot: &str, 
     check_list("Limitation", &payload.limitations, MAX_LIMITATIONS, NOTE_LIMIT)?;
     if payload.nodes.is_empty() && payload.limitations.is_empty() { return Err("A helicopter view without nodes must explain why in limitations".into()); }
     if !payload.nodes.is_empty() && payload.capabilities.is_empty() { return Err("A helicopter view with nodes must list the business capabilities it found".into()); }
-    let evidence_ids = check_evidence(&payload.evidence, snapshot)?;
+    Ok(())
+}
 
+fn check_helicopter_nodes<'a>(nodes: &'a [HelicopterNode], evidence_ids: &HashSet<&str>) -> Result<HashMap<&'a str, HelicopterKind>> {
     let mut kinds: HashMap<&str, HelicopterKind> = HashMap::new();
-    for node in &payload.nodes {
-        check_id("Node", &node.id)?;
-        if kinds.insert(node.id.as_str(), node.kind).is_some() { return Err(format!("Duplicate node id '{}'", node.id)); }
-        business_text(&format!("Node '{}' label", node.id), &node.label, LABEL_LIMIT, true)?;
-        business_text(&format!("Node '{}' description", node.id), &node.description, NOTE_LIMIT, false)?;
-        check_refs(&format!("Node '{}'", node.id), &node.evidence_ids, &evidence_ids)?;
-        if node.kind != HelicopterKind::BusinessGroup && node.evidence_ids.is_empty() {
-            return Err(format!("Node '{}' cites no evidence; only a journey grouping may stand without it, so name what is unclear as limitations instead of inventing it", node.id));
-        }
+    for node in nodes { check_helicopter_node(node, evidence_ids, &mut kinds)?; }
+    check_helicopter_parents(nodes, &kinds)?;
+    Ok(kinds)
+}
+
+fn check_helicopter_node<'a>(node: &'a HelicopterNode, evidence_ids: &HashSet<&str>, kinds: &mut HashMap<&'a str, HelicopterKind>) -> Result<()> {
+    check_id("Node", &node.id)?;
+    if kinds.insert(node.id.as_str(), node.kind).is_some() { return Err(format!("Duplicate node id '{}'", node.id)); }
+    business_text(&format!("Node '{}' label", node.id), &node.label, LABEL_LIMIT, true)?;
+    business_text(&format!("Node '{}' description", node.id), &node.description, NOTE_LIMIT, false)?;
+    check_refs(&format!("Node '{}'", node.id), &node.evidence_ids, evidence_ids)?;
+    if node.kind != HelicopterKind::BusinessGroup && node.evidence_ids.is_empty() {
+        return Err(format!("Node '{}' cites no evidence; only a journey grouping may stand without it, so name what is unclear as limitations instead of inventing it", node.id));
     }
-    for node in &payload.nodes {
+    Ok(())
+}
+
+fn check_helicopter_parents(nodes: &[HelicopterNode], kinds: &HashMap<&str, HelicopterKind>) -> Result<()> {
+    for node in nodes {
         let Some(parent) = &node.parent_id else { continue; };
         if parent == &node.id { return Err(format!("Node '{}' cannot contain itself", node.id)); }
         match kinds.get(parent.as_str()) {
@@ -657,45 +712,55 @@ pub fn validate_helicopter(payload: HelicopterPayload, expected_snapshot: &str, 
             Some(_) => return Err(format!("Node '{}' sits inside '{parent}', which is not a journey grouping; only a businessGroup contains other nodes", node.id)),
         }
     }
-    check_containment(&payload.nodes.iter().map(|node| (node.id.as_str(), node.parent_id.as_deref())).collect::<Vec<_>>())?;
+    Ok(())
+}
 
+fn check_helicopter_edges(edges: &[HelicopterEdge], kinds: &HashMap<&str, HelicopterKind>, evidence_ids: &HashSet<&str>) -> Result<()> {
     let mut edge_ids: HashSet<&str> = HashSet::new();
-    for edge in &payload.edges {
-        check_id("Edge", &edge.id)?;
-        if !edge_ids.insert(edge.id.as_str()) { return Err(format!("Duplicate edge id '{}'", edge.id)); }
-        for (side, end) in [("source", &edge.source_id), ("target", &edge.target_id)] {
-            match kinds.get(end.as_str()) {
-                None => return Err(format!("Edge '{}' has a dangling {side} '{end}'", edge.id)),
-                Some(HelicopterKind::BusinessGroup) => return Err(format!("Edge '{}' has a journey grouping as its {side}; a flow connects steps, containment is never a flow", edge.id)),
-                Some(_) => (),
-            }
-        }
-        business_text(&format!("Edge '{}' label", edge.id), &edge.label, LABEL_LIMIT, false)?;
-        check_refs(&format!("Edge '{}'", edge.id), &edge.evidence_ids, &evidence_ids)?;
-        if edge.certainty == HelicopterCertainty::Inferred && edge.evidence_ids.is_empty() {
-            return Err(format!("Edge '{}' is inferred but cites no evidence; mark it unknown (Needs clarification) instead", edge.id));
-        }
-    }
+    for edge in edges { check_helicopter_edge(edge, kinds, evidence_ids, &mut edge_ids)?; }
+    Ok(())
+}
 
-    let mut capability_ids: HashSet<&str> = HashSet::new();
-    for capability in &payload.capabilities {
-        check_id("Capability", &capability.id)?;
-        if !capability_ids.insert(capability.id.as_str()) { return Err(format!("Duplicate capability id '{}'", capability.id)); }
-        business_text(&format!("Capability '{}' label", capability.id), &capability.label, LABEL_LIMIT, true)?;
-        business_text(&format!("Capability '{}' description", capability.id), &capability.description, NOTE_LIMIT, false)?;
-        if capability.node_ids.is_empty() || capability.node_ids.len() > MAX_CAPABILITY_NODES {
-            return Err(format!("Capability '{}' must name between 1 and {MAX_CAPABILITY_NODES} nodes", capability.id));
+fn check_helicopter_edge<'a>(edge: &'a HelicopterEdge, kinds: &HashMap<&str, HelicopterKind>, evidence_ids: &HashSet<&str>, edge_ids: &mut HashSet<&'a str>) -> Result<()> {
+    check_id("Edge", &edge.id)?;
+    if !edge_ids.insert(edge.id.as_str()) { return Err(format!("Duplicate edge id '{}'", edge.id)); }
+    for (side, end) in [("source", &edge.source_id), ("target", &edge.target_id)] {
+        match kinds.get(end.as_str()) {
+            None => return Err(format!("Edge '{}' has a dangling {side} '{end}'", edge.id)),
+            Some(HelicopterKind::BusinessGroup) => return Err(format!("Edge '{}' has a journey grouping as its {side}; a flow connects steps, containment is never a flow", edge.id)),
+            Some(_) => (),
         }
-        let mut named: HashSet<&str> = HashSet::new();
-        for id in &capability.node_ids {
-            if !kinds.contains_key(id.as_str()) { return Err(format!("Capability '{}' names unknown node '{id}'", capability.id)); }
-            if !named.insert(id.as_str()) { return Err(format!("Capability '{}' names node '{id}' twice", capability.id)); }
-        }
-        check_refs(&format!("Capability '{}'", capability.id), &capability.evidence_ids, &evidence_ids)?;
-        if capability.evidence_ids.is_empty() { return Err(format!("Capability '{}' cites no evidence; do not invent product capabilities", capability.id)); }
     }
-    check_coverage(&payload.coverage, &evidence_ids)?;
-    Ok(payload)
+    business_text(&format!("Edge '{}' label", edge.id), &edge.label, LABEL_LIMIT, false)?;
+    check_refs(&format!("Edge '{}'", edge.id), &edge.evidence_ids, evidence_ids)?;
+    if edge.certainty == HelicopterCertainty::Inferred && edge.evidence_ids.is_empty() {
+        return Err(format!("Edge '{}' is inferred but cites no evidence; mark it unknown (Needs clarification) instead", edge.id));
+    }
+    Ok(())
+}
+
+fn check_capabilities(capabilities: &[HelicopterCapability], kinds: &HashMap<&str, HelicopterKind>, evidence_ids: &HashSet<&str>) -> Result<()> {
+    let mut capability_ids: HashSet<&str> = HashSet::new();
+    for capability in capabilities { check_capability(capability, kinds, evidence_ids, &mut capability_ids)?; }
+    Ok(())
+}
+
+fn check_capability<'a>(capability: &'a HelicopterCapability, kinds: &HashMap<&str, HelicopterKind>, evidence_ids: &HashSet<&str>, capability_ids: &mut HashSet<&'a str>) -> Result<()> {
+    check_id("Capability", &capability.id)?;
+    if !capability_ids.insert(capability.id.as_str()) { return Err(format!("Duplicate capability id '{}'", capability.id)); }
+    business_text(&format!("Capability '{}' label", capability.id), &capability.label, LABEL_LIMIT, true)?;
+    business_text(&format!("Capability '{}' description", capability.id), &capability.description, NOTE_LIMIT, false)?;
+    if capability.node_ids.is_empty() || capability.node_ids.len() > MAX_CAPABILITY_NODES {
+        return Err(format!("Capability '{}' must name between 1 and {MAX_CAPABILITY_NODES} nodes", capability.id));
+    }
+    let mut named: HashSet<&str> = HashSet::new();
+    for id in &capability.node_ids {
+        if !kinds.contains_key(id.as_str()) { return Err(format!("Capability '{}' names unknown node '{id}'", capability.id)); }
+        if !named.insert(id.as_str()) { return Err(format!("Capability '{}' names node '{id}' twice", capability.id)); }
+    }
+    check_refs(&format!("Capability '{}'", capability.id), &capability.evidence_ids, evidence_ids)?;
+    if capability.evidence_ids.is_empty() { return Err(format!("Capability '{}' cites no evidence; do not invent product capabilities", capability.id)); }
+    Ok(())
 }
 
 // ---- structure validation ----------------------------------------------------------------------------------------
@@ -737,6 +802,23 @@ fn check_unique_destinations<'a>(what: &str, paths: impl Iterator<Item = &'a str
 
 pub fn validate_structure(payload: StructurePayload, context: &StructureContext, snapshot: Option<&Snapshot>) -> Result<StructurePayload> {
     let proposed = context.kind == StructureKind::Proposed;
+    check_structure_identity(&payload, context)?;
+    check_structure_limits(&payload, proposed)?;
+    let evidence_ids = check_evidence(&payload.evidence, snapshot)?;
+    let entry_ids = check_entries(&payload.entries, proposed, snapshot, &evidence_ids)?;
+    check_entry_parents(&payload.entries, &entry_ids)?;
+    check_containment(&payload.entries.iter().map(|entry| (entry.id.as_str(), entry.parent_id.as_deref())).collect::<Vec<_>>())?;
+    if proposed {
+        check_unique_destinations("Destination path", payload.entries.iter().filter_map(|entry| entry.path.as_deref()))?;
+        check_unique_destinations("Member destination", payload.entries.iter().flat_map(|entry| entry.members.iter().map(String::as_str)))?;
+    }
+    check_conventions(&payload.conventions, proposed, &evidence_ids)?;
+    check_mappings(&payload.mappings, snapshot)?;
+    check_unique_destinations("Mapping destination", payload.mappings.iter().flat_map(|mapping| mapping.to_paths.iter().map(String::as_str)))?;
+    Ok(payload)
+}
+
+fn check_structure_identity(payload: &StructurePayload, context: &StructureContext) -> Result<()> {
     if payload.schema_version != SCHEMA { return Err("Unsupported repository structure schema version".into()); }
     if payload.snapshot_id != context.snapshot_id { return Err("The structure was produced for a different source snapshot".into()); }
     if payload.source_id.as_deref() != context.source_id || payload.source_hash.as_deref() != context.source_hash {
@@ -745,6 +827,10 @@ pub fn validate_structure(payload: StructurePayload, context: &StructureContext,
     if payload.base_request_id.as_deref() != context.base_request_id || payload.supersedes_request_id.as_deref() != context.supersedes_request_id {
         return Err("The structure's predecessor fields do not match the admitted request".into());
     }
+    Ok(())
+}
+
+fn check_structure_limits(payload: &StructurePayload, proposed: bool) -> Result<()> {
     if payload.entries.len() > MAX_NODES { return Err(format!("At most {MAX_NODES} structure entries are allowed")); }
     if payload.conventions.len() > MAX_CONVENTIONS { return Err(format!("At most {MAX_CONVENTIONS} naming conventions are allowed")); }
     if payload.mappings.len() > MAX_MAPPINGS { return Err(format!("At most {MAX_MAPPINGS} mappings are allowed")); }
@@ -754,46 +840,57 @@ pub fn validate_structure(payload: StructurePayload, context: &StructureContext,
         return Err("A current-structure analysis has no target document, so it has no conflicts or mappings".into());
     }
     if payload.entries.is_empty() && payload.limitations.is_empty() { return Err("A structure without entries must explain why in limitations".into()); }
-    let evidence_ids = check_evidence(&payload.evidence, snapshot)?;
+    Ok(())
+}
 
+fn check_entries<'a>(entries: &'a [StructureEntry], proposed: bool, snapshot: Option<&Snapshot>, evidence_ids: &HashSet<&str>) -> Result<HashSet<&'a str>> {
     let mut entry_ids: HashSet<&str> = HashSet::new();
     let mut members_total = 0usize;
-    for entry in &payload.entries {
-        check_id("Entry", &entry.id)?;
-        if !entry_ids.insert(entry.id.as_str()) { return Err(format!("Duplicate structure entry id '{}'", entry.id)); }
-        check_text(&format!("Entry '{}' label", entry.id), &entry.label, LABEL_LIMIT, true)?;
-        check_text(&format!("Entry '{}' purpose", entry.id), &entry.purpose, NOTE_LIMIT, false)?;
-        if let Some(pattern) = &entry.pattern { check_text(&format!("Entry '{}' pattern", entry.id), pattern, LABEL_LIMIT, true)?; }
-        check_refs(&format!("Entry '{}'", entry.id), &entry.evidence_ids, &evidence_ids)?;
-        if entry.members.len() > MAX_MEMBERS_PER_ENTRY { return Err(format!("Entry '{}' lists more than {MAX_MEMBERS_PER_ENTRY} members", entry.id)); }
-        members_total += entry.members.len();
-        if members_total > MAX_MEMBERS_TOTAL { return Err(format!("Entries list more than {MAX_MEMBERS_TOTAL} members in total")); }
-        if entry.pattern.is_some() && entry.members.is_empty() { return Err(format!("Entry '{}' is a generalized pattern but lists no exact members", entry.id)); }
-        let paths = entry.path.iter().chain(entry.members.iter());
-        for path in paths {
-            if proposed {
-                if !destination_ok(path) { return Err(format!("Entry '{}' has an unusable destination path '{path}'", entry.id)); }
-            } else {
-                if !safe_relative_path(path) || path.contains('\\') { return Err(format!("Entry '{}' has an invalid path '{path}'", entry.id)); }
-                if snapshot.is_some_and(|snapshot| !snapshot.knows_path(path)) {
-                    return Err(format!("Entry '{}' names '{path}', which is not in the inventory of this snapshot", entry.id));
-                }
-            }
-        }
-    }
-    for entry in &payload.entries {
-        if let Some(parent) = &entry.parent_id {
-            if parent == &entry.id { return Err(format!("Entry '{}' cannot be its own parent", entry.id)); }
-            if !entry_ids.contains(parent.as_str()) { return Err(format!("Entry '{}' has unknown parent '{parent}'", entry.id)); }
-        }
-    }
-    check_containment(&payload.entries.iter().map(|entry| (entry.id.as_str(), entry.parent_id.as_deref())).collect::<Vec<_>>())?;
-    if proposed {
-        check_unique_destinations("Destination path", payload.entries.iter().filter_map(|entry| entry.path.as_deref()))?;
-        check_unique_destinations("Member destination", payload.entries.iter().flat_map(|entry| entry.members.iter().map(String::as_str)))?;
-    }
+    for entry in entries { check_entry(entry, proposed, snapshot, evidence_ids, &mut entry_ids, &mut members_total)?; }
+    Ok(entry_ids)
+}
 
-    for convention in &payload.conventions {
+fn check_entry<'a>(entry: &'a StructureEntry, proposed: bool, snapshot: Option<&Snapshot>, evidence_ids: &HashSet<&str>, entry_ids: &mut HashSet<&'a str>, members_total: &mut usize) -> Result<()> {
+    check_id("Entry", &entry.id)?;
+    if !entry_ids.insert(entry.id.as_str()) { return Err(format!("Duplicate structure entry id '{}'", entry.id)); }
+    check_text(&format!("Entry '{}' label", entry.id), &entry.label, LABEL_LIMIT, true)?;
+    check_text(&format!("Entry '{}' purpose", entry.id), &entry.purpose, NOTE_LIMIT, false)?;
+    if let Some(pattern) = &entry.pattern { check_text(&format!("Entry '{}' pattern", entry.id), pattern, LABEL_LIMIT, true)?; }
+    check_refs(&format!("Entry '{}'", entry.id), &entry.evidence_ids, evidence_ids)?;
+    if entry.members.len() > MAX_MEMBERS_PER_ENTRY { return Err(format!("Entry '{}' lists more than {MAX_MEMBERS_PER_ENTRY} members", entry.id)); }
+    *members_total += entry.members.len();
+    if *members_total > MAX_MEMBERS_TOTAL { return Err(format!("Entries list more than {MAX_MEMBERS_TOTAL} members in total")); }
+    if entry.pattern.is_some() && entry.members.is_empty() { return Err(format!("Entry '{}' is a generalized pattern but lists no exact members", entry.id)); }
+    check_entry_paths(entry, proposed, snapshot)
+}
+
+fn check_entry_paths(entry: &StructureEntry, proposed: bool, snapshot: Option<&Snapshot>) -> Result<()> {
+    for path in entry.path.iter().chain(entry.members.iter()) {
+        if !proposed { check_current_path(&entry.id, path, snapshot)?; }
+        else if !destination_ok(path) { return Err(format!("Entry '{}' has an unusable destination path '{path}'", entry.id)); }
+    }
+    Ok(())
+}
+
+fn check_current_path(entry_id: &str, path: &str, snapshot: Option<&Snapshot>) -> Result<()> {
+    if !safe_relative_path(path) || path.contains('\\') { return Err(format!("Entry '{entry_id}' has an invalid path '{path}'")); }
+    if snapshot.is_some_and(|snapshot| !snapshot.knows_path(path)) {
+        return Err(format!("Entry '{entry_id}' names '{path}', which is not in the inventory of this snapshot"));
+    }
+    Ok(())
+}
+
+fn check_entry_parents(entries: &[StructureEntry], entry_ids: &HashSet<&str>) -> Result<()> {
+    for entry in entries {
+        let Some(parent) = &entry.parent_id else { continue; };
+        if parent == &entry.id { return Err(format!("Entry '{}' cannot be its own parent", entry.id)); }
+        if !entry_ids.contains(parent.as_str()) { return Err(format!("Entry '{}' has unknown parent '{parent}'", entry.id)); }
+    }
+    Ok(())
+}
+
+fn check_conventions(conventions: &[StructureConvention], proposed: bool, evidence_ids: &HashSet<&str>) -> Result<()> {
+    for convention in conventions {
         check_text("Convention scope", &convention.scope, 200, true)?;
         check_text(&format!("Convention '{}' current", convention.scope), &convention.current, NOTE_LIMIT, true)?;
         check_text(&format!("Convention '{}' rationale", convention.scope), &convention.rationale, NOTE_LIMIT, false)?;
@@ -802,36 +899,49 @@ pub fn validate_structure(payload: StructurePayload, context: &StructureContext,
             (Some(_), false) => return Err(format!("Convention '{}' proposes a name, but a current analysis has no target document", convention.scope)),
             (None, _) => (),
         }
-        check_refs(&format!("Convention '{}'", convention.scope), &convention.evidence_ids, &evidence_ids)?;
+        check_refs(&format!("Convention '{}'", convention.scope), &convention.evidence_ids, evidence_ids)?;
     }
+    Ok(())
+}
 
+fn check_mappings(mappings: &[StructureMapping], snapshot: Option<&Snapshot>) -> Result<()> {
     let mut from_seen: HashSet<&str> = HashSet::new();
-    for mapping in &payload.mappings {
-        for (what, paths) in [("fromPaths", &mapping.from_paths), ("toPaths", &mapping.to_paths)] {
-            if paths.len() > MAX_PATHS_PER_MAPPING { return Err(format!("A mapping lists more than {MAX_PATHS_PER_MAPPING} {what}")); }
-        }
-        check_text("Mapping rationale", &mapping.rationale, NOTE_LIMIT, false)?;
-        let (from, to) = (mapping.from_paths.len(), mapping.to_paths.len());
-        let shape = match mapping.operation {
-            MappingOperation::Unchanged => from == 1 && to == 1 && mapping.from_paths[0] == mapping.to_paths[0],
-            MappingOperation::Rename | MappingOperation::Move => from == 1 && to == 1 && mapping.from_paths[0] != mapping.to_paths[0],
-            MappingOperation::Split => from == 1 && to >= 2,
-            MappingOperation::Merge => from >= 2 && to == 1,
-            MappingOperation::Create => from == 0 && to >= 1,
-            MappingOperation::Remove => from >= 1 && to == 0,
-        };
-        if !shape { return Err(format!("A {} mapping has an impossible shape ({from} source paths, {to} destinations); splits and merges must be explicit", mapping.operation.name())); }
-        for path in &mapping.from_paths {
-            if !safe_relative_path(path) || path.contains('\\') { return Err(format!("Mapping source '{path}' is not a clean relative path")); }
-            if snapshot.is_some_and(|snapshot| !snapshot.knows_path(path)) { return Err(format!("Mapping source '{path}' is not in the inventory of this snapshot")); }
-            if !from_seen.insert(path.as_str()) { return Err(format!("Mapping source '{path}' is mapped more than once")); }
-        }
-        for path in &mapping.to_paths {
-            if !destination_ok(path) { return Err(format!("Mapping destination '{path}' is not a usable relative path")); }
-        }
+    for mapping in mappings { check_mapping(mapping, snapshot, &mut from_seen)?; }
+    Ok(())
+}
+
+fn mapping_shape_ok(mapping: &StructureMapping) -> bool {
+    let (from, to) = (mapping.from_paths.len(), mapping.to_paths.len());
+    match mapping.operation {
+        MappingOperation::Unchanged => from == 1 && to == 1 && mapping.from_paths[0] == mapping.to_paths[0],
+        MappingOperation::Rename | MappingOperation::Move => from == 1 && to == 1 && mapping.from_paths[0] != mapping.to_paths[0],
+        MappingOperation::Split => from == 1 && to >= 2,
+        MappingOperation::Merge => from >= 2 && to == 1,
+        MappingOperation::Create => from == 0 && to >= 1,
+        MappingOperation::Remove => from >= 1 && to == 0,
     }
-    check_unique_destinations("Mapping destination", payload.mappings.iter().flat_map(|mapping| mapping.to_paths.iter().map(String::as_str)))?;
-    Ok(payload)
+}
+
+fn check_mapping<'a>(mapping: &'a StructureMapping, snapshot: Option<&Snapshot>, from_seen: &mut HashSet<&'a str>) -> Result<()> {
+    for (what, paths) in [("fromPaths", &mapping.from_paths), ("toPaths", &mapping.to_paths)] {
+        if paths.len() > MAX_PATHS_PER_MAPPING { return Err(format!("A mapping lists more than {MAX_PATHS_PER_MAPPING} {what}")); }
+    }
+    check_text("Mapping rationale", &mapping.rationale, NOTE_LIMIT, false)?;
+    if !mapping_shape_ok(mapping) {
+        return Err(format!("A {} mapping has an impossible shape ({} source paths, {} destinations); splits and merges must be explicit", mapping.operation.name(), mapping.from_paths.len(), mapping.to_paths.len()));
+    }
+    for path in &mapping.from_paths { check_mapping_source(path, snapshot, from_seen)?; }
+    for path in &mapping.to_paths {
+        if !destination_ok(path) { return Err(format!("Mapping destination '{path}' is not a usable relative path")); }
+    }
+    Ok(())
+}
+
+fn check_mapping_source<'a>(path: &'a str, snapshot: Option<&Snapshot>, from_seen: &mut HashSet<&'a str>) -> Result<()> {
+    if !safe_relative_path(path) || path.contains('\\') { return Err(format!("Mapping source '{path}' is not a clean relative path")); }
+    if snapshot.is_some_and(|snapshot| !snapshot.knows_path(path)) { return Err(format!("Mapping source '{path}' is not in the inventory of this snapshot")); }
+    if !from_seen.insert(path) { return Err(format!("Mapping source '{path}' is mapped more than once")); }
+    Ok(())
 }
 
 // ---- structure sources -------------------------------------------------------------------------------------------
@@ -920,6 +1030,16 @@ fn list_row(sources: &dyn StructureSources, producer: &DependencyProducer, sourc
     Ok(row)
 }
 
+fn finish_source(sources: &dyn StructureSources, producer: &DependencyProducer, source_id: &str, row: StructureSourceRow, bytes: Vec<u8>) -> Result<LoadedSource> {
+    if bytes.len() as u64 != row.byte_length || format!("{:x}", Sha256::digest(&bytes)) != row.sha256 {
+        return Err("The target Markdown bytes do not match the recorded hash".into());
+    }
+    // Identity recheck after reading: same source, same hash, same producer.
+    let again = list_row(sources, producer, source_id)?;
+    if again != row || !sources.producer_live(producer) { return Err("The Architect session or target Markdown changed while it was being read".into()); }
+    Ok(LoadedSource { row, bytes })
+}
+
 /// Read the selected source in full under `producer`'s lease, prove its identity twice, and return its exact bytes.
 pub fn load_structure_source(sources: &dyn StructureSources, producer: &DependencyProducer, source_id: &str) -> Result<LoadedSource> {
     let row = list_row(sources, producer, source_id)?;
@@ -931,15 +1051,7 @@ pub fn load_structure_source(sources: &dyn StructureSources, producer: &Dependen
         bytes.extend_from_slice(page.text.as_bytes());
         if bytes.len() as u64 > MAX_TARGET_BYTES { return Err("The target Markdown exceeds 1 MiB".into()); }
         match page.next_offset {
-            None => {
-                if bytes.len() as u64 != row.byte_length || format!("{:x}", Sha256::digest(&bytes)) != row.sha256 {
-                    return Err("The target Markdown bytes do not match the recorded hash".into());
-                }
-                // Identity recheck after reading: same source, same hash, same producer.
-                let again = list_row(sources, producer, source_id)?;
-                if again != row || !sources.producer_live(producer) { return Err("The Architect session or target Markdown changed while it was being read".into()); }
-                return Ok(LoadedSource { row, bytes });
-            }
+            None => return finish_source(sources, producer, source_id, row, bytes),
             Some(next) if next > offset => offset = next,
             Some(_) => return Err("The Architect bridge returned a non-advancing page offset".into()),
         }

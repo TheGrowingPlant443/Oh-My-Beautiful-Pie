@@ -47,6 +47,13 @@ def _cap(text, binding=None):
     return text[:RAW_CAP]
 
 
+def _inherit_binding(text):
+    receiver, dot, name = text.rpartition(".")
+    if not dot:
+        return {"kind": "identifier", "name": name, "receiver": None, "receiverKind": None, "role": "inherits"}
+    return {"kind": "path", "name": name, "receiver": receiver, "receiverKind": "path", "role": "inherits"}
+
+
 class _Walker:
     def __init__(self, ctx):
         self.ctx = ctx
@@ -167,41 +174,45 @@ class _Walker:
         tree-sitter-swift attaches a trailing call suffix or navigation to a whole binary expression
         (`a + b.f(x)` parses as call(additive(a, b.f), (x))), so operands are re-associated here.
         """
-        ctx = self.ctx
         binding: dict = {"name": None, "receiver": None, "receiverKind": None}
-        dynamic = False
         if expr is None:
             binding.update(kind="dynamic", dynamic=True)
             return binding, True
         if expr.type == "simple_identifier":
-            binding.update(kind="identifier", name=ctx.text(expr))
-        elif expr.type == "navigation_expression":
-            target = expr.child_by_field_name("target")
-            suffix = expr.child_by_field_name("suffix")
-            sname = None
-            if suffix is not None:
-                inner = suffix.child_by_field_name("suffix")
-                sname = ctx.text(inner) if inner is not None else None
-            rtext = None
-            rk = "expression"
-            if target is not None:
-                target, moved = self.rightmost(target)
-                rtext = ctx.source[self.callee_start(target):target.end_byte].decode("utf-8", "replace")
-                rk = {"self_expression": "self", "super_expression": "super", "simple_identifier": "identifier"}.get(target.type, "expression")
-                if target.type in ("user_type", "type_identifier"):
-                    rk = "path"
-                if moved:
-                    binding["reassociated"] = True
-            binding.update(kind="member", name=sname, receiver=_cap(rtext, binding) if rtext is not None else None, receiverKind=rk)
-            if target is not None and suffix is not None and b"?" in ctx.source[target.end_byte:suffix.start_byte]:
-                binding["optional"] = True
-            if target is None or sname is None:
-                binding.update(kind="dynamic", dynamic=True)  # implicit member `.foo()` / unknown suffix
-                dynamic = True
-        else:
-            binding.update(kind="dynamic", dynamic=True)
-            dynamic = True
-        return binding, dynamic
+            binding.update(kind="identifier", name=self.ctx.text(expr))
+            return binding, False
+        if expr.type == "navigation_expression":
+            return binding, self.navigation_callee(expr, binding)
+        binding.update(kind="dynamic", dynamic=True)
+        return binding, True
+
+    def navigation_callee(self, expr, binding):
+        """Fill the member-call binding for a navigation callee; return whether it is dynamic."""
+        target = expr.child_by_field_name("target")
+        suffix = expr.child_by_field_name("suffix")
+        inner = suffix.child_by_field_name("suffix") if suffix is not None else None
+        sname = self.ctx.text(inner) if inner is not None else None
+        rtext = None
+        rk = "expression"
+        if target is not None:
+            target, rtext, rk = self.navigation_target(target, binding)
+        binding.update(kind="member", name=sname, receiver=_cap(rtext, binding) if rtext is not None else None, receiverKind=rk)
+        if target is not None and suffix is not None and b"?" in self.ctx.source[target.end_byte:suffix.start_byte]:
+            binding["optional"] = True
+        if target is None or sname is None:
+            binding.update(kind="dynamic", dynamic=True)  # implicit member `.foo()` / unknown suffix
+            return True
+        return False
+
+    def navigation_target(self, target, binding):
+        target, moved = self.rightmost(target)
+        rtext = self.ctx.source[self.callee_start(target):target.end_byte].decode("utf-8", "replace")
+        rk = {"self_expression": "self", "super_expression": "super", "simple_identifier": "identifier"}.get(target.type, "expression")
+        if target.type in ("user_type", "type_identifier"):
+            rk = "path"
+        if moved:
+            binding["reassociated"] = True
+        return target, rtext, rk
 
     def call_site(self, node):
         ctx = self.ctx
@@ -225,12 +236,9 @@ class _Walker:
     def constructor_site(self, node):
         ctx = self.ctx
         ct = node.child_by_field_name("constructed_type")
-        ctext = ""
-        name = None
         binding: dict = {"kind": "new", "name": None, "receiver": None, "receiverKind": None, "initializer": True}
         if ct is not None:
             idents = [ctx.text(c) for c in ct.named_children if c.type == "type_identifier"]
-            ctext = ".".join(idents) if idents else ctx.text(ct)
             if idents:
                 binding["name"] = idents[-1]
                 binding["receiver"] = ".".join(idents[:-1]) or None
@@ -256,17 +264,14 @@ class _Walker:
         ctx = self.ctx
         bases = []
         for c in node.named_children:
-            if c.type == "inheritance_specifier":
-                inh = c.child_by_field_name("inherits_from")
-                if inh is not None:
-                    bases.append(ctx.text(inh))
-                    parts = ctx.text(inh).rsplit(".", 1)
-                    ctx.add_site(
-                        "references", _cap(ctx.text(inh)), inh, caller=outer,
-                        binding={"kind": "path" if len(parts) > 1 else "identifier", "name": parts[-1],
-                                 "receiver": parts[0] if len(parts) > 1 else None,
-                                 "receiverKind": "path" if len(parts) > 1 else None, "role": "inherits"},
-                    )
+            if c.type != "inheritance_specifier":
+                continue
+            inh = c.child_by_field_name("inherits_from")
+            if inh is None:
+                continue
+            text = ctx.text(inh)
+            bases.append(text)
+            ctx.add_site("references", _cap(text), inh, caller=outer, binding=_inherit_binding(text))
         if bases:
             bindings["extends"] = bases
 
@@ -274,148 +279,172 @@ class _Walker:
     def enter(self, node):
         if not node.is_named:
             return True
-        ctx = self.ctx
-        t = node.type
-        if t in CONDITIONAL:
+        if node.type in CONDITIONAL:
             self.cond += 1
             self.cond_nodes.add(node.id)
-        if t == "directive":
-            text = ctx.text(node)
-            if text.startswith("#if"):
-                self.pp += 1
-                self.cond += 1
-            elif text.startswith("#endif") and self.pp > 0:
-                self.pp -= 1
-                self.cond -= 1
+        handler = _ENTER.get(node.type)
+        return True if handler is None else handler(self, node)
+
+    def enter_directive(self, node):
+        text = self.ctx.text(node)
+        if text.startswith("#if"):
+            self.pp += 1
+            self.cond += 1
+        elif text.startswith("#endif") and self.pp > 0:
+            self.pp -= 1
+            self.cond -= 1
+        return True
+
+    def enter_import(self, node):
+        self.import_site(node)
+        return False
+
+    def enter_class(self, node):
+        ctx = self.ctx
+        dk = node.child_by_field_name("declaration_kind")
+        dk_text = ctx.text(dk) if dk is not None else "class"
+        name_node = node.child_by_field_name("name")
+        name = ctx.text(name_node)
+        kind = TYPE_KINDS.get(dk_text, "class")
+        outer = ctx.owner
+        bindings: dict = {"declarationKind": dk_text}
+        if dk_text == "extension":
+            bindings["implFor"] = name
+            bindings["implTrait"] = None
+        self.inheritance(node, bindings, outer)
+        sym = ctx.add_symbol(kind, name, node, bindings=bindings)
+        if dk_text != "extension":
+            self.declare(name, "class" if kind in ("class", "struct") else "enum", *self.scope_range(), sym=sym, node=name_node, mutable=False)
+        self.push(node, sym, name, kind)
+        return True
+
+    def enter_protocol(self, node):
+        ctx = self.ctx
+        name_node = node.child_by_field_name("name")
+        name = ctx.text(name_node)
+        outer = ctx.owner
+        bindings = {"declarationKind": "protocol"}
+        self.inheritance(node, bindings, outer)
+        sym = ctx.add_symbol("interface", name, node, bindings=bindings)
+        self.declare(name, "type", *self.scope_range(), sym=sym, node=name_node)
+        self.push(node, sym, name, "interface")
+        return True
+
+    def enter_function(self, node):
+        ctx = self.ctx
+        name_node = node.child_by_field_name("name")
+        name = ctx.text(name_node)
+        member = self.in_type_scope()
+        kind = "method" if member else "function"
+        mods = node.child_by_field_name("modifiers") or next((c for c in node.named_children if c.type == "modifiers"), None)
+        modtext = ctx.text(mods) if mods is not None else ""
+        bindings = {
+            "static": member and any(w in modtext.split() for w in ("static", "class")),
+            "body": node.child_by_field_name("body") is not None,
+            "async": any(c.type == "async" for c in node.children),
+            "throws": any(c.type in ("throws", "rethrows") for c in node.children),
+        }
+        sym = ctx.add_symbol(kind, name, node, bindings=bindings)
+        if not member:
+            rng = self.block_range(node) if self.in_func_scope() else self.scope_range()
+            self.declare(name, "function", rng[0], rng[1], sym=sym, node=name_node, mutable=False)
+        self.push(node, sym, name, kind)
+        self.declare_params(node)
+        return True
+
+    def enter_init(self, node):
+        sym = self.ctx.add_symbol("constructor", "init", node, bindings={"failable": any(c.type in ("?", "!") for c in node.children), "body": True})
+        self.push(node, sym, "init", "constructor")
+        self.declare_params(node)
+        return True
+
+    def enter_deinit(self, node):
+        sym = self.ctx.add_symbol("method", "deinit", node, bindings={"destructor": True, "static": False})
+        self.push(node, sym, "deinit", "method")
+        return True
+
+    def enter_subscript(self, node):
+        sym = self.ctx.add_symbol("method", "subscript", node, bindings={"subscript": True, "static": False})
+        self.push(node, sym, "subscript", "method")
+        self.declare_params(node)
+        return True
+
+    def enter_accessor(self, node):
+        acc = "get" if node.type == "computed_getter" else "set"
+        sym = self.ctx.add_symbol("accessor", acc, node, bindings={"accessor": acc})
+        self.push(node, sym, acc, "accessor")
+        if node.type == "computed_setter":
+            self.declare("newValue", "parameter", node.start_byte, node.end_byte, node=node, mutable=False)
+        return True
+
+    def enter_computed_property(self, node):
+        if node.parent is None or node.parent.type != "property_declaration":
             return True
-        if t == "import_declaration":
-            self.import_site(node)
-            return False
-        if t == "class_declaration":
-            dk = node.child_by_field_name("declaration_kind")
-            dk_text = ctx.text(dk) if dk is not None else "class"
-            name_node = node.child_by_field_name("name")
-            name = ctx.text(name_node)
-            kind = TYPE_KINDS.get(dk_text, "class")
-            outer = ctx.owner
-            bindings: dict = {"declarationKind": dk_text}
-            if dk_text == "extension":
-                bindings["implFor"] = name
-                bindings["implTrait"] = None
-            self.inheritance(node, bindings, outer)
-            sym = ctx.add_symbol(kind, name, node, bindings=bindings)
-            if dk_text != "extension":
-                self.declare(name, "class" if kind in ("class", "struct") else "enum", *self.scope_range(), sym=sym, node=name_node, mutable=False)
-            self.push(node, sym, name, kind)
-            return True
-        if t == "protocol_declaration":
-            name_node = node.child_by_field_name("name")
-            name = ctx.text(name_node)
-            outer = ctx.owner
-            bindings = {"declarationKind": "protocol"}
-            self.inheritance(node, bindings, outer)
-            sym = ctx.add_symbol("interface", name, node, bindings=bindings)
-            self.declare(name, "type", *self.scope_range(), sym=sym, node=name_node)
-            self.push(node, sym, name, "interface")
-            return True
-        if t in ("function_declaration", "protocol_function_declaration"):
-            name_node = node.child_by_field_name("name")
-            name = ctx.text(name_node)
-            member = self.in_type_scope()
-            kind = "method" if member else "function"
-            mods = node.child_by_field_name("modifiers") or next((c for c in node.named_children if c.type == "modifiers"), None)
-            modtext = ctx.text(mods) if mods is not None else ""
-            bindings = {
-                "static": member and any(w in modtext.split() for w in ("static", "class")),
-                "body": node.child_by_field_name("body") is not None,
-                "async": any(c.type == "async" for c in node.children),
-                "throws": any(c.type in ("throws", "rethrows") for c in node.children),
-            }
-            sym = ctx.add_symbol(kind, name, node, bindings=bindings)
-            if not member:
-                rng = self.block_range(node) if self.in_func_scope() else self.scope_range()
-                self.declare(name, "function", rng[0], rng[1], sym=sym, node=name_node, mutable=False)
-            self.push(node, sym, name, kind)
-            self.declare_params(node)
-            return True
-        if t == "init_declaration":
-            sym = ctx.add_symbol("constructor", "init", node, bindings={"failable": any(c.type in ("?", "!") for c in node.children), "body": True})
-            self.push(node, sym, "init", "constructor")
-            self.declare_params(node)
-            return True
-        if t == "deinit_declaration":
-            sym = ctx.add_symbol("method", "deinit", node, bindings={"destructor": True, "static": False})
-            self.push(node, sym, "deinit", "method")
-            return True
-        if t == "subscript_declaration":
-            sym = ctx.add_symbol("method", "subscript", node, bindings={"subscript": True, "static": False})
-            self.push(node, sym, "subscript", "method")
-            self.declare_params(node)
-            return True
-        if t in ("computed_getter", "computed_setter"):
-            acc = "get" if t == "computed_getter" else "set"
-            owner_name = ctx.current_scope.name if ctx.current_scope is not None else None
-            sym = ctx.add_symbol("accessor", acc, node, bindings={"accessor": acc})
-            self.push(node, sym, acc, "accessor")
-            if t == "computed_setter":
-                self.declare("newValue", "parameter", node.start_byte, node.end_byte, node=node, mutable=False)
-            return True
-        if t == "computed_property" and node.parent is not None and node.parent.type == "property_declaration":
-            pat = node.parent.child_by_field_name("name")
-            names = self.bound_names(pat) if pat is not None else []
-            nm = ctx.text(names[0]) if names else ""
-            sym = ctx.add_symbol("accessor", nm, node, bindings={"accessor": "get", "computedProperty": True})
-            self.push(node, sym, nm, "accessor")
-            return True
-        if t in ("didset_clause", "willset_clause"):
-            acc = "didSet" if t == "didset_clause" else "willSet"
-            sym = ctx.add_symbol("accessor", acc, node, bindings={"accessor": acc})
-            self.push(node, sym, acc, "accessor")
-            self.declare("oldValue" if acc == "didSet" else "newValue", "parameter", node.start_byte, node.end_byte, node=node)
-            return True
-        if t == "lambda_literal":
-            parent = node.parent
-            outer_range = self.block_range(node) if parent is not None else self.scope_range()
-            outer = ctx.owner
-            sym = ctx.add_symbol("lambda", "<closure>", node, bindings={})
-            self.push(node, sym, None, "lambda")
-            for c in node.named_children:
-                if c.type == "lambda_function_type":
-                    for pp in c.named_children:
-                        if pp.type == "lambda_function_type_parameters":
-                            self.declare_params(node, params=pp.named_children)
-            if parent is not None and parent.type == "property_declaration":
-                pat = parent.child_by_field_name("name")
-                names = self.bound_names(pat) if pat is not None else []
-                if names:
-                    name = ctx.text(names[0])
-                    sym["bindings"]["assignedTo"] = name
-                    self.declare(name, "variable", parent.end_byte, outer_range[1], sym=sym, node=names[0], mutable=self.is_var(parent), owner=outer)
-            return True
-        if t == "property_declaration":
-            self.property_declaration(node)
-            return True
-        if t in ("if_statement", "while_statement", "guard_statement"):
-            names = []
-            for i, c in enumerate(node.children):
-                if node.field_name_for_child(i) == "bound_identifier" and c.type == "simple_identifier":
-                    names.append(c)
-            for n in names:
-                if t == "guard_statement":
-                    rng = (node.end_byte, self.block_range(node)[1])
-                else:
-                    rng = (node.start_byte, node.end_byte)
-                self.declare(ctx.text(n), "variable", rng[0], rng[1], node=n, mutable=False)
-            return True
-        if t == "constructor_expression":
-            self.constructor_site(node)
-            return True
-        if t == "macro_invocation":
-            self.macro_site(node)
-            return True
-        if t == "call_expression":
-            self.call_site(node)
-            return True
+        pat = node.parent.child_by_field_name("name")
+        names = self.bound_names(pat) if pat is not None else []
+        nm = self.ctx.text(names[0]) if names else ""
+        sym = self.ctx.add_symbol("accessor", nm, node, bindings={"accessor": "get", "computedProperty": True})
+        self.push(node, sym, nm, "accessor")
+        return True
+
+    def enter_observer(self, node):
+        acc = "didSet" if node.type == "didset_clause" else "willSet"
+        sym = self.ctx.add_symbol("accessor", acc, node, bindings={"accessor": acc})
+        self.push(node, sym, acc, "accessor")
+        self.declare("oldValue" if acc == "didSet" else "newValue", "parameter", node.start_byte, node.end_byte, node=node)
+        return True
+
+    def enter_lambda(self, node):
+        parent = node.parent
+        outer_range = self.block_range(node) if parent is not None else self.scope_range()
+        outer = self.ctx.owner
+        sym = self.ctx.add_symbol("lambda", "<closure>", node, bindings={})
+        self.push(node, sym, None, "lambda")
+        for c in node.named_children:
+            if c.type == "lambda_function_type":
+                self.declare_lambda_params(node, c)
+        if parent is not None and parent.type == "property_declaration":
+            self.declare_lambda_name(parent, sym, outer_range, outer)
+        return True
+
+    def declare_lambda_params(self, node, function_type):
+        for pp in function_type.named_children:
+            if pp.type == "lambda_function_type_parameters":
+                self.declare_params(node, params=pp.named_children)
+
+    def declare_lambda_name(self, parent, sym, outer_range, outer):
+        pat = parent.child_by_field_name("name")
+        names = self.bound_names(pat) if pat is not None else []
+        if names:
+            name = self.ctx.text(names[0])
+            sym["bindings"]["assignedTo"] = name
+            self.declare(name, "variable", parent.end_byte, outer_range[1], sym=sym, node=names[0], mutable=self.is_var(parent), owner=outer)
+
+    def enter_property(self, node):
+        self.property_declaration(node)
+        return True
+
+    def enter_bound_condition(self, node):
+        for i, c in enumerate(node.children):
+            if node.field_name_for_child(i) != "bound_identifier" or c.type != "simple_identifier":
+                continue
+            if node.type == "guard_statement":
+                rng = (node.end_byte, self.block_range(node)[1])
+            else:
+                rng = (node.start_byte, node.end_byte)
+            self.declare(self.ctx.text(c), "variable", rng[0], rng[1], node=c, mutable=False)
+        return True
+
+    def enter_constructor(self, node):
+        self.constructor_site(node)
+        return True
+
+    def enter_macro(self, node):
+        self.macro_site(node)
+        return True
+
+    def enter_call(self, node):
+        self.call_site(node)
         return True
 
     @staticmethod
@@ -450,7 +479,33 @@ class _Walker:
             self.cond = self.pushed.pop(node.id)
 
 
-def extract(language: str, source: bytes, ctx: "common.Context") -> dict:
+_ENTER = {
+    "directive": _Walker.enter_directive,
+    "import_declaration": _Walker.enter_import,
+    "class_declaration": _Walker.enter_class,
+    "protocol_declaration": _Walker.enter_protocol,
+    "function_declaration": _Walker.enter_function,
+    "protocol_function_declaration": _Walker.enter_function,
+    "init_declaration": _Walker.enter_init,
+    "deinit_declaration": _Walker.enter_deinit,
+    "subscript_declaration": _Walker.enter_subscript,
+    "computed_getter": _Walker.enter_accessor,
+    "computed_setter": _Walker.enter_accessor,
+    "computed_property": _Walker.enter_computed_property,
+    "didset_clause": _Walker.enter_observer,
+    "willset_clause": _Walker.enter_observer,
+    "lambda_literal": _Walker.enter_lambda,
+    "property_declaration": _Walker.enter_property,
+    "if_statement": _Walker.enter_bound_condition,
+    "while_statement": _Walker.enter_bound_condition,
+    "guard_statement": _Walker.enter_bound_condition,
+    "constructor_expression": _Walker.enter_constructor,
+    "macro_invocation": _Walker.enter_macro,
+    "call_expression": _Walker.enter_call,
+}
+
+
+def extract(_language: str, _source: bytes, ctx: "common.Context") -> dict:
     tree = ctx.parse()
     root = tree.root_node
     ctx.module_symbol(root)

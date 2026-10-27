@@ -139,55 +139,82 @@ pub(crate) fn inspect_components(cognee_folder: &Path, home: &Path, node_overrid
         return Err(blocked(CogneeUiState::Unsupported, "This platform has no supported Next.js native binding."));
     }
     let venv = cognee_folder.join("venv");
-    #[cfg(windows)]
-    let site = venv.join("Lib").join("site-packages");
-    #[cfg(unix)]
-    let site = {
-        let lib = venv.join("lib");
-        let mut sites = match fs::read_dir(&lib) {
-            Ok(entries) => entries.filter_map(|entry| entry.ok()).map(|entry| entry.path())
-                .filter(|path| path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("python")))
-                .map(|path| path.join("site-packages")).collect::<Vec<_>>(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(unreadable(&lib, error)),
-        };
-        sites.sort();
-        sites.into_iter().find(|path| path.join("cognee").is_dir()).unwrap_or_else(|| lib.join("site-packages"))
+    let frontend = locate_frontend(&python_site(&venv)?, home)?;
+    let modules = frontend_modules(&frontend)?;
+    let next_json = read_next(&modules)?;
+    let next_entry = modules.join("next").join("dist").join("bin").join("next");
+    let binding = if cfg!(windows) { "win32-x64-msvc" }
+        else if cfg!(all(target_os = "macos", target_arch = "aarch64")) { "darwin-arm64" }
+        else if cfg!(target_os = "macos") { "darwin-x64" }
+        else if cfg!(target_arch = "aarch64") { "linux-arm64-gnu" }
+        else { "linux-x64-gnu" };
+    let swc_package = modules.join("@next").join(format!("swc-{binding}"));
+    let swc_binding = swc_package.join(format!("next-swc.{binding}.node"));
+    require_installed(&modules, &next_entry, &swc_binding)?;
+    check_swc_version(&swc_package)?;
+    let node = find_node(node_override)?.ok_or_else(|| blocked(CogneeUiState::MissingDependencies, "Node.js was not found on this computer's PATH; the Cognee web interface needs it. OMP Manager never installs it."))?;
+    check_node(&node, &next_json)?;
+    Ok(Components { frontend, node, next_entry, swc_binding, venv_python: if cfg!(windows) { venv.join("Scripts").join("python.exe") } else { venv.join("bin").join("python") } })
+}
+
+#[cfg(windows)]
+fn python_site(venv: &Path) -> Result<PathBuf, Blocked> {
+    Ok(venv.join("Lib").join("site-packages"))
+}
+
+#[cfg(unix)]
+fn python_site(venv: &Path) -> Result<PathBuf, Blocked> {
+    let lib = venv.join("lib");
+    let mut sites = match fs::read_dir(&lib) {
+        Ok(entries) => entries.filter_map(|entry| entry.ok()).map(|entry| entry.path())
+            .filter(|path| path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("python")))
+            .map(|path| path.join("site-packages")).collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(unreadable(&lib, error)),
     };
-    // The same candidates, in the same order, as Cognee's own frontend lookup: three development locations next to the
-    // package, then the download cache. Looking is read-only; the cache folder is never created.
+    sites.sort();
+    Ok(sites.into_iter().find(|path| path.join("cognee").is_dir()).unwrap_or_else(|| lib.join("site-packages")))
+}
+
+/// The same candidates, in the same order, as Cognee's own frontend lookup: three development locations next to the
+/// package, then the download cache. Looking is read-only; the cache folder is never created.
+fn locate_frontend(site: &Path, home: &Path) -> Result<PathBuf, Blocked> {
     let candidates = [
         site.join("cognee-frontend"),
         site.join("cognee").join("cognee-frontend"),
         site.join("cognee").join("api").join("cognee-frontend"),
         home.join(".cognee").join("ui-cache").join("frontend"),
     ];
-    let mut frontend = None;
-    for candidate in &candidates {
+    for candidate in candidates {
         if is_file(&candidate.join("package.json"))? {
-            frontend = Some(candidate.clone());
-            break;
+            return Ok(candidate);
         }
     }
-    let Some(frontend) = frontend else {
-        return Err(blocked(
-            CogneeUiState::MissingFrontend,
-            "Cognee is installed, but its web interface (the cognee-frontend package) is not installed on this computer. OMP Manager never downloads or installs it; install it yourself, then check again.",
-        ));
-    };
+    Err(blocked(
+        CogneeUiState::MissingFrontend,
+        "Cognee is installed, but its web interface (the cognee-frontend package) is not installed on this computer. OMP Manager never downloads or installs it; install it yourself, then check again.",
+    ))
+}
+
+/// Confirms the folder is the `cognee-frontend` package with a `node_modules` directory; returns that directory.
+fn frontend_modules(frontend: &Path) -> Result<PathBuf, Blocked> {
     let package = read_json(&frontend.join("package.json"))?.ok_or_else(|| unreadable(&frontend.join("package.json"), "it disappeared"))?;
     if package.get("name").and_then(|name| name.as_str()) != Some("cognee-frontend") {
-        return Err(blocked(CogneeUiState::Unsupported, format!("{} is not the cognee-frontend package, so it is not started.", forward(&frontend))));
+        return Err(blocked(CogneeUiState::Unsupported, format!("{} is not the cognee-frontend package, so it is not started.", forward(frontend))));
     }
     let modules = frontend.join("node_modules");
     if stat(&modules)?.is_none_or(|meta| !meta.is_dir()) {
         return Err(blocked(
             CogneeUiState::MissingDependencies,
-            format!("The Cognee web interface is present in {}, but its Node packages are not installed (no node_modules). OMP Manager never installs them; run the install yourself, then try again.", forward(&frontend)),
+            format!("The Cognee web interface is present in {}, but its Node packages are not installed (no node_modules). OMP Manager never installs them; run the install yourself, then try again.", forward(frontend)),
         ));
     }
-    let next_package = read_json(&modules.join("next").join("package.json"))?;
-    let next_json = match &next_package {
+    Ok(modules)
+}
+
+/// The installed `next` package metadata, which must be the one supported Next.js version.
+fn read_next(modules: &Path) -> Result<serde_json::Value, Blocked> {
+    let next_json = match read_json(&modules.join("next").join("package.json"))? {
         Some(json) if json.get("name").and_then(|name| name.as_str()) == Some("next") => json,
         Some(_) => return Err(blocked(CogneeUiState::Unsupported, "node_modules/next is not the Next.js package, so the interface is not started.")),
         None => {
@@ -204,55 +231,57 @@ pub(crate) fn inspect_components(cognee_folder: &Path, home: &Path, node_overrid
             format!("Next.js {version} is installed for the Cognee web interface; only Next.js {SUPPORTED_NEXT} was inspected and is supported, so it is not started."),
         ));
     }
-    let next_entry = modules.join("next").join("dist").join("bin").join("next");
-    let binding = if cfg!(windows) { "win32-x64-msvc" }
-        else if cfg!(all(target_os = "macos", target_arch = "aarch64")) { "darwin-arm64" }
-        else if cfg!(target_os = "macos") { "darwin-x64" }
-        else if cfg!(target_arch = "aarch64") { "linux-arm64-gnu" }
-        else { "linux-x64-gnu" };
-    let swc_package = modules.join("@next").join(format!("swc-{binding}"));
-    let swc_binding = swc_package.join(format!("next-swc.{binding}.node"));
+    Ok(next_json)
+}
+
+/// Every file the frontend needs must exist; all missing ones are named together.
+fn require_installed(modules: &Path, next_entry: &Path, swc_binding: &Path) -> Result<(), Blocked> {
     let mut missing = Vec::new();
     for (path, label) in [
-        (&next_entry, "next/dist/bin/next"),
+        (next_entry, "next/dist/bin/next"),
         (&modules.join("typescript").join("lib").join("typescript.js"), "typescript"),
         (&modules.join("@types").join("react").join("index.d.ts"), "@types/react"),
         (&modules.join("@types").join("node").join("index.d.ts"), "@types/node"),
-        (&swc_binding, "the platform-specific @next/swc native binding"),
+        (swc_binding, "the platform-specific @next/swc native binding"),
     ] {
         if !is_file(path)? {
             missing.push(label);
         }
     }
-    if !missing.is_empty() {
-        return Err(blocked(
-            CogneeUiState::MissingDependencies,
-            format!("These installed packages of the Cognee web interface are missing: {}. OMP Manager never installs or downloads them; install them yourself, then try again.", missing.join(", ")),
-        ));
+    if missing.is_empty() {
+        return Ok(());
     }
+    Err(blocked(
+        CogneeUiState::MissingDependencies,
+        format!("These installed packages of the Cognee web interface are missing: {}. OMP Manager never installs or downloads them; install them yourself, then try again.", missing.join(", ")),
+    ))
+}
+
+fn check_swc_version(swc_package: &Path) -> Result<(), Blocked> {
     match read_json(&swc_package.join("package.json"))?.as_ref().and_then(|json| json.get("version")).and_then(|version| version.as_str()) {
-        Some(SUPPORTED_NEXT) => {}
-        Some(other) => {
-            return Err(blocked(CogneeUiState::Unsupported, format!("The installed Next.js native binding is version {other}, not {SUPPORTED_NEXT}, so the interface is not started.")))
-        }
-        None => return Err(blocked(CogneeUiState::MissingDependencies, "The installed Next.js native binding has no readable package.json.")),
+        Some(SUPPORTED_NEXT) => Ok(()),
+        Some(other) => Err(blocked(CogneeUiState::Unsupported, format!("The installed Next.js native binding is version {other}, not {SUPPORTED_NEXT}, so the interface is not started."))),
+        None => Err(blocked(CogneeUiState::MissingDependencies, "The installed Next.js native binding has no readable package.json.")),
     }
-    let node = find_node(node_override)?.ok_or_else(|| blocked(CogneeUiState::MissingDependencies, "Node.js was not found on this computer's PATH; the Cognee web interface needs it. OMP Manager never installs it."))?;
-    #[cfg(windows)]
-    {
+}
+
+#[cfg(windows)]
+fn check_node(node: &Path, next_json: &serde_json::Value) -> Result<(), Blocked> {
     let floor = node_floor(next_json);
-    match node_version(&node) {
-        Some(found) if found >= floor => {}
-        Some(found) => {
-            return Err(blocked(
-                CogneeUiState::Unsupported,
-                format!("Node.js {}.{}.{} is installed; Next.js {SUPPORTED_NEXT} needs {}.{}.{} or later.", found.0, found.1, found.2, floor.0, floor.1, floor.2),
-            ))
-        }
-        None => return Err(blocked(CogneeUiState::Unreadable, format!("The version of Node.js at {} could not be read.", forward(&node)))),
+    match node_version(node) {
+        Some(found) if found >= floor => Ok(()),
+        Some(found) => Err(blocked(
+            CogneeUiState::Unsupported,
+            format!("Node.js {}.{}.{} is installed; Next.js {SUPPORTED_NEXT} needs {}.{}.{} or later.", found.0, found.1, found.2, floor.0, floor.1, floor.2),
+        )),
+        None => Err(blocked(CogneeUiState::Unreadable, format!("The version of Node.js at {} could not be read.", forward(node)))),
     }
-    }
-    Ok(Components { frontend, node, next_entry, swc_binding, venv_python: if cfg!(windows) { venv.join("Scripts").join("python.exe") } else { venv.join("bin").join("python") } })
+}
+
+/// Only Windows identifies the Node.js version; elsewhere the executable is accepted as found.
+#[cfg(not(windows))]
+fn check_node(_node: &Path, _next_json: &serde_json::Value) -> Result<(), Blocked> {
+    Ok(())
 }
 
 /// The passive capability shown on page entry: the same inspection as a click, nothing more.
@@ -277,67 +306,90 @@ pub(crate) struct Backend {
 pub(crate) fn split_command_line(line: &str) -> Vec<String> {
     let chars: Vec<char> = line.chars().collect();
     let mut tokens = Vec::new();
-    let mut i = 0;
-    let skip = |i: &mut usize| {
-        while *i < chars.len() && (chars[*i] == ' ' || chars[*i] == '\t') {
-            *i += 1;
-        }
-    };
-    skip(&mut i);
+    let mut i = skip_blanks(&chars, 0);
     if i < chars.len() {
-        let mut program = String::new();
-        if chars[i] == '"' {
-            i += 1;
-            while i < chars.len() && chars[i] != '"' {
-                program.push(chars[i]);
-                i += 1;
-            }
-            i += 1;
-        } else {
-            while i < chars.len() && chars[i] != ' ' && chars[i] != '\t' {
-                program.push(chars[i]);
-                i += 1;
-            }
-        }
-        tokens.push(program);
+        tokens.push(read_program(&chars, &mut i));
     }
     loop {
-        skip(&mut i);
+        i = skip_blanks(&chars, i);
         if i >= chars.len() {
             break;
         }
-        let mut token = String::new();
-        let mut quoted = false;
-        while i < chars.len() {
-            let mut slashes = 0;
-            while i < chars.len() && chars[i] == '\\' {
-                slashes += 1;
-                i += 1;
-            }
-            if i < chars.len() && chars[i] == '"' {
-                token.extend(std::iter::repeat('\\').take(slashes / 2));
-                if slashes % 2 == 1 {
-                    token.push('"');
-                    i += 1;
-                } else if quoted && chars.get(i + 1) == Some(&'"') {
-                    token.push('"');
-                    i += 2;
-                } else {
-                    quoted = !quoted;
-                    i += 1;
-                }
-                continue;
-            }
-            token.extend(std::iter::repeat('\\').take(slashes));
-            if i >= chars.len() || (!quoted && (chars[i] == ' ' || chars[i] == '\t')) {
-                break;
-            }
-            token.push(chars[i]);
-            i += 1;
-        }
-        tokens.push(token);
+        tokens.push(read_token(&chars, &mut i));
     }
     tokens
+}
+
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
+fn skip_blanks(chars: &[char], mut i: usize) -> usize {
+    while i < chars.len() && is_blank(chars[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Characters from `*i` up to (not including) the first one for which `stop` holds.
+fn take_until(chars: &[char], i: &mut usize, stop: impl Fn(char) -> bool) -> String {
+    let mut taken = String::new();
+    while *i < chars.len() && !stop(chars[*i]) {
+        taken.push(chars[*i]);
+        *i += 1;
+    }
+    taken
+}
+
+/// The program name: a quoted name runs to the next quote, otherwise to the next blank; no backslash rules.
+fn read_program(chars: &[char], i: &mut usize) -> String {
+    if chars[*i] != '"' {
+        return take_until(chars, i, is_blank);
+    }
+    *i += 1;
+    let program = take_until(chars, i, |c| c == '"');
+    *i += 1;
+    program
+}
+
+/// One argument under `CommandLineToArgvW` rules; `*i` is on its first character.
+fn read_token(chars: &[char], i: &mut usize) -> String {
+    let mut token = String::new();
+    let mut quoted = false;
+    while *i < chars.len() {
+        let start = *i;
+        while *i < chars.len() && chars[*i] == '\\' {
+            *i += 1;
+        }
+        let slashes = *i - start;
+        if *i < chars.len() && chars[*i] == '"' {
+            apply_quote(chars, i, slashes, &mut quoted, &mut token);
+            continue;
+        }
+        token.extend(std::iter::repeat('\\').take(slashes));
+        if *i >= chars.len() || (!quoted && is_blank(chars[*i])) {
+            break;
+        }
+        token.push(chars[*i]);
+        *i += 1;
+    }
+    token
+}
+
+/// A `"` after `slashes` backslashes: half of them survive; an odd count makes the quote literal, `""` inside quotes
+/// is one literal quote, anything else toggles quoting.
+fn apply_quote(chars: &[char], i: &mut usize, slashes: usize, quoted: &mut bool, token: &mut String) {
+    token.extend(std::iter::repeat('\\').take(slashes / 2));
+    if slashes % 2 == 1 {
+        token.push('"');
+        *i += 1;
+    } else if *quoted && chars.get(*i + 1) == Some(&'"') {
+        token.push('"');
+        *i += 2;
+    } else {
+        *quoted = !*quoted;
+        *i += 1;
+    }
 }
 
 /// The port of a command line that is exactly `<python> -m uvicorn cognee.api.client:app [--host <loopback>] [--port N] ...`
@@ -471,7 +523,7 @@ impl CogneeUi {
 mod live {
     use super::*;
     use crate::process_tree::{ContainedChild, ContainedSpec, StdioMode};
-    use parking_lot::{Condvar, Mutex};
+    use parking_lot::{Condvar, Mutex, MutexGuard};
     use std::net::SocketAddr;
     use std::net::ToSocketAddrs;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -616,45 +668,9 @@ mod live {
         pub(crate) fn open(&self, components: &Components) -> CogneeOpenResult {
             let hooks = self.hooks.lock().clone();
             let mut inner = self.inner.lock();
-            let existing = loop {
-                if self.closing() {
-                    return result(CogneeOpenState::StartingFailed, None, "OMP Manager is closing; the Cognee UI was not started.");
-                }
-                match &inner.phase {
-                    Phase::Starting => {
-                        let seen = inner.finished;
-                        while inner.finished == seen && matches!(inner.phase, Phase::Starting) && !self.closing() {
-                            self.changed.wait(&mut inner);
-                        }
-                        if inner.finished != seen {
-                            if let Some(answer) = inner.last.clone() {
-                                return answer;
-                            }
-                        }
-                    }
-                    Phase::Stopping => self.changed.wait(&mut inner),
-                    Phase::Blocked(owned) => {
-                        let owned = owned.clone();
-                        inner.phase = Phase::Stopping;
-                        drop(inner);
-                        let retired = owned.child.terminate();
-                        inner = self.inner.lock();
-                        inner.phase = if retired.is_ok() { Phase::Idle } else { Phase::Blocked(owned) };
-                        self.changed.notify_all();
-                        if let Err(error) = retired {
-                            return result(CogneeOpenState::StartingFailed, None, format!("The Cognee UI process started earlier could not be stopped completely ({error}), so no new one is started."));
-                        }
-                    }
-                    Phase::Ready(owned) => {
-                        let owned = owned.clone();
-                        inner.phase = Phase::Starting;
-                        break Some(owned);
-                    }
-                    Phase::Idle => {
-                        inner.phase = Phase::Starting;
-                        break None;
-                    }
-                }
+            let existing = match self.claim_start(&mut inner) {
+                Ok(existing) => existing,
+                Err(answer) => return answer,
             };
             drop(inner);
             let (outcome, answer) = self.drive(&hooks, components, existing);
@@ -670,6 +686,58 @@ mod live {
             answer
         }
 
+        /// Waits out other starts and stops until this click owns the `Starting` phase. `Err` is the click's final answer;
+        /// `Ok` carries the frontend this app already owns, if any.
+        fn claim_start(&self, inner: &mut MutexGuard<'_, Inner>) -> Result<Option<Arc<Owned>>, CogneeOpenResult> {
+            loop {
+                if self.closing() {
+                    return Err(result(CogneeOpenState::StartingFailed, None, "OMP Manager is closing; the Cognee UI was not started."));
+                }
+                match &inner.phase {
+                    Phase::Starting => {
+                        if let Some(answer) = self.join_start(inner) {
+                            return Err(answer);
+                        }
+                    }
+                    Phase::Stopping => self.changed.wait(inner),
+                    Phase::Blocked(owned) => {
+                        let owned = owned.clone();
+                        self.retire_blocked(inner, owned)?;
+                    }
+                    Phase::Ready(owned) => {
+                        let owned = owned.clone();
+                        inner.phase = Phase::Starting;
+                        return Ok(Some(owned));
+                    }
+                    Phase::Idle => {
+                        inner.phase = Phase::Starting;
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        /// Waits for the one running start; its answer, unless shutdown began or no answer was recorded.
+        fn join_start(&self, inner: &mut MutexGuard<'_, Inner>) -> Option<CogneeOpenResult> {
+            let seen = inner.finished;
+            while inner.finished == seen && matches!(inner.phase, Phase::Starting) && !self.closing() {
+                self.changed.wait(inner);
+            }
+            if inner.finished != seen {
+                return inner.last.clone();
+            }
+            None
+        }
+
+        /// Retires a frontend that could not be proven stopped; the lock is released while the process tree is terminated.
+        fn retire_blocked(&self, inner: &mut MutexGuard<'_, Inner>, owned: Arc<Owned>) -> Result<(), CogneeOpenResult> {
+            inner.phase = Phase::Stopping;
+            let retired = MutexGuard::unlocked(inner, || owned.child.terminate());
+            inner.phase = if retired.is_ok() { Phase::Idle } else { Phase::Blocked(owned) };
+            self.changed.notify_all();
+            retired.map_err(|error| result(CogneeOpenState::StartingFailed, None, format!("The Cognee UI process started earlier could not be stopped completely ({error}), so no new one is started.")))
+        }
+
         fn abort(&self, owned: Arc<Owned>, state: CogneeOpenState, message: String) -> (Outcome, CogneeOpenResult) {
             match owned.child.terminate() {
                 Ok(()) => (Outcome::Idle, result(state, None, message)),
@@ -681,63 +749,55 @@ mod live {
         }
 
         fn drive(&self, hooks: &Hooks, components: &Components, existing: Option<Arc<Owned>>) -> (Outcome, CogneeOpenResult) {
-            let keep = |existing: Option<Arc<Owned>>| existing.map_or(Outcome::Idle, Outcome::Ready);
             let port = hooks.frontend_port;
-            // The backend must already run: it is identified only from the process list and the listener tables.
-            let backend = match (hooks.discover)(&components.venv_python).and_then(|found| choose_backend(&found)) {
-                Ok(backend) => backend,
-                Err(message) => return (keep(existing), result(CogneeOpenState::BackendUnavailable, None, message)),
+            let (backend, resolved) = match admit(hooks, components) {
+                Ok(admitted) => admitted,
+                Err(answer) => return (existing.map_or(Outcome::Idle, Outcome::Ready), answer),
             };
-            let backend_resolved = resolve_localhost(backend.port);
-            if !backend_resolved.as_ref().is_ok_and(|addresses| addresses.contains(&backend.address)) {
-                let message = match backend_resolved {
-                    Ok(_) => format!("The Cognee backend listens on {} but \"localhost\" does not resolve to that address, so the UI could not reach it.", backend.address),
-                    Err(error) => error,
-                };
-                return (keep(existing), result(CogneeOpenState::BackendUnavailable, None, message));
-            }
             let origin = format!("http://localhost:{}", backend.port);
-            let resolved = match resolve_localhost(port) {
-                Ok(addresses) => addresses,
-                Err(error) => return (keep(existing), result(CogneeOpenState::Unsupported, None, error)),
-            };
             if let Some(owned) = existing {
-                let reusable = owned.backend_port == backend.port
-                    && matches!(self.check(&owned, hooks, &origin, &resolved), Check::Ready);
-                if reusable {
-                    return self.finish(owned, hooks);
-                }
-                // A different backend, a dead process or a replaced listener: retire this app's own job first.
-                if let Err(error) = owned.child.terminate() {
-                    return (Outcome::Blocked(owned), result(CogneeOpenState::StartingFailed, None, format!("The Cognee UI process started earlier could not be stopped completely ({error}), so no new one is started.")));
+                if let std::ops::ControlFlow::Break(done) = self.reuse_existing(owned, hooks, backend.port, &origin, &resolved) {
+                    return done;
                 }
             }
             if self.closing() {
                 return (Outcome::Idle, result(CogneeOpenState::StartingFailed, None, "OMP Manager is closing; the Cognee UI was not started."));
             }
-            match native::tcp_listeners() {
-                Ok(listeners) => {
-                    if let Some(foreign) = listeners.iter().find(|listener| listener.port == port) {
-                        return (Outcome::Idle, busy(port, foreign.pid));
-                    }
-                }
-                Err(error) => return (Outcome::Idle, result(CogneeOpenState::StartingFailed, None, format!("The listening ports could not be read: {error}"))),
+            if let Some(answer) = port_blocker(port) {
+                return (Outcome::Idle, answer);
             }
             let child = match ContainedChild::spawn(spawn_spec(components, backend.port, port)) {
                 Ok(child) => child,
                 Err(error) => return (Outcome::Idle, result(CogneeOpenState::StartingFailed, None, format!("The Cognee UI could not be started: {error}"))),
             };
-            let owned = Arc::new(Owned { child, backend_port: backend.port });
+            self.await_ready(Arc::new(Owned { child, backend_port: backend.port }), hooks, &origin, &resolved)
+        }
+
+        /// `Break` ends the click with the reused frontend's answer or a stuck one; `Continue` means the old job is retired.
+        fn reuse_existing(&self, owned: Arc<Owned>, hooks: &Hooks, backend_port: u16, origin: &str, resolved: &[IpAddr]) -> std::ops::ControlFlow<(Outcome, CogneeOpenResult)> {
+            let reusable = owned.backend_port == backend_port && matches!(self.check(&owned, hooks, origin, resolved), Check::Ready);
+            if reusable {
+                return std::ops::ControlFlow::Break(self.finish(owned, hooks));
+            }
+            // A different backend, a dead process or a replaced listener: retire this app's own job first.
+            match owned.child.terminate() {
+                Ok(()) => std::ops::ControlFlow::Continue(()),
+                Err(error) => std::ops::ControlFlow::Break((Outcome::Blocked(owned), result(CogneeOpenState::StartingFailed, None, format!("The Cognee UI process started earlier could not be stopped completely ({error}), so no new one is started.")))),
+            }
+        }
+
+        /// Polls the freshly spawned frontend until it is ready, failed, foreign-bound or out of time.
+        fn await_ready(&self, owned: Arc<Owned>, hooks: &Hooks, origin: &str, resolved: &[IpAddr]) -> (Outcome, CogneeOpenResult) {
             let deadline = Instant::now() + hooks.startup_timeout;
             let mut waiting;
             loop {
                 if self.closing() {
                     return self.abort(owned, CogneeOpenState::StartingFailed, "OMP Manager is closing; the Cognee UI start was cancelled.".into());
                 }
-                match self.check(&owned, hooks, &origin, &resolved) {
+                match self.check(&owned, hooks, origin, resolved) {
                     Check::Ready => return self.finish(owned, hooks),
                     Check::Busy(pid) => {
-                        let message = busy(port, pid).message.unwrap_or_default();
+                        let message = busy(hooks.frontend_port, pid).message.unwrap_or_default();
                         return self.abort(owned, CogneeOpenState::PortBusy, message);
                     }
                     Check::Failed(message) => return self.abort(owned, CogneeOpenState::StartingFailed, message),
@@ -796,6 +856,35 @@ mod live {
                 // The child is known ready: keep it for the next explicit click.
                 Err(error) => (Outcome::Ready(owned), result(CogneeOpenState::OpenFailed, Some(url), format!("The Cognee UI is ready, but the browser could not be opened: {error}"))),
             }
+        }
+    }
+
+    /// The running, verified backend whose address "localhost" reaches, and where "localhost" resolves for the frontend port.
+    fn admit(hooks: &Hooks, components: &Components) -> Result<(Backend, Vec<IpAddr>), CogneeOpenResult> {
+        let backend = identify_backend(hooks, components)?;
+        let resolved = resolve_localhost(hooks.frontend_port).map_err(|error| result(CogneeOpenState::Unsupported, None, error))?;
+        Ok((backend, resolved))
+    }
+
+    /// The backend must already run: it is identified only from the process list and the listener tables.
+    fn identify_backend(hooks: &Hooks, components: &Components) -> Result<Backend, CogneeOpenResult> {
+        let unavailable = |message: String| result(CogneeOpenState::BackendUnavailable, None, message);
+        let backend = (hooks.discover)(&components.venv_python).and_then(|found| choose_backend(&found)).map_err(unavailable)?;
+        let resolved = resolve_localhost(backend.port);
+        if resolved.as_ref().is_ok_and(|addresses| addresses.contains(&backend.address)) {
+            return Ok(backend);
+        }
+        Err(unavailable(match resolved {
+            Ok(_) => format!("The Cognee backend listens on {} but \"localhost\" does not resolve to that address, so the UI could not reach it.", backend.address),
+            Err(error) => error,
+        }))
+    }
+
+    /// Why no new frontend may start: a foreign listener on `port` or an unreadable listener table.
+    fn port_blocker(port: u16) -> Option<CogneeOpenResult> {
+        match native::tcp_listeners() {
+            Ok(listeners) => listeners.iter().find(|listener| listener.port == port).map(|foreign| busy(port, foreign.pid)),
+            Err(error) => Some(result(CogneeOpenState::StartingFailed, None, format!("The listening ports could not be read: {error}"))),
         }
     }
 

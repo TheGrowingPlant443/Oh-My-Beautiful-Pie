@@ -457,6 +457,25 @@ mod linux {
         std::str::from_utf8(digits).ok()?.parse().ok()
     }
 
+    /// Records the wanted socket inodes held by one process's descriptors; the lowest PID owns a shared socket.
+    fn record_fd_owners(entries: fs::ReadDir, pid: u32, wanted: &HashSet<u64>, owners: &mut HashMap<u64, u32>, cancel: &AtomicBool) -> Result<(), String> {
+        for (count, entry) in entries.enumerate() {
+            if count >= MAX_FDS_PER_PROCESS {
+                break;
+            }
+            if count % FD_CANCEL_STRIDE == FD_CANCEL_STRIDE - 1 {
+                cancelled(cancel)?;
+            }
+            let Ok(entry) = entry else { continue };
+            // A descriptor closed since the listing, or a non-socket link: nothing to record.
+            let Ok(target) = fs::read_link(entry.path()) else { continue };
+            if let Some(inode) = socket_inode(&target).filter(|inode| wanted.contains(inode)) {
+                owners.entry(inode).and_modify(|owner: &mut u32| *owner = (*owner).min(pid)).or_insert(pid);
+            }
+        }
+        Ok(())
+    }
+
     /// Owners of the wanted socket inodes. A socket shared by several processes (a forked listener) is attributed to
     /// the lowest PID, whatever order `pids` is in. Processes whose descriptors cannot be listed are returned too:
     /// their sockets are invisible to this scan.
@@ -475,20 +494,7 @@ mod linux {
                     continue;
                 }
             };
-            for (count, entry) in entries.enumerate() {
-                if count >= MAX_FDS_PER_PROCESS {
-                    break;
-                }
-                if count % FD_CANCEL_STRIDE == FD_CANCEL_STRIDE - 1 {
-                    cancelled(cancel)?;
-                }
-                let Ok(entry) = entry else { continue };
-                // A descriptor closed since the listing, or a non-socket link: nothing to record.
-                let Ok(target) = fs::read_link(entry.path()) else { continue };
-                if let Some(inode) = socket_inode(&target).filter(|inode| wanted.contains(inode)) {
-                    owners.entry(inode).and_modify(|owner: &mut u32| *owner = (*owner).min(*pid)).or_insert(*pid);
-                }
-            }
+            record_fd_owners(entries, *pid, wanted, &mut owners, cancel)?;
         }
         Ok((owners, unreadable))
     }

@@ -153,9 +153,9 @@ class PythonRecipes(unittest.TestCase):
         t = next(s for s in kit.sites(r, "imports") if s["binding"]["specifier"] == "t")
         self.assertTrue(t["typeOnly"] and t["binding"]["typeKind"] == "type" and t["conditional"])
         decl_names = {d["name"] for d in kit.declarations(r, None)}
-        self.assertTrue({"b", "c", "x", "a", "e", "T"} <= decl_names)
+        self.assertLessEqual({"b", "c", "x", "a", "e", "T"}, decl_names)
         imp_decl = next(d for d in kit.declarations(r, None, "b"))
-        self.assertTrue(imp_decl["siteId"] in {s["id"] for s in r["sites"]})
+        self.assertIn(imp_decl["siteId"], {s["id"] for s in r["sites"]})
 
     def test_dynamic_import_calls(self):
         r = self.run_py(
@@ -243,7 +243,7 @@ class PythonRecipes(unittest.TestCase):
         lam = next(s for s in r["symbols"] if s["name"] == "" and s["kind"] == "lambda")
         self.assertEqual((iife["resolution"], iife["targetId"]), ("resolvedStatic", lam["id"]))
         named = kit.syms(r, "function", "f")[0]
-        self.assertEqual(named["bindings"]["body"], True)
+        self.assertIs(named["bindings"]["body"], True)
         inner = kit.sites(r, "calls", "g")[0]
         self.assertEqual(inner["callerId"], named["id"])
 

@@ -66,6 +66,15 @@ def _split(name):
     return None, name
 
 
+def _dir_specifier(levels, tail):
+    """Join `levels` parent hops ("..") onto a literal tail relative to __DIR__."""
+    ups = "/".join([".."] * levels)
+    if not ups:
+        return tail
+    sep = "" if tail.startswith("/") else "/"
+    return ups + sep + tail
+
+
 class _Walker:
     def __init__(self, ctx):
         self.ctx = ctx
@@ -75,6 +84,26 @@ class _Walker:
         self.ns: str | None = None
         self.ns_braced: dict[int, str | None] = {}
         self.names: dict = {}
+        self.handlers = {
+            "namespace_definition": self.enter_namespace,
+            "namespace_use_declaration": self.enter_use,
+            "function_definition": self.enter_function,
+            "anonymous_class": self.enter_anonymous_class,
+            "use_declaration": self.enter_trait_use,
+            "method_declaration": self.enter_method,
+            "anonymous_function": self.enter_lambda,
+            "arrow_function": self.enter_lambda,
+            "assignment_expression": self.enter_assignment,
+            "augmented_assignment_expression": self.enter_assignment,
+            "catch_clause": self.enter_catch,
+            "object_creation_expression": self.enter_new,
+            **dict.fromkeys(CLASS_LIKE, self.enter_class),
+            **dict.fromkeys(INCLUDE_NODES, self.enter_include),
+            **dict.fromkeys(
+                ("function_call_expression", "member_call_expression", "nullsafe_member_call_expression", "scoped_call_expression"),
+                self.enter_call,
+            ),
+        }
 
     # -- helpers -------------------------------------------------------------
     def scope_range(self):
@@ -101,7 +130,7 @@ class _Walker:
             mutable=mutable, position=node.start_byte if node is not None else None, owner=own,
         )
 
-    def push_node(self, node, sym):
+    def push_node(self, node):
         self.pushed[node.id] = self.cond
         self.cond = 0
 
@@ -157,50 +186,52 @@ class _Walker:
             node = node.named_children[0]
         return node
 
+    def dirname_prefix(self, node):
+        """Directory levels for a dirname(__FILE__ | <dir expression>) call, else None."""
+        ctx = self.ctx
+        fn = node.child_by_field_name("function")
+        args = node.child_by_field_name("arguments")
+        if fn is None or args is None or ctx.text(fn).lstrip("\\") != "dirname":
+            return None
+        items = [a for a in args.named_children if a.type == "argument"]
+        if len(items) != 1 or not items[0].named_children:
+            return None
+        inner = items[0].named_children[0]
+        if inner.type == "name" and ctx.text(inner) == "__FILE__":
+            return 0
+        sub = self.dir_prefix(inner)
+        return None if sub is None else sub + 1
+
     def dir_prefix(self, node):
         """Return number of directory levels above the including file if node is __DIR__/dirname(...)."""
-        ctx = self.ctx
         node = self.unwrap(node)
-        if node.type == "name" and ctx.text(node) == "__DIR__":
+        if node.type == "name" and self.ctx.text(node) == "__DIR__":
             return 0
         if node.type == "function_call_expression":
-            fn = node.child_by_field_name("function")
-            args = node.child_by_field_name("arguments")
-            if fn is not None and ctx.text(fn).lstrip("\\") == "dirname" and args is not None:
-                items = [a for a in args.named_children if a.type == "argument"]
-                if len(items) == 1 and items[0].named_children:
-                    inner = items[0].named_children[0]
-                    if inner.type == "name" and ctx.text(inner) == "__FILE__":
-                        return 0
-                    sub = self.dir_prefix(inner)
-                    if sub is not None:
-                        return sub + 1
+            return self.dirname_prefix(node)
         return None
+
+    def include_specifier(self, arg):
+        """(specifier, relativeTo, dynamic) for an include argument; only literals and __DIR__ chains resolve."""
+        lit = self.string_value(arg)
+        if lit is not None:
+            return lit, None, False
+        ops: list = []
+        self.concat_operands(arg, ops)
+        head = self.dir_prefix(ops[0]) if ops else None
+        lits = [self.string_value(o) for o in (ops[1:] if head is not None else ops)]
+        if not lits or any(v is None for v in lits):
+            return None, None, True
+        tail = "".join(lits)
+        if head is None:
+            return tail, None, False
+        return _dir_specifier(head, tail), "__DIR__", False
 
     def include_site(self, node):
         ctx = self.ctx
         loader = INCLUDE_NODES[node.type]
         arg = self.unwrap(node.named_children[0]) if node.named_children else None
-        specifier, relative_to, dynamic = None, None, True
-        if arg is not None:
-            lit = self.string_value(arg)
-            if lit is not None:
-                specifier, dynamic = lit, False
-            else:
-                ops: list = []
-                self.concat_operands(arg, ops)
-                head = self.dir_prefix(ops[0]) if ops else None
-                rest = ops[1:] if head is not None else ops
-                lits = [self.string_value(o) for o in rest]
-                if lits and all(v is not None for v in lits):
-                    tail = "".join(lits)
-                    if head is None:
-                        specifier = tail
-                    else:
-                        ups = "/".join([".."] * head)
-                        specifier = tail if not ups else ups + ("" if tail.startswith("/") else "/") + tail
-                        relative_to = "__DIR__"
-                    dynamic = False
+        specifier, relative_to, dynamic = (None, None, True) if arg is None else self.include_specifier(arg)
         binding = {
             "kind": "include", "specifier": specifier, "imported": None, "alias": None, "default": False,
             "namespace": False, "reexport": False, "typeOnly": False, "typeKind": None, "local": None,
@@ -219,39 +250,42 @@ class _Walker:
                 return c.type
         return None
 
-    def use_sites(self, node):
-        ctx = self.ctx
-        decl_kind = self._keyword(node)
-        group = None
+    def _use_group(self, node):
+        """(group node | None, name prefix written before the group)."""
         prefix = None
         for c in node.children:
             if c.type == "namespace_use_group":
-                group = c
-            elif c.type == "namespace_name" and group is None:
-                prefix = ctx.text(c)
-        clauses = []
-        if group is not None:
-            clauses = [c for c in group.named_children if c.type == "namespace_use_clause"]
-        else:
-            clauses = [c for c in node.named_children if c.type == "namespace_use_clause"]
-        for clause in clauses:
-            name_node = next((c for c in clause.named_children if c.type in ("qualified_name", "name", "namespace_name")), None)
-            if name_node is None:
-                continue
-            written = ctx.text(name_node)
-            spec = (prefix.rstrip("\\") + "\\" + written) if prefix is not None else written
-            imported = spec.rsplit("\\", 1)[-1]
-            alias_node = clause.child_by_field_name("alias")
-            alias = ctx.text(alias_node) if alias_node is not None else None
-            kw = self._keyword(clause) or decl_kind
-            type_kind = {"function": "function", "const": "const"}.get(kw)
-            binding = {
-                "kind": "use", "specifier": spec, "imported": imported, "alias": alias, "default": False,
-                "namespace": False, "reexport": False, "typeOnly": False, "typeKind": type_kind,
-                "local": alias or imported, "relativeTo": None, "system": False,
-            }
-            site = ctx.add_site("imports", _cap(ctx.text(clause), binding), clause, conditional=self.cond > 0, binding=binding)
-            self.declare_here(alias or imported, "import", site=site, node=clause, mutable=False)
+                return c, prefix
+            if c.type == "namespace_name":
+                prefix = self.ctx.text(c)
+        return None, prefix
+
+    def use_clause_site(self, clause, prefix, decl_kind):
+        ctx = self.ctx
+        name_node = next((c for c in clause.named_children if c.type in ("qualified_name", "name", "namespace_name")), None)
+        if name_node is None:
+            return
+        written = ctx.text(name_node)
+        spec = (prefix.rstrip("\\") + "\\" + written) if prefix is not None else written
+        imported = spec.rsplit("\\", 1)[-1]
+        alias_node = clause.child_by_field_name("alias")
+        alias = ctx.text(alias_node) if alias_node is not None else None
+        kw = self._keyword(clause) or decl_kind
+        type_kind = {"function": "function", "const": "const"}.get(kw)
+        binding = {
+            "kind": "use", "specifier": spec, "imported": imported, "alias": alias, "default": False,
+            "namespace": False, "reexport": False, "typeOnly": False, "typeKind": type_kind,
+            "local": alias or imported, "relativeTo": None, "system": False,
+        }
+        site = ctx.add_site("imports", _cap(ctx.text(clause), binding), clause, conditional=self.cond > 0, binding=binding)
+        self.declare_here(alias or imported, "import", site=site, node=clause, mutable=False)
+
+    def use_sites(self, node):
+        decl_kind = self._keyword(node)
+        group, prefix = self._use_group(node)
+        for clause in (group if group is not None else node).named_children:
+            if clause.type == "namespace_use_clause":
+                self.use_clause_site(clause, prefix, decl_kind)
 
     # -- calls -----------------------------------------------------------------
     def new_site(self, node):
@@ -264,33 +298,88 @@ class _Walker:
             break
         args = next((c for c in node.named_children if c.type == "arguments"), None)
         binding: dict = {"kind": "new", "name": None, "receiver": None, "receiverKind": None}
-        dynamic = False
-        resolution = None
         if target is None:
             return
+        raw, dynamic, resolution = self._new_target_binding(node, target, args, binding)
+        ctx.add_site("calls", _cap(raw, binding), node, conditional=self.cond > 0, dynamic=dynamic, resolution=resolution, binding=binding)
+
+    def _new_target_binding(self, node, target, args, binding):
+        ctx = self.ctx
         if target.type == "anonymous_class":
             binding["name"] = "<anonymous class>"
             binding["anonymous"] = True
-            resolution = "unsupported"
-            raw = "new class"
-        elif target.type in ("name", "qualified_name"):
+            return "new class", False, "unsupported"
+        if target.type in ("name", "qualified_name"):
             text = ctx.text(target)
             prefix, last = _split(text)
             binding["name"], binding["receiver"] = last, prefix
             binding["receiverKind"] = "path" if prefix else None
-            raw = "new " + text
-        elif target.type == "relative_scope":
+            return "new " + text, False, None
+        if target.type == "relative_scope":
             text = ctx.text(target)
             binding["name"] = text
             binding["receiverKind"] = "super" if text == "parent" else "self"
-            raw = "new " + text
-        else:
-            dynamic = True
-            binding["kind"] = "dynamic"
+            return "new " + text, False, None
+        binding["kind"] = "dynamic"
+        binding["dynamic"] = True
+        binding["new"] = True
+        end = args.start_byte if args is not None else node.end_byte
+        raw = _cap(ctx.source[node.start_byte:end].decode("utf-8", "replace").rstrip(), binding)
+        return raw, True, None
+
+    def _call_name(self, name, binding):
+        """Set the called member name; True when the name is computed (dynamic)."""
+        if name is not None and name.type == "name":
+            binding["name"] = self.ctx.text(name)
+            return False
+        binding.update(kind="dynamic", dynamic=True, name=None)
+        return True
+
+    def function_call_binding(self, node, binding):
+        ctx = self.ctx
+        fn = node.child_by_field_name("function")
+        if fn is not None and fn.type in ("name", "qualified_name"):
+            text = ctx.text(fn)
+            prefix, last = _split(text)
+            binding.update(kind="path" if prefix else "identifier", name=last, receiver=prefix,
+                           receiverKind="path" if prefix else None)
+            return last.lower() in DYNAMIC_FUNCS
+        binding.update(kind="dynamic", dynamic=True)
+        if fn is not None and fn.type == "variable_name":
+            binding["name"] = ctx.text(fn)
+            binding["variableCallee"] = True
+        return True
+
+    def member_call_binding(self, node, binding):
+        ctx = self.ctx
+        obj = node.child_by_field_name("object")
+        rtext = ctx.text(obj) if obj is not None else None
+        kind = "expression"
+        if obj is not None and obj.type == "variable_name":
+            kind = "this" if rtext == "$this" else "identifier"
+        binding.update(kind="member", receiver=_cap(rtext or "", binding), receiverKind=kind)
+        if node.type == "nullsafe_member_call_expression":
+            binding["optional"] = True
+        return self._call_name(node.child_by_field_name("name"), binding)
+
+    @staticmethod
+    def _scope_kind(scope, stext):
+        if scope is not None and scope.type == "relative_scope":
+            return "super" if stext == "parent" else "self"
+        if scope is not None and scope.type in ("name", "qualified_name"):
+            return "path"
+        return "expression"
+
+    def scoped_call_binding(self, node, binding):
+        scope = node.child_by_field_name("scope")
+        stext = self.ctx.text(scope) if scope is not None else ""
+        rk = self._scope_kind(scope, stext)
+        binding.update(kind="member" if rk != "path" else "path", receiver=_cap(stext, binding), receiverKind=rk)
+        dynamic = self._call_name(node.child_by_field_name("name"), binding)
+        if rk == "expression":
             binding["dynamic"] = True
-            binding["new"] = True
-            raw = _cap(ctx.source[node.start_byte:(args.start_byte if args is not None else node.end_byte)].decode("utf-8", "replace").rstrip(), binding)
-        ctx.add_site("calls", _cap(raw, binding), node, conditional=self.cond > 0, dynamic=dynamic, resolution=resolution, binding=binding)
+            dynamic = True
+        return dynamic
 
     def call_site(self, node):
         ctx = self.ctx
@@ -299,55 +388,12 @@ class _Walker:
         end = args.start_byte if args is not None else node.end_byte
         raw = ctx.source[node.start_byte:end].decode("utf-8", "replace").rstrip()
         binding: dict = {"name": None, "receiver": None, "receiverKind": None}
-        dynamic = False
         if t == "function_call_expression":
-            fn = node.child_by_field_name("function")
-            if fn is not None and fn.type in ("name", "qualified_name"):
-                text = ctx.text(fn)
-                prefix, last = _split(text)
-                binding.update(kind="path" if prefix else "identifier", name=last, receiver=prefix,
-                               receiverKind="path" if prefix else None)
-                dynamic = last.lower() in DYNAMIC_FUNCS
-            else:
-                binding.update(kind="dynamic", dynamic=True)
-                dynamic = True
-                if fn is not None and fn.type == "variable_name":
-                    binding["name"] = ctx.text(fn)
-                    binding["variableCallee"] = True
+            dynamic = self.function_call_binding(node, binding)
         elif t in ("member_call_expression", "nullsafe_member_call_expression"):
-            obj = node.child_by_field_name("object")
-            name = node.child_by_field_name("name")
-            rtext = ctx.text(obj) if obj is not None else None
-            kind = "expression"
-            if obj is not None and obj.type == "variable_name":
-                kind = "this" if rtext == "$this" else "identifier"
-            binding.update(kind="member", receiver=_cap(rtext or "", binding), receiverKind=kind)
-            if t == "nullsafe_member_call_expression":
-                binding["optional"] = True
-            if name is not None and name.type == "name":
-                binding["name"] = ctx.text(name)
-            else:
-                binding.update(kind="dynamic", dynamic=True, name=None)
-                dynamic = True
+            dynamic = self.member_call_binding(node, binding)
         else:  # scoped_call_expression
-            scope = node.child_by_field_name("scope")
-            name = node.child_by_field_name("name")
-            stext = ctx.text(scope) if scope is not None else ""
-            if scope is not None and scope.type == "relative_scope":
-                rk = "super" if stext == "parent" else "self"
-            elif scope is not None and scope.type in ("name", "qualified_name"):
-                rk = "path"
-            else:
-                rk = "expression"
-            binding.update(kind="member" if rk != "path" else "path", receiver=_cap(stext, binding), receiverKind=rk)
-            if name is not None and name.type == "name":
-                binding["name"] = ctx.text(name)
-            else:
-                binding.update(kind="dynamic", dynamic=True, name=None)
-                dynamic = True
-            if rk == "expression":
-                binding["dynamic"] = True
-                dynamic = True
+            dynamic = self.scoped_call_binding(node, binding)
         ctx.add_site("calls", _cap(raw, binding), node, conditional=self.cond > 0, dynamic=dynamic, binding=binding)
 
     def reference(self, name_node, role, caller):
@@ -364,153 +410,175 @@ class _Walker:
     def enter(self, node):
         if not node.is_named:
             return True
-        ctx = self.ctx
         t = node.type
         if t in CONDITIONAL:
             self.cond += 1
             self.cond_nodes.add(node.id)
-        if t == "namespace_definition":
-            name = node.child_by_field_name("name")
-            body = node.child_by_field_name("body")
-            text = ctx.text(name) if name is not None else None
-            if body is not None:
-                self.ns_braced[node.id] = self.ns
-                self.ns = text
-                sym = ctx.add_symbol("namespace", text or "", node, push=True, bindings={"namespace": text, "braced": True})
-                self.push_node(node, sym)
-            else:
-                self.ns = text
-            return True
-        if t == "namespace_use_declaration":
-            self.use_sites(node)
-            return False
-        if t in INCLUDE_NODES:
-            self.include_site(node)
-            return True
-        if t == "function_definition":
-            name_node = node.child_by_field_name("name")
-            name = ctx.text(name_node)
-            body = node.child_by_field_name("body")
-            bindings = {"namespace": self.ns, "body": body is not None}
-            fqn = self.fqn(name)
-            if fqn is not None:
-                bindings["fqn"] = fqn
-            sym = ctx.add_symbol("function", name, node, bindings=bindings)
-            self.declare_here(name, "function", sym=sym, node=name_node, mutable=self.cond > 0)
-            ctx.push_scope(sym["id"], name, "function")
-            self.push_node(node, sym)
-            self.declare_params(node.child_by_field_name("parameters"))
-            return True
-        if t in CLASS_LIKE:
-            name_node = node.child_by_field_name("name")
-            name = ctx.text(name_node)
-            outer = ctx.owner
-            bindings: dict = {"namespace": self.ns}
-            fqn = self.fqn(name)
-            if fqn is not None:
-                bindings["fqn"] = fqn
-            extends, implements = [], []
-            for c in node.named_children:
-                if c.type == "base_clause":
-                    extends = [ctx.text(n) for n in c.named_children if n.type in ("name", "qualified_name")]
-                elif c.type == "class_interface_clause":
-                    implements = [ctx.text(n) for n in c.named_children if n.type in ("name", "qualified_name")]
-            if extends:
-                bindings["extends"] = extends
-            if implements:
-                bindings["implements"] = implements
-            sym = ctx.add_symbol(CLASS_LIKE[t], name, node, bindings=bindings)
-            self.declare_here(name, "class", sym=sym, node=name_node, mutable=self.cond > 0)
-            ctx.push_scope(sym["id"], name, CLASS_LIKE[t])
-            self.push_node(node, sym)
-            for c in node.named_children:
-                if c.type == "base_clause":
-                    for n in c.named_children:
-                        if n.type in ("name", "qualified_name"):
-                            self.reference(n, "extends", outer)
-                elif c.type == "class_interface_clause":
-                    for n in c.named_children:
-                        if n.type in ("name", "qualified_name"):
-                            self.reference(n, "implements", outer)
-            return True
-        if t == "anonymous_class":
-            bindings = {"namespace": self.ns, "anonymous": True}
-            outer = ctx.owner
-            sym = ctx.add_symbol("class", "<anonymous class>", node, bindings=bindings)
-            ctx.push_scope(sym["id"], None, "class")
-            self.push_node(node, sym)
-            for c in node.named_children:
-                if c.type == "base_clause":
-                    sym["bindings"]["extends"] = [ctx.text(n) for n in c.named_children if n.type in ("name", "qualified_name")]
-                    for n in c.named_children:
-                        if n.type in ("name", "qualified_name"):
-                            self.reference(n, "extends", outer)
-                elif c.type == "class_interface_clause":
-                    sym["bindings"]["implements"] = [ctx.text(n) for n in c.named_children if n.type in ("name", "qualified_name")]
-                    for n in c.named_children:
-                        if n.type in ("name", "qualified_name"):
-                            self.reference(n, "implements", outer)
-            return True
-        if t == "use_declaration" and ctx.current_scope is not None and ctx.current_scope.kind in ("class", "trait", "enum"):
+        handler = self.handlers.get(t)
+        return True if handler is None else handler(node)
+
+    def enter_namespace(self, node):
+        ctx = self.ctx
+        name = node.child_by_field_name("name")
+        body = node.child_by_field_name("body")
+        text = ctx.text(name) if name is not None else None
+        if body is not None:
+            self.ns_braced[node.id] = self.ns
+            self.ns = text
+            ctx.add_symbol("namespace", text or "", node, push=True, bindings={"namespace": text, "braced": True})
+            self.push_node(node)
+        else:
+            self.ns = text
+        return True
+
+    def enter_use(self, node):
+        self.use_sites(node)
+        return False
+
+    def enter_include(self, node):
+        self.include_site(node)
+        return True
+
+    def enter_function(self, node):
+        ctx = self.ctx
+        name_node = node.child_by_field_name("name")
+        name = ctx.text(name_node)
+        body = node.child_by_field_name("body")
+        bindings = {"namespace": self.ns, "body": body is not None}
+        fqn = self.fqn(name)
+        if fqn is not None:
+            bindings["fqn"] = fqn
+        sym = ctx.add_symbol("function", name, node, bindings=bindings)
+        self.declare_here(name, "function", sym=sym, node=name_node, mutable=self.cond > 0)
+        ctx.push_scope(sym["id"], name, "function")
+        self.push_node(node)
+        self.declare_params(node.child_by_field_name("parameters"))
+        return True
+
+    @staticmethod
+    def heritage(node):
+        """(role, name nodes) per extends/implements clause of a class-like node."""
+        roles = {"base_clause": "extends", "class_interface_clause": "implements"}
+        return [
+            (roles[c.type], [n for n in c.named_children if n.type in ("name", "qualified_name")])
+            for c in node.named_children if c.type in roles
+        ]
+
+    def heritage_references(self, heritage, outer):
+        for role, names in heritage:
+            for n in names:
+                self.reference(n, role, outer)
+
+    def enter_class(self, node):
+        ctx = self.ctx
+        t = node.type
+        name_node = node.child_by_field_name("name")
+        name = ctx.text(name_node)
+        outer = ctx.owner
+        bindings: dict = {"namespace": self.ns}
+        fqn = self.fqn(name)
+        if fqn is not None:
+            bindings["fqn"] = fqn
+        heritage = self.heritage(node)
+        for role, names in heritage:
+            if names:
+                bindings[role] = [ctx.text(n) for n in names]
+        sym = ctx.add_symbol(CLASS_LIKE[t], name, node, bindings=bindings)
+        self.declare_here(name, "class", sym=sym, node=name_node, mutable=self.cond > 0)
+        ctx.push_scope(sym["id"], name, CLASS_LIKE[t])
+        self.push_node(node)
+        self.heritage_references(heritage, outer)
+        return True
+
+    def enter_anonymous_class(self, node):
+        ctx = self.ctx
+        outer = ctx.owner
+        sym = ctx.add_symbol("class", "<anonymous class>", node, bindings={"namespace": self.ns, "anonymous": True})
+        ctx.push_scope(sym["id"], None, "class")
+        self.push_node(node)
+        heritage = self.heritage(node)
+        for role, names in heritage:
+            sym["bindings"][role] = [ctx.text(n) for n in names]
+        self.heritage_references(heritage, outer)
+        return True
+
+    def enter_trait_use(self, node):
+        ctx = self.ctx
+        if ctx.current_scope is not None and ctx.current_scope.kind in ("class", "trait", "enum"):
             for n in node.named_children:
                 if n.type in ("name", "qualified_name"):
                     self.reference(n, "trait", ctx.owner)
-            return True
-        if t == "method_declaration":
-            name_node = node.child_by_field_name("name")
-            name = ctx.text(name_node)
-            body = node.child_by_field_name("body")
-            mods = [c.type for c in node.named_children if c.type.endswith("_modifier")]
-            vis = next((ctx.text(c) for c in node.named_children if c.type == "visibility_modifier"), "")
-            bindings = {
-                "static": "static_modifier" in mods, "visibility": vis, "abstract": "abstract_modifier" in mods,
-                "body": body is not None,
-            }
-            kind = "constructor" if name.lower() == "__construct" else "method"
-            sym = ctx.add_symbol(kind, name, node, bindings=bindings)
-            ctx.push_scope(sym["id"], name, kind)
-            self.push_node(node, sym)
-            self.declare_params(node.child_by_field_name("parameters"))
-            return True
-        if t in ("anonymous_function", "arrow_function"):
-            parent = node.parent
-            outer = ctx.owner
-            outer_range = self.scope_range()
-            sym = ctx.add_symbol("lambda", "<closure>" if t == "anonymous_function" else "<arrow>", node,
-                                 node_kind=t, bindings={"static": any(c.type == "static_modifier" for c in node.children)})
-            ctx.push_scope(sym["id"], None, "lambda")
-            self.push_node(node, sym)
-            self.declare_params(node.child_by_field_name("parameters"))
-            for c in node.named_children:
-                if c.type == "anonymous_function_use_clause":
-                    for v in c.named_children:
-                        if v.type == "variable_name":
-                            self.declare_here(ctx.text(v), "variable", node=v, mutable=True)
-            if parent is not None and parent.type == "assignment_expression":
-                left = parent.child_by_field_name("left")
-                if left is not None and left.type == "variable_name":
-                    name = ctx.text(left)
-                    sym["bindings"]["assignedTo"] = name
-                    self.declare_here(name, "variable", sym=sym, node=left, mutable=True, owner=outer, scope=outer_range)
-            return True
-        if t == "assignment_expression" or t == "augmented_assignment_expression":
-            left = node.child_by_field_name("left")
-            right = node.child_by_field_name("right")
-            if left is not None and left.type == "variable_name":
-                if not (right is not None and right.type in ("anonymous_function", "arrow_function")):
-                    self.declare_here(ctx.text(left), "variable", node=left, mutable=True)
-            return True
-        if t == "catch_clause":
-            n = node.child_by_field_name("name")
-            if n is not None and n.type == "variable_name":
-                self.declare_here(ctx.text(n), "catch", node=n, mutable=True)
-            return True
-        if t in ("function_call_expression", "member_call_expression", "nullsafe_member_call_expression", "scoped_call_expression"):
-            self.call_site(node)
-            return True
-        if t == "object_creation_expression":
-            self.new_site(node)
-            return True
+        return True
+
+    def enter_method(self, node):
+        ctx = self.ctx
+        name_node = node.child_by_field_name("name")
+        name = ctx.text(name_node)
+        body = node.child_by_field_name("body")
+        mods = [c.type for c in node.named_children if c.type.endswith("_modifier")]
+        vis = next((ctx.text(c) for c in node.named_children if c.type == "visibility_modifier"), "")
+        bindings = {
+            "static": "static_modifier" in mods, "visibility": vis, "abstract": "abstract_modifier" in mods,
+            "body": body is not None,
+        }
+        kind = "constructor" if name.lower() == "__construct" else "method"
+        sym = ctx.add_symbol(kind, name, node, bindings=bindings)
+        ctx.push_scope(sym["id"], name, kind)
+        self.push_node(node)
+        self.declare_params(node.child_by_field_name("parameters"))
+        return True
+
+    def declare_use_vars(self, node):
+        for c in node.named_children:
+            if c.type == "anonymous_function_use_clause":
+                for v in c.named_children:
+                    if v.type == "variable_name":
+                        self.declare_here(self.ctx.text(v), "variable", node=v, mutable=True)
+
+    def declare_assigned_lambda(self, parent, sym, outer, outer_range):
+        if parent is None or parent.type != "assignment_expression":
+            return
+        left = parent.child_by_field_name("left")
+        if left is None or left.type != "variable_name":
+            return
+        name = self.ctx.text(left)
+        sym["bindings"]["assignedTo"] = name
+        self.declare_here(name, "variable", sym=sym, node=left, mutable=True, owner=outer, scope=outer_range)
+
+    def enter_lambda(self, node):
+        ctx = self.ctx
+        parent = node.parent
+        outer = ctx.owner
+        outer_range = self.scope_range()
+        sym = ctx.add_symbol("lambda", "<closure>" if node.type == "anonymous_function" else "<arrow>", node,
+                             node_kind=node.type, bindings={"static": any(c.type == "static_modifier" for c in node.children)})
+        ctx.push_scope(sym["id"], None, "lambda")
+        self.push_node(node)
+        self.declare_params(node.child_by_field_name("parameters"))
+        self.declare_use_vars(node)
+        self.declare_assigned_lambda(parent, sym, outer, outer_range)
+        return True
+
+    def enter_assignment(self, node):
+        left = node.child_by_field_name("left")
+        right = node.child_by_field_name("right")
+        is_lambda = right is not None and right.type in ("anonymous_function", "arrow_function")
+        if left is not None and left.type == "variable_name" and not is_lambda:
+            self.declare_here(self.ctx.text(left), "variable", node=left, mutable=True)
+        return True
+
+    def enter_catch(self, node):
+        n = node.child_by_field_name("name")
+        if n is not None and n.type == "variable_name":
+            self.declare_here(self.ctx.text(n), "catch", node=n, mutable=True)
+        return True
+
+    def enter_call(self, node):
+        self.call_site(node)
+        return True
+
+    def enter_new(self, node):
+        self.new_site(node)
         return True
 
     def leave(self, node):
@@ -524,7 +592,7 @@ class _Walker:
             self.ns = self.ns_braced.pop(node.id)
 
 
-def extract(language: str, source: bytes, ctx: "common.Context") -> dict:
+def extract(_language: str, _source: bytes, ctx: "common.Context") -> dict:
     tree = ctx.parse()
     root = tree.root_node
     ctx.module_symbol(root)

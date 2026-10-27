@@ -126,22 +126,47 @@ fn read(root: &Path, relative: &str) -> Result<Option<Vec<u8>>> {
 fn hash(bytes: &Option<Vec<u8>>) -> Option<String> { bytes.as_ref().map(|b| fsio::sha256_hex(b)) }
 fn revision(items: &[MarkdownItem]) -> String { hashes_revision(items.iter().filter_map(|i|i.source_hash.as_ref().map(|h|(&i.id,h)))) }
 fn hashes_revision<'a>(hashes: impl Iterator<Item=(&'a String,&'a String)>) -> String {let bytes:Vec<u8>=hashes.flat_map(|(id,h)|format!("{id}\0{h}\n").into_bytes()).collect();fsio::sha256_hex(&bytes)}
+struct Walk<'a> { root: &'a Path, native: bool, names: &'a mut BTreeSet<String>, warnings: &'a mut Vec<String> }
 fn walk(root: &Path, prefix: &str, native: bool, names: &mut BTreeSet<String>, warnings: &mut Vec<String>, depth: usize) -> Result<()> {
-    if depth>32 {return Err("Markdown namespace nesting exceeds review safety bound".into());}
-    let dir=root.join(prefix);
-    match fs::symlink_metadata(&dir) { Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(()), Err(e)=>return Err(e.to_string()), Ok(m) if crate::code_quality::snapshot::is_link(&m)||!m.is_dir()=>return Err(format!("Refusing linked/non-directory namespace: {}",dir.display())), _=>{} }
-    let mut case=BTreeSet::new();
-    for entry in fs::read_dir(dir).map_err(|e|e.to_string())? {
-        let entry=entry.map_err(|e|e.to_string())?; let name=entry.file_name().into_string().map_err(|_|"Non-Unicode asset path")?;
-        if name.starts_with('.') || matches!(name.to_ascii_lowercase().as_str(),"node_modules"|"vendor"|"cache"|"sessions"|"history"|"artifacts"|"credentials"|"auth"|"sdk") {continue;}
-        if !case.insert(name.to_lowercase()) {return Err("Case-colliding Markdown namespace entries".into());}
+    Walk { root, native, names, warnings }.dir(prefix, depth)
+}
+/// A missing namespace folder is empty; a link or non-directory is refused.
+fn namespace_exists(dir: &Path) -> Result<bool> {
+    match fs::symlink_metadata(dir) {
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.to_string()),
+        Ok(m) if crate::code_quality::snapshot::is_link(&m)||!m.is_dir() => Err(format!("Refusing linked/non-directory namespace: {}",dir.display())),
+        Ok(_) => Ok(true),
+    }
+}
+fn ignored_name(name: &str) -> bool {
+    name.starts_with('.') || matches!(name.to_ascii_lowercase().as_str(),"node_modules"|"vendor"|"cache"|"sessions"|"history"|"artifacts"|"credentials"|"auth"|"sdk")
+}
+impl Walk<'_> {
+    fn dir(&mut self, prefix: &str, depth: usize) -> Result<()> {
+        if depth>32 {return Err("Markdown namespace nesting exceeds review safety bound".into());}
+        let dir=self.root.join(prefix);
+        if !namespace_exists(&dir)? {return Ok(());}
+        let mut case=BTreeSet::new();
+        for entry in fs::read_dir(dir).map_err(|e|e.to_string())? {
+            let entry=entry.map_err(|e|e.to_string())?; let name=entry.file_name().into_string().map_err(|_|"Non-Unicode asset path")?;
+            if ignored_name(&name) {continue;}
+            if !case.insert(name.to_lowercase()) {return Err("Case-colliding Markdown namespace entries".into());}
+            self.entry(prefix,depth,&entry.path(),name)?;
+        }
+        Ok(())
+    }
+    fn entry(&mut self, prefix: &str, depth: usize, path: &Path, name: String) -> Result<()> {
         let rel=if prefix.is_empty(){name.clone()}else{format!("{prefix}/{name}")};
-        let meta=fs::symlink_metadata(entry.path()).map_err(|e|e.to_string())?;
-        if crate::code_quality::snapshot::is_link(&meta) {warnings.push(format!("Refused linked asset: {rel}"));continue;}
+        let meta=fs::symlink_metadata(path).map_err(|e|e.to_string())?;
+        if crate::code_quality::snapshot::is_link(&meta) {self.warnings.push(format!("Refused linked asset: {rel}"));return Ok(());}
         if meta.is_dir() {
-            if !native || !prefix.is_empty() || matches!(name.as_str(),"agent-instructions"|"skills"|"rules"|"tools"|"extensions") {walk(root,&rel,native,names,warnings,depth+1)?;}
-        } else if meta.is_file() && (!native || allowed(&rel)) && fsio::is_markdown_name(&name) {names.insert(rel); if names.len()>10000{return Err("More than 10,000 Markdown assets; review a smaller native target".into());}}
-    } Ok(())
+            if !self.native || !prefix.is_empty() || matches!(name.as_str(),"agent-instructions"|"skills"|"rules"|"tools"|"extensions") {self.dir(&rel,depth+1)?;}
+        } else if meta.is_file() && (!self.native || allowed(&rel)) && fsio::is_markdown_name(&name) {
+            self.names.insert(rel); if self.names.len()>10000{return Err("More than 10,000 Markdown assets; review a smaller native target".into());}
+        }
+        Ok(())
+    }
 }
 fn dependencies(bytes: &[u8]) -> Vec<String> {
     let mut found=BTreeSet::new();
@@ -156,6 +181,95 @@ fn diff(before: &Option<Vec<u8>>, after: &Option<Vec<u8>>) -> String {
     let mut out=String::from("--- current destination\n+++ reviewed source\n");
     for (prefix,text) in [("-",old.as_str()),("+",new.as_str())] {for line in text.lines().take(100) {out.push_str(prefix);out.extend(line.chars().take(500));out.push('\n');} if text.lines().count()>100 {out.push_str("[Preview shortened; full content hashes remain bound to review]\n");}}
     out
+}
+fn baseline_admits(baseline: &Baseline, rel: &str) -> bool {
+    baseline.allowed_paths.contains(rel)||baseline.hashes.contains_key(rel)||baseline.allowed_prefixes.iter().any(|p|rel.starts_with(p))
+}
+/// Vault notes deploy only where the baseline already maps them; the rest are reported, never admitted.
+fn admit_vault_notes(vault: &VaultRoot, namespace: &str, baseline: &Baseline, names: &mut BTreeSet<String>, warnings: &mut Vec<String>) -> Result<()> {
+    let mut source=BTreeSet::new();walk(&vault.root,namespace,false,&mut source,warnings,0)?;
+    for path in source {
+        let rel=path.strip_prefix(&format!("{namespace}/")).ok_or("Invalid namespace")?;
+        if allowed(rel)&&baseline_admits(baseline,rel){names.insert(rel.into());}else{warnings.push(format!("Unmapped note — no native deployment authority: {path}"));}
+    }
+    Ok(())
+}
+fn item_state(sh: &Option<String>, nh: &Option<String>, ah: &Option<String>) -> &'static str {
+    if sh==nh {"unchanged"}else if ah.is_none(){if sh.is_none(){"nativeOnly"}else if nh.is_none(){"new"}else{"conflict"}}
+    else if nh!=ah {"nativeChanged"}else if sh.is_none(){"deleted"}else{"changed"}
+}
+fn inspect_item(r: &Resolved, baseline: &Baseline, id: String, warnings: &mut Vec<String>) -> Result<Option<MarkdownItem>> {
+    if !allowed(&id){return Err("Stored mapping is not an admitted Markdown destination".into());}
+    let vault_path=format!("{}/{}",r.namespace,id);
+    let native=match read(&r.native,&id){Ok(value)=>value,Err(e)=>{warnings.push(format!("Refused {id}: {e}"));return Ok(None);}};
+    let source=match &r.vault{Some(v)=>read(&v.root,&vault_path)?,None=>None};
+    let nh=hash(&native);let sh=hash(&source); let ah=baseline.hashes.get(&id).cloned();
+    let state=item_state(&sh,&nh,&ah);
+    if sh.is_none()&&nh.is_none(){return Ok(None);}
+    Ok(Some(MarkdownItem{native_path:r.native.join(&id).to_string_lossy().into_owned(),source_hash:sh,native_hash:nh,applied_hash:ah,state:state.into(),diff:diff(&native,&source),native_dependencies:dependencies(source.as_deref().or(native.as_deref()).unwrap_or_default()),vault_path,id}))
+}
+fn default_selection(status: &MarkdownStatus, import: bool) -> Vec<String> {
+    status.items.iter().filter(|i|if import {i.native_hash.is_some()&&(i.source_hash.is_none()||i.source_hash==i.native_hash)}else{matches!(i.state.as_str(),"new"|"changed"|"deleted")}).map(|i|i.id.clone()).collect()
+}
+fn ensure_unique(ids: &[String]) -> Result<()> {
+    let unique:BTreeSet<_>=ids.iter().collect();if unique.len()!=ids.len(){return Err("Duplicate Markdown selection".into());}
+    Ok(())
+}
+fn check_selection(status: &MarkdownStatus, ids: &[String], import: bool) -> Result<()> {
+    ensure_unique(ids)?;
+    for id in ids {let item=status.items.iter().find(|i|&i.id==id).ok_or("Unknown Markdown selection")?;if import&&item.native_hash.is_none(){return Err("Import requires an admitted native Markdown source".into());}}
+    Ok(())
+}
+fn review_diffs(vault: &VaultRoot, native: &Path, items: &mut [MarkdownItem]) -> Result<()> {
+    for item in items {item.diff=diff(&read(&vault.root,&item.vault_path)?,&read(native,&item.id)?);}
+    Ok(())
+}
+/// The reviewed vault and native root must still be the ones the review token was issued for.
+fn bound_vault<'a>(r: &'a Resolved, reviewed: &Resolved) -> Result<&'a VaultRoot> {
+    let old_v=reviewed.vault.as_ref().ok_or("Missing reviewed vault")?;let v=r.vault.as_ref().ok_or("Vault no longer bound")?;
+    if r.native!=reviewed.native||r.native_identity!=reviewed.native_identity||v.root!=old_v.root||v.binding_revision!=old_v.binding_revision||v.vault_id!=old_v.vault_id{return Err("Target binding changed since review".into());}
+    Ok(v)
+}
+/// A selected item must still match what was reviewed and be valid for this direction.
+fn verified_item<'a>(id: &str, now: &'a MarkdownStatus, reviewed: &[MarkdownItem], import: bool) -> Result<&'a MarkdownItem> {
+    let item=now.items.iter().find(|i|i.id==id).ok_or("Unknown Markdown selection")?;
+    let reviewed=reviewed.iter().find(|i|i.id==id).ok_or("Item was not reviewed")?;
+    if item.native_hash!=reviewed.native_hash||item.source_hash!=reviewed.source_hash{return Err(format!("{id} changed since review"));}
+    if !import&&!matches!(item.state.as_str(),"new"|"changed"|"deleted"){return Err(format!("{id}: import current native Markdown or cancel/review; runtime changed"));}
+    Ok(item)
+}
+/// Writes the immutable backup and records the operation; returns the bytes to publish.
+fn stage_item(import: bool, r: &Resolved, v: &VaultRoot, folder: &Path, item: &MarkdownItem, index: usize, baseline: &mut Baseline) -> Result<(Operation, Option<Vec<u8>>)> {
+    let id=&item.id;
+    let native=read(&r.native,id)?;let source=read(&v.root,&item.vault_path)?;
+    let (before,after,relative)=if import{(source,native,item.vault_path.clone())}else{(native,source,id.clone())};
+    if import&&after.is_none(){return Err("Import source disappeared".into());}
+    let backup=before.as_ref().map(|_|format!("{index}.md"));
+    if let (Some(bytes),Some(name))=(&before,&backup){fsio::write_atomic(&folder.join(name),bytes,false)?;}
+    let next=hash(&after);baseline.allowed_paths.insert(id.clone());
+    match &next {Some(h)=>{baseline.hashes.insert(id.clone(),h.clone());},None=>{baseline.hashes.remove(id);}}
+    Ok((Operation{relative,before:hash(&before),after:next,backup},after))
+}
+fn read_backup(folder: &Path, backup: Option<&str>) -> Result<Option<Vec<u8>>> {
+    let Some(name)=backup else {return Ok(None)};
+    if !name.ends_with(".md")||name.contains(['/', '\\']){return Err("Invalid backup path".into());}
+    Ok(Some(fsio::read_regular_bounded(&folder.join(name),MAX_FILE)?))
+}
+fn grant_profile(baseline: &mut Baseline) {
+    // A normalized human Profile request grants Markdown discovery namespaces, never profile configuration.
+    for path in ["AGENTS.md","RULES.md","SKILLS.md"] {baseline.allowed_paths.insert(path.into());}
+    for prefix in ["rules/","skills/","agent-instructions/","tools/","extensions/"] {baseline.allowed_prefixes.insert(prefix.into());}
+}
+fn grant_item(baseline: &mut Baseline, item: &setup::SetupItem) {
+    match item.kind {
+        setup::SetupKind::Agents=>{baseline.allowed_paths.insert(if item.name.is_empty(){"AGENTS.md".into()}else{format!("agent-instructions/{}/AGENTS.md",item.name)});},
+        setup::SetupKind::Rules=>{baseline.allowed_paths.insert("RULES.md".into());},
+        setup::SetupKind::Skill=>{baseline.allowed_paths.insert("SKILLS.md".into());baseline.allowed_prefixes.insert(format!("skills/{}/",item.name));},
+        setup::SetupKind::Workflow=>{baseline.allowed_paths.insert(format!("rules/workflow-{}.md",item.name));},
+        setup::SetupKind::Tool=>{baseline.allowed_prefixes.insert(format!("tools/{}/",item.name));},
+        setup::SetupKind::Plugin=>{baseline.allowed_prefixes.insert(format!("extensions/{}/",item.name));},
+        setup::SetupKind::Profile=>{},
+    }
 }
 impl AgentMarkdownService {
     pub fn new(app_config: PathBuf, knowledge: Arc<KnowledgeService>) -> Arc<Self> { Arc::new(Self {dir:app_config.join("knowledge"),knowledge,pending:Mutex::new(HashMap::new()),serial:Mutex::new(()),boundary:OnceLock::new()}) }
@@ -186,19 +300,9 @@ impl AgentMarkdownService {
     fn inspect(&self,r:&Resolved)->Result<MarkdownStatus>{
         let baseline=self.load(&r.key)?; let mut warnings=Vec::new(); let mut names=BTreeSet::new();
         walk(&r.native,"",true,&mut names,&mut warnings,0)?;
-        if let Some(vault)=&r.vault {let mut source=BTreeSet::new();walk(&vault.root,&r.namespace,false,&mut source,&mut warnings,0)?;for path in source {let rel=path.strip_prefix(&format!("{}/",r.namespace)).ok_or("Invalid namespace")?;if allowed(rel)&&(baseline.allowed_paths.contains(rel)||baseline.hashes.contains_key(rel)||baseline.allowed_prefixes.iter().any(|p|rel.starts_with(p))){names.insert(rel.into());}else{warnings.push(format!("Unmapped note — no native deployment authority: {path}"));}}}
+        if let Some(vault)=&r.vault {admit_vault_notes(vault,&r.namespace,&baseline,&mut names,&mut warnings)?;}
         names.extend(baseline.hashes.keys().cloned()); let mut items=Vec::new();
-        for id in names {
-            if !allowed(&id){return Err("Stored mapping is not an admitted Markdown destination".into());}
-            let vault_path=format!("{}/{}",r.namespace,id);
-            let native=match read(&r.native,&id){Ok(value)=>value,Err(e)=>{warnings.push(format!("Refused {id}: {e}"));continue;}};
-            let source=match &r.vault{Some(v)=>read(&v.root,&vault_path)?,None=>None};
-            let nh=hash(&native);let sh=hash(&source); let ah=baseline.hashes.get(&id).cloned();
-            let state=if sh==nh {"unchanged"}else if ah.is_none(){if sh.is_none(){"nativeOnly"}else if nh.is_none(){"new"}else{"conflict"}}
-                else if nh!=ah {"nativeChanged"}else if sh.is_none(){"deleted"}else{"changed"};
-            if sh.is_none()&&nh.is_none(){continue;}
-            items.push(MarkdownItem{id:id.clone(),native_path:r.native.join(&id).to_string_lossy().into_owned(),vault_path,source_hash:sh,native_hash:nh,applied_hash:ah,state:state.into(),diff:diff(&native,&source),native_dependencies:dependencies(source.as_deref().or(native.as_deref()).unwrap_or_default())});
-        }
+        for id in names {if let Some(item)=inspect_item(r,&baseline,id,&mut warnings)? {items.push(item);}}
         let source_revision=revision(&items);
         let bound=r.vault.as_ref().is_some_and(|v|v.vault_id==baseline.vault_id)&&baseline.native_root==r.native.to_string_lossy();
         if baseline.enabled&&!bound {warnings.push("Vault/native binding changed; explicitly import/review before enabling this target again".into());}
@@ -212,13 +316,12 @@ impl AgentMarkdownService {
         self.recover()?;let _serial=self.serial.lock();let r=self.resolve(registry,target)?;self.prepare(r,false,Some(source_revision),None)
     }
     fn prepare(&self,r:Resolved,import:bool,expected:Option<&str>,selected:Option<Vec<String>>)->Result<MarkdownPreparation>{
-        r.vault.as_ref().ok_or("Choose a vault for this target first")?;let status=self.inspect(&r)?;
+        let vault=r.vault.as_ref().ok_or("Choose a vault for this target first")?;let status=self.inspect(&r)?;
         if !import&&!status.enabled{return Err("Enable vault-authoritative Markdown through reviewed Import first".into());}
         if expected.is_some_and(|v|v!=status.source_revision){return Err("Markdown source revision changed; refresh and review again".into());}
-        let ids=selected.unwrap_or_else(||status.items.iter().filter(|i|if import {i.native_hash.is_some()&&(i.source_hash.is_none()||i.source_hash==i.native_hash)}else{matches!(i.state.as_str(),"new"|"changed"|"deleted")}).map(|i|i.id.clone()).collect());
-        let unique:BTreeSet<_>=ids.iter().collect();if unique.len()!=ids.len(){return Err("Duplicate Markdown selection".into());}
-        for id in &ids {let item=status.items.iter().find(|i|&i.id==id).ok_or("Unknown Markdown selection")?;if import&&item.native_hash.is_none(){return Err("Import requires an admitted native Markdown source".into());}}
-        let mut items=status.items.clone(); if import {for item in &mut items{let v=r.vault.as_ref().unwrap();item.diff=diff(&read(&v.root,&item.vault_path)?,&read(&r.native,&item.id)?);}}
+        let ids=selected.unwrap_or_else(||default_selection(&status,import));
+        check_selection(&status,&ids,import)?;
+        let mut items=status.items.clone(); if import {review_diffs(vault,&r.native,&mut items)?;}
         let token=uuid::Uuid::new_v4().to_string();let result=MarkdownPreparation{token:token.clone(),target:r.target.clone(),source_revision:status.source_revision.clone(),items,selected_ids:ids.clone(),warnings:status.warnings};
         let mut pending=self.pending.lock();pending.retain(|_,p|p.expires>Instant::now());pending.insert(token,Pending{resolved:r,expires:Instant::now()+TTL,import,revision:status.source_revision,selected:ids,items:status.items});Ok(result)
     }
@@ -231,36 +334,43 @@ impl AgentMarkdownService {
         self.commit_prepared(r,pending,selection)
     }
     fn commit_prepared(&self,r:Resolved,pending:Pending,selection:Option<Vec<String>>)->Result<MarkdownStatus>{
-        let old_v=pending.resolved.vault.as_ref().ok_or("Missing reviewed vault")?;let v=r.vault.as_ref().ok_or("Vault no longer bound")?;
-        if r.native!=pending.resolved.native||r.native_identity!=pending.resolved.native_identity||v.root!=old_v.root||v.binding_revision!=old_v.binding_revision||v.vault_id!=old_v.vault_id{return Err("Target binding changed since review".into());}
+        let v=bound_vault(&r,&pending.resolved)?;
         let _admission=ADMISSION.write();self.recover_locked()?;let now=self.inspect(&r)?;
         if now.source_revision!=pending.revision{return Err("Markdown source revision changed since review".into());}
-        let ids=selection.unwrap_or(pending.selected);let unique:BTreeSet<_>=ids.iter().collect();if unique.len()!=ids.len(){return Err("Duplicate Markdown selection".into());}
+        let ids=selection.unwrap_or(pending.selected);ensure_unique(&ids)?;
         let transaction=uuid::Uuid::new_v4().to_string();
-        let _hold=if !pending.import {Some(self.boundary.get().ok_or("native_markdown_boundary_unavailable: captured-host admission guard not installed")?.hold(&transaction,&r.target)?)}else{None};
-        let mut baseline=self.load(&r.key)?;if baseline.vault_id!=v.vault_id||baseline.native_root!=r.native.to_string_lossy(){baseline=Baseline::default();}baseline.enabled=true;baseline.vault_id=v.vault_id.clone();baseline.native_root=r.native.to_string_lossy().into_owned();
+        let _hold=self.apply_hold(pending.import,&transaction,&r.target)?;
+        let mut baseline=self.enabled_baseline(&r,v)?;
         let folder=self.dir.join("deployments").join(&transaction);plain_root(&folder,true)?;
         let mut operations=Vec::new();let mut contents=Vec::new();
         for id in &ids {
-            let item=now.items.iter().find(|i|&i.id==id).ok_or("Unknown Markdown selection")?;
-            let reviewed=pending.items.iter().find(|i|&i.id==id).ok_or("Item was not reviewed")?;
-            if item.native_hash!=reviewed.native_hash||item.source_hash!=reviewed.source_hash{return Err(format!("{id} changed since review"));}
-            if !pending.import&&!matches!(item.state.as_str(),"new"|"changed"|"deleted"){return Err(format!("{id}: import current native Markdown or cancel/review; runtime changed"));}
-            let native=read(&r.native,id)?;let source=read(&v.root,&item.vault_path)?;
-            let (before,after,relative)=if pending.import{(source,native,item.vault_path.clone())}else{(native,source,id.clone())};
-            if pending.import&&after.is_none(){return Err("Import source disappeared".into());}
-            let backup=before.as_ref().map(|_|format!("{}.md",operations.len()));
-            if let (Some(bytes),Some(name))=(&before,&backup){fsio::write_atomic(&folder.join(name),bytes,false)?;}
-            let next=hash(&after);baseline.allowed_paths.insert(id.clone());if let Some(h)=&next{baseline.hashes.insert(id.clone(),h.clone());}else{baseline.hashes.remove(id);}
-            operations.push(Operation{relative,before:hash(&before),after:next,backup});contents.push(after);
+            let item=verified_item(id,&now,&pending.items,pending.import)?;
+            let (operation,after)=stage_item(pending.import,&r,v,&folder,item,operations.len(),&mut baseline)?;
+            operations.push(operation);contents.push(after);
         }
         baseline.applied_revision=Some(hashes_revision(baseline.hashes.iter()));
         let root=if pending.import{v.root.clone()}else{r.native.clone()};plain_root(&root,true)?;
         let mut journal=Journal{id:transaction,state:"applying".into(),key:r.key.clone(),target:r.target.clone(),root:root.clone(),root_identity:fsio::dir_identity(&root),namespace:pending.import.then(||r.namespace.clone()),operations,baseline};
         self.write_journal(&folder,&journal)?;
-        let result=(||{for (op,after) in journal.operations.iter().zip(&contents){publish(&root,&op.relative,op.before.as_deref(),after.as_deref(),&self.dir.join("agent-publications"))?;}journal.state="committed".into();self.write_journal(&folder,&journal)?;self.save(&r.key,&journal.baseline)})();
-        if let Err(error)=result{let recovery=fsio::recover_publications(&self.dir.join("agent-publications")).and_then(|_|self.recover_one(&folder,&mut journal));return Err(format!("Markdown batch failed: {error}; recovery: {}",recovery.err().unwrap_or_else(||journal.state.clone())));}
+        if let Err(error)=self.publish_journal(&folder,&mut journal,&contents){return Err(self.fail_batch(&folder,&mut journal,&error));}
         journal.state="applied".into();self.write_journal(&folder,&journal)?;self.inspect(&r)
+    }
+    fn apply_hold(&self,import:bool,transaction:&str,target:&KnowledgeAssetTarget)->Result<Option<Box<dyn Send>>> {
+        if import {return Ok(None);}
+        Ok(Some(self.boundary.get().ok_or("native_markdown_boundary_unavailable: captured-host admission guard not installed")?.hold(transaction,target)?))
+    }
+    fn enabled_baseline(&self,r:&Resolved,v:&VaultRoot)->Result<Baseline> {
+        let mut baseline=self.load(&r.key)?;let native_root=r.native.to_string_lossy().into_owned();
+        if baseline.vault_id!=v.vault_id||baseline.native_root!=native_root{baseline=Baseline::default();}
+        baseline.enabled=true;baseline.vault_id=v.vault_id.clone();baseline.native_root=native_root;Ok(baseline)
+    }
+    fn publish_journal(&self,folder:&Path,journal:&mut Journal,contents:&[Option<Vec<u8>>])->Result<()> {
+        for (op,after) in journal.operations.iter().zip(contents){publish(&journal.root,&op.relative,op.before.as_deref(),after.as_deref(),&self.dir.join("agent-publications"))?;}
+        journal.state="committed".into();self.write_journal(folder,journal)?;self.save(&journal.key,&journal.baseline)
+    }
+    fn fail_batch(&self,folder:&Path,journal:&mut Journal,error:&str)->String {
+        let recovery=fsio::recover_publications(&self.dir.join("agent-publications")).and_then(|_|self.recover_one(folder,journal));
+        format!("Markdown batch failed: {error}; recovery: {}",recovery.err().unwrap_or_else(||journal.state.clone()))
     }
     fn write_journal(&self,folder:&Path,journal:&Journal)->Result<()> {crate::dependency_security::atomic_json(&folder.join("journal.json"),journal,16*1024*1024)}
     fn recover_one(&self,folder:&Path,j:&mut Journal)->Result<()> {
@@ -268,16 +378,17 @@ impl AgentMarkdownService {
         plain_root(&j.root,false)?;if fsio::dir_identity(&j.root)!=j.root_identity{return Err("Deployment root identity changed; recovery refuses another root".into());}
         if j.state=="committed" {self.save(&j.key,&j.baseline)?;j.state="applied".into();return self.write_journal(folder,j);}
         if j.state!="applying"{return Err("Unknown Markdown journal state".into());}
-        for op in j.operations.iter().rev(){
-            let rel=if let Some(namespace)=&j.namespace{op.relative.strip_prefix(&format!("{namespace}/")).ok_or("Journal escaped namespace")?}else{op.relative.as_str()};
-            if !allowed(rel){return Err("Journal has an inadmissible Markdown path".into());}
-            let current=read(&j.root,&op.relative)?;let current_hash=hash(&current);
-            if current_hash==op.before{continue;}if current_hash!=op.after{return Err(format!("Recovery conflict at {}; retain backup and review manually",op.relative));}
-            let before=match &op.backup {Some(name)=>{if !name.ends_with(".md")||name.contains(['/', '\\']){return Err("Invalid backup path".into());}Some(fsio::read_regular_bounded(&folder.join(name),MAX_FILE)?)},None=>None};
-            if hash(&before)!=op.before{return Err("Immutable Markdown backup hash mismatch".into());}
-            publish(&j.root,&op.relative,op.after.as_deref(),before.as_deref(),&self.dir.join("agent-publications"))?;
-        }
+        for op in j.operations.iter().rev(){self.rollback_operation(folder,j,op)?;}
         j.state="rolledBack".into();self.write_journal(folder,j)
+    }
+    fn rollback_operation(&self,folder:&Path,j:&Journal,op:&Operation)->Result<()> {
+        let rel=if let Some(namespace)=&j.namespace{op.relative.strip_prefix(&format!("{namespace}/")).ok_or("Journal escaped namespace")?}else{op.relative.as_str()};
+        if !allowed(rel){return Err("Journal has an inadmissible Markdown path".into());}
+        let current_hash=hash(&read(&j.root,&op.relative)?);
+        if current_hash==op.before{return Ok(());}if current_hash!=op.after{return Err(format!("Recovery conflict at {}; retain backup and review manually",op.relative));}
+        let before=read_backup(folder,op.backup.as_deref())?;
+        if hash(&before)!=op.before{return Err("Immutable Markdown backup hash mismatch".into());}
+        publish(&j.root,&op.relative,op.after.as_deref(),before.as_deref(),&self.dir.join("agent-publications"))
     }
     fn recover_locked(&self)->Result<()> {
         let publications=self.dir.join("agent-publications");
@@ -307,21 +418,7 @@ impl AgentMarkdownService {
     fn reserve_route(&self,r:Resolved,items:&[setup::SetupItem],profile:bool)->Result<Option<MarkdownRoute>>{
         let status=self.inspect(&r)?;if !status.enabled{return Ok(None);}
         let mut baseline=self.load(&r.key)?;
-        if profile {
-            // A normalized human Profile request grants Markdown discovery namespaces, never profile configuration.
-            for path in ["AGENTS.md","RULES.md","SKILLS.md"] {baseline.allowed_paths.insert(path.into());}
-            for prefix in ["rules/","skills/","agent-instructions/","tools/","extensions/"] {baseline.allowed_prefixes.insert(prefix.into());}
-        } else {
-            for item in items {match item.kind {
-                setup::SetupKind::Agents=>{baseline.allowed_paths.insert(if item.name.is_empty(){"AGENTS.md".into()}else{format!("agent-instructions/{}/AGENTS.md",item.name)});},
-                setup::SetupKind::Rules=>{baseline.allowed_paths.insert("RULES.md".into());},
-                setup::SetupKind::Skill=>{baseline.allowed_paths.insert("SKILLS.md".into());baseline.allowed_prefixes.insert(format!("skills/{}/",item.name));},
-                setup::SetupKind::Workflow=>{baseline.allowed_paths.insert(format!("rules/workflow-{}.md",item.name));},
-                setup::SetupKind::Tool=>{baseline.allowed_prefixes.insert(format!("tools/{}/",item.name));},
-                setup::SetupKind::Plugin=>{baseline.allowed_prefixes.insert(format!("extensions/{}/",item.name));},
-                setup::SetupKind::Profile=>{},
-            }}
-        }
+        if profile {grant_profile(&mut baseline);} else {for item in items {grant_item(&mut baseline,item);}}
         self.save(&r.key,&baseline)?;
         Ok(Some(MarkdownRoute{source_root:PathBuf::from(status.source_root.ok_or("Enabled source missing")?),native_root:r.native}))
     }

@@ -115,9 +115,45 @@ fn create_only(parent: &fsio::DirectoryPins, name: &str, text: &[u8]) -> Result<
     published
 }
 
+/// Immutable private copy of the original bytes, made from the locked handle BEFORE anything moves.
+#[cfg(any(windows, unix))]
+fn backup_original<R: std::io::Read + std::io::Seek>(locked: &mut R, journal_dir: &Path, backup_name: &str) -> Result<()> {
+    use std::io::{SeekFrom, Write};
+    fs::create_dir_all(journal_dir).map_err(|e| fsio::err("Cannot create the private publication journal", e))?;
+    let mut backup = fs::OpenOptions::new().write(true).create_new(true).open(journal_dir.join(backup_name)).map_err(|e| fsio::err("Cannot back up the original note", e))?;
+    std::io::copy(locked, &mut backup).map_err(|e| fsio::err("Cannot back up the original note", e))?;
+    backup.flush().and_then(|_| backup.sync_all()).map_err(|e| fsio::err("Cannot back up the original note", e))?;
+    locked.seek(SeekFrom::Start(0)).map_err(|e| fsio::err("Cannot rewind the locked note", e))?;
+    Ok(())
+}
+
+/// The staged note could not take the name. A foreign process (or anything else) occupied it in the gap: never
+/// overwrite it; put the original back only if the name is still free, otherwise keep the foreign note and the
+/// original's backup. Always an error.
+#[cfg(any(windows, unix))]
+fn undo_failed_publication(locked: &super::rooted::Handle, parent: &fsio::DirectoryPins, journal_dir: &Path, record: &mut PublicationJournal, publish_error: String) -> Result<()> {
+    match super::rooted::rename_handle(locked, parent, &record.name, false) {
+        Ok(()) => {
+            let _ = publication_journal::finish(journal_dir, &record.id);
+            let _ = fs::remove_file(journal_dir.join(&record.backup));
+            Err(format!("The note changed while it was being replaced; the original was restored and nothing was overwritten: {publish_error}"))
+        }
+        Err(restore_error) => {
+            let message = format!(
+                "The note was replaced by someone else while it was being published. Their version was kept untouched; the original is saved at {} ({publish_error}; restore: {restore_error})",
+                journal_dir.join(&record.backup).display()
+            );
+            record.state = "conflicted".into();
+            record.message = Some(message.clone());
+            let _ = publication_journal::save(journal_dir, record);
+            let _ = super::rooted::delete_handle(locked); // the reservation duplicates the immutable backup
+            Err(message)
+        }
+    }
+}
+
 #[cfg(any(windows, unix))]
 fn replace_checked(root: &Path, parents: &[String], parent: &fsio::DirectoryPins, name: &str, text: &[u8], expected: &str, journal_dir: &Path) -> Result<()> {
-    use std::io::{Seek, SeekFrom};
     let id = uuid::Uuid::new_v4().to_string();
     // Recovery must never mistake this live writer for a crashed one: guard the id for the whole replacement.
     let _inflight = InFlight::begin(&id);
@@ -128,18 +164,8 @@ fn replace_checked(root: &Path, parents: &[String], parent: &fsio::DirectoryPins
         if base_hash != expected { return Err("The note changed since it was read; review it before replacing".into()); }
         if crash_requested(0, parent.path(), name) { return Err(CRASH_MARKER.into()); }
         let backup_name = publication_journal::backup_name(&id);
-        fs::create_dir_all(journal_dir).map_err(|e| fsio::err("Cannot create the private publication journal", e))?;
-        // Immutable private copy of the original bytes, made from the locked handle BEFORE anything moves.
-        {
-            use std::io::Write;
-            let mut backup = fs::OpenOptions::new().write(true).create_new(true).open(journal_dir.join(&backup_name)).map_err(|e| fsio::err("Cannot back up the original note", e))?;
-            let copied = std::io::copy(&mut locked, &mut backup).map_err(|e| fsio::err("Cannot back up the original note", e))?;
-            backup.flush().and_then(|_| backup.sync_all()).map_err(|e| fsio::err("Cannot back up the original note", e))?;
-            locked.seek(SeekFrom::Start(0)).map_err(|e| fsio::err("Cannot rewind the locked note", e))?;
-            let _ = copied;
-        }
-        let backup_path = journal_dir.join(&backup_name);
-        let discard_backup = || { let _ = fs::remove_file(&backup_path); };
+        backup_original(&mut locked, journal_dir, &backup_name)?;
+        let discard_backup = || { let _ = fs::remove_file(journal_dir.join(&backup_name)); };
         let reservation = publication_journal::reservation_name(&id);
         let mut record = PublicationJournal {
             version: publication_journal::JOURNAL_VERSION,
@@ -172,28 +198,7 @@ fn replace_checked(root: &Path, parents: &[String], parent: &fsio::DirectoryPins
                 discard_backup();
                 Ok(())
             }
-            Err(publish_error) => {
-                // A foreign process (or anything else) occupied the name in the gap. Never overwrite it: put the original
-                // back only if the name is still free; otherwise keep the foreign note and the original's backup.
-                match super::rooted::rename_handle(&locked, parent, name, false) {
-                    Ok(()) => {
-                        let _ = publication_journal::finish(journal_dir, &id);
-                        discard_backup();
-                        Err(format!("The note changed while it was being replaced; the original was restored and nothing was overwritten: {publish_error}"))
-                    }
-                    Err(restore_error) => {
-                        let message = format!(
-                            "The note was replaced by someone else while it was being published. Their version was kept untouched; the original is saved at {} ({publish_error}; restore: {restore_error})",
-                            backup_path.display()
-                        );
-                        record.state = "conflicted".into();
-                        record.message = Some(message.clone());
-                        let _ = publication_journal::save(journal_dir, &record);
-                        let _ = super::rooted::delete_handle(&locked); // the reservation duplicates the immutable backup
-                        Err(message)
-                    }
-                }
-            }
+            Err(publish_error) => undo_failed_publication(&locked, parent, journal_dir, &mut record, publish_error),
         }
     })();
     // A simulated process death leaves everything exactly as it was, like a real one would.

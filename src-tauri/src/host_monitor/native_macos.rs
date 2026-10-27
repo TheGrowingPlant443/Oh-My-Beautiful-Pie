@@ -81,6 +81,43 @@ fn finish_record(parsed: &mut ParsedLsof, pid: Option<u32>, record: FileRecord<'
     }
 }
 
+/// A record boundary: `p` starts a process (and ends the open file record), `f` starts a file record.
+fn start_section(parsed: &mut ParsedLsof, pid: &mut Option<u32>, record: &mut Option<FileRecord<'_>>, tag: u8, value: Result<&str, std::str::Utf8Error>, resolve_scope: fn(&str) -> Option<u32>) {
+    if let Some(previous) = record.take() { finish_record(parsed, *pid, previous, resolve_scope); }
+    if tag == b'f' {
+        *record = Some(FileRecord::default());
+        return;
+    }
+    *pid = value.ok().and_then(|value| value.parse::<u32>().ok()).filter(|pid| *pid > 0);
+    if pid.is_none() { parsed.malformed += 1; }
+}
+
+fn apply_file_field<'a>(record: &mut FileRecord<'a>, tag: u8, value: Result<&'a str, std::str::Utf8Error>) {
+    let Ok(value) = value else { record.invalid = true; return; };
+    match tag {
+        b't' => record.family = match value { "IPv4" => Some(Family::Ipv4), "IPv6" => Some(Family::Ipv6), _ => None },
+        b'P' => record.protocol = match value { "TCP" => Some(Protocol::Tcp), "UDP" => Some(Protocol::Udp), _ => None },
+        b'n' => record.name = Some(value),
+        b'T' => if let Some(state) = value.strip_prefix("ST=") { record.state = Some(state); },
+        _ => {}
+    }
+}
+
+fn remote_order(a: &Option<Endpoint>, b: &Option<Endpoint>) -> std::cmp::Ordering {
+    let key = |endpoint: &Endpoint| (endpoint.port, endpoint.scope_id);
+    match (a, b) {
+        (Some(a), Some(b)) => key(a).cmp(&key(b)).then_with(|| a.address.cmp(&b.address)),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn socket_order(a: &RawSocket, b: &RawSocket) -> std::cmp::Ordering {
+    let key = |row: &RawSocket| (row.pid, if row.family == Family::Ipv4 { 4 } else { 6 }, row.local.port, row.local.scope_id, row.tcp_state);
+    key(a).cmp(&key(b)).then_with(|| a.local.address.cmp(&b.local.address)).then_with(|| remote_order(&a.remote, &b.remote))
+}
+
 /// `-F0pftPnT` emits NUL-terminated fields, with newlines between process/file sets. File boundaries, not
 /// newlines, delimit records. Unknown T fields (queues, etc.) never become TCP state or direction evidence.
 fn parse_lsof(bytes: &[u8], resolve_scope: fn(&str) -> Option<u32>) -> ParsedLsof {
@@ -98,42 +135,16 @@ fn parse_lsof(bytes: &[u8], resolve_scope: fn(&str) -> Option<u32>) -> ParsedLso
         if field.is_empty() { continue; }
         let (tag, value) = (field[0], std::str::from_utf8(&field[1..]));
         if tag == b'p' || tag == b'f' {
-            if let Some(previous) = record.take() { finish_record(&mut parsed, pid, previous, resolve_scope); }
-            if tag == b'p' {
-                pid = value.ok().and_then(|value| value.parse::<u32>().ok()).filter(|pid| *pid > 0);
-                if pid.is_none() { parsed.malformed += 1; }
-            } else {
-                record = Some(FileRecord::default());
-            }
-            continue;
-        }
-        let Some(record) = record.as_mut() else { continue; };
-        let Ok(value) = value else { record.invalid = true; continue; };
-        match tag {
-            b't' => record.family = match value { "IPv4" => Some(Family::Ipv4), "IPv6" => Some(Family::Ipv6), _ => None },
-            b'P' => record.protocol = match value { "TCP" => Some(Protocol::Tcp), "UDP" => Some(Protocol::Udp), _ => None },
-            b'n' => record.name = Some(value),
-            b'T' => if let Some(state) = value.strip_prefix("ST=") { record.state = Some(state); },
-            _ => {}
+            start_section(&mut parsed, &mut pid, &mut record, tag, value, resolve_scope);
+        } else if let Some(record) = record.as_mut() {
+            apply_file_field(record, tag, value);
         }
     }
     if let Some(record) = record { finish_record(&mut parsed, pid, record, resolve_scope); }
     // Several descriptors in one process may refer to the same socket. Keep one row per observed owner/endpoint.
-    let order = |a: &RawSocket, b: &RawSocket| {
-        let key = |row: &RawSocket| (row.pid, if row.family == Family::Ipv4 { 4 } else { 6 }, row.local.port, row.local.scope_id, row.tcp_state);
-        key(a).cmp(&key(b)).then_with(|| a.local.address.cmp(&b.local.address)).then_with(|| {
-            let key = |endpoint: &Endpoint| (endpoint.port, endpoint.scope_id);
-            match (&a.remote, &b.remote) {
-                (Some(a), Some(b)) => key(a).cmp(&key(b)).then_with(|| a.address.cmp(&b.address)),
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            }
-        })
-    };
-    parsed.tcp.sort_unstable_by(order);
+    parsed.tcp.sort_unstable_by(socket_order);
     parsed.tcp.dedup();
-    parsed.udp.sort_unstable_by(order);
+    parsed.udp.sort_unstable_by(socket_order);
     parsed.udp.dedup();
     parsed
 }
@@ -144,7 +155,7 @@ mod platform {
     use std::ffi::CString;
     use std::io::{self, Read};
     use std::os::fd::AsRawFd;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -231,6 +242,27 @@ mod platform {
         u32::try_from(unsafe { info.assume_init() }.pti_threadnum).ok()
     }
 
+    /// One process row and whether it counts as limited; `None` when the process is gone.
+    fn process_row(pid: u32) -> Option<(RawProcess, bool)> {
+        let (info, exited) = match probe(pid) {
+            Probe::Running(info) => (info, false),
+            Probe::Exited(info) => (info, true),
+            Probe::Gone => return None,
+            Probe::Limited => {
+                return Some((RawProcess { pid, parent_pid: 0, threads: 0, name: "(unreadable)".into(), creation: None, availability: Availability::Limited }, true));
+            }
+        };
+        let threads = if exited { Some(0) } else { thread_count(pid) };
+        // Guard the separate task-info query against PID reuse before attaching its thread count.
+        let stable = exited || matches!(&probe(pid), Probe::Running(after) if creation(after) == creation(&info));
+        let readable = stable && threads.is_some();
+        Some((RawProcess {
+            pid, parent_pid: info.pbi_ppid, threads: if stable { threads.unwrap_or(0) } else { 0 },
+            name: process_name(&info), creation: Some(creation(&info)),
+            availability: if exited { Availability::Exited } else if readable { Availability::Available } else { Availability::Limited },
+        }, !readable))
+    }
+
     fn processes(cancel: &AtomicBool) -> Result<(Vec<RawProcess>, SectionState), String> {
         let (ids, truncated) = match process_ids() {
             Ok(ids) => ids,
@@ -240,26 +272,9 @@ mod platform {
         let mut limited = 0;
         for (index, pid) in ids.into_iter().enumerate() {
             if index % 32 == 0 { cancelled(cancel)?; }
-            let (info, exited) = match probe(pid) {
-                Probe::Running(info) => (info, false),
-                Probe::Exited(info) => (info, true),
-                Probe::Gone => continue,
-                Probe::Limited => {
-                    limited += 1;
-                    rows.push(RawProcess { pid, parent_pid: 0, threads: 0, name: "(unreadable)".into(), creation: None, availability: Availability::Limited });
-                    continue;
-                }
-            };
-            let threads = if exited { Some(0) } else { thread_count(pid) };
-            // Guard the separate task-info query against PID reuse before attaching its thread count.
-            let stable = exited || matches!(&probe(pid), Probe::Running(after) if creation(after) == creation(&info));
-            let readable = stable && threads.is_some();
-            if !readable { limited += 1; }
-            rows.push(RawProcess {
-                pid, parent_pid: info.pbi_ppid, threads: if stable { threads.unwrap_or(0) } else { 0 },
-                name: process_name(&info), creation: Some(creation(&info)),
-                availability: if exited { Availability::Exited } else if readable { Availability::Available } else { Availability::Limited },
-            });
+            let Some((row, is_limited)) = process_row(pid) else { continue };
+            if is_limited { limited += 1; }
+            rows.push(row);
         }
         let state = if truncated || limited > 0 {
             SectionState::partial(format!("macOS process scan: {limited} processes had inaccessible or changing metadata; enumeration truncated: {truncated}"))
@@ -304,6 +319,40 @@ mod platform {
         Some(unsafe { libc::if_nametoindex(zone.as_ptr()) }).filter(|index| *index != 0)
     }
 
+    /// Reads one bounded chunk and reports `reason` when the pipe reached its limit.
+    fn drain_limit(reader: &mut impl Read, bytes: &mut Vec<u8>, limit: usize, done: &mut bool, reason: &'static str) -> io::Result<Option<&'static str>> {
+        let (finished, full) = drain(reader, bytes, limit)?;
+        *done |= finished;
+        Ok(full.then_some(reason))
+    }
+
+    fn poll_exit(child: &mut Child, status: &mut Option<ExitStatus>) -> io::Result<()> {
+        if status.is_none() { *status = child.try_wait()?; }
+        Ok(())
+    }
+
+    type LsofRun = (Vec<u8>, bool, Option<ExitStatus>, Option<&'static str>);
+
+    /// Polls lsof's pipes and exit until it ends or a cancellation/output/time bound stops it.
+    fn read_lsof(cancel: &AtomicBool, child: &mut Child, stdout: &mut ChildStdout, stderr: &mut ChildStderr) -> io::Result<LsofRun> {
+        nonblocking(stdout.as_raw_fd())?;
+        nonblocking(stderr.as_raw_fd())?;
+        let (mut output, mut errors) = (Vec::new(), Vec::new());
+        let (mut out_done, mut err_done) = (false, false);
+        let mut status = None;
+        let timer = Instant::now();
+        let reason = loop {
+            if cancel.load(Ordering::Acquire) { break Some("cancelled"); }
+            if let Some(reason) = drain_limit(stdout, &mut output, MAX_OUTPUT, &mut out_done, "output limit reached")? { break Some(reason); }
+            if let Some(reason) = drain_limit(stderr, &mut errors, MAX_STDERR, &mut err_done, "diagnostic limit reached")? { break Some(reason); }
+            poll_exit(child, &mut status)?;
+            if status.is_some() && out_done && err_done { break None; }
+            if timer.elapsed() >= LSOF_TIMEOUT { break Some("five-second time limit reached"); }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        Ok((output, !errors.is_empty(), status, reason))
+    }
+
     fn sockets(cancel: &AtomicBool) -> Result<(ParsedLsof, SectionState), String> {
         cancelled(cancel)?;
         // Absolute executable and fixed arguments: no shell, DNS, service lookup, network request or privilege prompt.
@@ -317,28 +366,7 @@ mod platform {
         let mut child = ChildGuard(child);
         let mut stdout = child.0.stdout.take().expect("requested stdout pipe");
         let mut stderr = child.0.stderr.take().expect("requested stderr pipe");
-        let result = (|| -> io::Result<_> {
-            nonblocking(stdout.as_raw_fd())?;
-            nonblocking(stderr.as_raw_fd())?;
-            let (mut output, mut errors) = (Vec::new(), Vec::new());
-            let (mut out_done, mut err_done) = (false, false);
-            let mut status = None;
-            let timer = Instant::now();
-            let reason = loop {
-                if cancel.load(Ordering::Acquire) { break Some("cancelled"); }
-                let (done, full) = drain(&mut stdout, &mut output, MAX_OUTPUT)?;
-                out_done |= done;
-                if full { break Some("output limit reached"); }
-                let (done, full) = drain(&mut stderr, &mut errors, MAX_STDERR)?;
-                err_done |= done;
-                if full { break Some("diagnostic limit reached"); }
-                if status.is_none() { status = child.0.try_wait()?; }
-                if status.is_some() && out_done && err_done { break None; }
-                if timer.elapsed() >= LSOF_TIMEOUT { break Some("five-second time limit reached"); }
-                std::thread::sleep(Duration::from_millis(10));
-            };
-            Ok((output, !errors.is_empty(), status, reason))
-        })();
+        let result = read_lsof(cancel, &mut child.0, &mut stdout, &mut stderr);
         // Reap before parsing or returning; Drop covers every earlier error path too.
         drop(child);
         cancelled(cancel)?;

@@ -15,7 +15,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::dependencies::{self, DependencyGraph};
 use crate::dependency_context::{self, DependencyContextService};
 use crate::dependency_security::{self, DependencyJobAdmission, DependencyJobKind, DependencySecurityService, JobDisposition, SecurityReviewState, SecurityReviewStatus};
-use crate::inhouse::InhouseService;
+use crate::inhouse::{InhouseService, InhouseStatus};
 use crate::instance::{InstanceKind, Registry};
 use crate::manager::DependencyProducer;
 use crate::package_insights::PackageInsightsService;
@@ -343,6 +343,83 @@ impl DependencyProjectReviewService {
         Some(child)
     }
 
+    /// A saved or running review of this project that satisfies the request, or nothing when fresh work is needed.
+    fn saved_admission(&self, registry: &Registry, security: &DependencySecurityService, key: &str, rerun: bool) -> Result<Option<DependencyJobAdmission>> {
+        let previous = self.index.lock().latest.get(key).cloned();
+        let Some(previous) = previous else { return Ok(None) };
+        match self.read(registry, security, &previous) {
+            Ok(state) if state.status == SecurityReviewStatus::Pending => Ok(Some(self.admission(registry, &previous, JobDisposition::Pending, None))),
+            Ok(state) if !rerun => {
+                let disposition = if state.status == SecurityReviewStatus::Error { JobDisposition::Error } else { JobDisposition::Complete };
+                Ok(Some(self.admission(registry, &previous, disposition, state.error)))
+            }
+            Err(error) if !rerun => Err(format!("The saved project review cannot be read: {error}")),
+            _ => Ok(None),
+        }
+    }
+
+    fn inhouse_skip(policy: &InhouseStatus, node: &dependencies::DepNode) -> Option<WorkEntry> {
+        if !policy.gate { return None; }
+        let reason = policy.inhouse.get(&node.id)?;
+        let reason = if reason.trim().is_empty() { "Marked in-house; never looked up publicly.".to_string() } else { format!("Marked in-house: {reason}") };
+        Some(WorkEntry { package_id: node.id.clone(), request_id: None, state: WorkState::Skipped, reason: Some(clip(&reason, LIMITATION_UNITS)) })
+    }
+
+    /// Skipped and reused entries, plus the packages that still need a review.
+    fn plan_work(
+        &self, registry: &Registry, security: &DependencySecurityService, key: &str, rerun: bool, policy: &InhouseStatus, directs: &[&dependencies::DepNode],
+    ) -> (Vec<WorkEntry>, Vec<String>) {
+        let mut entries: Vec<WorkEntry> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        for node in directs {
+            if let Some(entry) = Self::inhouse_skip(policy, node) {
+                entries.push(entry);
+                continue;
+            }
+            match self.reusable(registry, security, key, &node.id, rerun) {
+                Some(id) => entries.push(WorkEntry { package_id: node.id.clone(), request_id: Some(id), state: WorkState::Reused, reason: None }),
+                None => missing.push(node.id.clone()),
+            }
+        }
+        (entries, missing)
+    }
+
+    /// Claim a security request per missing package; returns the entries and the ids of newly created requests.
+    fn claim_missing(
+        registry: &Arc<Registry>, security: &DependencySecurityService, graph: &DependencyGraph, context_id: &str, missing: &[String], rerun: bool, bound: &DependencyProducer,
+    ) -> (Vec<WorkEntry>, Vec<String>) {
+        let mut entries: Vec<WorkEntry> = Vec::new();
+        let mut new_ids: Vec<String> = Vec::new();
+        for package_id in missing {
+            match security.claim_selected(registry, graph, context_id, package_id, rerun, bound) {
+                Ok(claim) => {
+                    let state = if matches!(claim.disposition, JobDisposition::New) { WorkState::New } else { WorkState::Reused };
+                    if state == WorkState::New { new_ids.push(claim.request_id.clone()); }
+                    entries.push(WorkEntry { package_id: package_id.clone(), request_id: Some(claim.request_id), state, reason: None });
+                }
+                Err(error) => entries.push(WorkEntry { package_id: package_id.clone(), request_id: None, state: WorkState::Failed, reason: Some(clip(&error, LIMITATION_UNITS)) }),
+            }
+        }
+        (entries, new_ids)
+    }
+
+    /// Send the one Architect prompt and record its admission outcome; returns `(prompt_sent, error)`.
+    fn dispatch_prompt(
+        &self, registry: &Registry, security: &DependencySecurityService, request_id: &str, message: &str, new_ids: &[String], producer: &DependencyProducer,
+    ) -> (Option<bool>, Option<String>) {
+        let outcome = match registry.manager_hub() {
+            Some(hub) => hub.prompt_human_generation(&producer.instance_id, producer.generation, message).map(|_| ()),
+            None => Err("manager bridge not initialized".into()),
+        };
+        let (prompt_sent, error) = match outcome {
+            Ok(()) => (Some(true), None),
+            Err(failure) => (None, Some(format!("Prompt admission outcome unknown: {failure}. Inspect The Architect's conversation before sending anything else; a late report can still arrive."))),
+        };
+        security.finish_claims(new_ids, prompt_sent, error.clone());
+        let _ = atomic_json(&self.directory(request_id).join("admission.json"), &SavedAdmission { prompt_sent, error: error.clone() }, MAX_REQUEST_BYTES);
+        (prompt_sent, error)
+    }
+
     pub fn start(
         &self, registry: &Arc<Registry>, security: &DependencySecurityService, insights: &PackageInsightsService,
         inhouse: &InhouseService, context: &DependencyContextService, folder: &Path, rerun: bool,
@@ -351,18 +428,7 @@ impl DependencyProjectReviewService {
         let folder = fs::canonicalize(folder).map_err(|error| format!("Invalid project folder: {error}"))?;
         let graph = dependencies::scan(&folder, &registry.home, true)?;
         let key = graph.key.clone();
-        let previous = self.index.lock().latest.get(&key).cloned();
-        if let Some(previous) = previous {
-            match self.read(registry, security, &previous) {
-                Ok(state) if state.status == SecurityReviewStatus::Pending => return Ok(self.admission(registry, &previous, JobDisposition::Pending, None)),
-                Ok(state) if !rerun => {
-                    let disposition = if state.status == SecurityReviewStatus::Error { JobDisposition::Error } else { JobDisposition::Complete };
-                    return Ok(self.admission(registry, &previous, disposition, state.error));
-                }
-                Err(error) if !rerun => return Err(format!("The saved project review cannot be read: {error}")),
-                _ => (),
-            }
-        }
+        if let Some(admission) = self.saved_admission(registry, security, &key, rerun)? { return Ok(admission); }
         // Fresh work: refresh the privacy snapshot from this authoritative scan before any public lookup or prompt.
         let policy = inhouse.review_policy(&graph)?;
         if policy.gate && !policy.complete { return Err(BLOCKED.into()); }
@@ -378,36 +444,15 @@ impl DependencyProjectReviewService {
         }
         let summary = context.publish(registry, insights, inhouse, &graph)?;
         let _ = context.activate(&summary);
-        let mut entries: Vec<WorkEntry> = Vec::new();
-        let mut missing: Vec<String> = Vec::new();
-        for node in &directs {
-            if policy.gate {
-                if let Some(reason) = policy.inhouse.get(&node.id) {
-                    let reason = if reason.trim().is_empty() { "Marked in-house; never looked up publicly.".to_string() } else { format!("Marked in-house: {reason}") };
-                    entries.push(WorkEntry { package_id: node.id.clone(), request_id: None, state: WorkState::Skipped, reason: Some(clip(&reason, LIMITATION_UNITS)) });
-                    continue;
-                }
-            }
-            match self.reusable(registry, security, &key, &node.id, rerun) {
-                Some(id) => entries.push(WorkEntry { package_id: node.id.clone(), request_id: Some(id), state: WorkState::Reused, reason: None }),
-                None => missing.push(node.id.clone()),
-            }
-        }
+        let (mut entries, missing) = self.plan_work(registry, security, &key, rerun, &policy, &directs);
         let mut producer: Option<DependencyProducer> = None;
         let mut new_ids: Vec<String> = Vec::new();
         if !missing.is_empty() {
             // The Architect is needed only when some package has no saved or in-flight review; failure claims nothing.
             let bound = dependency_security::ensure_producer(registry)?;
-            for package_id in &missing {
-                match security.claim_selected(registry, &graph, &summary.id, package_id, rerun, &bound) {
-                    Ok(claim) => {
-                        let state = if matches!(claim.disposition, JobDisposition::New) { WorkState::New } else { WorkState::Reused };
-                        if state == WorkState::New { new_ids.push(claim.request_id.clone()); }
-                        entries.push(WorkEntry { package_id: package_id.clone(), request_id: Some(claim.request_id), state, reason: None });
-                    }
-                    Err(error) => entries.push(WorkEntry { package_id: package_id.clone(), request_id: None, state: WorkState::Failed, reason: Some(clip(&error, LIMITATION_UNITS)) }),
-                }
-            }
+            let (claimed, ids) = Self::claim_missing(registry, security, &graph, &summary.id, &missing, rerun, &bound);
+            entries.extend(claimed);
+            new_ids = ids;
             if !new_ids.is_empty() { producer = Some(bound); }
         }
         entries.sort_by(|a, b| a.package_id.cmp(&b.package_id));
@@ -416,20 +461,13 @@ impl DependencyProjectReviewService {
             if !new_ids.is_empty() { security.finish_claims(&new_ids, Some(false), Some(format!("The project review could not be saved: {error}"))); }
             return Err(error);
         }
-        let (mut prompt_sent, mut error) = (None, None);
-        if let Some(producer) = &producer {
-            let message = self.prompt(&request, &graph, &summary, new_ids.len(), entries.len());
-            let outcome = match registry.manager_hub() {
-                Some(hub) => hub.prompt_human_generation(&producer.instance_id, producer.generation, &message).map(|_| ()),
-                None => Err("manager bridge not initialized".into()),
-            };
-            match outcome {
-                Ok(()) => prompt_sent = Some(true),
-                Err(failure) => error = Some(format!("Prompt admission outcome unknown: {failure}. Inspect The Architect's conversation before sending anything else; a late report can still arrive.")),
+        let (prompt_sent, error) = match &producer {
+            Some(bound) => {
+                let message = self.prompt(&request, &graph, &summary, new_ids.len(), entries.len());
+                self.dispatch_prompt(registry, security, &request_id, &message, &new_ids, bound)
             }
-            security.finish_claims(&new_ids, prompt_sent, error.clone());
-            let _ = atomic_json(&self.directory(&request_id).join("admission.json"), &SavedAdmission { prompt_sent, error: error.clone() }, MAX_REQUEST_BYTES);
-        }
+            None => (None, None),
+        };
         self.register(&request, true);
         let state = self.refresh(registry, security, &request_id)?;
         let disposition = if !new_ids.is_empty() { JobDisposition::New }

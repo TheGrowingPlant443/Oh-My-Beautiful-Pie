@@ -318,29 +318,31 @@ impl ManagerHub {
         let deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
         let targets: Vec<String> = registry.snapshot().into_iter().filter(|row| row.status == "running" || row.status == "starting").map(|row| row.id).collect();
         for id in targets {
-            loop {
-                if self.closing.load(Ordering::Relaxed) { return Err("manager bridge closed".into()); }
-                match self.connection(&id, true) {
-                    Ok(_) => {}
-                    // Not connected, so no native session can read instructions through this bridge.
-                    Err(_) => break,
-                }
-                let lease = match registry.lease(&id, Origin::Human, true) { Ok(lease) => lease, Err(_) => break };
-                match self.control(&id, &lease, "setup_markdown_hold", json!({"transactionId": transaction_id}), Origin::Human) {
-                    Ok(_) => { guard.held.push((id.clone(), lease)); break; }
-                    Err(error) if error.contains("native_session_busy") => {
-                        if std::time::Instant::now() >= deadline {
-                            return Err("native_session_busy: an app-managed OMP session did not reach a quiet boundary in ten minutes; nothing was applied".into());
-                        }
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
-                    // A session that stopped between listing and holding is no longer a reader.
-                    Err(error) if error == "bridge_not_ready" || error == "stale_generation" => break,
-                    Err(error) => return Err(error),
-                }
+            if let Some(lease) = self.hold_markdown_session(registry, &id, transaction_id, deadline)? {
+                guard.held.push((id, lease));
             }
         }
         Ok(Box::new(guard))
+    }
+    /// Holds one session; `None` when it is not connected (or stopped meanwhile), so it cannot read instructions through this bridge.
+    fn hold_markdown_session(&self, registry: &Registry, id: &str, transaction_id: &str, deadline: std::time::Instant) -> Result<Option<ControlLease>> {
+        loop {
+            if self.closing.load(Ordering::Relaxed) { return Err("manager bridge closed".into()); }
+            if self.connection(id, true).is_err() { return Ok(None); }
+            let Ok(lease) = registry.lease(id, Origin::Human, true) else { return Ok(None) };
+            match self.control(id, &lease, "setup_markdown_hold", json!({"transactionId": transaction_id}), Origin::Human) {
+                Ok(_) => return Ok(Some(lease)),
+                Err(error) if error.contains("native_session_busy") => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("native_session_busy: an app-managed OMP session did not reach a quiet boundary in ten minutes; nothing was applied".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                // A session that stopped between listing and holding is no longer a reader.
+                Err(error) if error == "bridge_not_ready" || error == "stale_generation" => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
     }
     fn decision_repository(&self, registry: &Registry, id: &str) -> Result<DecisionRepository> {
         let own = registry.workspace_metadata(id)?.definition;
@@ -643,39 +645,43 @@ impl ManagerHub {
         })
     }
     fn serve(self: Arc<Self>, stream: TcpStream) {
-        // Windows accepts inherit the listener's non-blocking flag.
-        if stream.set_nonblocking(false).is_err() {
-            return;
+        let Some((mut reader, actor, stream)) = self.serve_handshake(stream) else { return };
+        let writer = Arc::new(Mutex::new(stream));
+        if !self.attach_connection(&actor, &writer) { return; }
+        if send(&writer,&json!({"type":"response","id":"hello","ok":true,"data":{"role":actor.role,"instanceId":actor.id,"generation":actor.generation}})).is_err(){return}
+        while let Ok(Some(frame)) = read_frame(&mut reader) {
+            if !self.is_current_connection(&actor) {
+                break;
+            }
+            self.dispatch_frame(&actor, &writer, frame);
         }
+        self.close_connection(&actor, &writer);
+    }
+    fn serve_handshake(&self, stream: TcpStream) -> Option<(BufReader<TcpStream>, Actor, TcpStream)> {
+        // Windows accepts inherit the listener's non-blocking flag.
+        stream.set_nonblocking(false).ok()?;
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let reader_stream = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let mut reader = BufReader::new(reader_stream);
-        let hello = match read_frame(&mut reader) {
-            Ok(Some(v)) => v,
-            _ => return,
-        };
-        let actor = match self.authenticate(&hello) {
-            Ok(a) => a,
-            Err(_) => return,
-        };
+        let mut reader = BufReader::new(stream.try_clone().ok()?);
+        let Ok(Some(hello)) = read_frame(&mut reader) else { return None };
+        let actor = self.authenticate(&hello).ok()?;
         // The 10 s hello deadline must not outlive authentication: Windows keeps it on the cloned reader.
         let _ = reader.get_ref().set_read_timeout(None);
         let _ = stream.set_read_timeout(None);
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-        let writer = Arc::new(Mutex::new(stream));
+        Some((reader, actor, stream))
+    }
+    /// Registers `writer` as the actor's live connection and closes any previous one; false when the client is gone or stale.
+    fn attach_connection(&self, actor: &Actor, writer: &Connection) -> bool {
         let previous = {
             let Ok(mut state) = self.state.lock() else {
-                return;
+                return false;
             };
             let Some(client) = state.clients.get_mut(&actor.id) else {
-                return;
+                return false;
             };
             if client.generation != actor.generation {
-                return;
+                return false;
             }
             client.connection_id = actor.connection_id.clone();
             client.ready = false;
@@ -686,59 +692,59 @@ impl ManagerHub {
                 let _ = s.shutdown(Shutdown::Both);
             }
         }
-        if send(&writer,&json!({"type":"response","id":"hello","ok":true,"data":{"role":actor.role,"instanceId":actor.id,"generation":actor.generation}})).is_err(){return}
-        while let Ok(Some(frame)) = read_frame(&mut reader) {
-            let current = self.state.lock().ok().is_some_and(|s| {
-                s.clients.get(&actor.id).is_some_and(|c| {
-                    c.generation == actor.generation && c.connection_id == actor.connection_id
-                })
-            });
-            if !current {
-                break;
+        true
+    }
+    fn is_current_connection(&self, actor: &Actor) -> bool {
+        self.state.lock().ok().is_some_and(|s| {
+            s.clients.get(&actor.id).is_some_and(|c| {
+                c.generation == actor.generation && c.connection_id == actor.connection_id
+            })
+        })
+    }
+    fn dispatch_frame(self: &Arc<Self>, actor: &Actor, writer: &Connection, frame: Value) {
+        match frame["type"].as_str() {
+            Some("request") => {
+                let hub = self.clone();
+                let actor = actor.clone();
+                let output = writer.clone();
+                std::thread::spawn(move || hub.answer_request(&actor, &output, &frame));
             }
-            match frame["type"].as_str() {
-                Some("request") => {
-                    let hub = self.clone();
-                    let actor = actor.clone();
-                    let output = writer.clone();
-                    std::thread::spawn(move || {
-                        let id = frame["id"].clone();
-                        let result = hub.execute(&actor, &frame);
-                        let response = match result {
-                            Ok(data) => json!({"type":"response","id":id,"ok":true,"data":data}),
-                            Err(error) => {
-                                json!({"type":"response","id":id,"ok":false,"error":error})
-                            }
-                        };
-                        if let Err(error) = send(&output, &response) {
-                            let _ = send(
-                                &output,
-                                &json!({"type":"response","id":id,"ok":false,"error":error}),
-                            );
-                        }
-                    });
+            Some("event") => {
+                if let Err(e) = self.event(actor, &frame) {
+                    eprintln!("manager event: {e}");
                 }
-                Some("event") => {
-                    if let Err(e) = self.event(&actor, &frame) {
-                        eprintln!("manager event: {e}");
-                    }
-                }
-                Some("response") => self.control_response(&actor, &frame),
-                Some("ack") if actor.role == InstanceKind::Manager => {
-                    if let Ok(mut state) = self.state.lock() {
-                        if let Some(queue) = state.queues.get_mut(&actor.id) {
-                            queue.retain(|n| n["eventId"] != frame["eventId"]);
-                        }
-                    }
-                }
-                _ => {
-                    let _ = send(
-                        &writer,
-                        &json!({"type":"response","id":frame["id"],"ok":false,"error":"invalid_action"}),
-                    );
-                }
+            }
+            Some("response") => self.control_response(actor, &frame),
+            Some("ack") if actor.role == InstanceKind::Manager => self.acknowledge_event(actor, &frame),
+            _ => {
+                let _ = send(
+                    writer,
+                    &json!({"type":"response","id":frame["id"],"ok":false,"error":"invalid_action"}),
+                );
             }
         }
+    }
+    fn answer_request(&self, actor: &Actor, output: &Connection, frame: &Value) {
+        let id = frame["id"].clone();
+        let response = match self.execute(actor, frame) {
+            Ok(data) => json!({"type":"response","id":id,"ok":true,"data":data}),
+            Err(error) => json!({"type":"response","id":id,"ok":false,"error":error}),
+        };
+        if let Err(error) = send(output, &response) {
+            let _ = send(
+                output,
+                &json!({"type":"response","id":id,"ok":false,"error":error}),
+            );
+        }
+    }
+    fn acknowledge_event(&self, actor: &Actor, frame: &Value) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(queue) = state.queues.get_mut(&actor.id) {
+                queue.retain(|n| n["eventId"] != frame["eventId"]);
+            }
+        }
+    }
+    fn close_connection(&self, actor: &Actor, writer: &Connection) {
         // A bridge must never keep writing into a connection nobody reads; closing makes it fail fast and reconnect.
         if let Ok(s) = writer.lock() {
             let _ = s.shutdown(Shutdown::Both);
@@ -746,35 +752,7 @@ impl ManagerHub {
         if let Some(workspace) = self.workspace.get().and_then(Weak::upgrade) {
             workspace.disconnected(&actor.id, actor.generation, &actor.connection_id);
         }
-        let current = {
-            let Ok(mut state) = self.state.lock() else {
-                return;
-            };
-            let current = state.clients.get(&actor.id).is_some_and(|c| {
-                c.connection_id == actor.connection_id && c.generation == actor.generation
-            });
-            if current {
-                if let Some(client) = state.clients.get_mut(&actor.id) {
-                    client.stream = None;
-                    client.ready = false;
-                }
-                let pending: Vec<String> = state
-                    .inflight
-                    .iter()
-                    .filter(|(_, p)| p.target == actor.id && p.generation == actor.generation)
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for key in pending {
-                    if let Some(p) = state.inflight.remove(&key) {
-                        let _ = p
-                            .sender
-                            .send(Err("bridge disconnected; outcome may be unknown".into()));
-                    }
-                }
-            }
-            current
-        };
-        if current {
+        if self.release_client(actor) {
             self.srs_lifecycle(&actor.id, actor.generation, "disconnect", Value::Null);
             self.monitor_lifecycle(&actor.id, actor.generation, "disconnect");
             if let Ok(registry) = self.registry() {
@@ -782,6 +760,36 @@ impl ManagerHub {
             }
             self.clear_decisions(&actor.id);
         }
+    }
+    /// Drops the actor's stream and fails its in-flight controls when this is still its current connection.
+    fn release_client(&self, actor: &Actor) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let current = state.clients.get(&actor.id).is_some_and(|c| {
+            c.connection_id == actor.connection_id && c.generation == actor.generation
+        });
+        if !current {
+            return false;
+        }
+        if let Some(client) = state.clients.get_mut(&actor.id) {
+            client.stream = None;
+            client.ready = false;
+        }
+        let pending: Vec<String> = state
+            .inflight
+            .iter()
+            .filter(|(_, p)| p.target == actor.id && p.generation == actor.generation)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in pending {
+            if let Some(p) = state.inflight.remove(&key) {
+                let _ = p
+                    .sender
+                    .send(Err("bridge disconnected; outcome may be unknown".into()));
+            }
+        }
+        true
     }
     fn connection(&self, id: &str, ready: bool) -> Result<Connection> {
         let state = self.state.lock().map_err(|e| e.to_string())?;
@@ -1004,89 +1012,99 @@ impl ManagerHub {
         let payload = &frame["payload"];
         let registry = self.registry()?;
         if actor.role == InstanceKind::Architect {
-            let lifecycle = if kind == "session_changed" {
-                let old = registry.lease(&actor.id, Origin::Human, false)?.session_id;
-                if payload["sessionId"].as_str() == old.as_deref() { "ready" } else { "session_changed" }
-            } else { kind };
-            self.srs_lifecycle(&actor.id, actor.generation, lifecycle, payload.clone());
-            self.monitor_lifecycle(&actor.id, actor.generation, lifecycle);
+            self.architect_event_lifecycle(&registry, actor, kind, payload)?;
         }
         if registry.lease(&actor.id, Origin::Human, false)?.generation != actor.generation {
             return Err("stale_generation".into());
         }
         match kind {
-            "ready" | "session_changed" => {
-                registry.apply_identity(&actor.id, actor.generation, payload)?;
-                if let Some(terminals) = self.terminals.get() {
-                    if let Err(error) = terminals.apply_snapshot(&actor.id, actor.generation, payload) {
-                        eprintln!("terminal snapshot: {error}");
-                    }
-                }
-                if let Ok(mut state) = self.state.lock() {
-                    if let Some(c) = state.clients.get_mut(&actor.id) {
-                        c.ready = payload["supported"] != false;
-                    }
-                }
-                self.ready_changed.notify_all();
-                self.clear_decisions(&actor.id);
-                let lease = registry.lease(&actor.id, Origin::Human, false)?;
-                if let Ok(stream) = self.connection(&actor.id, false) {
-                    send(
-                        &stream,
-                        &json!({"type":"control","id":uuid::Uuid::new_v4().to_string(),"action":"ownership","payload":lease}),
-                    )?;
-                }
-                if actor.role == InstanceKind::Manager {
-                    self.replay(&actor.id);
-                }
-                for pending in payload["pendingDecisions"].as_array().into_iter().flatten() {
-                    self.register_decision(actor, pending)?;
-                }
-            }
+            "ready" | "session_changed" => self.event_ready(&registry, actor, payload)?,
             "needs_decision" => self.register_decision(actor, payload)?,
-            "decision_resolved" => {
-                let base = text(payload, "requestId")?;
-                let resolved = {
-                    let mut state = self.state.lock().map_err(|e| e.to_string())?;
-                    let key = state
-                        .decisions
-                        .iter()
-                        .find(|(_, d)| {
-                            d.worker == actor.id
-                                && d.base_id == base
-                                && d.generation == actor.generation
-                        })
-                        .map(|(k, _)| k.clone());
-                    key.and_then(|k| state.decisions.remove(&k))
-                };
-                if let Some(decision) = resolved {
-                    registry.resolve_human_decision(&actor.id, &decision.public_id);
-                    self.retire_notification(&decision.public_id);
-                    self.owner_notification(
-                        &actor.id,
-                        actor.generation,
-                        kind,
-                        json!({"requestId":decision.public_id,"source":payload["source"]}),
-                    );
-                }
-                self.update_decision_count(&actor.id);
-                self.publish_human_decisions();
-            }
+            "decision_resolved" => self.event_decision_resolved(&registry, actor, kind, payload)?,
             "agent_started" => {}
-            "terminal_command" | "terminal_output" | "terminal_hold" => {
-                let terminals = self.terminals.get().ok_or("terminal service unavailable")?;
-                match kind {
-                    "terminal_command" => terminals.apply_command(&actor.id, actor.generation, payload)?,
-                    "terminal_output" => terminals.apply_output(&actor.id, actor.generation, payload)?,
-                    _ => terminals.apply_hold(&actor.id, actor.generation, payload)?,
-                }
-            }
+            "terminal_command" | "terminal_output" | "terminal_hold" => self.event_terminal(actor, kind, payload)?,
             "completed" | "turn_error" | "turn_aborted" => {
                 if actor.role == InstanceKind::Instance {
                     self.owner_notification(&actor.id, actor.generation, kind, payload.clone());
                 }
             }
             _ => return Err("invalid_event".into()),
+        }
+        Ok(())
+    }
+    fn architect_event_lifecycle(&self, registry: &Registry, actor: &Actor, kind: &str, payload: &Value) -> Result<()> {
+        let lifecycle = if kind == "session_changed" {
+            let old = registry.lease(&actor.id, Origin::Human, false)?.session_id;
+            if payload["sessionId"].as_str() == old.as_deref() { "ready" } else { "session_changed" }
+        } else { kind };
+        self.srs_lifecycle(&actor.id, actor.generation, lifecycle, payload.clone());
+        self.monitor_lifecycle(&actor.id, actor.generation, lifecycle);
+        Ok(())
+    }
+    fn event_ready(&self, registry: &Registry, actor: &Actor, payload: &Value) -> Result<()> {
+        registry.apply_identity(&actor.id, actor.generation, payload)?;
+        if let Some(terminals) = self.terminals.get() {
+            if let Err(error) = terminals.apply_snapshot(&actor.id, actor.generation, payload) {
+                eprintln!("terminal snapshot: {error}");
+            }
+        }
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(c) = state.clients.get_mut(&actor.id) {
+                c.ready = payload["supported"] != false;
+            }
+        }
+        self.ready_changed.notify_all();
+        self.clear_decisions(&actor.id);
+        let lease = registry.lease(&actor.id, Origin::Human, false)?;
+        if let Ok(stream) = self.connection(&actor.id, false) {
+            send(
+                &stream,
+                &json!({"type":"control","id":uuid::Uuid::new_v4().to_string(),"action":"ownership","payload":lease}),
+            )?;
+        }
+        if actor.role == InstanceKind::Manager {
+            self.replay(&actor.id);
+        }
+        for pending in payload["pendingDecisions"].as_array().into_iter().flatten() {
+            self.register_decision(actor, pending)?;
+        }
+        Ok(())
+    }
+    fn event_decision_resolved(&self, registry: &Registry, actor: &Actor, kind: &str, payload: &Value) -> Result<()> {
+        let base = text(payload, "requestId")?;
+        let resolved = {
+            let mut state = self.state.lock().map_err(|e| e.to_string())?;
+            let key = state
+                .decisions
+                .iter()
+                .find(|(_, d)| {
+                    d.worker == actor.id
+                        && d.base_id == base
+                        && d.generation == actor.generation
+                })
+                .map(|(k, _)| k.clone());
+            key.and_then(|k| state.decisions.remove(&k))
+        };
+        if let Some(decision) = resolved {
+            registry.resolve_human_decision(&actor.id, &decision.public_id);
+            self.retire_notification(&decision.public_id);
+            self.owner_notification(
+                &actor.id,
+                actor.generation,
+                kind,
+                json!({"requestId":decision.public_id,"source":payload["source"]}),
+            );
+        }
+        self.update_decision_count(&actor.id);
+        self.publish_human_decisions();
+        Ok(())
+    }
+    fn event_terminal(&self, actor: &Actor, kind: &str, payload: &Value) -> Result<()> {
+        let terminals = self.terminals.get().ok_or("terminal service unavailable")?;
+        match kind {
+            "terminal_command" => terminals.apply_command(&actor.id, actor.generation, payload)?,
+            "terminal_output" => terminals.apply_output(&actor.id, actor.generation, payload)?,
+            _ => terminals.apply_hold(&actor.id, actor.generation, payload)?,
         }
         Ok(())
     }
@@ -1380,7 +1398,7 @@ impl ManagerHub {
         registry.revise_plan(target, &backup.text)?;
         Ok(())
     }
-    fn plan_action(&self, registry: &Arc<Registry>, target: &str, action: &str, p: &Value) -> Result<Value> {
+    fn plan_payload<'a>(action: &str, p: &'a Value) -> Result<&'a serde_json::Map<String, Value>> {
         let allowed: &[&str] = match action {
             "plan_status" | "plan_read_plan" | "plan_screen" | "plan_interrupt" | "plan_handoff_info" => &[],
             "plan_transcript" => &["tail"],
@@ -1392,22 +1410,14 @@ impl ManagerHub {
         if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
             return Err(format!("invalid_plan_payload: {action} does not accept '{key}' (allowed: {})", if allowed.is_empty() { "none".into() } else { allowed.join(", ") }));
         }
+        Ok(object)
+    }
+    fn plan_action(&self, registry: &Arc<Registry>, target: &str, action: &str, p: &Value) -> Result<Value> {
+        let object = Self::plan_payload(action, p)?;
         match action {
-            "plan_status" => {
-                let row = registry.inspect(target, Origin::Human)?;
-                Ok(json!({
-                    "name": row.name, "kind": row.kind, "projectPath": row.project_path, "status": row.status,
-                    "activity": row.activity, "task": row.task, "todoDone": row.todo_done, "todoTotal": row.todo_total,
-                    "planPath": row.plan_path, "planKind": row.plan_kind,
-                    "subagents": row.subagents.iter().map(|s| json!({"name": s.name, "agent": s.agent, "status": s.status, "task": s.task})).collect::<Vec<_>>(),
-                }))
-            }
+            "plan_status" => Self::plan_status(registry, target),
             "plan_read_plan" => Ok(json!({"kind": registry.inspect(target, Origin::Human)?.plan_kind, "path": registry.plan_file(target)?, "text": registry.plan(target, Origin::Human)?})),
-            "plan_transcript" => {
-                let tail = object.get("tail").map(|v| v.as_u64().ok_or("invalid_plan_payload")).transpose()?.unwrap_or(20_000).clamp(1_000, 60_000) as usize;
-                let (path, input) = registry.main_transcript(target, Origin::Human)?;
-                Ok(json!({"text": plan::tail(&session::render_transcript_file(&path, &input)?, tail)}))
-            }
+            "plan_transcript" => Self::plan_transcript(registry, target, object),
             "plan_screen" => {
                 let screen = registry.screen(target, Origin::Human).map_err(|e| if e == "instance not started" { plan::NOT_RUNNING.to_string() } else { e })?;
                 Ok(json!({"text": plan::tail(screen["text"].as_str().unwrap_or(""), 8_000)}))
@@ -1416,19 +1426,7 @@ impl ManagerHub {
                 self.plan_control(registry, target, "abort", json!({}))?;
                 Ok(json!({"interrupted": true}))
             }
-            "plan_write_plan" => {
-                let text = object.get("text").and_then(Value::as_str)
-                    .filter(|t| !t.trim().is_empty() && t.chars().count() <= 262_144)
-                    .ok_or("plan text must be 1..262144 characters")?;
-                // The session must stop working before its plan changes; a stopped session has nothing to interrupt.
-                let interrupted = match self.plan_control(registry, target, "abort", json!({})) {
-                    Ok(_) => true,
-                    Err(e) if e == plan::NOT_RUNNING => false,
-                    Err(e) => return Err(e),
-                };
-                let backup = registry.revise_plan(target, text)?;
-                Ok(json!({"path": registry.plan_file(target)?, "bytes": text.len(), "interrupted": interrupted, "backup": backup}))
-            }
+            "plan_write_plan" => self.plan_write_plan(registry, target, object),
             "plan_handoff_info" => {
                 let revision = registry.plan_revision(target)?
                     .ok_or("There is no plan to hand off; call write_plan first")?;
@@ -1436,34 +1434,64 @@ impl ManagerHub {
                 Ok(json!({"name": row.name, "revision": revision.id,
                     "needsStart": self.connection(target, true).is_err() && !matches!(row.status.as_str(), "running" | "starting")}))
             }
-            "plan_handoff" => {
-                let summary = object.get("summary").and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty() && s.chars().count() <= 4_000)
-                    .ok_or("summary must be 1..4000 characters")?;
-                let revision = registry.plan_revision(target)?
-                    .ok_or("There is no plan to hand off; call write_plan first")?;
-                if p["revision"].as_str() != Some(revision.id.as_str()) {
-                    return Err("The plan changed; confirm the new revision before handoff".into());
-                }
-                let start = p.get("startIfStopped").map(|v| v.as_bool().ok_or("startIfStopped must be boolean")).transpose()?.unwrap_or(false);
-                if self.connection(target, true).is_err() {
-                    let row = registry.inspect(target, Origin::Human)?;
-                    if !matches!(row.status.as_str(), "running" | "starting") {
-                        if !start { return Err(plan::NOT_RUNNING.into()); }
-                        registry.start(target, Origin::Human)?;
-                    }
-                    self.wait_ready(target)?;
-                }
-                // Starting/resuming may load a different native identity. Never send an unconfirmed revision.
-                let current = registry.plan_revision(target)?.ok_or("The session changed; review the plan before handoff")?;
-                if current.id != revision.id { return Err("The plan changed; confirm the new revision before handoff".into()); }
-                let message = plan::handoff_message(&revision.path, &revision.text, summary);
-                self.plan_control(registry, target, "prompt", json!({"message": message}))?;
-                registry.mark_plan_handoff(target, &revision.id)?;
-                Ok(json!({"accepted": true}))
-            }
+            "plan_handoff" => self.plan_handoff(registry, target, object, p),
             _ => Err("invalid_action".into()),
         }
+    }
+    fn plan_status(registry: &Registry, target: &str) -> Result<Value> {
+        let row = registry.inspect(target, Origin::Human)?;
+        Ok(json!({
+            "name": row.name, "kind": row.kind, "projectPath": row.project_path, "status": row.status,
+            "activity": row.activity, "task": row.task, "todoDone": row.todo_done, "todoTotal": row.todo_total,
+            "planPath": row.plan_path, "planKind": row.plan_kind,
+            "subagents": row.subagents.iter().map(|s| json!({"name": s.name, "agent": s.agent, "status": s.status, "task": s.task})).collect::<Vec<_>>(),
+        }))
+    }
+    fn plan_transcript(registry: &Registry, target: &str, object: &serde_json::Map<String, Value>) -> Result<Value> {
+        let tail = object.get("tail").map(|v| v.as_u64().ok_or("invalid_plan_payload")).transpose()?.unwrap_or(20_000).clamp(1_000, 60_000) as usize;
+        let (path, input) = registry.main_transcript(target, Origin::Human)?;
+        Ok(json!({"text": plan::tail(&session::render_transcript_file(&path, &input)?, tail)}))
+    }
+    fn plan_write_plan(&self, registry: &Registry, target: &str, object: &serde_json::Map<String, Value>) -> Result<Value> {
+        let text = object.get("text").and_then(Value::as_str)
+            .filter(|t| !t.trim().is_empty() && t.chars().count() <= 262_144)
+            .ok_or("plan text must be 1..262144 characters")?;
+        // The session must stop working before its plan changes; a stopped session has nothing to interrupt.
+        let interrupted = match self.plan_control(registry, target, "abort", json!({})) {
+            Ok(_) => true,
+            Err(e) if e == plan::NOT_RUNNING => false,
+            Err(e) => return Err(e),
+        };
+        let backup = registry.revise_plan(target, text)?;
+        Ok(json!({"path": registry.plan_file(target)?, "bytes": text.len(), "interrupted": interrupted, "backup": backup}))
+    }
+    fn plan_handoff(&self, registry: &Registry, target: &str, object: &serde_json::Map<String, Value>, p: &Value) -> Result<Value> {
+        let summary = object.get("summary").and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty() && s.chars().count() <= 4_000)
+            .ok_or("summary must be 1..4000 characters")?;
+        let revision = registry.plan_revision(target)?
+            .ok_or("There is no plan to hand off; call write_plan first")?;
+        if p["revision"].as_str() != Some(revision.id.as_str()) {
+            return Err("The plan changed; confirm the new revision before handoff".into());
+        }
+        let start = p.get("startIfStopped").map(|v| v.as_bool().ok_or("startIfStopped must be boolean")).transpose()?.unwrap_or(false);
+        self.plan_handoff_ready(registry, target, start)?;
+        // Starting/resuming may load a different native identity. Never send an unconfirmed revision.
+        let current = registry.plan_revision(target)?.ok_or("The session changed; review the plan before handoff")?;
+        if current.id != revision.id { return Err("The plan changed; confirm the new revision before handoff".into()); }
+        let message = plan::handoff_message(&revision.path, &revision.text, summary);
+        self.plan_control(registry, target, "prompt", json!({"message": message}))?;
+        registry.mark_plan_handoff(target, &revision.id)?;
+        Ok(json!({"accepted": true}))
+    }
+    fn plan_handoff_ready(&self, registry: &Registry, target: &str, start: bool) -> Result<()> {
+        if self.connection(target, true).is_ok() { return Ok(()); }
+        let row = registry.inspect(target, Origin::Human)?;
+        if !matches!(row.status.as_str(), "running" | "starting") {
+            if !start { return Err(plan::NOT_RUNNING.into()); }
+            registry.start(target, Origin::Human)?;
+        }
+        self.wait_ready(target)
     }
     fn execute(&self, actor: &Actor, frame: &Value) -> Result<Value> {
         let current = self.state.lock().map_err(|e| e.to_string())?.clients.get(&actor.id).is_some_and(|client| client.generation == actor.generation && client.connection_id == actor.connection_id);
@@ -1475,46 +1503,16 @@ impl ManagerHub {
         let action = text(frame, "action")?;
         let p = &frame["payload"];
         if matches!(action, "srs_tool" | "srs_ask_map" | "srs_ask_receipt" | "srs_ask_retired" | "srs_stage_admitted" | "srs_stage_validate" | "srs_stage_yielded") {
-            if actor.role != InstanceKind::Architect { return Err("unauthorized".into()); }
-            let producer = self.dependency_producer(&actor.id, actor.generation)?;
-            let service = self.srs.get().and_then(Weak::upgrade).ok_or("SRS service unavailable")?;
-            return service.handle_bridge(&producer, action, p.clone());
+            return self.execute_srs(actor, action, p);
         }
         if matches!(action, "monitor_snapshot_read" | "monitor_explanation_validate" | "monitor_explanation_retired") {
-            // Authenticated Architect only, before the Manager boundary; the producer derives from the actor, never the payload.
-            if actor.role != InstanceKind::Architect { return Err("unauthorized".into()); }
-            let producer = self.dependency_producer(&actor.id, actor.generation)?;
-            let service = self.host_monitor.get().and_then(Weak::upgrade).ok_or("host monitor service unavailable")?;
-            return service.handle_bridge(&producer, action, p.clone());
+            return self.execute_monitor(actor, action, p);
         }
         if matches!(action, "workspace_begin" | "workspace_ready" | "workspace_complete" | "workspace_failed" | "workspace_reconcile") {
-            if !registry.workspace_metadata(&actor.id).is_ok_and(|m| crate::instance::may_change_directory(&m.definition)) { return Err("unauthorized".into()); }
-            let service = self.workspace.get().and_then(Weak::upgrade).ok_or("workspace service unavailable")?;
-            return match action {
-                "workspace_begin" => service.begin(&actor.id, actor.generation, &actor.connection_id, text(p,"requestId")?),
-                "workspace_ready" => service.ready(&actor.id, actor.generation, &actor.connection_id, p),
-                "workspace_reconcile" => service.reconcile(&actor.id, actor.generation, p),
-                _ => service.complete(&actor.id, actor.generation, &actor.connection_id, p, action == "workspace_failed"),
-            };
+            return self.execute_workspace(actor, &registry, action, p);
         }
         if matches!(action, "browser_prepare" | "browser_close_tab" | "browser_close_all" | "browser_tabs") {
-            let fields: &[&str] = match action {
-                "browser_close_all" | "browser_tabs" => &[],
-                "browser_prepare" => &["name", "target"],
-                _ => &["name"],
-            };
-            let object = p.as_object().ok_or("invalid_browser_payload")?;
-            if object.keys().any(|key| !fields.contains(&key.as_str())) { return Err("invalid_browser_payload".into()); }
-            let browser = self.browser.get().ok_or("browser supervisor unavailable")?;
-            return match action {
-                "browser_prepare" => {
-                    let target = p.get("target").map(|v| v.as_str().ok_or("invalid_browser_payload")).transpose()?;
-                    browser.prepare_tab(&actor.id, actor.generation, text(p, "name")?, target)
-                }
-                "browser_tabs" => browser.list_tabs(&actor.id, actor.generation),
-                "browser_close_tab" => browser.close_tab(&actor.id, actor.generation, Some(text(p, "name")?)).map(|_| Value::Null),
-                _ => browser.close_tab(&actor.id, actor.generation, None).map(|_| Value::Null),
-            };
+            return self.execute_browser(actor, action, p);
         }
         if action.starts_with("plan_") {
             if let Some(target) = registry.plan_target(&actor.id) {
@@ -1522,70 +1520,126 @@ impl ManagerHub {
             }
         }
         if action == "code_quality" {
-            // Read-only saved results for the caller's own repository, for every role; the repository comes from the
-            // authenticated actor's Registry definition, never from the payload.
-            let service = self.code_quality.get().and_then(Weak::upgrade).ok_or("code quality service unavailable")?;
-            let request: crate::code_quality::types::AgentReportRequest = serde_json::from_value(p.clone()).map_err(|e| format!("invalid_code_quality_payload: {e}"))?;
-            let (folder, subject, epoch) = Self::quality_repository(&registry, actor)?;
-            let result = service.agent_report(&folder, &request)?;
-            let after = registry.workspace_metadata(&subject)?;
-            if after.workspace_epoch != epoch || after.definition.input.project_path != folder {
-                return Err("workspace_changed: the working directory changed while reading; retry".into());
-            }
-            return Ok(result);
+            return self.execute_code_quality(actor, &registry, p);
         }
         if actor.role != InstanceKind::Manager { return Err("unauthorized".into()); }
-        let origin = Origin::Manager(&actor.id);
-        if action == "list" {
-            let rows = registry
-                .snapshot()
-                .into_iter()
-                .filter(|r| {
-                    r.kind == InstanceKind::Instance
-                        && r.manager_id.as_deref() == Some(actor.id.as_str())
-                })
-                .collect::<Vec<_>>();
-            let state = self.state.lock().map_err(|e| e.to_string())?;
-            return Ok(
-                json!({"instances":rows,"pendingDecisions":state.decisions.values().filter(|d|rows.iter().any(|r|r.id==d.worker)).map(Decision::view).collect::<Vec<_>>()}),
-            );
+        self.execute_manager(actor, &registry, action, p)
+    }
+    fn execute_srs(&self, actor: &Actor, action: &str, p: &Value) -> Result<Value> {
+        if actor.role != InstanceKind::Architect { return Err("unauthorized".into()); }
+        let producer = self.dependency_producer(&actor.id, actor.generation)?;
+        let service = self.srs.get().and_then(Weak::upgrade).ok_or("SRS service unavailable")?;
+        service.handle_bridge(&producer, action, p.clone())
+    }
+    fn execute_monitor(&self, actor: &Actor, action: &str, p: &Value) -> Result<Value> {
+        // Authenticated Architect only, before the Manager boundary; the producer derives from the actor, never the payload.
+        if actor.role != InstanceKind::Architect { return Err("unauthorized".into()); }
+        let producer = self.dependency_producer(&actor.id, actor.generation)?;
+        let service = self.host_monitor.get().and_then(Weak::upgrade).ok_or("host monitor service unavailable")?;
+        service.handle_bridge(&producer, action, p.clone())
+    }
+    fn execute_workspace(&self, actor: &Actor, registry: &Registry, action: &str, p: &Value) -> Result<Value> {
+        if !registry.workspace_metadata(&actor.id).is_ok_and(|m| crate::instance::may_change_directory(&m.definition)) { return Err("unauthorized".into()); }
+        let service = self.workspace.get().and_then(Weak::upgrade).ok_or("workspace service unavailable")?;
+        match action {
+            "workspace_begin" => service.begin(&actor.id, actor.generation, &actor.connection_id, text(p,"requestId")?),
+            "workspace_ready" => service.ready(&actor.id, actor.generation, &actor.connection_id, p),
+            "workspace_reconcile" => service.reconcile(&actor.id, actor.generation, p),
+            _ => service.complete(&actor.id, actor.generation, &actor.connection_id, p, action == "workspace_failed"),
         }
-        if action == "create" {
-            let start = p["start"].as_bool().unwrap_or(true);
-            let prompt = p["prompt"].as_str();
-            if !start && prompt.is_some() {
-                return Err("prompt_requires_start".into());
+    }
+    fn execute_browser(&self, actor: &Actor, action: &str, p: &Value) -> Result<Value> {
+        let fields: &[&str] = match action {
+            "browser_close_all" | "browser_tabs" => &[],
+            "browser_prepare" => &["name", "target"],
+            _ => &["name"],
+        };
+        let object = p.as_object().ok_or("invalid_browser_payload")?;
+        if object.keys().any(|key| !fields.contains(&key.as_str())) { return Err("invalid_browser_payload".into()); }
+        let browser = self.browser.get().ok_or("browser supervisor unavailable")?;
+        match action {
+            "browser_prepare" => {
+                let target = p.get("target").map(|v| v.as_str().ok_or("invalid_browser_payload")).transpose()?;
+                browser.prepare_tab(&actor.id, actor.generation, text(p, "name")?, target)
             }
-            let mut input: CreateInput =
-                serde_json::from_value(p["config"].clone()).map_err(|e| e.to_string())?;
-            input.agent_file = None;
-            let row = registry.create_owned(&actor.id, input)?;
-            if start {
-                if let Err(error) = registry.start(&row.id, origin) {
+            "browser_tabs" => browser.list_tabs(&actor.id, actor.generation),
+            "browser_close_tab" => browser.close_tab(&actor.id, actor.generation, Some(text(p, "name")?)).map(|_| Value::Null),
+            _ => browser.close_tab(&actor.id, actor.generation, None).map(|_| Value::Null),
+        }
+    }
+    /// Read-only saved results for the caller's own repository, for every role; the repository comes from the
+    /// authenticated actor's Registry definition, never from the payload.
+    fn execute_code_quality(&self, actor: &Actor, registry: &Registry, p: &Value) -> Result<Value> {
+        let service = self.code_quality.get().and_then(Weak::upgrade).ok_or("code quality service unavailable")?;
+        let request: crate::code_quality::types::AgentReportRequest = serde_json::from_value(p.clone()).map_err(|e| format!("invalid_code_quality_payload: {e}"))?;
+        let (folder, subject, epoch) = Self::quality_repository(registry, actor)?;
+        let result = service.agent_report(&folder, &request)?;
+        let after = registry.workspace_metadata(&subject)?;
+        if after.workspace_epoch != epoch || after.definition.input.project_path != folder {
+            return Err("workspace_changed: the working directory changed while reading; retry".into());
+        }
+        Ok(result)
+    }
+    fn execute_manager(&self, actor: &Actor, registry: &Registry, action: &str, p: &Value) -> Result<Value> {
+        match action {
+            "list" => self.manager_list(actor, registry),
+            "create" => self.manager_create(actor, registry, p),
+            _ => self.manager_instance_action(actor, registry, action, p),
+        }
+    }
+    fn manager_list(&self, actor: &Actor, registry: &Registry) -> Result<Value> {
+        let rows = registry
+            .snapshot()
+            .into_iter()
+            .filter(|r| {
+                r.kind == InstanceKind::Instance
+                    && r.manager_id.as_deref() == Some(actor.id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let state = self.state.lock().map_err(|e| e.to_string())?;
+        Ok(
+            json!({"instances":rows,"pendingDecisions":state.decisions.values().filter(|d|rows.iter().any(|r|r.id==d.worker)).map(Decision::view).collect::<Vec<_>>()}),
+        )
+    }
+    fn manager_create(&self, actor: &Actor, registry: &Registry, p: &Value) -> Result<Value> {
+        let origin = Origin::Manager(&actor.id);
+        let start = p["start"].as_bool().unwrap_or(true);
+        let prompt = p["prompt"].as_str();
+        if !start && prompt.is_some() {
+            return Err("prompt_requires_start".into());
+        }
+        let mut input: CreateInput =
+            serde_json::from_value(p["config"].clone()).map_err(|e| e.to_string())?;
+        input.agent_file = None;
+        let row = registry.create_owned(&actor.id, input)?;
+        if start {
+            if let Err(error) = registry.start(&row.id, origin) {
+                return Ok(
+                    json!({"instance":registry.inspect(&row.id,origin)?,"error":error,"promptSent":false}),
+                );
+            }
+            if prompt.is_some() {
+                if let Err(error) = self.wait_ready(&row.id) {
                     return Ok(
                         json!({"instance":registry.inspect(&row.id,origin)?,"error":error,"promptSent":false}),
                     );
                 }
-                if prompt.is_some() {
-                    if let Err(error) = self.wait_ready(&row.id) {
-                        return Ok(
-                            json!({"instance":registry.inspect(&row.id,origin)?,"error":error,"promptSent":false}),
-                        );
-                    }
-                    let lease = registry.lease(&row.id, origin, true)?;
-                    self.control(
-                        &row.id,
-                        &lease,
-                        "prompt",
-                        json!({"message":prompt,"delivery":"follow_up"}),
-                        origin,
-                    )?;
-                }
+                let lease = registry.lease(&row.id, origin, true)?;
+                self.control(
+                    &row.id,
+                    &lease,
+                    "prompt",
+                    json!({"message":prompt,"delivery":"follow_up"}),
+                    origin,
+                )?;
             }
-            return Ok(
-                json!({"instance":registry.inspect(&row.id,origin)?,"promptSent":prompt.is_some()}),
-            );
         }
+        Ok(
+            json!({"instance":registry.inspect(&row.id,origin)?,"promptSent":prompt.is_some()}),
+        )
+    }
+    fn manager_instance_action(&self, actor: &Actor, registry: &Registry, action: &str, p: &Value) -> Result<Value> {
+        let origin = Origin::Manager(&actor.id);
         let id = text(p, "instanceId")?;
         match action {
             "start" => {
@@ -1637,63 +1691,66 @@ impl ManagerHub {
                     origin,
                 )
             }
-            "subscribe" => {
-                registry.lease(id, origin, false)?;
-                let enabled = p["enabled"].as_bool().ok_or("enabled is required")?;
-                let decisions = {
-                    let mut state = self.state.lock().map_err(|e| e.to_string())?;
-                    let was_enabled = state
-                        .subscriptions
-                        .insert(id.into(), enabled)
-                        .unwrap_or(true);
-                    if !enabled {
-                        for queue in state.queues.values_mut() {
-                            queue.retain(|n| n["instanceId"] != id);
-                        }
-                    }
-                    state
-                        .decisions
-                        .values()
-                        .filter(|d| enabled && !was_enabled && d.worker == id)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                };
-                if enabled {
-                    self.replay(&actor.id);
-                }
-                for decision in decisions {
-                    self.owner_notification(
-                        id,
-                        decision.generation,
-                        "needs_decision",
-                        decision.view(),
-                    );
-                }
-                Ok(json!({"subscribed":enabled}))
-            }
-            "request_human" => {
-                registry.lease(id, origin, false)?;
-                let decision_id = p["requestId"].as_str().map(String::from);
-                if let Some(request) = &decision_id {
-                    let state = self.state.lock().map_err(|e| e.to_string())?;
-                    if !state.decisions.get(request).is_some_and(|d| d.worker == id) {
-                        return Err("decision_already_resolved".into());
-                    }
-                }
-                registry.request_human(id, &actor.id, text(p, "reason")?.into(), decision_id)?;
-                self.owner_notification(
-                    id,
-                    registry.lease(id, origin, false)?.generation,
-                    "human_requested",
-                    p.clone(),
-                );
-                Ok(json!({"humanRequested":true}))
-            }
+            "subscribe" => self.manager_subscribe(actor, registry, id, p),
+            "request_human" => self.manager_request_human(actor, registry, id, p),
             "respond" => {
                 self.respond_decision(id, text(p, "requestId")?, p["generation"].as_u64().ok_or("generation is required")?, None, p["response"].clone(), origin)
             }
             _ => Err("invalid_action".into()),
         }
+    }
+    fn manager_subscribe(&self, actor: &Actor, registry: &Registry, id: &str, p: &Value) -> Result<Value> {
+        registry.lease(id, Origin::Manager(&actor.id), false)?;
+        let enabled = p["enabled"].as_bool().ok_or("enabled is required")?;
+        let decisions = {
+            let mut state = self.state.lock().map_err(|e| e.to_string())?;
+            let was_enabled = state
+                .subscriptions
+                .insert(id.into(), enabled)
+                .unwrap_or(true);
+            if !enabled {
+                for queue in state.queues.values_mut() {
+                    queue.retain(|n| n["instanceId"] != id);
+                }
+            }
+            state
+                .decisions
+                .values()
+                .filter(|d| enabled && !was_enabled && d.worker == id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if enabled {
+            self.replay(&actor.id);
+        }
+        for decision in decisions {
+            self.owner_notification(
+                id,
+                decision.generation,
+                "needs_decision",
+                decision.view(),
+            );
+        }
+        Ok(json!({"subscribed":enabled}))
+    }
+    fn manager_request_human(&self, actor: &Actor, registry: &Registry, id: &str, p: &Value) -> Result<Value> {
+        let origin = Origin::Manager(&actor.id);
+        registry.lease(id, origin, false)?;
+        let decision_id = p["requestId"].as_str().map(String::from);
+        if let Some(request) = &decision_id {
+            let state = self.state.lock().map_err(|e| e.to_string())?;
+            if !state.decisions.get(request).is_some_and(|d| d.worker == id) {
+                return Err("decision_already_resolved".into());
+            }
+        }
+        registry.request_human(id, &actor.id, text(p, "reason")?.into(), decision_id)?;
+        self.owner_notification(
+            id,
+            registry.lease(id, origin, false)?.generation,
+            "human_requested",
+            p.clone(),
+        );
+        Ok(json!({"humanRequested":true}))
     }
 }
 

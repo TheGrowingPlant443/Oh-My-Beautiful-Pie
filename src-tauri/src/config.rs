@@ -135,7 +135,7 @@ pub fn native_request(root: &Path, home: &Path, mut request: Value) -> Result<Va
     let mut child = command(bun)
         .arg(root.join("omp-config.mjs"))
         .current_dir(cwd)
-        .env("PI_COMPILED", "false")
+        .env_remove("PI_COMPILED")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

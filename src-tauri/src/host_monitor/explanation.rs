@@ -233,6 +233,58 @@ fn pin_message(error: &str) -> String {
 }
 fn architect_code(message: &str) -> &'static str { if message.contains("Create The Architect first") { "architect_missing" } else { "architect_unavailable" } }
 
+/// Explicit human continuation: valid only while its frozen origin display is still open. Any refusal is already finished.
+fn resume_producer(run: &Run<'_>, resume: &Resume<'_>) -> Result<DependencyProducer, ExplainResult> {
+    let (ex, ports, snapshot_id) = (run.ex, run.ports, run.snapshot_id);
+    if !ex.continuation_open(snapshot_id) || !ports.view_frozen(snapshot_id) {
+        // A continuation whose origin display closed or thawed can never admit anything; forget it.
+        ex.cancel_continuation(snapshot_id);
+        return Err(run.unsent(None, "continuation_cancelled", "The Pause SRS and continue request is no longer open; nothing was sent.", None));
+    }
+    let producer = match ports.producer() { Ok(producer) => producer, Err(error) => return Err(run.unsent(None, architect_code(&error), error, None)) };
+    let producer = pause_blocking_job(run, producer, resume)?;
+    // Never admit after an awaited pause if the origin was dismissed meanwhile.
+    if !ex.continuation_live(&run.request_id) { return Err(run.unsent(Some(producer), "continuation_cancelled", "The Pause SRS and continue request was dismissed; nothing was sent.", None)); }
+    Ok(producer)
+}
+fn pause_blocking_job(run: &Run<'_>, producer: DependencyProducer, resume: &Resume<'_>) -> Result<DependencyProducer, ExplainResult> {
+    match run.ports.blocking_job(&producer) {
+        Some((job, attempt)) if job == resume.job_id && (resume.attempt_id.is_empty() || attempt == resume.attempt_id) => {
+            if let Err(error) = run.ports.pause_srs(&job) { return Err(run.unsent(Some(producer), &code_of(&error, "srs_pause_failed"), error, None)); }
+        }
+        Some((job, attempt)) => return Err(run.unsent(Some(producer), "srs_job_changed", "A different SRS job now owns the Architect. Review it before continuing.", Some(BlockedBy { job_id: job, attempt_id: attempt }))),
+        None => {}
+    }
+    Ok(producer)
+}
+/// Offers the prompt; a continuation waits out the two pre-send refusals until the native SRS guard releases.
+fn offer_prompt(run: &Run<'_>, producer: &DependencyProducer, pin: &PinnedSnapshot, message: &str) -> Result<(), MonitorPromptError> {
+    let (ex, ports, continuation) = (run.ex, run.ports, run.continuation);
+    let deadline = Instant::now() + ports.continuation_wait();
+    loop {
+        if continuation && !ex.continuation_live(&run.request_id) {
+            return Err(MonitorPromptError::NotSent { code: "continuation_cancelled".into(), message: "The Pause SRS and continue request was dismissed; nothing was sent.".into() });
+        }
+        match ports.prompt(producer, &run.request_id, pin, message) {
+            // Both refusals are pre-send: the native SRS guard has not released yet, so waiting and re-asking cannot duplicate.
+            Err(MonitorPromptError::NotSent { code, .. }) if continuation && matches!(code.as_str(), "srs_owns_architect" | "native_monitor_not_quiescent") && Instant::now() < deadline => ports.wait_native(),
+            Err(MonitorPromptError::SrsActive { .. }) if continuation && Instant::now() < deadline => ports.wait_native(),
+            other => return other,
+        }
+    }
+}
+fn finish_prompt(run: &Run<'_>, producer: DependencyProducer, outcome: Result<(), MonitorPromptError>) -> ExplainResult {
+    let (ex, request_id) = (run.ex, &run.request_id);
+    match outcome {
+        Ok(()) => ex.finish(request_id, Some(Phase::Admitted), ExplainResult { request_id: request_id.clone(), snapshot_id: run.snapshot_id.into(), producer: Some(producer), prompt_sent: Some(true), error: None, blocked_by: None }),
+        Err(MonitorPromptError::NotSent { code, message }) => run.unsent(Some(producer), &code, message, None),
+        Err(MonitorPromptError::SrsActive { job_id, attempt_id }) => run.unsent(Some(producer), "srs_active",
+            "An SRS job is using The Architect. Pause SRS and continue to explain this snapshot, or wait for it to finish.", Some(BlockedBy { job_id, attempt_id })),
+        Err(MonitorPromptError::Uncertain(error)) => ex.finish(request_id, Some(Phase::Uncertain), failure(request_id, run.snapshot_id, Some(producer), None, "delivery_uncertain",
+            format!("Prompt admission outcome unknown: {error}. It is not resent automatically; inspect The Architect's conversation before asking again."))),
+    }
+}
+
 pub(super) fn explain(ex: &Explanations, ports: &dyn Ports, snapshot_id: &str, resume: Option<Resume<'_>>) -> ExplainResult {
     let continuation = resume.is_some();
     let request_id = match ex.begin(snapshot_id, continuation) {
@@ -242,26 +294,7 @@ pub(super) fn explain(ex: &Explanations, ports: &dyn Ports, snapshot_id: &str, r
         Begin::New(request_id) => request_id,
     };
     let mut run = Run { ex, ports, request_id, snapshot_id, continuation, pinned: false };
-    let mut known: Option<DependencyProducer> = None;
-    if let Some(resume) = &resume {
-        // The explicit human continuation: valid only while its frozen origin display is still open.
-        if !ex.continuation_open(snapshot_id) || !ports.view_frozen(snapshot_id) {
-            // A continuation whose origin display closed or thawed can never admit anything; forget it.
-            ex.cancel_continuation(snapshot_id);
-            return run.unsent(None, "continuation_cancelled", "The Pause SRS and continue request is no longer open; nothing was sent.", None);
-        }
-        let producer = match ports.producer() { Ok(producer) => producer, Err(error) => return run.unsent(None, architect_code(&error), error, None) };
-        match ports.blocking_job(&producer) {
-            Some((job, attempt)) if job == resume.job_id && (resume.attempt_id.is_empty() || attempt == resume.attempt_id) => {
-                if let Err(error) = ports.pause_srs(&job) { return run.unsent(Some(producer), &code_of(&error, "srs_pause_failed"), error, None); }
-            }
-            Some((job, attempt)) => return run.unsent(Some(producer), "srs_job_changed", "A different SRS job now owns the Architect. Review it before continuing.", Some(BlockedBy { job_id: job, attempt_id: attempt })),
-            None => {}
-        }
-        // Never admit after an awaited pause if the origin was dismissed meanwhile.
-        if !ex.continuation_live(&run.request_id) { return run.unsent(Some(producer), "continuation_cancelled", "The Pause SRS and continue request was dismissed; nothing was sent.", None); }
-        known = Some(producer);
-    }
+    let known = match resume.as_ref().map(|resume| resume_producer(&run, resume)).transpose() { Ok(known) => known, Err(result) => return result };
     // Exactly the acknowledged displayed snapshot is pinned (and its view frozen) before any producer await.
     let pin = match ports.pin(snapshot_id, &run.request_id) {
         Ok(pin) => { run.pinned = true; pin }
@@ -273,26 +306,8 @@ pub(super) fn explain(ex: &Explanations, ports: &dyn Ports, snapshot_id: &str, r
     };
     if let Err((code, message)) = ex.begin_send(&run.request_id, &producer) { return run.unsent(Some(producer), code, message, None); }
     let message = monitor_prompt(&pin, &run.request_id);
-    let deadline = Instant::now() + ports.continuation_wait();
-    let outcome = loop {
-        if continuation && !ex.continuation_live(&run.request_id) {
-            break Err(MonitorPromptError::NotSent { code: "continuation_cancelled".into(), message: "The Pause SRS and continue request was dismissed; nothing was sent.".into() });
-        }
-        match ports.prompt(&producer, &run.request_id, &pin, &message) {
-            // Both refusals are pre-send: the native SRS guard has not released yet, so waiting and re-asking cannot duplicate.
-            Err(MonitorPromptError::NotSent { code, .. }) if continuation && matches!(code.as_str(), "srs_owns_architect" | "native_monitor_not_quiescent") && Instant::now() < deadline => ports.wait_native(),
-            Err(MonitorPromptError::SrsActive { .. }) if continuation && Instant::now() < deadline => ports.wait_native(),
-            other => break other,
-        }
-    };
-    match outcome {
-        Ok(()) => ex.finish(&run.request_id, Some(Phase::Admitted), ExplainResult { request_id: run.request_id.clone(), snapshot_id: snapshot_id.into(), producer: Some(producer), prompt_sent: Some(true), error: None, blocked_by: None }),
-        Err(MonitorPromptError::NotSent { code, message }) => run.unsent(Some(producer), &code, message, None),
-        Err(MonitorPromptError::SrsActive { job_id, attempt_id }) => run.unsent(Some(producer), "srs_active",
-            "An SRS job is using The Architect. Pause SRS and continue to explain this snapshot, or wait for it to finish.", Some(BlockedBy { job_id, attempt_id })),
-        Err(MonitorPromptError::Uncertain(error)) => ex.finish(&run.request_id, Some(Phase::Uncertain), failure(&run.request_id, snapshot_id, Some(producer), None, "delivery_uncertain",
-            format!("Prompt admission outcome unknown: {error}. It is not resent automatically; inspect The Architect's conversation before asking again."))),
-    }
+    let outcome = offer_prompt(&run, &producer, &pin, &message);
+    finish_prompt(&run, producer, outcome)
 }
 
 fn count(summary: &Value, key: &str) -> String {

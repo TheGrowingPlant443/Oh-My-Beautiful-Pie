@@ -156,56 +156,76 @@ fn file_of_node(index: &SourceGraphIndex, node: Node) -> Option<u32> {
     match node { Node::File(i) => Some(i), Node::Symbol(i) => index.lookup.files.get(&index.symbols[i as usize].file_id).copied() }
 }
 
+type FileGroups = BTreeMap<(String, String, &'static str, &'static str), Vec<u32>>;
+
 fn neighbors(index: &SourceGraphIndex, level: Level, id: &str, direction: Direction) -> Result<Vec<Value>> {
-    let node = index.lookup.node(id);
-    let wanted = match (level, node) {
-        (Level::Files, Some(Node::File(_))) | (Level::Functions, Some(Node::Symbol(_))) => node.unwrap(),
+    let wanted = match (level, index.lookup.node(id)) {
+        (Level::Files, Some(node @ Node::File(_))) | (Level::Functions, Some(node @ Node::Symbol(_))) => node,
         _ => return Err(format!("Unknown {} id", if level == Level::Files { "file" } else { "function" })),
     };
     let (outgoing, incoming) = (direction != Direction::In, direction != Direction::Out);
     let mut items = Vec::new();
-    let direct = |items: &mut Vec<Value>, edge_index: u32, dir: &str| {
-        let edge = &index.edges[edge_index as usize];
-        let peer = if dir == "out" { &edge.target_id } else { &edge.source_id };
-        let (sites, truncated) = site_values(index, &edge.evidence_ids);
-        items.push(json!({ "kind": "edge", "direction": dir, "self": edge.source_id == edge.target_id, "peerId": peer, "peerLabel": node_label(index, peer), "edge": val(edge), "sites": sites, "sitesTruncated": truncated }));
-    };
-    if outgoing { for e in index.lookup.edges_out.get(id).into_iter().flatten() { direct(&mut items, *e, "out"); } }
-    if incoming { for e in index.lookup.edges_in.get(id).into_iter().flatten() { if index.edges[*e as usize].source_id != id || !outgoing { direct(&mut items, *e, "in"); } } }
+    push_direct_edges(index, id, outgoing, incoming, &mut items);
     if let Node::File(file) = wanted {
-        // Cross-file call/reference aggregates derived from function-level edges, labelled separately.
-        let mut groups: BTreeMap<(String, String, &'static str, &'static str), Vec<u32>> = BTreeMap::new();
-        for symbol in index.lookup.symbols_by_file.get(id).into_iter().flatten() {
-            let symbol_id = &index.symbols[*symbol as usize].id;
-            let mut collect = |edges: Option<&Vec<u32>>, dir: &'static str| {
-                for e in edges.into_iter().flatten() {
-                    let edge = &index.edges[*e as usize];
-                    let peer = if dir == "out" { &edge.target_id } else { &edge.source_id };
-                    let Some(peer_node @ Node::Symbol(_)) = index.lookup.node(peer) else { continue };
-                    let Some(peer_file) = file_of_node(index, peer_node) else { continue };
-                    if peer_file == file { continue; }
-                    groups.entry((index.files[peer_file as usize].path.clone(), edge.relation.clone(), edge.resolution.as_str(), dir)).or_default().push(*e);
-                }
-            };
-            if outgoing { collect(index.lookup.edges_out.get(symbol_id), "out"); }
-            if incoming { collect(index.lookup.edges_in.get(symbol_id), "in"); }
-        }
-        for ((path, relation, resolution, dir), edges) in groups {
-            let peer_id = index.lookup.files_by_path.get(&path).map(|i| index.files[*i as usize].id.clone());
-            items.push(json!({ "kind": "aggregate", "direction": dir, "peerId": peer_id, "peerLabel": path, "relation": relation, "resolution": resolution, "count": edges.len(),
-                "edgeIds": edges.iter().take(EDGE_SAMPLE).map(|e| &index.edges[*e as usize].id).collect::<Vec<_>>(), "edgeIdsTruncated": edges.len() > EDGE_SAMPLE }));
-        }
-        if outgoing {
-            for site in index.lookup.sites_by_file.get(id).into_iter().flatten().map(|s| &index.sites[*s as usize]) {
-                if site.caller_id.is_none() && site.target_id.is_none() { items.push(json!({ "kind": "site", "direction": "out", "site": val(site) })); }
-            }
-        }
+        push_file_aggregates(index, id, file, outgoing, incoming, &mut items);
+        if outgoing { push_file_sites(index, id, &mut items); }
     } else if outgoing {
-        for site in index.lookup.sites_by_caller.get(id).into_iter().flatten().map(|s| &index.sites[*s as usize]) {
-            if site.target_id.is_none() { items.push(json!({ "kind": "site", "direction": "out", "site": val::<SourceSite>(site) })); }
-        }
+        push_caller_sites(index, id, &mut items);
     }
     Ok(items)
+}
+
+fn push_direct_edge(index: &SourceGraphIndex, items: &mut Vec<Value>, edge_index: u32, dir: &str) {
+    let edge = &index.edges[edge_index as usize];
+    let peer = if dir == "out" { &edge.target_id } else { &edge.source_id };
+    let (sites, truncated) = site_values(index, &edge.evidence_ids);
+    items.push(json!({ "kind": "edge", "direction": dir, "self": edge.source_id == edge.target_id, "peerId": peer, "peerLabel": node_label(index, peer), "edge": val(edge), "sites": sites, "sitesTruncated": truncated }));
+}
+
+fn push_direct_edges(index: &SourceGraphIndex, id: &str, outgoing: bool, incoming: bool, items: &mut Vec<Value>) {
+    if outgoing { for e in index.lookup.edges_out.get(id).into_iter().flatten() { push_direct_edge(index, items, *e, "out"); } }
+    if incoming {
+        // A self edge was already reported as outgoing when both directions are wanted.
+        for e in index.lookup.edges_in.get(id).into_iter().flatten() { if index.edges[*e as usize].source_id != id || !outgoing { push_direct_edge(index, items, *e, "in"); } }
+    }
+}
+
+/// Cross-file call/reference aggregates derived from function-level edges, labelled separately.
+fn push_file_aggregates(index: &SourceGraphIndex, id: &str, file: u32, outgoing: bool, incoming: bool, items: &mut Vec<Value>) {
+    let mut groups = FileGroups::new();
+    for symbol in index.lookup.symbols_by_file.get(id).into_iter().flatten() {
+        let symbol_id = &index.symbols[*symbol as usize].id;
+        if outgoing { collect_file_edges(index, &mut groups, file, index.lookup.edges_out.get(symbol_id), "out"); }
+        if incoming { collect_file_edges(index, &mut groups, file, index.lookup.edges_in.get(symbol_id), "in"); }
+    }
+    for ((path, relation, resolution, dir), edges) in groups {
+        let peer_id = index.lookup.files_by_path.get(&path).map(|i| index.files[*i as usize].id.clone());
+        items.push(json!({ "kind": "aggregate", "direction": dir, "peerId": peer_id, "peerLabel": path, "relation": relation, "resolution": resolution, "count": edges.len(),
+            "edgeIds": edges.iter().take(EDGE_SAMPLE).map(|e| &index.edges[*e as usize].id).collect::<Vec<_>>(), "edgeIdsTruncated": edges.len() > EDGE_SAMPLE }));
+    }
+}
+
+fn collect_file_edges(index: &SourceGraphIndex, groups: &mut FileGroups, file: u32, edges: Option<&Vec<u32>>, dir: &'static str) {
+    for e in edges.into_iter().flatten() {
+        let edge = &index.edges[*e as usize];
+        let peer = if dir == "out" { &edge.target_id } else { &edge.source_id };
+        let Some(peer_node @ Node::Symbol(_)) = index.lookup.node(peer) else { continue };
+        let Some(peer_file) = file_of_node(index, peer_node) else { continue };
+        if peer_file == file { continue; }
+        groups.entry((index.files[peer_file as usize].path.clone(), edge.relation.clone(), edge.resolution.as_str(), dir)).or_default().push(*e);
+    }
+}
+
+fn push_file_sites(index: &SourceGraphIndex, id: &str, items: &mut Vec<Value>) {
+    for site in index.lookup.sites_by_file.get(id).into_iter().flatten().map(|s| &index.sites[*s as usize]) {
+        if site.caller_id.is_none() && site.target_id.is_none() { items.push(json!({ "kind": "site", "direction": "out", "site": val(site) })); }
+    }
+}
+
+fn push_caller_sites(index: &SourceGraphIndex, id: &str, items: &mut Vec<Value>) {
+    for site in index.lookup.sites_by_caller.get(id).into_iter().flatten().map(|s| &index.sites[*s as usize]) {
+        if site.target_id.is_none() { items.push(json!({ "kind": "site", "direction": "out", "site": val::<SourceSite>(site) })); }
+    }
 }
 
 // ---- overview --------------------------------------------------------------------------------------------------
@@ -261,38 +281,51 @@ fn project(index: &SourceGraphIndex, level: Level) -> Vec<Projected> {
 /// Components are returned sinks first.
 pub(super) fn tarjan(adjacency: &[Vec<u32>]) -> Vec<Vec<u32>> {
     let n = adjacency.len();
-    let (mut order, mut low, mut on) = (vec![u32::MAX; n], vec![0u32; n], vec![false; n]);
-    let (mut stack, mut components, mut counter) = (Vec::new(), Vec::new(), 0u32);
+    let mut scc = Scc { adjacency, order: vec![u32::MAX; n], low: vec![0u32; n], on: vec![false; n], stack: Vec::new(), components: Vec::new(), counter: 0 };
     for root in 0..n {
-        if order[root] != u32::MAX { continue; }
-        order[root] = counter; low[root] = counter; counter += 1; stack.push(root as u32); on[root] = true;
-        let mut calls: Vec<(u32, usize)> = vec![(root as u32, 0)];
+        if scc.order[root] == u32::MAX { scc.search(root); }
+    }
+    scc.components
+}
+
+struct Scc<'a> { adjacency: &'a [Vec<u32>], order: Vec<u32>, low: Vec<u32>, on: Vec<bool>, stack: Vec<u32>, components: Vec<Vec<u32>>, counter: u32 }
+
+impl Scc<'_> {
+    fn enter(&mut self, v: usize, calls: &mut Vec<(u32, usize)>) {
+        self.order[v] = self.counter; self.low[v] = self.counter; self.counter += 1;
+        self.stack.push(v as u32); self.on[v] = true;
+        calls.push((v as u32, 0));
+    }
+
+    /// Depth-first search from `root` with an explicit call stack.
+    fn search(&mut self, root: usize) {
+        let mut calls: Vec<(u32, usize)> = Vec::new();
+        self.enter(root, &mut calls);
         while let Some(&(v, position)) = calls.last() {
             let v = v as usize;
-            if position < adjacency[v].len() {
+            if position < self.adjacency[v].len() {
                 calls.last_mut().unwrap().1 += 1;
-                let w = adjacency[v][position] as usize;
-                if order[w] == u32::MAX {
-                    order[w] = counter; low[w] = counter; counter += 1; stack.push(w as u32); on[w] = true;
-                    calls.push((w as u32, 0));
-                } else if on[w] { low[v] = low[v].min(order[w]); }
+                let w = self.adjacency[v][position] as usize;
+                if self.order[w] == u32::MAX { self.enter(w, &mut calls); } else if self.on[w] { self.low[v] = self.low[v].min(self.order[w]); }
             } else {
                 calls.pop();
-                if low[v] == order[v] {
-                    let mut component = Vec::new();
-                    loop {
-                        let w = stack.pop().unwrap();
-                        on[w as usize] = false;
-                        component.push(w);
-                        if w as usize == v { break; }
-                    }
-                    components.push(component);
-                }
-                if let Some(&(parent, _)) = calls.last() { low[parent as usize] = low[parent as usize].min(low[v]); }
+                self.leave(v);
+                if let Some(&(parent, _)) = calls.last() { self.low[parent as usize] = self.low[parent as usize].min(self.low[v]); }
             }
         }
     }
-    components
+
+    fn leave(&mut self, v: usize) {
+        if self.low[v] != self.order[v] { return; }
+        let mut component = Vec::new();
+        loop {
+            let w = self.stack.pop().unwrap();
+            self.on[w as usize] = false;
+            component.push(w);
+            if w as usize == v { break; }
+        }
+        self.components.push(component);
+    }
 }
 
 pub(crate) fn overview(index: &SourceGraphIndex, level: Level, group_by: GroupBy) -> std::sync::Arc<Overview> {
@@ -306,69 +339,90 @@ pub(crate) fn overview(index: &SourceGraphIndex, level: Level, group_by: GroupBy
 fn build_overview(index: &SourceGraphIndex, level: Level, group_by: GroupBy) -> Overview {
     let n = node_count(index, level);
     let projected = project(index, level);
-    let mut groups: Vec<Group> = Vec::new();
     let mut group_of = vec![0usize; n];
-    match group_by {
-        GroupBy::Directory => {
-            let mut paths: Vec<&str> = vec![""];
-            paths.extend(index.directories.iter().map(String::as_str));
-            for node in 0..n as u32 { paths.push(directory_of(file_path_of(index, level, node))); }
-            paths.sort_unstable();
-            paths.dedup();
-            let position: HashMap<&str, usize> = paths.iter().enumerate().map(|(i, p)| (*p, i)).collect();
-            for path in &paths {
-                groups.push(Group {
-                    id: format!("dir:{path}"), kind: "directory", label: if path.is_empty() { ".".into() } else { (*path).into() }, path: Some((*path).into()),
-                    parent: if path.is_empty() { None } else { position.get(directory_of(path)).copied() },
-                    layer: None, cyclic: false, members: Vec::new(), internal_edges: 0, links: Vec::new(),
-                });
-            }
-            for node in 0..n as u32 {
-                let group = position[directory_of(file_path_of(index, level, node))];
-                group_of[node as usize] = group;
-                groups[group].members.push(node);
-            }
-        }
-        GroupBy::Scc => {
-            let mut adjacency: Vec<Vec<u32>> = vec![Vec::new(); n];
-            let mut self_loops = vec![false; n];
-            for edge in &projected {
-                if index.edges[edge.edge as usize].resolution != Resolution::ResolvedStatic { continue; }
-                if edge.a == edge.b { self_loops[edge.a as usize] = true; } else { adjacency[edge.a as usize].push(edge.b); }
-            }
-            let components = tarjan(&adjacency);
-            let mut component_of = vec![0usize; n];
-            for (c, members) in components.iter().enumerate() { for m in members { component_of[*m as usize] = c; } }
-            // Tarjan emits sinks first, so walking backwards visits sources first: longest-path layers.
-            let mut layer = vec![0u32; components.len()];
-            for c in (0..components.len()).rev() {
-                for m in &components[c] {
-                    for w in &adjacency[*m as usize] {
-                        let target = component_of[*w as usize];
-                        if target != c { layer[target] = layer[target].max(layer[c] + 1); }
-                    }
-                }
-            }
-            let mut built: Vec<(u32, String, usize)> = components.iter().enumerate().map(|(c, members)| {
-                let smallest = members.iter().map(|m| node_id(index, level, *m)).min().unwrap_or("").to_string();
-                (layer[c], smallest, c)
-            }).collect();
-            built.sort();
-            for (rank, (_, smallest, c)) in built.iter().enumerate() {
-                let mut members = components[*c].clone();
-                members.sort_by(|a, b| node_id(index, level, *a).cmp(node_id(index, level, *b)));
-                let cyclic = members.len() > 1 || self_loops[members[0] as usize];
-                let label = if members.len() == 1 { label_of(index, level, members[0]) } else { format!("{} members in a cycle, including {}", members.len(), label_of(index, level, members[0])) };
-                for m in &members { group_of[*m as usize] = rank; }
-                groups.push(Group { id: format!("scc:{smallest}"), kind: "scc", label, path: None, parent: None, layer: Some(layer[*c]), cyclic, members, internal_edges: 0, links: Vec::new() });
+    let mut groups = match group_by {
+        GroupBy::Directory => directory_groups(index, level, &mut group_of),
+        GroupBy::Scc => scc_groups(index, level, &projected, &mut group_of),
+    };
+    let relations = aggregate_links(index, &projected, &group_of, &mut groups);
+    Overview { groups, relations, level }
+}
+
+fn directory_groups(index: &SourceGraphIndex, level: Level, group_of: &mut [usize]) -> Vec<Group> {
+    let n = group_of.len() as u32;
+    let mut paths: Vec<&str> = vec![""];
+    paths.extend(index.directories.iter().map(String::as_str));
+    for node in 0..n { paths.push(directory_of(file_path_of(index, level, node))); }
+    paths.sort_unstable();
+    paths.dedup();
+    let position: HashMap<&str, usize> = paths.iter().enumerate().map(|(i, p)| (*p, i)).collect();
+    let mut groups: Vec<Group> = paths.iter().map(|path| Group {
+        id: format!("dir:{path}"), kind: "directory", label: if path.is_empty() { ".".into() } else { (*path).into() }, path: Some((*path).into()),
+        parent: if path.is_empty() { None } else { position.get(directory_of(path)).copied() },
+        layer: None, cyclic: false, members: Vec::new(), internal_edges: 0, links: Vec::new(),
+    }).collect();
+    for node in 0..n {
+        let group = position[directory_of(file_path_of(index, level, node))];
+        group_of[node as usize] = group;
+        groups[group].members.push(node);
+    }
+    groups
+}
+
+/// Resolved-static adjacency between nodes plus which nodes call themselves.
+fn scc_adjacency(index: &SourceGraphIndex, projected: &[Projected], n: usize) -> (Vec<Vec<u32>>, Vec<bool>) {
+    let mut adjacency: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut self_loops = vec![false; n];
+    for edge in projected {
+        if index.edges[edge.edge as usize].resolution != Resolution::ResolvedStatic { continue; }
+        if edge.a == edge.b { self_loops[edge.a as usize] = true; } else { adjacency[edge.a as usize].push(edge.b); }
+    }
+    (adjacency, self_loops)
+}
+
+/// Longest-path layers per component. Tarjan emits sinks first, so walking backwards visits sources first.
+fn scc_layers(components: &[Vec<u32>], adjacency: &[Vec<u32>]) -> Vec<u32> {
+    let mut component_of = vec![0usize; adjacency.len()];
+    for (c, members) in components.iter().enumerate() { for m in members { component_of[*m as usize] = c; } }
+    let mut layer = vec![0u32; components.len()];
+    for c in (0..components.len()).rev() {
+        for m in &components[c] {
+            for w in &adjacency[*m as usize] {
+                let target = component_of[*w as usize];
+                if target != c { layer[target] = layer[target].max(layer[c] + 1); }
             }
         }
     }
-    // Aggregate arrows between groups, keeping the underlying edge ids.
+    layer
+}
+
+fn scc_groups(index: &SourceGraphIndex, level: Level, projected: &[Projected], group_of: &mut [usize]) -> Vec<Group> {
+    let (adjacency, self_loops) = scc_adjacency(index, projected, group_of.len());
+    let components = tarjan(&adjacency);
+    let layer = scc_layers(&components, &adjacency);
+    let mut built: Vec<(u32, String, usize)> = components.iter().enumerate().map(|(c, members)| {
+        let smallest = members.iter().map(|m| node_id(index, level, *m)).min().unwrap_or("").to_string();
+        (layer[c], smallest, c)
+    }).collect();
+    built.sort();
+    let mut groups = Vec::with_capacity(built.len());
+    for (rank, (_, smallest, c)) in built.iter().enumerate() {
+        let mut members = components[*c].clone();
+        members.sort_by(|a, b| node_id(index, level, *a).cmp(node_id(index, level, *b)));
+        let cyclic = members.len() > 1 || self_loops[members[0] as usize];
+        let label = if members.len() == 1 { label_of(index, level, members[0]) } else { format!("{} members in a cycle, including {}", members.len(), label_of(index, level, members[0])) };
+        for m in &members { group_of[*m as usize] = rank; }
+        groups.push(Group { id: format!("scc:{smallest}"), kind: "scc", label, path: None, parent: None, layer: Some(layer[*c]), cyclic, members, internal_edges: 0, links: Vec::new() });
+    }
+    groups
+}
+
+/// Aggregate arrows between groups, keeping the underlying edge ids. Returns the relation names the links index into.
+fn aggregate_links(index: &SourceGraphIndex, projected: &[Projected], group_of: &[usize], groups: &mut [Group]) -> Vec<String> {
     let mut relations: Vec<String> = Vec::new();
     let mut relation_ids: HashMap<&str, u32> = HashMap::new();
     let mut links: HashMap<(usize, usize, u32, Resolution, bool), (u64, Vec<u32>)> = HashMap::new();
-    for edge in &projected {
+    for edge in projected {
         let source = &index.edges[edge.edge as usize];
         let (from, to) = (group_of[edge.a as usize], group_of[edge.b as usize]);
         if from == to { groups[from].internal_edges += 1; continue; }
@@ -380,10 +434,10 @@ fn build_overview(index: &SourceGraphIndex, level: Level, group_by: GroupBy) -> 
     for ((from, to, relation, resolution, derived), (count, edges)) in links {
         groups[from].links.push(Link { target: to, relation, resolution, derived, count, edges });
     }
-    for group in &mut groups {
+    for group in groups {
         group.links.sort_by(|a, b| b.count.cmp(&a.count).then(a.target.cmp(&b.target)).then(a.relation.cmp(&b.relation)).then((a.resolution as u8).cmp(&(b.resolution as u8))).then(a.derived.cmp(&b.derived)));
     }
-    Overview { groups, relations, level }
+    relations
 }
 
 fn group_json(index: &SourceGraphIndex, overview: &Overview, position: usize) -> Value {

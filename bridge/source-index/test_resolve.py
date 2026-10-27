@@ -811,6 +811,36 @@ class PythonResolution(ResolveCase):
         self.assertResolved(ambiguous, self.fid("a/util.py"))
         self.assertResolved(ns, self.fid("ns/pkg/mod.py"))
 
+    def test_distinct_python_source_roots_remain_ambiguous(self):
+        fx = self.fx
+        for path in ("pkg/main.py", "pkg/util.py", "pkg/src/util.py"):
+            fx.file(path, language=self.PY)
+        first = fx.fn("pkg/util.py", self.PY, "work")
+        second = fx.fn("pkg/src/util.py", self.PY, "work")
+        imported = fx.imp("pkg/main.py", self.PY, "util", "work", "work")
+        call = fx.call("pkg/main.py", self.PY, "work")
+        self.run_idx()
+        self.assertEqual(self.site_res(imported), ("candidate", None, [self.fid("pkg/src/util.py"), self.fid("pkg/util.py")]))
+        self.assertEqual(self.site_res(call), ("candidate", None, sorted([first, second])))
+
+    def test_pyproject_dependency_sources_and_requirement_directives(self):
+        fx = self.fx
+        fx.file("pyproject.toml", (
+            '[project]\ndependencies = ["Project-Dep>=1"]\n'
+            '[project.optional-dependencies]\ntest = ["Optional.Dep>=1"]\n'
+            '[tool.poetry.dependencies]\nPoetry_Dep = "*"\n'
+            '[tool.poetry.dev-dependencies]\n"Dev.Dep" = "*"\n'
+        ))
+        fx.file("requirements-extra.txt", "# ignored\n-r extra.txt\nRequirements_Dep>=1\n")
+        fx.file("main.py", language=self.PY)
+        declared = [fx.imp("main.py", self.PY, name) for name in ("project_dep", "optional_dep", "poetry_dep", "dev_dep", "requirements_dep")]
+        directive = fx.imp("main.py", self.PY, "_r")
+        self.run_idx()
+        for site in declared:
+            self.assertEqual(self.site_res(site), ("external", None, []))
+            self.assertEqual(self.note(site), "declared-dependency")
+        self.assertRes(directive, "unresolved")
+
 
 # ===========================================================================
 # Rust
@@ -989,6 +1019,68 @@ class GoResolution(ResolveCase):
         self.run_idx()
         self.assertResolved(call, callee)
 
+    def test_dependency_tokens_preserve_ascii_version_prefix_and_whitespace(self):
+        fx = self.fx
+        fx.file("go.mod", "\n".join((
+            "module example.com/app",
+            "require example.com/inline v1suffix",
+            "require (",
+            "\texample.com/block\tv2.0",
+            ")",
+            "require",
+            "\u00a0example.com/wrapped",
+            "\u2003v3suffix",
+            "require\rexample.com/carriage\rv4",
+            "junk\rexample.com/not_a_line v5",
+            "require example.com/unicode_digit v\u0661.0",
+            "require example.com/wide_digit v\uff19.0",
+            "require example.com/uppercase V6",
+            "require example.com/bare_version v",
+            "require .a/b.c v7",
+            "require example.com/invalid+path v8",
+            "ignored example.com/unanchored v9",
+            "example.com/retry",
+            "example.com/restarted v0",
+            "example.com/previous",
+            "v1.example.com/consumed v2",
+            "require .example.com/leading v9",
+        )))
+        fx.file("main.go", language=self.GO)
+        accepted = (
+            "example.com/inline/sub", "example.com/block", "example.com/wrapped", "example.com/carriage",
+            "example.com/restarted", "example.com/previous", ".example.com/leading",
+        )
+        rejected = (
+            "example.com/not_a_line", "example.com/unicode_digit", "example.com/wide_digit", "example.com/uppercase",
+            "example.com/bare_version", ".a/b.c", "example.com/invalid+path", "example.com/unanchored",
+            "example.com/retry", "v1.example.com/consumed",
+        )
+        sites = [(name, fx.imp("main.go", self.GO, name), "external") for name in accepted]
+        sites.extend((name, fx.imp("main.go", self.GO, name), "unresolved") for name in rejected)
+        self.run_idx()
+        for name, site, expected in sites:
+            with self.subTest(specifier=name):
+                self.assertEqual(self.site_res(site), (expected, None, []))
+
+    def test_local_module_failure_precedes_replacement_and_dependency_replacement_resolves(self):
+        fx = self.fx
+        fx.file("go.mod", (
+            "module example.com/app\n"
+            "replace example.com/app => ./fallback\n"
+            "replace example.com/dep => ./vendor/dep\n"
+        ))
+        for path in ("main.go", "fallback/missing/a.go", "vendor/dep/z.go", "vendor/dep/a.go", "vendor/dep/a_test.go"):
+            fx.file(path, language=self.GO)
+        helper = fx.fn("vendor/dep/a.go", self.GO, "Helper")
+        missing = fx.imp("main.go", self.GO, "example.com/app/missing")
+        replaced = fx.imp("main.go", self.GO, "example.com/dep", local="dep", implicitLocal=True)
+        call = fx.call("main.go", self.GO, "Helper", receiver="dep")
+        self.run_idx()
+        self.assertEqual(self.site_res(missing), ("unresolved", None, []))
+        self.assertEqual(self.note(missing), "package-directory-not-in-snapshot")
+        self.assertEqual(self.site_res(replaced), ("candidate", None, [self.fid("vendor/dep/a.go"), self.fid("vendor/dep/z.go")]))
+        self.assertResolved(call, helper)
+
 
 # ===========================================================================
 # C / C++
@@ -1072,6 +1164,39 @@ class OtherLanguages(ResolveCase):
         self.assertEqual((res, set(cands)), ("candidate", {self.fid("b/Util.java"), self.fid("b/Other.java")}))
         self.assertRes(ext, "external")
         self.assertResolved(c, helper)
+
+    def test_static_import_member_binding_for_each_separator(self):
+        fx = self.fx
+        fx.file("Main.java", language="java")
+        fx.file("Util.java", language="java")
+        util = fx.sym("Util.java", "java", "Util", "class", fqn="Util")
+        helper = fx.sym("Util.java", "java", "help", "method", util, static=True)
+        sites = []
+        for i, sep in enumerate((".", "::", "\\", "/")):
+            local = f"help{i}"
+            imported = fx.imp("Main.java", "java", "Util" + sep + "help", local=local, static=True)
+            call = fx.call("Main.java", "java", local)
+            sites.append((sep, imported, call))
+        self.run_idx()
+        for sep, imported, call in sites:
+            with self.subTest(separator=sep):
+                self.assertResolved(imported, self.fid("Util.java"))
+                self.assertResolved(call, helper)
+
+    def test_static_member_head_preserves_unmatched_inputs_and_separator_runs(self):
+        cases = (
+            ("", ""), ("name", "name"), ("a::b", "a"), ("a:b", "a"), ("a.b", "a"), (r"a\b", "a"), ("a/b", "a"),
+            ("a::b::c", "a::b"), (r"a.::\/b", "a"), ("::b", ""),
+            ("...", "..."), ("::", "::"), ("\\", "\\"), ("/", "/"),
+            ("a::", "a::"), ("a.", "a."), ("a\\", "a\\"), ("a/", "a/"),
+        )
+        for spec, expected in cases:
+            with self.subTest(specifier=spec):
+                self.assertEqual(resolve._static_member_head(spec), expected)
+        separators = ":" * 100_000
+        self.assertEqual(resolve._static_member_head("pkg" + separators + "member"), "pkg")
+        trailing = "pkg" + separators
+        self.assertEqual(resolve._static_member_head(trailing), trailing)
 
     def test_java_unresolved_when_some_sources_are_not_parsed(self):
         fx = self.fx

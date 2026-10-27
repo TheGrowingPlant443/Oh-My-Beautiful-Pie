@@ -1,13 +1,16 @@
 import { writable, type Readable } from "svelte/store";
 import type { KnowledgeApi, VaultDocumentPage, VaultEntry, VaultLinkRecord, VaultNoteRecord, VaultSearchHit } from "./knowledge";
-import type { IndexClient, IndexResult } from "./knowledge-index";
+import type { IndexClient, IndexJob, IndexResult } from "./knowledge-index";
 import type { Camera } from "./system-overview";
 import {
   createMarkdown, EMBED_BYTE_BUDGET, extractFragment, frontmatterPending, MAX_EMBED_DEPTH, newEnv, renderProperties, renderSegment, splitFrontmatter, splitStable,
   type EmbedResult, type RenderServices,
 } from "./vault-markdown";
 
-const errorText = (error: unknown): string => error instanceof Error ? error.message : typeof error === "string" ? error : JSON.stringify(error);
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === "string" ? error : JSON.stringify(error);
+}
 export const PAGE_ROWS = 200;
 
 // =====================================================================================================================
@@ -75,31 +78,42 @@ export function createDocumentSession(options: { api: DocumentApi; vaultId: stri
     cancelled: () => disposed,
   });
 
+  type EmbedRead = { text: string; offset: number; complete: boolean } | { stop: EmbedResult };
+
+  /** Reads whole pages of an embedded note up to the byte budget; a note that changes underneath stops the embed. */
+  async function readEmbedText(target: string): Promise<EmbedRead> {
+    let text = "";
+    let offset = 0;
+    let hash: string | null = null;
+    for (;;) {
+      const page = await api.readDocument(vaultId, target, offset);
+      if (disposed) return { stop: { html: "", notice: null } };
+      if (hash !== null && page.hash !== hash) return { stop: { html: "", notice: `${target} changed while it was being embedded; reload to see one consistent version.` } };
+      hash = page.hash;
+      text += page.text;
+      if (page.nextOffset === null) return { text, offset, complete: true };
+      offset = page.nextOffset;
+      if (offset >= EMBED_BYTE_BUDGET) return { text, offset, complete: false };
+    }
+  }
+
   /** Reads an embedded note (up to a byte budget) and renders the requested section. It never silently drops text: a partial read says so. */
   async function embed(target: string, fragment: string | null, stack: readonly string[]): Promise<EmbedResult> {
     if (stack.includes(target)) return { html: "", notice: `Not expanded: ${[...stack, target].join(" → ")} would embed itself.` };
     if (stack.length > MAX_EMBED_DEPTH) return { html: "", notice: `Not expanded: embedded notes are followed ${MAX_EMBED_DEPTH} levels deep.` };
-    let text = "";
-    let offset = 0;
-    let hash: string | null = null;
-    let complete = false;
-    for (;;) {
-      const page = await api.readDocument(vaultId, target, offset);
-      if (disposed) return { html: "", notice: null };
-      if (hash !== null && page.hash !== hash) return { html: "", notice: `${target} changed while it was being embedded; reload to see one consistent version.` };
-      hash = page.hash;
-      text += page.text;
-      if (page.nextOffset === null) { complete = true; break; }
-      offset = page.nextOffset;
-      if (offset >= EMBED_BYTE_BUDGET) break;
-    }
-    let body = text.replace(/\r\n?/g, "\n");
+    const read = await readEmbedText(target);
+    if ("stop" in read) return read.stop;
+    const { complete, offset } = read;
+    let body = read.text.replaceAll(/\r\n?/g, "\n");
     const front = splitFrontmatter(body);
     if (front) body = front.body;
-    let notice: string | null = complete ? null : `Only the first ${Math.round(offset / 1024).toLocaleString()} KiB of ${target} is shown here; open the note to read the rest.`;
+    const notice = complete ? null : `Only the first ${Math.round(offset / 1024).toLocaleString()} KiB of ${target} is shown here; open the note to read the rest.`;
     if (fragment) {
       const part = extractFragment(body, fragment);
-      if (part === null) return { html: "", notice: complete ? `“${fragment}” was not found in ${target}.` : `“${fragment}” was not found in the part of ${target} read for this embed; open the note to look further.` };
+      if (part === null) {
+        const where = complete ? target : `the part of ${target} read for this embed; open the note to look further`;
+        return { html: "", notice: `“${fragment}” was not found in ${where}.` };
+      }
       body = part;
     }
     const html = await renderSegment(markdown, body, newEnv(target), services([...stack, target], target));
@@ -213,11 +227,12 @@ export function createDocumentSession(options: { api: DocumentApi; vaultId: stri
 // =====================================================================================================================
 
 export interface Listing { items: VaultEntry[]; total: number; nextOffset: number | null; loading: boolean; error: string | null }
-export interface SearchState { text: string; status: "idle" | "loading" | "ready" | "error"; items: VaultSearchHit[]; total: number; nextOffset: number | null; error: string | null }
-export interface LinkList { path: string | null; status: "idle" | "loading" | "ready" | "error"; items: VaultLinkRecord[]; total: number; nextOffset: number | null; error: string | null }
+export type LoadStatus = "idle" | "loading" | "ready" | "error";
+export interface SearchState { text: string; status: LoadStatus; items: VaultSearchHit[]; total: number; nextOffset: number | null; error: string | null }
+export interface LinkList { path: string | null; status: LoadStatus; items: VaultLinkRecord[]; total: number; nextOffset: number | null; error: string | null }
 export type VaultIndexResult = Extract<IndexResult, { kind: "vault" }>;
 export interface VaultGraphState {
-  status: "idle" | "loading" | "ready" | "error";
+  status: LoadStatus;
   notes: { loaded: number; total: number };
   links: { loaded: number; total: number };
   result: VaultIndexResult | null;
@@ -291,7 +306,10 @@ export function createVaultStore(options: { api: VaultApi; indexClient: Pick<Ind
   let rerun = false;
 
   /** `ok`: belongs to the current revision. `newer`: the vault changed under us, re-read. `older`: a late answer, dropped. */
-  const judge = (revision: number): "ok" | "newer" | "older" => state.revision === null || revision === state.revision ? "ok" : revision > state.revision ? "newer" : "older";
+  const judge = (revision: number): "ok" | "newer" | "older" => {
+    if (state.revision === null || revision === state.revision) return "ok";
+    return revision > state.revision ? "newer" : "older";
+  };
 
   function setListing(prefix: string, patch: Partial<Listing>): void {
     commit({ listings: { ...state.listings, [prefix]: { ...(state.listings[prefix] ?? blankListing()), ...patch } } });
@@ -303,7 +321,7 @@ export function createVaultStore(options: { api: VaultApi; indexClient: Pick<Ind
     listingSeq.set(prefix, sequence);
     const known = state.listings[prefix];
     const offset = more && known ? known.nextOffset ?? 0 : 0;
-    if (more && known && known.nextOffset === null) return;
+    if (more && known?.nextOffset === null) return;
     setListing(prefix, { loading: true, error: null, ...(more ? {} : { items: known?.items ?? [] }) });
     try {
       const page = await api.listEntries(vaultId, prefix, offset, PAGE_ROWS);
@@ -317,6 +335,26 @@ export function createVaultStore(options: { api: VaultApi; indexClient: Pick<Ind
     }
   }
 
+  /** Pages one section into the worker. False when the load was superseded or the vault moved on; the job is then cancelled. */
+  async function pushSection(job: IndexJob, section: "notes" | "links", mine: number, revision: number | null): Promise<boolean> {
+    let offset = 0;
+    for (;;) {
+      const page = await api.queryLinks<VaultNoteRecord | VaultLinkRecord>(vaultId, { kind: section, offset, limit: PAGE_ROWS });
+      if (mine !== graphSeq) { job.cancel(); return false; }
+      if (page.revision !== revision) {
+        job.cancel();
+        if (judge(page.revision) === "newer") void refresh();
+        return false;
+      }
+      if (section === "notes") job.push({ section, items: page.items as VaultNoteRecord[] });
+      else job.push({ section, items: page.items as VaultLinkRecord[] });
+      const progress = { loaded: offset + page.items.length, total: page.total };
+      commit({ graph: { ...state.graph, [section]: progress } });
+      if (page.nextOffset === null) return true;
+      offset = page.nextOffset;
+    }
+  }
+
   async function loadGraph(): Promise<void> {
     const mine = ++graphSeq;
     const revision = state.revision;
@@ -324,21 +362,10 @@ export function createVaultStore(options: { api: VaultApi; indexClient: Pick<Ind
     commit({ graph: { ...blankGraph(), status: "loading", revision } });
     try {
       for (const section of ["notes", "links"] as const) {
-        let offset = 0;
-        for (;;) {
-          const page = await api.queryLinks<VaultNoteRecord | VaultLinkRecord>(vaultId, { kind: section, offset, limit: PAGE_ROWS });
-          if (mine !== graphSeq) { job.cancel(); return; }
-          if (page.revision !== revision) { job.cancel(); if (judge(page.revision) === "newer") void refresh(); return; }
-          if (section === "notes") job.push({ section, items: page.items as VaultNoteRecord[] });
-          else job.push({ section, items: page.items as VaultLinkRecord[] });
-          const progress = { loaded: offset + page.items.length, total: page.total };
-          commit({ graph: { ...state.graph, [section]: progress } });
-          if (page.nextOffset === null) break;
-          offset = page.nextOffset;
-        }
+        if (!(await pushSection(job, section, mine, revision))) return;
       }
       const result = await job.finish();
-      if (mine !== graphSeq || result === null || result.kind !== "vault") return;
+      if (mine !== graphSeq || result?.kind !== "vault") return;
       commit({ graph: { ...state.graph, status: "ready", result, error: null } });
     } catch (error) {
       job.cancel();

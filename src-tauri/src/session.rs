@@ -246,6 +246,15 @@ pub struct TailReader {
     resolved_local: HashMap<String, PathBuf>,
 }
 
+/// A `write` tool call targeting a `local://` URI, as (call id, URI).
+fn local_write_call(block: &Value) -> Option<(&str, &str)> {
+    if block["type"] != "toolCall" || block["name"] != "write" {
+        return None;
+    }
+    let uri = block["arguments"]["path"].as_str()?;
+    uri.starts_with("local://").then_some((block["id"].as_str()?, uri))
+}
+
 impl TailReader {
     fn fold(&mut self, value: Value) {
         if value["type"] == "mode_change" {
@@ -259,37 +268,24 @@ impl TailReader {
             self.todos(&value["data"]["phases"]);
         }
         if value["type"] == "message" && value["message"]["role"] == "assistant" {
-            for block in value["message"]["content"].as_array().into_iter().flatten() {
-                if block["type"] == "toolCall" && block["name"] == "write" {
-                    if let (Some(id), Some(uri)) =
-                        (block["id"].as_str(), block["arguments"]["path"].as_str())
-                    {
-                        if uri.starts_with("local://") {
-                            self.local_writes.insert(id.into(), uri.into());
-                        }
-                    }
-                }
+            self.record_local_writes(&value["message"]);
+        }
+        if value["type"] == "message" && value["message"]["role"] == "toolResult" {
+            self.fold_tool_result(&value["message"]);
+        }
+    }
+
+    fn record_local_writes(&mut self, message: &Value) {
+        for block in message["content"].as_array().into_iter().flatten() {
+            if let Some((id, uri)) = local_write_call(block) {
+                self.local_writes.insert(id.into(), uri.into());
             }
         }
-        if value["type"] != "message" || value["message"]["role"] != "toolResult" {
-            return;
-        }
-        let message = &value["message"];
+    }
+
+    fn fold_tool_result(&mut self, message: &Value) {
         match message["toolName"].as_str() {
-            Some("write") => {
-                if let Some(id) = message["toolCallId"].as_str() {
-                    if let Some(uri) = self.local_writes.remove(id) {
-                        if message["isError"] != true {
-                            if let Some(path) = message["details"]["resolvedPath"].as_str() {
-                                let path = PathBuf::from(path);
-                                if path.is_absolute() {
-                                    self.resolved_local.insert(uri, path);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            Some("write") => self.resolve_local_write(message),
             Some("todo") => self.todos(&message["details"]["phases"]),
             Some("task") => {
                 for item in message["details"]["progress"]
@@ -303,6 +299,23 @@ impl TailReader {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn resolve_local_write(&mut self, message: &Value) {
+        let Some(id) = message["toolCallId"].as_str() else {
+            return;
+        };
+        let Some(uri) = self.local_writes.remove(id) else {
+            return;
+        };
+        if message["isError"] == true {
+            return;
+        }
+        if let Some(path) = message["details"]["resolvedPath"].as_str().map(PathBuf::from) {
+            if path.is_absolute() {
+                self.resolved_local.insert(uri, path);
+            }
         }
     }
 
@@ -338,42 +351,12 @@ impl TailReader {
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         let len = metadata.len();
         let created = metadata.created().ok();
-        let mut replaced = len < self.offset || (self.created.is_some() && created != self.created);
-        if !replaced && self.offset > 0 {
-            file.seek(SeekFrom::Start(self.offset - self.checkpoint.len() as u64))
-                .map_err(|e| e.to_string())?;
-            let mut previous = vec![0; self.checkpoint.len()];
-            file.read_exact(&mut previous).map_err(|e| e.to_string())?;
-            replaced = previous != self.checkpoint;
-        }
-        if replaced {
+        if self.is_replaced(&mut file, len, created)? {
             *self = Self::default();
         }
         self.created = created;
         if len > self.offset {
-            file.seek(SeekFrom::Start(self.offset))
-                .map_err(|e| e.to_string())?;
-            file.read_to_end(&mut self.pending)
-                .map_err(|e| e.to_string())?;
-            self.offset = file.stream_position().map_err(|e| e.to_string())?;
-            let complete = self
-                .pending
-                .iter()
-                .rposition(|b| *b == b'\n')
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let bytes: Vec<u8> = self.pending.drain(..complete).collect();
-            for line in bytes.split(|b| *b == b'\n') {
-                if let Ok(value) = serde_json::from_slice(line) {
-                    self.fold(value);
-                }
-            }
-            let size = self.offset.min(64) as usize;
-            file.seek(SeekFrom::Start(self.offset - size as u64))
-                .map_err(|e| e.to_string())?;
-            self.checkpoint = vec![0; size];
-            file.read_exact(&mut self.checkpoint)
-                .map_err(|e| e.to_string())?;
+            self.read_appended(&mut file)?;
         }
         self.state.title = header(path).and_then(|(_, title)| title);
         self.state.plan_path = self
@@ -384,47 +367,92 @@ impl TailReader {
                     .map(|fallback| self.resolved_local.get(uri).cloned().unwrap_or(fallback))
             })
             .filter(|p| p.is_file());
+        self.refresh_subagents(path);
+        Ok(())
+    }
+
+    fn is_replaced(&self, file: &mut File, len: u64, created: Option<SystemTime>) -> Result<bool, String> {
+        if len < self.offset || (self.created.is_some() && created != self.created) {
+            return Ok(true);
+        }
+        if self.offset == 0 {
+            return Ok(false);
+        }
+        file.seek(SeekFrom::Start(self.offset - self.checkpoint.len() as u64))
+            .map_err(|e| e.to_string())?;
+        let mut previous = vec![0; self.checkpoint.len()];
+        file.read_exact(&mut previous).map_err(|e| e.to_string())?;
+        Ok(previous != self.checkpoint)
+    }
+
+    fn read_appended(&mut self, file: &mut File) -> Result<(), String> {
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(|e| e.to_string())?;
+        file.read_to_end(&mut self.pending)
+            .map_err(|e| e.to_string())?;
+        self.offset = file.stream_position().map_err(|e| e.to_string())?;
+        let complete = self
+            .pending
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let bytes: Vec<u8> = self.pending.drain(..complete).collect();
+        for line in bytes.split(|b| *b == b'\n') {
+            if let Ok(value) = serde_json::from_slice(line) {
+                self.fold(value);
+            }
+        }
+        let size = self.offset.min(64) as usize;
+        file.seek(SeekFrom::Start(self.offset - size as u64))
+            .map_err(|e| e.to_string())?;
+        self.checkpoint = vec![0; size];
+        file.read_exact(&mut self.checkpoint)
+            .map_err(|e| e.to_string())
+    }
+
+    fn refresh_subagents(&mut self, path: &Path) {
         self.state.subagents.clear();
         for entry in fs::read_dir(path.with_extension(""))
             .into_iter()
             .flatten()
             .flatten()
         {
-            let child = entry.path();
-            if child.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                continue;
+            if let Some(subagent) = self.subagent(entry.path(), path) {
+                self.state.subagents.push(subagent);
             }
-            let Some((value, _)) = header(&child) else {
-                continue;
-            };
-            let Some(parent) = value["parentSession"].as_str() else {
-                continue;
-            };
-            if !same_path(Path::new(parent), path) {
-                continue;
-            }
-            let name = child
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            let progress = self.progress.get(&name);
-            self.state.subagents.push(Subagent {
-                id: name.clone(),
-                name,
-                path: child,
-                task: progress
-                    .and_then(|p| p["task"].as_str())
-                    .map(|s| s.lines().next().unwrap_or("").into()),
-                status: progress
-                    .and_then(|p| p["status"].as_str())
-                    .unwrap_or("unknown")
-                    .into(),
-                agent: progress.and_then(|p| p["agent"].as_str()).map(String::from),
-            });
         }
         self.state.subagents.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(())
+    }
+
+    fn subagent(&self, child: PathBuf, session: &Path) -> Option<Subagent> {
+        if child.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            return None;
+        }
+        let (value, _) = header(&child)?;
+        let parent = value["parentSession"].as_str()?;
+        if !same_path(Path::new(parent), session) {
+            return None;
+        }
+        let name = child
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let progress = self.progress.get(&name);
+        Some(Subagent {
+            id: name.clone(),
+            name,
+            path: child,
+            task: progress
+                .and_then(|p| p["task"].as_str())
+                .map(|s| s.lines().next().unwrap_or("").into()),
+            status: progress
+                .and_then(|p| p["status"].as_str())
+                .unwrap_or("unknown")
+                .into(),
+            agent: progress.and_then(|p| p["agent"].as_str()).map(String::from),
+        })
     }
 }
 

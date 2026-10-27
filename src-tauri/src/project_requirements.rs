@@ -426,54 +426,69 @@ fn first_tool(command: &str) -> Option<&'static str> {
     ALLOWED_TOOLS.iter().copied().find(|tool| *tool == stem)
 }
 
+fn parse_cargo(repo: &Repo, rel: &str, text: &str) -> Option<toml::Table> {
+    match toml::from_str::<toml::Table>(text) {
+        Ok(table) => Some(table),
+        Err(error) => {
+            let reason = error.to_string();
+            repo.note(format!("{rel} is not valid TOML ({}); only its presence was recorded.", reason.lines().next().unwrap_or("parse error")));
+            None
+        }
+    }
+}
+
+fn cargo_bins(repo: &Repo, table: &toml::Table, rel: &str, text: &str, dir: &str) -> Vec<(String, Evidence)> {
+    let mut bins: Vec<(String, Evidence)> = Vec::new();
+    for bin in table.get("bin").and_then(|b| b.as_array()).into_iter().flatten() {
+        if let Some(name) = bin.get("name").and_then(|n| n.as_str()) {
+            bins.push((name.to_string(), ev_at(rel, text, &format!("name = \"{name}\""), "[[bin]] target")));
+        }
+    }
+    let main = join(dir, "src/main.rs");
+    if let Some(name) = table.get("package").and_then(|p| p.get("name")).and_then(|n| n.as_str()) {
+        if bins.is_empty() && repo.has(&main) { bins.push((name.to_string(), ev(&main, None, "binary entry point"))); }
+    }
+    bins
+}
+
+fn add_cargo_bin(repo: &Repo, d: &mut Drafts, rel: &str, dir: &str, name: String, evidence: Evidence) {
+    let exe = format!("{name}{EXE}");
+    let mut candidates = Vec::new();
+    for base in [join(dir, "target"), "target".to_string()] {
+        for profile in ["debug", "release"] { candidates.push(repo.abs(&format!("{base}/{profile}/{exe}"))); }
+    }
+    d.add(Spec {
+        id: format!("executable:cargo-bin:{rel}:{name}"), name: name.clone(), category: Category::Executable, need: Need::Unknown,
+        environment: Environment::Host, probe: Probe::Local(candidates),
+        explanation: format!("Binary target `{name}` of {rel}; `cargo build` produces it. OMP Manager does not build or run it."),
+    }, [evidence]);
+}
+
+fn cargo_manifest(repo: &Repo, d: &mut Drafts, rel: &str, text: &str) {
+    let dir = dir_of(rel).to_string();
+    let table = parse_cargo(repo, rel, text);
+    let anchor = ["[package]", "[workspace]", "[dependencies]"].iter().find_map(|header| find_line(text, header));
+    let manifest = match anchor { Some((number, line)) => ev(rel, Some(number), line), None => ev(rel, None, "Cargo manifest") };
+    d.add(tool_spec("cargo", Need::Required, "Cargo builds, tests and runs this Rust project."), [manifest.clone()]);
+    let mut rustc = vec![manifest];
+    let mut bins: Vec<(String, Evidence)> = Vec::new();
+    let mut tauri = false;
+    if let Some(table) = &table {
+        if let Some(version) = table.get("package").and_then(|p| p.get("rust-version")).and_then(|v| v.as_str()) {
+            rustc.push(ev_at(rel, text, "rust-version", &format!("rust-version = \"{version}\"")));
+        }
+        bins = cargo_bins(repo, table, rel, text, &dir);
+        tauri = ["dependencies", "build-dependencies"].iter().any(|section| table.get(*section).and_then(|v| v.get("tauri")).is_some());
+    }
+    d.add(tool_spec("rustc", Need::Required, "The Rust compiler compiles this crate."), rustc);
+    if tauri { d.add(tauri_spec(repo, &dir), [ev_at(rel, text, "tauri", "tauri dependency")]); }
+    for (name, evidence) in bins { add_cargo_bin(repo, d, rel, &dir, name, evidence); }
+}
+
 fn detect_cargo(repo: &Repo, d: &mut Drafts) {
     for rel in repo.find(|n| n.eq_ignore_ascii_case("Cargo.toml")) {
         let Some(text) = repo.read(&rel) else { continue };
-        let dir = dir_of(&rel).to_string();
-        let table = match toml::from_str::<toml::Table>(&text) {
-            Ok(table) => Some(table),
-            Err(error) => {
-                let reason = error.to_string();
-                repo.note(format!("{rel} is not valid TOML ({}); only its presence was recorded.", reason.lines().next().unwrap_or("parse error")));
-                None
-            }
-        };
-        let anchor = ["[package]", "[workspace]", "[dependencies]"].iter().find_map(|header| find_line(&text, header));
-        let manifest = match anchor { Some((number, line)) => ev(&rel, Some(number), line), None => ev(&rel, None, "Cargo manifest") };
-        d.add(tool_spec("cargo", Need::Required, "Cargo builds, tests and runs this Rust project."), [manifest.clone()]);
-        let mut rustc = vec![manifest];
-        let mut bins: Vec<(String, Evidence)> = Vec::new();
-        let mut tauri = false;
-        if let Some(table) = &table {
-            let package = table.get("package");
-            if let Some(version) = package.and_then(|p| p.get("rust-version")).and_then(|v| v.as_str()) {
-                rustc.push(ev_at(&rel, &text, "rust-version", &format!("rust-version = \"{version}\"")));
-            }
-            for bin in table.get("bin").and_then(|b| b.as_array()).into_iter().flatten() {
-                if let Some(name) = bin.get("name").and_then(|n| n.as_str()) {
-                    bins.push((name.to_string(), ev_at(&rel, &text, &format!("name = \"{name}\""), "[[bin]] target")));
-                }
-            }
-            let main = join(&dir, "src/main.rs");
-            if let Some(name) = package.and_then(|p| p.get("name")).and_then(|n| n.as_str()) {
-                if bins.is_empty() && repo.has(&main) { bins.push((name.to_string(), ev(&main, None, "binary entry point"))); }
-            }
-            tauri = ["dependencies", "build-dependencies"].iter().any(|section| table.get(*section).and_then(|v| v.get("tauri")).is_some());
-        }
-        d.add(tool_spec("rustc", Need::Required, "The Rust compiler compiles this crate."), rustc);
-        if tauri { d.add(tauri_spec(repo, &dir), [ev_at(&rel, &text, "tauri", "tauri dependency")]); }
-        for (name, evidence) in bins {
-            let exe = format!("{name}{EXE}");
-            let mut candidates = Vec::new();
-            for base in [join(&dir, "target"), "target".to_string()] {
-                for profile in ["debug", "release"] { candidates.push(repo.abs(&format!("{base}/{profile}/{exe}"))); }
-            }
-            d.add(Spec {
-                id: format!("executable:cargo-bin:{rel}:{name}"), name: name.clone(), category: Category::Executable, need: Need::Unknown,
-                environment: Environment::Host, probe: Probe::Local(candidates),
-                explanation: format!("Binary target `{name}` of {rel}; `cargo build` produces it. OMP Manager does not build or run it."),
-            }, [evidence]);
-        }
+        cargo_manifest(repo, d, &rel, &text);
     }
     for rel in repo.find(|n| n == "rust-toolchain" || n == "rust-toolchain.toml") {
         let Some(text) = repo.read(&rel) else { continue };
@@ -496,6 +511,65 @@ fn npm_bin(repo: &Repo, d: &mut Drafts, rel: &str, dir: &str, text: &str, name: 
     }, [ev_at(rel, text, "\"bin\"", &format!("bin {name} -> {target}"))]);
 }
 
+fn node_engine(json: &serde_json::Value, key: &str) -> Option<String> {
+    json.get("engines").and_then(|e| e.get(key)).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn node_managers(repo: &Repo, json: &serde_json::Value, rel: &str, text: &str, dir: &str) -> Vec<(&'static str, Evidence)> {
+    let mut managers: Vec<(&'static str, Evidence)> = Vec::new();
+    if let Some(field) = json.get("packageManager").and_then(|v| v.as_str()) {
+        let name = field.split('@').next().unwrap_or("");
+        if let Some(manager) = PACKAGE_MANAGERS.iter().copied().find(|m| *m == name) {
+            managers.push((manager, ev_at(rel, text, "\"packageManager\"", field)));
+        }
+    }
+    let locks: [(&'static str, &[&str]); 4] = [
+        ("npm", &["package-lock.json", "npm-shrinkwrap.json"][..]), ("pnpm", &["pnpm-lock.yaml"][..]), ("yarn", &["yarn.lock"][..]), ("bun", &["bun.lockb", "bun.lock"][..]),
+    ];
+    for (manager, files) in locks {
+        for file in files {
+            let lock = join(dir, file);
+            if repo.has(&lock) { managers.push((manager, ev(&lock, None, "lockfile present"))); }
+        }
+    }
+    for manager in ["npm", "pnpm", "yarn"] {
+        if let Some(range) = node_engine(json, manager) { managers.push((manager, ev_at(rel, text, &format!("\"{manager}\""), &format!("engines.{manager} {range}")))); }
+    }
+    managers
+}
+
+fn node_bins(repo: &Repo, d: &mut Drafts, json: &serde_json::Value, rel: &str, dir: &str, text: &str) {
+    match json.get("bin") {
+        Some(serde_json::Value::String(target)) => {
+            let package = json.get("name").and_then(|n| n.as_str()).unwrap_or("bin");
+            npm_bin(repo, d, rel, dir, text, package.rsplit('/').next().unwrap_or(package), target);
+        }
+        Some(serde_json::Value::Object(map)) => {
+            for (name, target) in map {
+                if let Some(target) = target.as_str() { npm_bin(repo, d, rel, dir, text, name, target); }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn node_scripts(repo: &Repo, d: &mut Drafts, json: &serde_json::Value, rel: &str, text: &str, default_manager: &str) {
+    let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) else { return };
+    if scripts.len() > MAX_SCRIPTS { repo.note(format!("{rel} declares {} scripts; only the first {MAX_SCRIPTS} are listed.", scripts.len())); }
+    for (name, command) in scripts.iter().take(MAX_SCRIPTS) {
+        let Some(command) = command.as_str() else { continue };
+        let line = ev_at(rel, text, &format!("\"{name}\""), &format!("{name}: {command}"));
+        d.add(Spec {
+            id: format!("executable:npm-script:{rel}:{name}"), name: format!("{default_manager} run {name}"), category: Category::Executable,
+            need: Need::Optional, environment: Environment::Host, probe: Probe::Declared(repo.abs(rel)),
+            explanation: format!("Script \"{name}\" declared in {rel}. OMP Manager lists scripts; it never runs them."),
+        }, [line.clone()]);
+        if let Some(tool) = first_tool(command) {
+            d.add(tool_spec(tool, Need::Required, &format!("The \"{name}\" script in {rel} invokes {tool}.")), [line]);
+        }
+    }
+}
+
 fn detect_node(repo: &Repo, d: &mut Drafts) {
     for rel in repo.find(|n| n == "package.json") {
         let Some(text) = repo.read(&rel) else { continue };
@@ -504,33 +578,13 @@ fn detect_node(repo: &Repo, d: &mut Drafts) {
             Err(error) => { repo.note(format!("{rel} is not valid JSON ({error}); its requirements were skipped.")); continue; }
         };
         let dir = dir_of(&rel).to_string();
-        let engines = json.get("engines");
-        let engine = |key: &str| engines.and_then(|e| e.get(key)).and_then(|v| v.as_str()).map(str::to_string);
-        match engine("node") {
+        match node_engine(&json, "node") {
             Some(range) => d.add(
                 tool_spec("node", Need::Required, &format!("{rel} requires Node.js {range}.")),
                 [ev_at(&rel, &text, "\"node\"", &format!("engines.node {range}"))]),
             None => d.add(tool_spec("node", Need::Required, "A package.json project runs on Node.js."), [ev(&rel, None, "package.json present")]),
         }
-        let mut managers: Vec<(&'static str, Evidence)> = Vec::new();
-        if let Some(field) = json.get("packageManager").and_then(|v| v.as_str()) {
-            let name = field.split('@').next().unwrap_or("");
-            if let Some(manager) = PACKAGE_MANAGERS.iter().copied().find(|m| *m == name) {
-                managers.push((manager, ev_at(&rel, &text, "\"packageManager\"", field)));
-            }
-        }
-        let locks: [(&'static str, &[&str]); 4] = [
-            ("npm", &["package-lock.json", "npm-shrinkwrap.json"][..]), ("pnpm", &["pnpm-lock.yaml"][..]), ("yarn", &["yarn.lock"][..]), ("bun", &["bun.lockb", "bun.lock"][..]),
-        ];
-        for (manager, files) in locks {
-            for file in files {
-                let lock = join(&dir, file);
-                if repo.has(&lock) { managers.push((manager, ev(&lock, None, "lockfile present"))); }
-            }
-        }
-        for manager in ["npm", "pnpm", "yarn"] {
-            if let Some(range) = engine(manager) { managers.push((manager, ev_at(&rel, &text, &format!("\"{manager}\""), &format!("engines.{manager} {range}")))); }
-        }
+        let managers = node_managers(repo, &json, &rel, &text, &dir);
         let default_manager = managers.first().map(|(manager, _)| *manager).unwrap_or("npm");
         if managers.is_empty() {
             d.add(tool_spec("npm", Need::Optional, "No lockfile or packageManager field was found; npm is Node.js's default package manager."), [ev(&rel, None, "package.json without a lockfile")]);
@@ -541,33 +595,8 @@ fn detect_node(repo: &Repo, d: &mut Drafts) {
         if ["dependencies", "devDependencies"].iter().any(|section| json.get(*section).and_then(|v| v.get("@tauri-apps/cli")).is_some()) {
             d.add(tauri_spec(repo, &dir), [ev_at(&rel, &text, "@tauri-apps/cli", "@tauri-apps/cli dependency")]);
         }
-        match json.get("bin") {
-            Some(serde_json::Value::String(target)) => {
-                let package = json.get("name").and_then(|n| n.as_str()).unwrap_or("bin");
-                npm_bin(repo, d, &rel, &dir, &text, package.rsplit('/').next().unwrap_or(package), target);
-            }
-            Some(serde_json::Value::Object(map)) => {
-                for (name, target) in map {
-                    if let Some(target) = target.as_str() { npm_bin(repo, d, &rel, &dir, &text, name, target); }
-                }
-            }
-            _ => {}
-        }
-        if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
-            if scripts.len() > MAX_SCRIPTS { repo.note(format!("{rel} declares {} scripts; only the first {MAX_SCRIPTS} are listed.", scripts.len())); }
-            for (name, command) in scripts.iter().take(MAX_SCRIPTS) {
-                let Some(command) = command.as_str() else { continue };
-                let line = ev_at(&rel, &text, &format!("\"{name}\""), &format!("{name}: {command}"));
-                d.add(Spec {
-                    id: format!("executable:npm-script:{rel}:{name}"), name: format!("{default_manager} run {name}"), category: Category::Executable,
-                    need: Need::Optional, environment: Environment::Host, probe: Probe::Declared(repo.abs(&rel)),
-                    explanation: format!("Script \"{name}\" declared in {rel}. OMP Manager lists scripts; it never runs them."),
-                }, [line.clone()]);
-                if let Some(tool) = first_tool(command) {
-                    d.add(tool_spec(tool, Need::Required, &format!("The \"{name}\" script in {rel} invokes {tool}.")), [line]);
-                }
-            }
-        }
+        node_bins(repo, d, &json, &rel, &dir, &text);
+        node_scripts(repo, d, &json, &rel, &text, default_manager);
     }
 }
 
@@ -590,26 +619,34 @@ fn detect_python(repo: &Repo, d: &mut Drafts) {
     d.add(tool_spec("pip", need, why), evidence);
 }
 
+fn maven_manifest(repo: &Repo, d: &mut Drafts, rel: &str, text: &str) {
+    let dir = dir_of(rel);
+    let hint = ["<maven.compiler.release>", "<maven.compiler.source>", "<java.version>", "<release>", "<source>"].iter().find_map(|h| find_line(text, h));
+    let java = match hint { Some((number, line)) => ev(rel, Some(number), line), None => ev(rel, None, "Maven project") };
+    d.add(tool_spec("java", Need::Required, "Maven compiles this project with a Java JDK."), [java]);
+    let wrapper = repo.has(&join(dir, "mvnw")) || repo.has(&join(dir, "mvnw.cmd"));
+    let (need, why) = if wrapper { (Need::Optional, "The repository ships the Maven wrapper (mvnw), so a system Maven is optional.") } else { (Need::Required, "Maven builds this project.") };
+    d.add(tool_spec("mvn", need, why), [ev(rel, None, "pom.xml")]);
+}
+
+fn gradle_manifest(repo: &Repo, d: &mut Drafts, rel: &str, text: &str) {
+    let dir = dir_of(rel);
+    let hint = ["sourceCompatibility", "jvmToolchain", "JavaVersion"].iter().find_map(|h| find_line(text, h));
+    let java = match hint { Some((number, line)) => ev(rel, Some(number), line), None => ev(rel, None, "Gradle build script") };
+    d.add(tool_spec("java", Need::Required, "Gradle compiles this project with a Java JDK."), [java]);
+    let wrapper = repo.has(&join(dir, "gradlew")) || repo.has(&join(dir, "gradlew.bat"));
+    let (need, why) = if wrapper { (Need::Optional, "The repository ships the Gradle wrapper (gradlew), so a system Gradle is optional.") } else { (Need::Required, "Gradle builds this project.") };
+    d.add(tool_spec("gradle", need, why), [ev(rel, None, "Gradle build script")]);
+}
+
 fn detect_java(repo: &Repo, d: &mut Drafts) {
     for rel in repo.find(|n| n == "pom.xml") {
         let Some(text) = repo.read(&rel) else { continue };
-        let dir = dir_of(&rel).to_string();
-        let hint = ["<maven.compiler.release>", "<maven.compiler.source>", "<java.version>", "<release>", "<source>"].iter().find_map(|h| find_line(&text, h));
-        let java = match hint { Some((number, line)) => ev(&rel, Some(number), line), None => ev(&rel, None, "Maven project") };
-        d.add(tool_spec("java", Need::Required, "Maven compiles this project with a Java JDK."), [java]);
-        let wrapper = repo.has(&join(&dir, "mvnw")) || repo.has(&join(&dir, "mvnw.cmd"));
-        let (need, why) = if wrapper { (Need::Optional, "The repository ships the Maven wrapper (mvnw), so a system Maven is optional.") } else { (Need::Required, "Maven builds this project.") };
-        d.add(tool_spec("mvn", need, why), [ev(&rel, None, "pom.xml")]);
+        maven_manifest(repo, d, &rel, &text);
     }
     for rel in repo.find(|n| matches!(n, "build.gradle" | "build.gradle.kts" | "settings.gradle" | "settings.gradle.kts")) {
         let Some(text) = repo.read(&rel) else { continue };
-        let dir = dir_of(&rel).to_string();
-        let hint = ["sourceCompatibility", "jvmToolchain", "JavaVersion"].iter().find_map(|h| find_line(&text, h));
-        let java = match hint { Some((number, line)) => ev(&rel, Some(number), line), None => ev(&rel, None, "Gradle build script") };
-        d.add(tool_spec("java", Need::Required, "Gradle compiles this project with a Java JDK."), [java]);
-        let wrapper = repo.has(&join(&dir, "gradlew")) || repo.has(&join(&dir, "gradlew.bat"));
-        let (need, why) = if wrapper { (Need::Optional, "The repository ships the Gradle wrapper (gradlew), so a system Gradle is optional.") } else { (Need::Required, "Gradle builds this project.") };
-        d.add(tool_spec("gradle", need, why), [ev(&rel, None, "Gradle build script")]);
+        gradle_manifest(repo, d, &rel, &text);
     }
 }
 
@@ -641,12 +678,44 @@ fn detect_pins(repo: &Repo, d: &mut Drafts) {
     }
 }
 
+fn is_dockerfile(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "dockerfile" || lower.starts_with("dockerfile.") || lower.ends_with(".dockerfile")
+}
+
+fn is_container_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    is_dockerfile(name) || ((lower.starts_with("docker-compose") || lower.starts_with("compose.")) && (lower.ends_with(".yml") || lower.ends_with(".yaml")))
+}
+
+/// Base image of a `FROM` line and whether it names an earlier build stage; records this line's `AS` alias.
+fn from_image<'a>(line: &'a str, stages: &mut BTreeSet<String>) -> Option<(&'a str, bool)> {
+    let mut words = line.trim().split_whitespace();
+    if !words.next().is_some_and(|w| w.eq_ignore_ascii_case("from")) { return None; }
+    let rest: Vec<&str> = words.filter(|w| !w.starts_with("--")).collect();
+    let image = rest.first().copied()?;
+    let stage = stages.contains(&image.to_ascii_lowercase());
+    if let Some(position) = rest.iter().position(|w| w.eq_ignore_ascii_case("as")) {
+        if let Some(alias) = rest.get(position + 1) { stages.insert(alias.to_ascii_lowercase()); }
+    }
+    Some((image, stage))
+}
+
+fn dockerfile_images(d: &mut Drafts, rel: &str, text: &str) {
+    let mut stages: BTreeSet<String> = BTreeSet::new();
+    for (index, line) in text.lines().enumerate() {
+        let Some((image, stage)) = from_image(line, &mut stages) else { continue };
+        if stage || image.eq_ignore_ascii_case("scratch") || image.contains('$') || d.count_prefix("runtime:image:") >= MAX_IMAGES { continue; }
+        d.add(Spec {
+            id: format!("runtime:image:{image}"), name: image.into(), category: Category::Runtime, need: Need::Required, environment: Environment::Container,
+            probe: Probe::None,
+            explanation: format!("Base image used by {rel}; the container engine pulls it during the build. It is not checked on this computer."),
+        }, [ev(rel, Some(index + 1), line)]);
+    }
+}
+
 fn detect_containers(repo: &Repo, d: &mut Drafts) {
-    let is_dockerfile = |name: &str| { let lower = name.to_ascii_lowercase(); lower == "dockerfile" || lower.starts_with("dockerfile.") || lower.ends_with(".dockerfile") };
-    let files = repo.find(|n| {
-        let lower = n.to_ascii_lowercase();
-        is_dockerfile(n) || ((lower.starts_with("docker-compose") || lower.starts_with("compose.")) && (lower.ends_with(".yml") || lower.ends_with(".yaml")))
-    });
+    let files = repo.find(is_container_file);
     if files.is_empty() { return; }
     d.add(Spec {
         id: "containerEngine:engine".into(), name: "Docker-compatible container engine".into(), category: Category::ContainerEngine, need: Need::Optional,
@@ -655,23 +724,7 @@ fn detect_containers(repo: &Repo, d: &mut Drafts) {
     }, files.iter().map(|rel| ev(rel, None, "container build or compose file")));
     for rel in files.iter().filter(|rel| is_dockerfile(file_name(rel))) {
         let Some(text) = repo.read(rel) else { continue };
-        let mut stages: BTreeSet<String> = BTreeSet::new();
-        for (index, line) in text.lines().enumerate() {
-            let mut words = line.trim().split_whitespace();
-            if !words.next().is_some_and(|w| w.eq_ignore_ascii_case("from")) { continue; }
-            let rest: Vec<&str> = words.filter(|w| !w.starts_with("--")).collect();
-            let Some(image) = rest.first().copied() else { continue };
-            let stage = stages.contains(&image.to_ascii_lowercase());
-            if let Some(position) = rest.iter().position(|w| w.eq_ignore_ascii_case("as")) {
-                if let Some(alias) = rest.get(position + 1) { stages.insert(alias.to_ascii_lowercase()); }
-            }
-            if stage || image.eq_ignore_ascii_case("scratch") || image.contains('$') || d.count_prefix("runtime:image:") >= MAX_IMAGES { continue; }
-            d.add(Spec {
-                id: format!("runtime:image:{image}"), name: image.into(), category: Category::Runtime, need: Need::Required, environment: Environment::Container,
-                probe: Probe::None,
-                explanation: format!("Base image used by {rel}; the container engine pulls it during the build. It is not checked on this computer."),
-            }, [ev(rel, Some(index + 1), line)]);
-        }
+        dockerfile_images(d, rel, &text);
     }
 }
 
@@ -684,37 +737,50 @@ fn header_comment(text: &str) -> Option<String> {
     })
 }
 
-fn detect_executables(repo: &Repo, d: &mut Drafts) {
-    let environment = |rel: &str| -> Option<Environment> {
-        let in_scope = match rel.matches('/').count() { 0 => true, 1 => rel.starts_with("bin/") || rel.starts_with("scripts/"), _ => false };
-        if !in_scope { return None; }
-        let name = file_name(rel).to_ascii_lowercase();
-        match name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("") {
-            "sh" => Some(Environment::Wsl),
-            "exe" | "bat" | "cmd" | "ps1" => Some(Environment::Host),
-            _ if name == "gradlew" || name == "mvnw" => Some(Environment::Host),
-            _ => None,
-        }
+fn executable_environment(rel: &str) -> Option<Environment> {
+    let in_scope = match rel.matches('/').count() { 0 => true, 1 => rel.starts_with("bin/") || rel.starts_with("scripts/"), _ => false };
+    if !in_scope { return None; }
+    let name = file_name(rel).to_ascii_lowercase();
+    match name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("") {
+        "sh" => Some(Environment::Wsl),
+        "exe" | "bat" | "cmd" | "ps1" => Some(Environment::Host),
+        _ if name == "gradlew" || name == "mvnw" => Some(Environment::Host),
+        _ => None,
+    }
+}
+
+fn is_declaring_file(rel: &str) -> bool {
+    if rel.contains('/') { return false; }
+    let lower = rel.to_ascii_lowercase();
+    matches!(lower.as_str(), "package.json" | "cargo.toml" | "makefile" | "justfile") || lower.starts_with("readme") || lower.starts_with("dockerfile") || lower.starts_with("docker-compose") || lower.starts_with("compose.")
+}
+
+fn executable_reference(declaring: &[(String, String)], rel: &str, name: &str) -> Option<(String, usize, String)> {
+    declaring.iter().filter(|(declaring_rel, _)| declaring_rel.as_str() != rel).find_map(|(declaring_rel, text)| {
+        find_line(text, rel).or_else(|| find_line(text, name)).map(|(number, line)| (declaring_rel.clone(), number, line.to_string()))
+    })
+}
+
+fn executable_explanation(repo: &Repo, rel: &str, name: &str, wsl: bool, reference: Option<&(String, usize, String)>) -> String {
+    let header = if name.to_ascii_lowercase().ends_with(".exe") { None } else { repo.read(rel).and_then(|text| header_comment(&text)) };
+    let mut explanation = match reference {
+        Some((declaring_rel, number, _)) => format!("Declared in {declaring_rel}:{number}."),
+        None => "Executable file in the repository; no recognized project file references it.".to_string(),
     };
-    let executables: Vec<(String, Environment)> = repo.files.iter().filter_map(|rel| environment(rel).map(|env| (rel.clone(), env))).collect();
+    if let Some(comment) = header { explanation.push_str(&format!(" Header comment: {comment}")); }
+    if wsl { explanation.push_str(" On Windows, run it inside WSL."); }
+    explanation
+}
+
+fn detect_executables(repo: &Repo, d: &mut Drafts) {
+    let executables: Vec<(String, Environment)> = repo.files.iter().filter_map(|rel| executable_environment(rel).map(|env| (rel.clone(), env))).collect();
     if executables.is_empty() { return; }
-    let declaring: Vec<(String, String)> = repo.files.iter().filter(|rel| {
-        if rel.contains('/') { return false; }
-        let lower = rel.to_ascii_lowercase();
-        matches!(lower.as_str(), "package.json" | "cargo.toml" | "makefile" | "justfile") || lower.starts_with("readme") || lower.starts_with("dockerfile") || lower.starts_with("docker-compose") || lower.starts_with("compose.")
-    }).take(20).filter_map(|rel| repo.read(rel).map(|text| (rel.clone(), text))).collect();
+    let declaring: Vec<(String, String)> = repo.files.iter().filter(|rel| is_declaring_file(rel)).take(20)
+        .filter_map(|rel| repo.read(rel).map(|text| (rel.clone(), text))).collect();
     for (rel, env) in executables {
         let name = file_name(&rel).to_string();
-        let reference = declaring.iter().filter(|(declaring_rel, _)| *declaring_rel != rel).find_map(|(declaring_rel, text)| {
-            find_line(text, &rel).or_else(|| find_line(text, &name)).map(|(number, line)| (declaring_rel.clone(), number, line.to_string()))
-        });
-        let header = if name.to_ascii_lowercase().ends_with(".exe") { None } else { repo.read(&rel).and_then(|text| header_comment(&text)) };
-        let mut explanation = match &reference {
-            Some((declaring_rel, number, _)) => format!("Declared in {declaring_rel}:{number}."),
-            None => "Executable file in the repository; no recognized project file references it.".to_string(),
-        };
-        if let Some(comment) = header { explanation.push_str(&format!(" Header comment: {comment}")); }
-        if env == Environment::Wsl { explanation.push_str(" On Windows, run it inside WSL."); }
+        let reference = executable_reference(&declaring, &rel, &name);
+        let explanation = executable_explanation(repo, &rel, &name, env == Environment::Wsl, reference.as_ref());
         let mut evidence = vec![ev(&rel, None, "file present")];
         if let Some((declaring_rel, number, line)) = reference { evidence.push(ev(&declaring_rel, Some(number), &line)); }
         d.add(Spec {
@@ -750,23 +816,29 @@ fn mention_spec(term: &'static str) -> Spec {
     }
 }
 
+fn is_doc_file(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    let (depth, name) = (rel.matches('/').count(), file_name(&lower));
+    let ext = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
+    let text_ext = matches!(ext, "md" | "txt" | "rst" | "");
+    (depth == 0 && name.starts_with("readme") && text_ext) || (depth == 1 && lower.starts_with("docs/") && matches!(ext, "md" | "txt" | "rst"))
+}
+
+fn collect_mentions(rel: &str, text: &str, hits: &mut BTreeMap<&'static str, Vec<Evidence>>) {
+    for (index, line) in text.lines().enumerate() {
+        for term in MENTIONS {
+            let found = hits.entry(term).or_default();
+            if found.len() < 4 && mentions(line, term) { found.push(ev(rel, Some(index + 1), line)); }
+        }
+    }
+}
+
 fn detect_mentions(repo: &Repo, d: &mut Drafts) {
-    let docs: Vec<&String> = repo.files.iter().filter(|rel| {
-        let lower = rel.to_ascii_lowercase();
-        let (depth, name) = (rel.matches('/').count(), file_name(&lower).to_string());
-        let ext = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
-        let text_ext = matches!(ext, "md" | "txt" | "rst" | "");
-        (depth == 0 && name.starts_with("readme") && text_ext) || (depth == 1 && lower.starts_with("docs/") && matches!(ext, "md" | "txt" | "rst"))
-    }).take(MAX_DOCS).collect();
+    let docs: Vec<&String> = repo.files.iter().filter(|rel| is_doc_file(rel)).take(MAX_DOCS).collect();
     let mut hits: BTreeMap<&'static str, Vec<Evidence>> = BTreeMap::new();
     for rel in docs {
         let Some(text) = repo.read(rel) else { continue };
-        for (index, line) in text.lines().enumerate() {
-            for term in MENTIONS {
-                let found = hits.entry(term).or_default();
-                if found.len() < 4 && mentions(line, term) { found.push(ev(rel, Some(index + 1), line)); }
-            }
-        }
+        collect_mentions(rel, &text, &mut hits);
     }
     for term in MENTIONS {
         if let Some(evidence) = hits.remove(term).filter(|e| !e.is_empty()) { d.add(mention_spec(term), evidence); }

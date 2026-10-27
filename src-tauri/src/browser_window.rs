@@ -124,51 +124,85 @@ impl BrowserHost {
         let view = self.view.lock().clone();
         let live: Vec<(&BrowserInfo, Vec<HWND>)> = rows.iter().filter(|row| row.pid.is_some() && !row.headless).map(|row| (row, windows_of(row.pid.unwrap()))).collect();
         saved.retain(|hwnd, _| live.iter().any(|(_, windows)| windows.contains(&(*hwnd as HWND))));
+        let dock = Dock::capture(main, view);
+        for (info, windows) in &live {
+            for &hwnd in windows {
+                if info.embedded {
+                    dock.embed(browser, saved, info, hwnd);
+                } else {
+                    restore_window(saved, hwnd, &dock.origin);
+                }
+            }
+        }
+    }
+}
+
+/// Per-pass host state: the main window, the pane view and the client-area origin.
+struct Dock {
+    main: HWND,
+    foreground: HWND,
+    minimized: bool,
+    origin: POINT,
+    view: Option<View>,
+}
+impl Dock {
+    fn capture(main: HWND, view: Option<View>) -> Self {
         unsafe {
             let foreground = GetForegroundWindow();
             let minimized = IsIconic(main) != 0;
             let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(main, &mut origin);
-            for (info, windows) in &live {
-                let embedded = info.embedded;
-                for &hwnd in windows {
-                    let key = hwnd as isize;
-                    if embedded {
-                        if !saved.contains_key(&key) {
-                            let mut rect = RECT::default();
-                            GetWindowRect(hwnd, &mut rect);
-                            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                            saved.insert(key, Saved { ex_style, rect });
-                            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOOLWINDOW as isize);
-                        }
-                        let active = view.as_ref().filter(|v| v.instance_id == info.instance_id && v.generation == info.generation && !minimized && v.rect.width >= 1.0 && v.rect.height >= 1.0);
-                        match active {
-                            Some(v) => {
-                                if let Err(error) = place(hwnd, origin.x + v.rect.x as i32, origin.y + v.rect.y as i32, v.rect.width as i32, v.rect.height as i32) {
-                                    browser.report_embedding_error(&info.instance_id, info.generation, &format!("{}: {error}", crate::browser::EMBEDDING_ERROR));
-                                } else if foreground == main && !is_above(main, hwnd) {
-                                    // Reordering our own host works where cross-process HWND_TOP is ignored.
-                                    SetWindowPos(main, hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                                }
-                            }
-                            None => {
-                                if IsWindowVisible(hwnd) != 0 {
-                                    ShowWindow(hwnd, SW_HIDE);
-                                }
-                            }
-                        }
-                    } else if let Some(original) = saved.remove(&key) {
-                        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, original.ex_style & !(WS_EX_TOOLWINDOW as isize));
-                        let (x, y, width, height) = if original.rect.left < -20000 {
-                            (origin.x + 60, origin.y + 60, 1200, 800)
-                        } else {
-                            (original.rect.left, original.rect.top, original.rect.right - original.rect.left, original.rect.bottom - original.rect.top)
-                        };
-                        SetWindowPos(hwnd, std::ptr::null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
-                        ShowWindow(hwnd, SW_SHOWNORMAL);
-                    }
-                }
-            }
+            Self { main, foreground, minimized, origin, view }
         }
+    }
+    fn embed(&self, browser: &BrowserSupervisor, saved: &mut HashMap<isize, Saved>, info: &BrowserInfo, hwnd: HWND) {
+        let key = hwnd as isize;
+        if !saved.contains_key(&key) {
+            saved.insert(key, take_over_window(hwnd));
+        }
+        let active = self.view.as_ref().filter(|v| v.instance_id == info.instance_id && v.generation == info.generation && !self.minimized && v.rect.width >= 1.0 && v.rect.height >= 1.0);
+        match active {
+            Some(v) => self.dock_into(browser, info, hwnd, v),
+            None => hide_window(hwnd),
+        }
+    }
+    fn dock_into(&self, browser: &BrowserSupervisor, info: &BrowserInfo, hwnd: HWND, v: &View) {
+        if let Err(error) = place(hwnd, self.origin.x + v.rect.x as i32, self.origin.y + v.rect.y as i32, v.rect.width as i32, v.rect.height as i32) {
+            browser.report_embedding_error(&info.instance_id, info.generation, &format!("{}: {error}", crate::browser::EMBEDDING_ERROR));
+        } else if self.foreground == self.main && !is_above(self.main, hwnd) {
+            // Reordering our own host works where cross-process HWND_TOP is ignored.
+            unsafe { SetWindowPos(self.main, hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
+        }
+    }
+}
+
+/// Records the window's rect and style, then hides it from the taskbar.
+fn take_over_window(hwnd: HWND) -> Saved {
+    unsafe {
+        let mut rect = RECT::default();
+        GetWindowRect(hwnd, &mut rect);
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOOLWINDOW as isize);
+        Saved { ex_style, rect }
+    }
+}
+fn hide_window(hwnd: HWND) {
+    unsafe {
+        if IsWindowVisible(hwnd) != 0 {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+fn restore_window(saved: &mut HashMap<isize, Saved>, hwnd: HWND, origin: &POINT) {
+    let Some(original) = saved.remove(&(hwnd as isize)) else { return };
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, original.ex_style & !(WS_EX_TOOLWINDOW as isize));
+        let (x, y, width, height) = if original.rect.left < -20000 {
+            (origin.x + 60, origin.y + 60, 1200, 800)
+        } else {
+            (original.rect.left, original.rect.top, original.rect.right - original.rect.left, original.rect.bottom - original.rect.top)
+        };
+        SetWindowPos(hwnd, std::ptr::null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+        ShowWindow(hwnd, SW_SHOWNORMAL);
     }
 }

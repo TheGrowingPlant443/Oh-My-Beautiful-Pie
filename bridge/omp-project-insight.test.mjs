@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +8,7 @@ import {
   MAX_LIST_ENTRIES, MAX_READ_BYTES, containsSecret, evidenceExcluded, loadInsightResultText, registerProjectInsightTools, repoEvidence,
   saveDependencyDiscovery, saveRequirementsFindings,
 } from './omp-project-insight.mjs';
+import { publishExclusively } from './omp-insight-base.mjs';
 
 const actor = { instanceId: 'architect-fixture', generation: 7, launchId: 'launch-fixture', sessionId: 'session-fixture' };
 const fresh = () => mkdtempSync(path.join(os.tmpdir(), 'omp-insight-'));
@@ -267,5 +268,18 @@ test('the three Architect tools register, resolve the producer from the session 
     const wrongKind = await named('submit_requirements_findings').execute('id', requirements(fixture.requestId), undefined, undefined, { ok: true });
     assert.equal(wrongKind.isError, true);
     assert.equal(enqueued.length, 1);
+  } finally { cleanup(fixture); }
+});
+
+test('a publication cleanup failure never replaces the original failure but is reported after a successful write', () => {
+  const fixture = setup();
+  try {
+    const lock = path.join(fixture.folder, 'result.lock');
+    const original = new Error('request ended');
+    assert.throws(() => publishExclusively(fixture.folder, '{}', () => { rmSync(lock); throw original; }), error => error === original);
+    assert.equal(existsSync(path.join(fixture.folder, 'result.json')), false);
+    assert.throws(() => publishExclusively(fixture.folder, '{}', () => rmSync(lock)), { code: 'ENOENT' });
+    assert.equal(readFileSync(path.join(fixture.folder, 'result.json'), 'utf8'), '{}');
+    assert.deepEqual(readdirSync(fixture.folder).sort(), ['request.json', 'result.json']);
   } finally { cleanup(fixture); }
 });

@@ -9,6 +9,7 @@ import {
 } from './omp-project-insight.mjs';
 import { formatVisualizationResult, technicalMarker } from './omp-system-results.mjs';
 import { readTargetStructure, systemOverviewInspect } from './omp-source-snapshot.mjs';
+import { markdownLike } from './omp-structure-sources.mjs';
 
 const actor = { instanceId: 'architect-fixture', generation: 7, launchId: 'launch-fixture', sessionId: 'session-fixture' };
 const sha = value => createHash('sha256').update(value).digest('hex');
@@ -439,6 +440,8 @@ test('a proposed structure requires the admitted source identity and valid, coll
     rejects(() => saveRepositoryStructure(fixture.dir, proposed(fixture), actor), /baseRequestId must be/);
     rejects(() => saveRepositoryStructure(fixture.dir, { ...good, sourceHash: sha('other') }, actor), /sourceHash must be/);
     rejects(() => saveRepositoryStructure(fixture.dir, { ...good, sourceId: null }, actor), /sourceId must be/);
+    rejects(() => saveRepositoryStructure(fixture.dir, { ...good, supersedesRequestId: null }, actor), /supersedesRequestId must be/);
+    rejects(() => saveRepositoryStructure(fixture.dir, { ...good, sourceId: 'other', sourceHash: sha('other'), entries: [] }, actor), /sourceId must be "source-1"/);
     saveRepositoryStructure(fixture.dir, good, actor);
     const saved = resultOf(fixture);
     assert.equal(saved.kind, 'structureProposed');
@@ -641,6 +644,11 @@ test('helicopter rules: evidence, journeys, containment, capabilities, enums and
     bad(payload => { payload.nodes[1].parentId = 'ghost'; }, /unknown parent/);
     bad(payload => { payload.nodes[2].parentId = 'booking'; }, /cannot contain itself/);
     bad(payload => { payload.nodes[2].parentId = 'inner'; payload.nodes.push({ id: 'inner', kind: 'businessGroup', label: 'Inner', parentId: 'booking', description: '', evidenceIds: [] }); }, /containment cycle/);
+    bad(payload => {
+      payload.nodes[2].parentId = 'inner';
+      payload.nodes.push({ id: 'inner', kind: 'businessGroup', label: 'Inner', parentId: 'booking', description: '', evidenceIds: [] });
+      payload.nodes[6].parentId = 'ghost';
+    }, /node "pay" has unknown parent "ghost"/);
     bad(payload => { payload.edges[0].targetId = 'ghost'; }, /dangling target/);
     bad(payload => { payload.edges[0].targetId = 'booking'; }, /containment is never a flow/);
     bad(payload => { payload.edges[0].sourceId = 'booking'; }, /containment is never a flow/);
@@ -693,14 +701,48 @@ test('helicopter business text stays plain language: code, paths, identifiers, U
 });
 
 test('technicalMarker agrees with the backend on what counts as code or a path', () => {
-  for (const ok of ['Pay and/or refund', '24/7 support', 'Customer (or clinic) cancels', 'Cancel the visit(s)', 'Version 4.5 is announced.', 'e.g. a late cancellation', "Wait for the clinic's reply, then continue."]) {
+  for (const ok of ['Pay and/or refund', '24/7 support', 'Customer (or clinic) cancels', 'Cancel the visit(s)', 'Version 4.5 is announced.', 'e.g. a late cancellation', "Wait for the clinic's reply, then continue.", '[24/7]', '"and/or,"', 'rate/4.5', '_optional', 'optional_']) {
     assert.equal(technicalMarker(ok), null, ok);
   }
   for (const [bad, kind] of [
     ['C:\\data\\orders.csv', 'a file path'], ['open ./config/app', 'a file path'], ['src/booking', 'a file path'], ['see notes/readme.md', 'a file path'],
     ['handlers/order.ts is used', 'a file path'], ['start main.py', 'a source file name'], ['uses a => b', 'code syntax'], ['Order::new', 'code syntax'],
     ['order_total', 'a code identifier'], ['call `run`', 'inline code'],
+    ['[src/booking],', 'a file path'], ['"MAIN.PY!"', 'a source file name'], ['notes/data.a1', 'a file path'],
+    ['résumé_total', 'a code identifier'], ['order_total => result', 'code syntax'], ['src/app.ts and `run`', 'inline code'],
   ]) assert.equal(technicalMarker(bad), kind, bad);
+  assert.equal(technicalMarker('Business' + '.'.repeat(32768) + 'text'), null);
+  assert.equal(technicalMarker('.'.repeat(32768) + 'src/app.ts' + '!'.repeat(32768)), 'a file path');
+});
+
+test('fenced structure discovery keeps delimiter lengths, comments and native tree markers', () => {
+  for (const value of [
+    '   ~~~~text\nsrc/a/ # core\nREADME.md\n   ~~~~~` \t\n',
+    '```\n  |-- src\n```',
+    '~~~\n|  branch\n~~~',
+    '~~~\n|\n  branch\n~~~',
+    '````\n```\nsrc/\nlib/\n',
+    '```\n```\nsrc/\nlib/\n',
+    '```\ntext\n```\n~~~\nREADME.md\nconfig.toml\n~~~',
+    '\r```\nsrc/\nlib/\n```',
+    '```\n./\n../\n```',
+    '```\na//b // comment\n/a/b/ — comment\n```',
+  ]) assert.equal(markdownLike(value), true, value);
+  for (const value of [
+    '    ```\nsrc/\nlib/\n    ```',
+    '```\nsrc/\n```',
+    '```',
+    '```js\nconst a = 1;\nfoo(a);\n```',
+    '```text\nfolder.abcdefghi\none/\n```',
+    '```text\nREADME.md note\none/\n```',
+    '~~~\nnotes\n~~~\nsrc/\nlib/\n',
+  ]) assert.equal(markdownLike(value), false, value);
+});
+
+test('structure discovery scans long whitespace and rejects incomplete path lines without truncating them', () => {
+  assert.equal(markdownLike('```\n' + ' \n'.repeat(32768)), false);
+  assert.equal(markdownLike('```\n' + 'a/'.repeat(16384) + '!\nsecond/\n```'), false);
+  assert.equal(markdownLike('`'.repeat(32768) + '\nsrc/\nlib/\n```'), true);
 });
 
 test('submit_helicopter is a registered strict tool bound to the producer and its own kind, and announces the saved view', async () => {
@@ -746,6 +788,77 @@ test('replay formatting is exhaustive per kind: an unknown kind fails closed ins
     snapshotId: 's', purpose: 'P', nodes: [], edges: [], capabilities: [], coverage: [], limitations: ['Only configuration was readable.'],
   });
   assert.match(withHelicopter, /Helicopter view[\s\S]*Purpose: P[\s\S]*Limitations:\n {2}- Only configuration was readable\./);
+});
+
+test('system replay keeps section boundaries, label resolution and the 80-row limit', () => {
+  const result = {
+    snapshotId: 'snapshot', limitations: [],
+    nodes: Array.from({ length: 81 }, (_, index) => ({ id: `node-${index}`, kind: 'service', label: `Service ${index}`, parentId: index === 0 ? 'node-80' : null })),
+    edges: Array.from({ length: 81 }, (_, index) => ({ sourceId: `node-${index}`, targetId: 'node-80', relation: 'reads', certainty: ['declared', 'inferred', 'unknown'][index % 3], label: index === 0 ? '' : `lookup ${index}` })),
+    coverage: Array.from({ length: 81 }, (_, index) => ({ area: `Area ${index}`, status: 'unresolved', notes: index === 0 ? '' : 'outside scope' })),
+  };
+  const replay = formatVisualizationResult({ kind: 'systemOverview', folder: '/repo' }, result);
+  const [header, elements, relationships, coverage, limitations] = replay.split('\n\n');
+  assert.match(header, /Source snapshot: snapshot$/);
+  for (const section of [elements, relationships, coverage]) {
+    assert.equal(section.split('\n').filter(line => line.startsWith('  - ')).length, 80);
+    assert.ok(section.endsWith('  ... 1 more in the saved result'));
+  }
+  assert.match(elements, /\n  - \[service\] Service 0 \(in Service 80\)\n/);
+  assert.match(elements, /\n  - \[service\] Service 79\n/);
+  assert.doesNotMatch(elements, /\n  - \[service\] Service 80/);
+  assert.match(relationships, /\n  - Service 0 -reads-> Service 80 \[declared\]\n/);
+  assert.match(relationships, /\n  - Service 1 -reads-> Service 80 \[inferred\]: lookup 1\n/);
+  assert.match(relationships, /\n  - Service 2 -reads-> Service 80 \[unknown\]: lookup 2\n/);
+  assert.doesNotMatch(relationships, /\n  - Service 80 -reads/);
+  assert.match(coverage, /\n  - Area 0: unresolved\n  - Area 1: unresolved - outside scope\n/);
+  assert.doesNotMatch(coverage, /\n  - Area 80:/);
+  assert.match(limitations, /^Limitations:\n  - /);
+});
+
+test('helicopter replay uses business kinds and bounds capability rows without losing descriptions', () => {
+  const result = helicopter({ requestId: 'request', snapshotId: 'snapshot' });
+  result.capabilities = Array.from({ length: 81 }, (_, index) => ({ label: `Capability ${index}`, description: index === 0 ? '' : 'Available' }));
+  const replay = formatVisualizationResult({ kind: 'helicopter', folder: '/repo' }, result);
+  assert.match(replay, /\n\nPurpose: Lets customers/);
+  assert.match(replay, /\n  - \[who\] Customer\n/);
+  assert.match(replay, /\n  - \[starts when\] Customer asks for an appointment \(in Booking an appointment\)\n/);
+  assert.match(replay, /\n  - \[outside party\] Payment provider\n\nFlow/);
+  assert.match(replay, /\n\nBusiness capabilities \(81\):\n  - Capability 0\n  - Capability 1: Available\n/);
+  assert.match(replay, /\n  - Capability 79: Available\n  \.\.\. 1 more in the saved result\n\nCoverage/);
+  assert.doesNotMatch(replay, /\n  - Capability 80:/);
+});
+
+test('structure replay keeps path precedence, proposal directions, conflicts and section limits', () => {
+  const result = proposed({ requestId: 'request', snapshotId: 'snapshot' });
+  result.entries = Array.from({ length: 81 }, (_, index) => ({ label: `Group ${index}`, path: index === 0 ? 'src/core' : null, pattern: index < 2 ? '*.toml' : null, purpose: `Purpose ${index}` }));
+  result.conventions = Array.from({ length: 81 }, (_, index) => ({ scope: `Scope ${index}`, current: `Current ${index}`, proposed: index === 0 ? null : `Proposed ${index}` }));
+  result.mappings = [
+    { operation: 'create', fromPaths: [], toPaths: ['new'] },
+    { operation: 'remove', fromPaths: ['old'], toPaths: [] },
+    ...Array.from({ length: 79 }, (_, index) => ({ operation: 'move', fromPaths: [`old-${index}`], toPaths: [`new-${index}`] })),
+  ];
+  result.conflicts = Array.from({ length: 81 }, (_, index) => `Conflict ${index}`);
+  const replay = formatVisualizationResult({ kind: 'structureProposed', folder: '/repo' }, result);
+  const [header, groups, conventions, mappings, conflicts] = replay.split('\n\n');
+  assert.ok(header.includes(`Target document: source-1 (sha256 ${sha(TARGET)})`));
+  for (const section of [groups, conventions, mappings]) {
+    assert.equal(section.split('\n').filter(line => line.startsWith('  - ')).length, 80);
+    assert.ok(section.endsWith('  ... 1 more in the saved result'));
+  }
+  assert.match(groups, /\n  - Group 0 \(src\/core\): Purpose 0\n  - Group 1 \(\*\.toml\): Purpose 1\n/);
+  assert.match(groups, /\n  - Group 79: Purpose 79\n/);
+  assert.doesNotMatch(groups, /\n  - Group 80/);
+  assert.match(conventions, /\n  - Scope 0: Current 0\n  - Scope 1: Current 1 -> Proposed 1\n/);
+  assert.doesNotMatch(conventions, /\n  - Scope 80:/);
+  assert.match(mappings, /\n  - create: \(none\) -> new\n  - remove: old -> \(none\)\n/);
+  assert.match(mappings, /\n  - move: old-77 -> new-77\n/);
+  assert.doesNotMatch(mappings, /old-78/);
+  assert.match(conflicts, /^Target document conflicts:\n  - Conflict 0\n/);
+  assert.ok(conflicts.endsWith('  - Conflict 80'));
+  const current = formatVisualizationResult({ kind: 'structureCurrent', folder: '/repo' }, structure({ requestId: 'request', snapshotId: 'snapshot' }));
+  assert.match(current, /\n  - Infrastructure files \(\*\.yml\): Deployment config\n\nConventions/);
+  assert.doesNotMatch(current, /Target document:|Mappings \(|Target document conflicts:/);
 });
 
 test('project_visualization_prompt admits a helicopter request in the existing Architect session; its guard allows only its own submitter', async () => {

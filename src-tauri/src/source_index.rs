@@ -87,6 +87,25 @@ pub struct SourceIndexService {
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 
+/// Notes about what the inventory leaves out, shown with every index built from this snapshot.
+fn inventory_limitations(admitted: &inventory::Admitted) -> Vec<String> {
+    let mut limitations = vec!["Entries ignored by .gitignore or inside version-control, dependency or build-output folders (for example .git, node_modules, target, dist, build) are not inventoried.".to_string()];
+    if admitted.excluded_count > 0 {
+        limitations.push(format!("{} path(s) were excluded as secrets or build output (for example {}).", admitted.excluded_count, admitted.excluded_samples.join(", ")));
+    }
+    limitations.extend(admitted.warnings.iter().take(MAX_WARNING_LINES).cloned());
+    if admitted.warnings.len() > MAX_WARNING_LINES { limitations.push(format!("{} further inventory warning(s) were omitted.", admitted.warnings.len() - MAX_WARNING_LINES)); }
+    limitations
+}
+
+/// Partial result for a snapshot the parser could not (fully) process: every file says why it has no facts.
+fn inventory_only_finish(expected: &Expected, record: &InventoryRecord, status: FileStatus, file_reason: &str, reason: String) -> Finish {
+    match SourceGraphIndex::inventory_only(expected, status, file_reason, &reason, record.limitations.clone()) {
+        Ok(index) => Finish::Index { index: Box::new(index), error: Some(reason) },
+        Err(e) => Finish::Failed(e),
+    }
+}
+
 /// Identity of a repository folder: exact canonical spelling (case-folded only where the filesystem is).
 fn folder_key(canonical: &Path) -> String {
     let text = canonical.to_string_lossy().replace('\\', "/");
@@ -301,82 +320,81 @@ impl SourceIndexService {
         job.update(|s| s.capabilities = capabilities.clone());
         if job.cancelled() { return Finish::Cancelled; }
 
-        let admitted = match inventory::admit(folder, &ctl) { Ok(a) => a, Err(e) => return Self::fail(job, e) };
-        job.update(|s| s.total_files = admitted.files.len() as u64);
-        let source_dir = job.dir.join("source");
-        if let Err(e) = fs::create_dir_all(&source_dir) { return Self::fail(job, format!("Cannot create the snapshot directory: {e}")); }
-        let copied = match inventory::copy_snapshot(&admitted, &source_dir, &ctl, &|done| job.update(|s| s.completed_files = done)) {
-            Ok(c) => c,
-            Err(e) => return Self::fail(job, e),
-        };
-        if started.elapsed() >= JOB_DEADLINE { return Finish::Failed("The source index job exceeded its fifteen-minute deadline.".into()); }
-
-        let mut limitations = vec!["Entries ignored by .gitignore or inside version-control, dependency or build-output folders (for example .git, node_modules, target, dist, build) are not inventoried.".to_string()];
-        if admitted.excluded_count > 0 {
-            limitations.push(format!("{} path(s) were excluded as secrets or build output (for example {}).", admitted.excluded_count, admitted.excluded_samples.join(", ")));
-        }
-        limitations.extend(admitted.warnings.iter().take(MAX_WARNING_LINES).cloned());
-        if admitted.warnings.len() > MAX_WARNING_LINES { limitations.push(format!("{} further inventory warning(s) were omitted.", admitted.warnings.len() - MAX_WARNING_LINES)); }
-        let record = InventoryRecord {
-            version: 1, snapshot_id: job.id.clone(), folder: folder.to_string_lossy().into_owned(), created_at: now_ms(), source_hash: copied.source_hash.clone(),
-            files: copied.files, directories: admitted.directories, exclusions: admitted.excluded_samples, limitations,
-        };
-        if let Err(e) = write_json(&job.dir.join("inventory.json"), &record, MAX_INVENTORY_BYTES) { return Self::fail(job, format!("Cannot save the snapshot inventory: {e}")); }
-        job.update(|s| { s.snapshot_id = Some(job.id.clone()); s.source_hash = Some(record.source_hash.clone()); s.state = SourceIndexState::Parsing; s.completed_files = 0; });
+        let (record, source_dir) = match Self::snapshot(job, folder, &ctl, started) { Ok(done) => done, Err(finish) => return finish };
         if job.cancelled() { return Finish::Cancelled; }
 
         let manifest_files = record.manifest_files();
         let expected = Expected { snapshot_id: &record.snapshot_id, folder: &record.folder, source_hash: &record.source_hash, files: &manifest_files, directories: &record.directories };
-        let inventory_only = |reason: String| -> Finish {
-            match SourceGraphIndex::inventory_only(&expected, FileStatus::Failed, "Not parsed: the parser run did not produce accepted facts", &reason, record.limitations.clone()) {
-                Ok(index) => Finish::Index { index: Box::new(index), error: Some(reason) },
-                Err(e) => Finish::Failed(e),
-            }
-        };
         if !capabilities.available {
             // Without a parser the inventory and structure stay viewable; files are marked skipped, not parsed.
             let reason = capabilities.hint.clone().unwrap_or_else(|| "The parser runtime is unavailable".into());
-            return match SourceGraphIndex::inventory_only(&expected, FileStatus::Skipped, "Not parsed: the parser runtime is unavailable", &reason, record.limitations.clone()) {
-                Ok(index) => Finish::Index { index: Box::new(index), error: Some(reason) },
-                Err(e) => Finish::Failed(e),
-            };
+            return inventory_only_finish(&expected, &record, FileStatus::Skipped, "Not parsed: the parser runtime is unavailable", reason);
         }
+        self.parse(job, &expected, &capabilities, &record, &source_dir, started)
+    }
 
+    /// Admits and copies the folder, then persists the immutable inventory. A failure is returned as the job's final state.
+    fn snapshot(job: &Job, folder: &Path, ctl: &Ctl, started: Instant) -> std::result::Result<(InventoryRecord, PathBuf), Finish> {
+        let admitted = inventory::admit(folder, ctl).map_err(|e| Self::fail(job, e))?;
+        job.update(|s| s.total_files = admitted.files.len() as u64);
+        let source_dir = job.dir.join("source");
+        fs::create_dir_all(&source_dir).map_err(|e| Self::fail(job, format!("Cannot create the snapshot directory: {e}")))?;
+        let copied = inventory::copy_snapshot(&admitted, &source_dir, ctl, &|done| job.update(|s| s.completed_files = done)).map_err(|e| Self::fail(job, e))?;
+        if started.elapsed() >= JOB_DEADLINE { return Err(Finish::Failed("The source index job exceeded its fifteen-minute deadline.".into())); }
+
+        let limitations = inventory_limitations(&admitted);
+        let record = InventoryRecord {
+            version: 1, snapshot_id: job.id.clone(), folder: folder.to_string_lossy().into_owned(), created_at: now_ms(), source_hash: copied.source_hash.clone(),
+            files: copied.files, directories: admitted.directories, exclusions: admitted.excluded_samples, limitations,
+        };
+        write_json(&job.dir.join("inventory.json"), &record, MAX_INVENTORY_BYTES).map_err(|e| Self::fail(job, format!("Cannot save the snapshot inventory: {e}")))?;
+        job.update(|s| { s.snapshot_id = Some(job.id.clone()); s.source_hash = Some(record.source_hash.clone()); s.state = SourceIndexState::Parsing; s.completed_files = 0; });
+        Ok((record, source_dir))
+    }
+
+    /// Runs the parser over the copied source and validates what it returns; any parser failure keeps the inventory viewable.
+    fn parse(&self, job: &Job, expected: &Expected, capabilities: &SourceIndexCapabilities, record: &InventoryRecord, source_dir: &Path, started: Instant) -> Finish {
         let work = job.dir.join("work");
         if let Err(e) = fs::create_dir_all(&work) { return Self::fail(job, format!("Cannot create the parser scratch directory: {e}")); }
         let (manifest_path, output_path) = (work.join("manifest.json"), work.join("output.json"));
         let manifest = json!({
             "schemaVersion": 1, "snapshotId": record.snapshot_id, "folder": record.folder, "sourceHash": record.source_hash,
-            "root": source_dir.to_string_lossy(), "files": manifest_files, "directories": record.directories, "limitations": record.limitations,
+            "root": source_dir.to_string_lossy(), "files": expected.files, "directories": record.directories, "limitations": record.limitations,
         });
         if let Err(e) = write_json(&manifest_path, &manifest, MAX_INVENTORY_BYTES) { return Self::fail(job, format!("Cannot write the parser manifest: {e}")); }
         let remaining = JOB_DEADLINE.saturating_sub(started.elapsed()).max(Duration::from_secs(1));
         let run = ExtractRun { manifest: &manifest_path, output: &output_path, work_dir: &work, timeout: remaining, cancel: job.cancel.clone() };
+        let outcome = self.extract_with_progress(job, &run, &work);
+        let rejected = |reason: String| inventory_only_finish(expected, record, FileStatus::Failed, "Not parsed: the parser run did not produce accepted facts", reason);
+        match outcome {
+            ParserOutcome::Cancelled => Finish::Cancelled,
+            _ if job.cancelled() => Finish::Cancelled,
+            ParserOutcome::TimedOut => rejected(format!("The parser stopped at the {} minute deadline; no facts were accepted.", JOB_DEADLINE.as_secs() / 60)),
+            ParserOutcome::Failed(message) => rejected(message),
+            ParserOutcome::Finished => {
+                job.update(|s| s.state = SourceIndexState::Resolving);
+                match self.accept_output(&output_path, expected, capabilities, record) {
+                    Ok(index) => Finish::Index { index: Box::new(index), error: None },
+                    Err(e) => rejected(format!("The parser output was rejected: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Runs the parser while a sibling thread mirrors its progress file into the job status.
+    fn extract_with_progress(&self, job: &Job, run: &ExtractRun, work: &Path) -> ParserOutcome {
         let stop = AtomicBool::new(false);
-        let outcome = std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
             scope.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
                     Self::read_progress(job, &work.join("progress.json"));
                     std::thread::sleep(Duration::from_millis(250));
                 }
             });
-            let outcome = self.parser.extract(&run);
+            let outcome = self.parser.extract(run);
             stop.store(true, Ordering::Relaxed);
             outcome
-        });
-        match outcome {
-            ParserOutcome::Cancelled => Finish::Cancelled,
-            _ if job.cancelled() => Finish::Cancelled,
-            ParserOutcome::TimedOut => inventory_only(format!("The parser stopped at the {} minute deadline; no facts were accepted.", JOB_DEADLINE.as_secs() / 60)),
-            ParserOutcome::Failed(message) => inventory_only(message),
-            ParserOutcome::Finished => {
-                job.update(|s| s.state = SourceIndexState::Resolving);
-                match self.accept_output(&output_path, &expected, &capabilities, &record) {
-                    Ok(index) => Finish::Index { index: Box::new(index), error: None },
-                    Err(e) => inventory_only(format!("The parser output was rejected: {e}")),
-                }
-            }
-        }
+        })
     }
 
     fn read_progress(job: &Job, path: &Path) {

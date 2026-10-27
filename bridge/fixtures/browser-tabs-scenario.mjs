@@ -11,9 +11,9 @@ import {TestNativeHost} from './native-host.mjs';
 // attached to the agent session automatically, controllable, renameable, and must not break the AI's own tab.
 export default async function tabsScenario(pi) {
   const root=process.env.BROWSER_TEST_ROOT;
-  let session;
+  const captured={};
   const originalInfos=pi.pi.AgentSession.prototype.getAllToolInfos;
-  function captureInfos(...args){session=this;return originalInfos.apply(this,args);}
+  function captureInfos(...args){captured.session=this;return originalInfos.apply(this,args);}
   pi.pi.AgentSession.prototype.getAllToolInfos=captureInfos;
   const host=new TestNativeHost(root);
   const helper=spawn(process.env.BUN_BIN||'bun',[fileURLToPath(new URL('../omp-browser-service.mjs',import.meta.url)),root,process.env.OMP_SDK_DIR],{env:process.env,stdio:['pipe','pipe','inherit']});
@@ -54,8 +54,8 @@ export default async function tabsScenario(pi) {
     let exitCode=0;
     try {
       pi.getAllTools();
-      assert.ok(session,'Main native OMP session was not captured');
-      const tool=session.getToolByName('eval');
+      assert.ok(captured.session,'Main native OMP session was not captured');
+      const tool=captured.session.getToolByName('eval');
       async function cell(code){
         const result=await tool.execute('flow-'+crypto.randomUUID(),{language:'js',code,timeout:40});
         const text=result.content.filter(block=>block.type==='text').map(block=>block.text).join('\n');
@@ -90,7 +90,7 @@ export default async function tabsScenario(pi) {
       console.log('Hand-opened tabs are attached automatically and controllable');
     } catch(error) {process.stderr.write(String(error.stack||error)+'\n');exitCode=1;}
     finally {
-      try {if(session)await session.dispose();}
+      try {if(captured.session)await captured.session.dispose();}
       finally {
         if(pi.pi.AgentSession.prototype.getAllToolInfos===captureInfos)pi.pi.AgentSession.prototype.getAllToolInfos=originalInfos;
         try{await control('shutdown');}catch{}

@@ -632,33 +632,21 @@ fn count_of(counts: &mut Map<String, Value>, key: &str) {
     counts.insert(key.to_string(), json!(next));
 }
 
-/// Streams `graph.json` into the snapshot directory `dir`. Returns the finished metadata (artifact id not yet set).
-fn normalize(source: File, expected_len: u64, dir: &Path, folder: &str, located: &Located) -> Result<Normalized> {
-    let create = |name: &str| File::create(dir.join(name)).map(BufWriter::new).map_err(|e| err("Cannot create Graphify snapshot", e));
-    let mut normalizer = Normalizer {
+fn create_snapshot_file(dir: &Path, name: &str) -> Result<BufWriter<File>> {
+    File::create(dir.join(name)).map(BufWriter::new).map_err(|e| err("Cannot create Graphify snapshot", e))
+}
 
-        nodes: Spool::create(dir, "nodes")?,
-        links_raw: create("links.raw")?,
-        hyper_raw: create("hyperedges.raw")?,
-        node_refs: HashMap::new(),
-        communities: BTreeMap::new(),
-        seen: [false; 3],
-        top_keys: HashSet::new(),
-        legacy_edges: false,
-        directed: None,
-        multigraph: None,
-        graph_attributes: None,
-        extras: Map::new(),
-        link_count: 0,
-        hyper_count: 0,
-        issues: Issues::default(),
-        failure: None,
-    };
+fn write_failed(e: std::io::Error) -> String {
+    err("Cannot write Graphify snapshot", e)
+}
+
+/// Pass 1: streams `graph.json` once, retaining a byte-exact copy and feeding the normalizer. Returns the file hash and byte count.
+fn read_graph(normalizer: &mut Normalizer, source: File, expected_len: u64, dir: &Path) -> Result<(String, u64)> {
     let check = source.try_clone().map_err(|e| err("Cannot inspect graph.json", e))?;
-    let shared = Rc::new(RefCell::new((Sha256::new(), 0u64, create("graph.json")?)));
+    let shared = Rc::new(RefCell::new((Sha256::new(), 0u64, create_snapshot_file(dir, "graph.json")?)));
     let reader = BufReader::with_capacity(256 * 1024, HashRead { file: source, shared: shared.clone() });
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
-    let parsed = Top(&mut normalizer).deserialize(&mut deserializer).and_then(|()| deserializer.end());
+    let parsed = Top(&mut *normalizer).deserialize(&mut deserializer).and_then(|()| deserializer.end());
     if let Err(e) = parsed {
         return Err(normalizer.failure.take().unwrap_or_else(|| format!("graph.json is not a valid Graphify graph: {e}")));
     }
@@ -678,190 +666,266 @@ fn normalize(source: File, expected_len: u64, dir: &Path, folder: &str, located:
     if !normalizer.seen[1] {
         normalizer.issues.add("warning", "links", None, "graph.json has no \"links\" (or legacy \"edges\") array; the graph has no links".into());
     }
-    let directed = normalizer.directed.unwrap_or(false);
-    let multigraph = normalizer.multigraph.unwrap_or(false);
-    let io = |e: std::io::Error| err("Cannot write Graphify snapshot", e);
+    Ok((hash, bytes))
+}
 
-    // Pass 2: links (need the node table and the artifact hash).
-    normalizer.links_raw.flush().map_err(io)?;
-    normalizer.hyper_raw.flush().map_err(io)?;
+#[derive(Default)]
+struct LinkStats {
+    total: u64,
+    provenance_counts: Map<String, Value>,
+    origin_counts: Map<String, Value>,
+    self_loops: u64,
+    dangling_links: u64,
+}
+
+/// One raw spool line as a JSON object; `what` names the record kind in the error.
+fn object_of_line(text: std::io::Result<String>, what: &str, ordinal: u64) -> Result<Map<String, Value>> {
+    let text = text.map_err(|e| err("Cannot read Graphify snapshot", e))?;
+    match serde_json::from_str::<Value>(&text).map_err(|e| err("Cannot read Graphify snapshot", e))? {
+        Value::Object(object) => Ok(object),
+        _ => Err(format!("{what} #{ordinal} is not an object")),
+    }
+}
+
+fn link_endpoint(object: &mut Map<String, Value>, ordinal: u64, name: &str) -> Result<GraphifyRef> {
+    let value = object.remove(name).ok_or_else(|| format!("Link #{ordinal} has no {name}"))?;
+    ref_of(&value).ok_or_else(|| format!("Link #{ordinal} has an unusable {name} id (it must be a non-empty string or an integer)"))
+}
+
+fn take_link_directed(object: &mut Map<String, Value>, default: bool) -> bool {
+    match object.get("directed") {
+        Some(Value::Bool(flag)) => {
+            let flag = *flag;
+            object.remove("directed");
+            flag
+        }
+        _ => default,
+    }
+}
+
+fn take_link_key(object: &mut Map<String, Value>) -> Option<String> {
+    match object.get("key") {
+        Some(Value::String(_)) => take_string(object, "key"),
+        Some(Value::Number(number)) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn take_number(object: &mut Map<String, Value>, key: &str) -> Option<Value> {
+    match object.get(key) {
+        Some(Value::Number(_)) => object.remove(key),
+        _ => None,
+    }
+}
+
+/// The record id: its native id when unique and not reserved, otherwise the internal one (reported as an issue).
+fn assign_id(issues: &mut Issues, used: &mut HashSet<String>, native: Option<&str>, internal: String, section: &str, noun: &str, ordinal: u64) -> String {
+    match native {
+        Some(native) if !native.starts_with("graphify:") && used.insert(native.to_string()) => native.to_string(),
+        Some(native) => {
+            issues.add("warning", section, Some(ordinal), format!("The {noun} id {} is reused or reserved; its internal id is used", shown(native)));
+            internal
+        }
+        None => internal,
+    }
+}
+
+/// Resolves both endpoints; counts and reports dangling links and self-loops.
+fn resolve_link_nodes(normalizer: &mut Normalizer, stats: &mut LinkStats, ordinal: u64, source: &GraphifyRef, target: &GraphifyRef) -> (Option<u64>, Option<u64>, bool) {
+    let source_node = normalizer.node_refs.get(&key_of(source)).copied();
+    let target_node = normalizer.node_refs.get(&key_of(target)).copied();
+    let dangling = source_node.is_none() || target_node.is_none();
+    if dangling {
+        stats.dangling_links += 1;
+        normalizer.issues.add("warning", "links", Some(ordinal), format!("The link references a node that does not exist ({} → {})", shown(&source.id), shown(&target.id)));
+    }
+    if source_node.is_some() && source_node == target_node {
+        stats.self_loops += 1;
+    }
+    (source_node, target_node, dangling)
+}
+
+/// Builds the link record and its `links.ends` words `[source, target, flags]`.
+fn normalize_link(normalizer: &mut Normalizer, stats: &mut LinkStats, used: &mut HashSet<String>, hash: &str, directed: bool, ordinal: u64, mut object: Map<String, Value>) -> Result<(Value, [u64; 3])> {
+    let source_ref = link_endpoint(&mut object, ordinal, "source")?;
+    let target_ref = link_endpoint(&mut object, ordinal, "target")?;
+    let relation = take_string(&mut object, "relation");
+    if relation.is_none() {
+        normalizer.issues.add("warning", "links", Some(ordinal), "The link has no text \"relation\"".into());
+    }
+    let link_directed = take_link_directed(&mut object, directed);
+    let key = take_link_key(&mut object);
+    let native = native_id(&mut object, "id");
+    let confidence = take_confidence(&mut object);
+    let score = take_number(&mut object, "confidence_score");
+    let source_file = take_string(&mut object, "source_file");
+    let source_location = take_string(&mut object, "source_location");
+    let origin = take_string(&mut object, "_origin");
+    let (source_node, target_node, dangling) = resolve_link_nodes(normalizer, stats, ordinal, &source_ref, &target_ref);
+    let id = assign_id(&mut normalizer.issues, used, native.as_deref(), format!("graphify:{hash}:link:{ordinal}"), "links", "link", ordinal);
+    count_of(&mut stats.provenance_counts, confidence.as_deref().unwrap_or("none"));
+    count_of(&mut stats.origin_counts, origin.as_deref().unwrap_or("none"));
+    let dto = json!({
+        "ordinal": ordinal,
+        "id": id,
+        "nativeId": native,
+        "source": source_ref,
+        "target": target_ref,
+        "key": key,
+        "relation": relation.unwrap_or_default(),
+        "directed": link_directed,
+        "confidence": confidence,
+        "confidenceScore": score,
+        "sourceFile": source_file,
+        "sourceLocation": source_location,
+        "origin": origin,
+        "attributes": object,
+        "dangling": dangling,
+    });
+    Ok((dto, [source_node.unwrap_or(NO_NODE), target_node.unwrap_or(NO_NODE), u64::from(link_directed) | (u64::from(dangling) << 1)]))
+}
+
+/// Pass 2: links (need the node table and the artifact hash).
+fn normalize_links(normalizer: &mut Normalizer, dir: &Path, hash: &str, directed: bool) -> Result<LinkStats> {
+    normalizer.links_raw.flush().map_err(write_failed)?;
+    normalizer.hyper_raw.flush().map_err(write_failed)?;
     let mut links = Spool::create(dir, "links")?;
-    let mut ends = create("links.ends")?;
+    let mut ends = create_snapshot_file(dir, "links.ends")?;
     let mut used: HashSet<String> = HashSet::new();
-    let mut provenance_counts = Map::new();
-    let mut origin_counts = Map::new();
-    let (mut self_loops, mut dangling_links) = (0u64, 0u64);
+    let mut stats = LinkStats::default();
     for (ordinal, text) in lines(&dir.join("links.raw"))?.enumerate() {
         let ordinal = ordinal as u64;
-        let text = text.map_err(|e| err("Cannot read Graphify snapshot", e))?;
-        let value: Value = serde_json::from_str(&text).map_err(|e| err("Cannot read Graphify snapshot", e))?;
-        let Value::Object(mut object) = value else { return Err(format!("Link #{ordinal} is not an object")) };
-        let endpoint = |object: &mut Map<String, Value>, name: &str| -> Result<GraphifyRef> {
-            let value = object.remove(name).ok_or_else(|| format!("Link #{ordinal} has no {name}"))?;
-            ref_of(&value).ok_or_else(|| format!("Link #{ordinal} has an unusable {name} id (it must be a non-empty string or an integer)"))
-        };
-        let source_ref = endpoint(&mut object, "source")?;
-        let target_ref = endpoint(&mut object, "target")?;
-        let relation = take_string(&mut object, "relation");
-        if relation.is_none() {
-            normalizer.issues.add("warning", "links", Some(ordinal), "The link has no text \"relation\"".into());
-        }
-        let link_directed = match object.get("directed") {
-            Some(Value::Bool(flag)) => {
-                let flag = *flag;
-                object.remove("directed");
-                flag
-            }
-            _ => directed,
-        };
-        let key = match object.get("key") {
-            Some(Value::String(_)) => take_string(&mut object, "key"),
-            Some(Value::Number(number)) => Some(number.to_string()),
-            _ => None,
-        };
-        let native = native_id(&mut object, "id");
-        let confidence = take_confidence(&mut object);
-        let score = match object.get("confidence_score") {
-            Some(Value::Number(_)) => object.remove("confidence_score"),
-            _ => None,
-        };
-        let source_file = take_string(&mut object, "source_file");
-        let source_location = take_string(&mut object, "source_location");
-        let origin = take_string(&mut object, "_origin");
-        let source_node = normalizer.node_refs.get(&key_of(&source_ref)).copied();
-        let target_node = normalizer.node_refs.get(&key_of(&target_ref)).copied();
-        let dangling = source_node.is_none() || target_node.is_none();
-        if dangling {
-            dangling_links += 1;
-            normalizer.issues.add("warning", "links", Some(ordinal), format!("The link references a node that does not exist ({} → {})", shown(&source_ref.id), shown(&target_ref.id)));
-        }
-        if source_node.is_some() && source_node == target_node {
-            self_loops += 1;
-        }
-        let internal = format!("graphify:{hash}:link:{ordinal}");
-        let id = match &native {
-            Some(native) if !native.starts_with("graphify:") && used.insert(native.clone()) => native.clone(),
-            Some(native) => {
-                normalizer.issues.add("warning", "links", Some(ordinal), format!("The link id {} is reused or reserved; its internal id is used", shown(native)));
-                used.insert(internal.clone());
-                internal
-            }
-            None => {
-                used.insert(internal.clone());
-                internal
-            }
-        };
-        count_of(&mut provenance_counts, confidence.as_deref().unwrap_or("none"));
-        count_of(&mut origin_counts, origin.as_deref().unwrap_or("none"));
-        let dto = json!({
-            "ordinal": ordinal,
-            "id": id,
-            "nativeId": native,
-            "source": source_ref,
-            "target": target_ref,
-            "key": key,
-            "relation": relation.unwrap_or_default(),
-            "directed": link_directed,
-            "confidence": confidence,
-            "confidenceScore": score,
-            "sourceFile": source_file,
-            "sourceLocation": source_location,
-            "origin": origin,
-            "attributes": object,
-            "dangling": dangling,
-        });
+        let object = object_of_line(text, "Link", ordinal)?;
+        let (dto, [source, target, flags]) = normalize_link(normalizer, &mut stats, &mut used, hash, directed, ordinal, object)?;
         links.push(&line_of(&dto, &format!("Link #{ordinal}"))?)?;
-        write_ends(&mut ends, source_node.unwrap_or(NO_NODE), target_node.unwrap_or(NO_NODE), u64::from(link_directed) | (u64::from(dangling) << 1))?;
+        write_ends(&mut ends, source, target, flags)?;
     }
-    let link_total = links.finish()?;
-    ends.flush().map_err(io)?;
+    stats.total = links.finish()?;
+    ends.flush().map_err(write_failed)?;
+    Ok(stats)
+}
 
-    // Hyperedges stay separate group records.
+/// The member references of a hyperedge and how many of them name no known node.
+fn hyperedge_members(normalizer: &Normalizer, object: &mut Map<String, Value>, ordinal: u64) -> Result<(Vec<GraphifyRef>, u64)> {
+    let list_key = if object.get("nodes").is_some_and(Value::is_array) { "nodes" } else { "members" };
+    let members = match object.remove(list_key) {
+        Some(Value::Array(members)) => members,
+        _ => return Err(format!("Hyperedge #{ordinal} has no node list")),
+    };
+    let mut node_ids = Vec::with_capacity(members.len());
+    let mut unresolved = 0u64;
+    for member in &members {
+        let reference = ref_of(member).ok_or_else(|| format!("Hyperedge #{ordinal} has a member that is not a node id"))?;
+        if !normalizer.node_refs.contains_key(&key_of(&reference)) {
+            unresolved += 1;
+        }
+        node_ids.push(reference);
+    }
+    Ok((node_ids, unresolved))
+}
+
+fn normalize_hyperedge(normalizer: &mut Normalizer, used: &mut HashSet<String>, hash: &str, ordinal: u64, mut object: Map<String, Value>) -> Result<Value> {
+    let native = native_id(&mut object, "id");
+    let (node_ids, unresolved) = hyperedge_members(normalizer, &mut object, ordinal)?;
+    if unresolved > 0 {
+        normalizer.issues.add("warning", "hyperedges", Some(ordinal), format!("The hyperedge lists {unresolved} nodes that do not exist"));
+    }
+    let label = take_string(&mut object, "label");
+    let relation = take_string(&mut object, "relation");
+    let confidence = take_confidence(&mut object);
+    let source_file = take_string(&mut object, "source_file");
+    let id = assign_id(&mut normalizer.issues, used, native.as_deref(), format!("graphify:{hash}:hyperedge:{ordinal}"), "hyperedges", "hyperedge", ordinal);
+    Ok(json!({
+        "id": id,
+        "ordinal": ordinal,
+        "nativeId": native,
+        "label": label.or_else(|| native.clone()).unwrap_or_else(|| "(unlabeled hyperedge)".to_string()),
+        "relation": relation,
+        "nodeIds": node_ids,
+        "confidence": confidence,
+        "sourceFile": source_file,
+        "attributes": object,
+        "unresolvedMembers": unresolved,
+    }))
+}
+
+/// Hyperedges stay separate group records.
+fn normalize_hyperedges(normalizer: &mut Normalizer, dir: &Path, hash: &str) -> Result<u64> {
     let mut hyperedges = Spool::create(dir, "hyperedges")?;
-    let mut hyper_used = HashSet::new();
+    let mut used = HashSet::new();
     for (ordinal, text) in lines(&dir.join("hyperedges.raw"))?.enumerate() {
         let ordinal = ordinal as u64;
-        let text = text.map_err(|e| err("Cannot read Graphify snapshot", e))?;
-        let value: Value = serde_json::from_str(&text).map_err(|e| err("Cannot read Graphify snapshot", e))?;
-        let Value::Object(mut object) = value else { return Err(format!("Hyperedge #{ordinal} is not an object")) };
-        let native = native_id(&mut object, "id");
-        let list_key = if object.get("nodes").is_some_and(Value::is_array) { "nodes" } else { "members" };
-        let members = match object.remove(list_key) {
-            Some(Value::Array(members)) => members,
-            _ => return Err(format!("Hyperedge #{ordinal} has no node list")),
-        };
-        let mut node_ids = Vec::with_capacity(members.len());
-        let mut unresolved = 0u64;
-        for member in &members {
-            let reference = ref_of(member).ok_or_else(|| format!("Hyperedge #{ordinal} has a member that is not a node id"))?;
-            if !normalizer.node_refs.contains_key(&key_of(&reference)) {
-                unresolved += 1;
-            }
-            node_ids.push(reference);
-        }
-        if unresolved > 0 {
-            normalizer.issues.add("warning", "hyperedges", Some(ordinal), format!("The hyperedge lists {unresolved} nodes that do not exist"));
-        }
-        let label = take_string(&mut object, "label");
-        let relation = take_string(&mut object, "relation");
-        let confidence = take_confidence(&mut object);
-        let source_file = take_string(&mut object, "source_file");
-        let internal = format!("graphify:{hash}:hyperedge:{ordinal}");
-        let id = match &native {
-            Some(native) if !native.starts_with("graphify:") && hyper_used.insert(native.clone()) => native.clone(),
-            Some(native) => {
-                normalizer.issues.add("warning", "hyperedges", Some(ordinal), format!("The hyperedge id {} is reused or reserved; its internal id is used", shown(native)));
-                internal
-            }
-            None => internal,
-        };
-        let dto = json!({
-            "id": id,
-            "ordinal": ordinal,
-            "nativeId": native,
-            "label": label.or_else(|| native.clone()).unwrap_or_else(|| "(unlabeled hyperedge)".to_string()),
-            "relation": relation,
-            "nodeIds": node_ids,
-            "confidence": confidence,
-            "sourceFile": source_file,
-            "attributes": object,
-            "unresolvedMembers": unresolved,
-        });
+        let object = object_of_line(text, "Hyperedge", ordinal)?;
+        let dto = normalize_hyperedge(normalizer, &mut used, hash, ordinal, object)?;
         hyperedges.push(&line_of(&dto, &format!("Hyperedge #{ordinal}"))?)?;
     }
-    let hyper_total = hyperedges.finish()?;
+    hyperedges.finish()
+}
 
-    let node_total = normalizer.nodes.count;
+fn write_communities(normalizer: &Normalizer, dir: &Path) -> Result<u64> {
     let mut communities = Spool::create(dir, "communities")?;
-    let community_total = normalizer.communities.len() as u64;
     for (id, (size, names)) in &normalizer.communities {
         let label = if names.len() == 1 { names.iter().next().cloned() } else { None };
         communities.push(&serde_json::to_vec(&json!({ "id": id, "label": label, "size": size })).map_err(|e| e.to_string())?)?;
     }
     communities.finish()?;
-    normalizer.nodes.flush()?;
-    let _ = fs::remove_file(dir.join("links.raw"));
-    let _ = fs::remove_file(dir.join("hyperedges.raw"));
+    Ok(normalizer.communities.len() as u64)
+}
 
+/// Retains the full top-level metadata in `metadata.json`; the inline map is emptied when it exceeds the response budget.
+fn retain_metadata(normalizer: &mut Normalizer, dir: &Path) -> Result<(Map<String, Value>, Option<GraphifyMetadataReceipt>)> {
     let mut metadata = std::mem::take(&mut normalizer.extras);
     if let Some(graph) = normalizer.graph_attributes.take() {
         metadata.insert("graph".into(), graph);
     }
-    let mut metadata_file = SnapshotWriter { file: create("metadata.json")?, hash: Sha256::new(), bytes: 0 };
+    let mut metadata_file = SnapshotWriter { file: create_snapshot_file(dir, "metadata.json")?, hash: Sha256::new(), bytes: 0 };
     serde_json::to_writer(&mut metadata_file, &metadata).map_err(|e| err("Cannot retain Graphify metadata", e))?;
     metadata_file.file.flush().map_err(|e| err("Cannot retain Graphify metadata", e))?;
-    let metadata_receipt = if metadata_file.bytes > MAX_INLINE_METADATA_BYTES as u64 {
-        metadata.clear();
-        Some(GraphifyMetadataReceipt {
-            path: "metadata.json".into(),
-            raw_graph_path: "graph.json".into(),
-            bytes: metadata_file.bytes,
-            sha256: fsio::hex(metadata_file.hash.finalize()),
-            message: "Metadata exceeds the inline response budget. All original metadata is retained in the app-owned immutable metadata.json; graph.json retains the full byte-exact artifact. The inline metadata map is intentionally empty, not a replacement for the original.".into(),
-        })
-    } else {
-        None
+    if metadata_file.bytes <= MAX_INLINE_METADATA_BYTES as u64 {
+        return Ok((metadata, None));
+    }
+    metadata.clear();
+    let receipt = GraphifyMetadataReceipt {
+        path: "metadata.json".into(),
+        raw_graph_path: "graph.json".into(),
+        bytes: metadata_file.bytes,
+        sha256: fsio::hex(metadata_file.hash.finalize()),
+        message: "Metadata exceeds the inline response budget. All original metadata is retained in the app-owned immutable metadata.json; graph.json retains the full byte-exact artifact. The inline metadata map is intentionally empty, not a replacement for the original.".into(),
     };
+    Ok((metadata, Some(receipt)))
+}
+
+/// Streams `graph.json` into the snapshot directory `dir`. Returns the finished metadata (artifact id not yet set).
+fn normalize(source: File, expected_len: u64, dir: &Path, folder: &str, located: &Located) -> Result<Normalized> {
+    let mut normalizer = Normalizer {
+        nodes: Spool::create(dir, "nodes")?,
+        links_raw: create_snapshot_file(dir, "links.raw")?,
+        hyper_raw: create_snapshot_file(dir, "hyperedges.raw")?,
+        node_refs: HashMap::new(),
+        communities: BTreeMap::new(),
+        seen: [false; 3],
+        top_keys: HashSet::new(),
+        legacy_edges: false,
+        directed: None,
+        multigraph: None,
+        graph_attributes: None,
+        extras: Map::new(),
+        link_count: 0,
+        hyper_count: 0,
+        issues: Issues::default(),
+        failure: None,
+    };
+    let (hash, bytes) = read_graph(&mut normalizer, source, expected_len, dir)?;
+    let directed = normalizer.directed.unwrap_or(false);
+    let multigraph = normalizer.multigraph.unwrap_or(false);
+    let links = normalize_links(&mut normalizer, dir, &hash, directed)?;
+    let hyper_total = normalize_hyperedges(&mut normalizer, dir, &hash)?;
+    let node_total = normalizer.nodes.count;
+    let community_total = write_communities(&normalizer, dir)?;
+    normalizer.nodes.flush()?;
+    let _ = fs::remove_file(dir.join("links.raw"));
+    let _ = fs::remove_file(dir.join("hyperedges.raw"));
+    let (metadata, metadata_receipt) = retain_metadata(&mut normalizer, dir)?;
     let meta = GraphifyArtifact {
         artifact_id: String::new(),
         artifact_hash: hash.clone(),
@@ -870,7 +934,7 @@ fn normalize(source: File, expected_len: u64, dir: &Path, folder: &str, located:
         provenance: if located.provenance == Provenance::Verified { "verified" } else { "unverified" }.into(),
         directed,
         multigraph,
-        counts: GraphifyCounts { nodes: node_total, links: link_total, hyperedges: hyper_total, communities: community_total },
+        counts: GraphifyCounts { nodes: node_total, links: links.total, hyperedges: hyper_total, communities: community_total },
         metadata,
         metadata_receipt,
         bytes,
@@ -878,10 +942,10 @@ fn normalize(source: File, expected_len: u64, dir: &Path, folder: &str, located:
         schema: if normalizer.legacy_edges { "legacyEdges" } else { "nodeLink" }.into(),
         directed_declared: normalizer.directed.is_some(),
         multigraph_declared: normalizer.multigraph.is_some(),
-        provenance_counts,
-        origin_counts,
-        self_loops,
-        dangling_links,
+        provenance_counts: links.provenance_counts,
+        origin_counts: links.origin_counts,
+        self_loops: links.self_loops,
+        dangling_links: links.dangling_links,
         issue_count: normalizer.issues.total,
         issues: normalizer.issues.list.clone(),
         admitted_ms: now_ms(),
@@ -1025,6 +1089,29 @@ fn rank(exact: &[&str], haystacks: &[&str], needle: &str, lowered: &str) -> Opti
 
 fn str_of<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// SHA-256 of the whole open file, rejecting growth past the size cap and any change since `before` was taken.
+fn hash_live_graph(file: &mut File, before: &fs::Metadata) -> Result<String> {
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| err("Cannot compare graph.json", e))?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        if bytes > MAX_GRAPH_BYTES {
+            return Err("graph.json grew beyond the supported size during comparison".into());
+        }
+        hash.update(&buffer[..count]);
+    }
+    let after = file.metadata().map_err(|e| err("Cannot inspect graph.json", e))?;
+    if bytes != before.len() || fingerprint(before) != fingerprint(&after) {
+        return Err("graph.json changed during comparison".into());
+    }
+    Ok(fsio::hex(hash.finalize()))
 }
 
 impl Loaded {
@@ -1185,47 +1272,32 @@ impl KnowledgeService {
         Ok(loaded)
     }
 
+    /// Opens the live `graph.json` and reports whether it is byte-identical to the snapshot of `loaded`.
+    fn compare_live_graphify(&self, loaded: &Loaded, artifact_id: &str) -> Result<bool> {
+        let source: Source = read_json_file(&loaded.dir.join("source.json"))?;
+        let repository = self.repository_root(&loaded.meta.folder)?;
+        if source.project_key != fsio::norm(&repository) || artifact_id != self::artifact_id(&source.project_key, &loaded.meta.artifact_hash) {
+            return Err("The snapshot project identity no longer matches this repository".into());
+        }
+        let probe = probe_graphify(&repository, self.registered_output(&repository).as_deref());
+        let located = probe.located.ok_or_else(|| probe.capability.message.unwrap_or_else(|| "The live Graphify output is absent".into()))?;
+        let parent = located.graph_path.parent().ok_or("graph.json has no folder")?;
+        let (mut file, _) = fsio::open_components(parent, &["graph.json".to_string()])?;
+        let before = file.metadata().map_err(|e| err("Cannot inspect graph.json", e))?;
+        if fingerprint(&before) != located.fingerprint {
+            return Err("graph.json changed while it was being opened".into());
+        }
+        let hash = hash_live_graph(&mut file, &before)?;
+        Ok(hash == loaded.meta.artifact_hash
+            && located.claimed_root == loaded.meta.source_root
+            && (located.provenance == Provenance::Verified) == (loaded.meta.provenance == "verified"))
+    }
+
     /// Passive full-hash comparison. Does not admit, mutate, prune or invalidate any snapshot.
     pub fn check_graphify_artifact(&self, artifact_id: &str) -> Result<GraphifyArtifactCheck> {
         let loaded = self.loaded_graphify(artifact_id)?;
         let result = |current, message: Option<String>| GraphifyArtifactCheck { artifact_id: artifact_id.to_string(), current, message };
-        let inspect = (|| -> Result<bool> {
-            let source: Source = read_json_file(&loaded.dir.join("source.json"))?;
-            let repository = self.repository_root(&loaded.meta.folder)?;
-            if source.project_key != fsio::norm(&repository) || artifact_id != self::artifact_id(&source.project_key, &loaded.meta.artifact_hash) {
-                return Err("The snapshot project identity no longer matches this repository".into());
-            }
-            let probe = probe_graphify(&repository, self.registered_output(&repository).as_deref());
-            let located = probe.located.ok_or_else(|| probe.capability.message.unwrap_or_else(|| "The live Graphify output is absent".into()))?;
-            let parent = located.graph_path.parent().ok_or("graph.json has no folder")?;
-            let (mut file, _) = fsio::open_components(parent, &["graph.json".to_string()])?;
-            let before = file.metadata().map_err(|e| err("Cannot inspect graph.json", e))?;
-            if fingerprint(&before) != located.fingerprint {
-                return Err("graph.json changed while it was being opened".into());
-            }
-            let mut hash = Sha256::new();
-            let mut bytes = 0u64;
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let count = file.read(&mut buffer).map_err(|e| err("Cannot compare graph.json", e))?;
-                if count == 0 {
-                    break;
-                }
-                bytes += count as u64;
-                if bytes > MAX_GRAPH_BYTES {
-                    return Err("graph.json grew beyond the supported size during comparison".into());
-                }
-                hash.update(&buffer[..count]);
-            }
-            let after = file.metadata().map_err(|e| err("Cannot inspect graph.json", e))?;
-            if bytes != before.len() || fingerprint(&before) != fingerprint(&after) {
-                return Err("graph.json changed during comparison".into());
-            }
-            Ok(fsio::hex(hash.finalize()) == loaded.meta.artifact_hash
-                && located.claimed_root == loaded.meta.source_root
-                && (located.provenance == Provenance::Verified) == (loaded.meta.provenance == "verified"))
-        })();
-        Ok(match inspect {
+        Ok(match self.compare_live_graphify(&loaded, artifact_id) {
             Ok(true) => result(true, None),
             Ok(false) => result(false, Some("New Graphify output available — Refresh. This immutable snapshot remains readable.".into())),
             Err(message) => result(false, Some(format!("Live Graphify output cannot be compared: {message}. This immutable snapshot remains readable."))),
@@ -1264,148 +1336,177 @@ impl KnowledgeService {
     /// Exact search, neighbourhoods and lookups over a snapshot. Strict query union; nothing is guessed or merged.
     pub fn query_graphify_graph(&self, artifact_id: &str, query: &GraphifyQuery) -> Result<GraphifyQueryPage> {
         let loaded = self.loaded_graphify(artifact_id)?;
-        let dir = &loaded.dir;
-        let page = |kind: &'static str, total: u64, offset: usize, items: Vec<Value>| -> Result<GraphifyQueryPage> {
-            let mut page = GraphifyQueryPage { artifact_id: loaded.meta.artifact_id.clone(), artifact_hash: loaded.meta.artifact_hash.clone(), kind, total, offset: offset as u64, items: Vec::new(), next_offset: Some(u64::MAX) };
-            page.items = within_budget(items, encoded_len(&page)?)?;
-            let end = (offset as u64).min(total) + page.items.len() as u64;
-            page.next_offset = (end < total).then_some(end);
-            Ok(page)
-        };
-        // Pages an ordered list of record ordinals of one section.
-        let page_of = |kind: &'static str, section: &str, ordinals: &[u64], offset: usize, limit: usize| -> Result<GraphifyQueryPage> {
-            let total = ordinals.len();
-            let start = offset.min(total);
-            let end = (start + limit).min(total);
-            page(kind, total as u64, offset, read_records(dir, section, &ordinals[start..end])?)
-        };
         match query {
             GraphifyQuery::Node { id } => {
                 let ordinal = loaded.node_ordinal(id)?;
-                page("node", 1, 0, read_records(dir, "nodes", &[ordinal])?)
+                query_page(&loaded, "node", 1, 0, read_records(&loaded.dir, "nodes", &[ordinal])?)
             }
-            GraphifyQuery::Search { text, offset, limit } => {
-                window(*offset, *limit)?;
-                let needle = text.trim();
-                if needle.is_empty() {
-                    return Err("Search text is required".into());
-                }
-                let lowered = needle.to_lowercase();
-                let mut hits: Vec<(u8, u8, u64)> = Vec::new();
-                for (ordinal, line) in lines(&dir.join("nodes.jsonl"))?.enumerate() {
-                    let value: Value = serde_json::from_str(&line.map_err(|e| err("Cannot read Graphify snapshot", e))?).map_err(|e| err("Corrupt Graphify snapshot", e))?;
-                    let reference = value.get("ref").cloned().unwrap_or(Value::Null);
-                    let (id, label, file) = (str_of(&reference, "id"), str_of(&value, "label"), str_of(&value, "sourceFile"));
-                    let community = value.get("attributes").map(|a| str_of(a, "community_name")).unwrap_or("");
-                    if let Some(found) = rank(&[id, label], &[id, label, file, community], needle, &lowered) {
-                        hits.push((found, 0, ordinal as u64));
-                    }
-                }
-                for (ordinal, line) in lines(&dir.join("hyperedges.jsonl"))?.enumerate() {
-                    let value: Value = serde_json::from_str(&line.map_err(|e| err("Cannot read Graphify snapshot", e))?).map_err(|e| err("Corrupt Graphify snapshot", e))?;
-                    let (id, label) = (str_of(&value, "id"), str_of(&value, "label"));
-                    if let Some(found) = rank(&[id, label], &[id, label], needle, &lowered) {
-                        hits.push((found, 1, ordinal as u64));
-                    }
-                }
-                for (ordinal, line) in lines(&dir.join("links.jsonl"))?.enumerate() {
-                    let value: Value = serde_json::from_str(&line.map_err(|e| err("Cannot read Graphify snapshot", e))?).map_err(|e| err("Corrupt Graphify snapshot", e))?;
-                    let (id, relation, file) = (str_of(&value, "id"), str_of(&value, "relation"), str_of(&value, "sourceFile"));
-                    if let Some(found) = rank(&[id], &[id, relation, file], needle, &lowered) {
-                        hits.push((found + 3, 2, ordinal as u64));
-                    }
-                }
-                hits.sort();
-                let total = hits.len();
-                let start = (*offset).min(total);
-                let end = (start + *limit).min(total);
-                let mut items = Vec::new();
-                for (_, kind, ordinal) in &hits[start..end] {
-                    let section = ["nodes", "hyperedges", "links"][*kind as usize];
-                    let value = read_records(dir, section, &[*ordinal])?.pop().ok_or("Graphify search record is missing")?;
-                    items.push(match *kind {
-                        0 => json!({ "kind": "node", "node": value }),
-                        1 => json!({ "kind": "hyperedge", "hyperedge": value }),
-                        _ => json!({ "kind": "link", "link": value }),
-                    });
-                }
-                page("search", total as u64, *offset, items)
-            }
-            GraphifyQuery::Neighbors { id, direction, offset, limit } => {
-                window(*offset, *limit)?;
-                let node = loaded.node_ordinal(id)?;
-                let mut matches: Vec<(u64, u64, u64)> = Vec::new();
-                let mut ends = BufReader::new(File::open(dir.join("links.ends")).map_err(|e| err("Cannot read Graphify snapshot", e))?);
-                let mut record = [0u8; 24];
-                let mut ordinal = 0u64;
-                loop {
-                    match ends.read_exact(&mut record) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) => return Err(err("Cannot read Graphify snapshot", e)),
-                    }
-                    let word = |i: usize| u64::from_le_bytes(record[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
-                    let (source, target, flags) = (word(0), word(1), word(2));
-                    let directed = flags & 1 == 1;
-                    let wanted = match direction {
-                        GraphifyDirection::Both => source == node || target == node,
-                        GraphifyDirection::Out => source == node || (!directed && target == node),
-                        GraphifyDirection::In => target == node || (!directed && source == node),
-                    };
-                    if wanted {
-                        matches.push((ordinal, source, target));
-                    }
-                    ordinal += 1;
-                }
-                let total = matches.len();
-                let start = (*offset).min(total);
-                let end = (start + *limit).min(total);
-                let chosen = &matches[start..end];
-                let mut links = read_records(dir, "links", &chosen.iter().map(|m| m.0).collect::<Vec<_>>())?;
-                let mut wanted_nodes: Vec<u64> = chosen.iter().flat_map(|m| [m.1, m.2]).filter(|n| *n != NO_NODE).collect();
-                wanted_nodes.sort_unstable();
-                wanted_nodes.dedup();
-                let nodes: HashMap<u64, Value> = wanted_nodes.iter().copied().zip(read_records(dir, "nodes", &wanted_nodes)?).collect();
-                for (link, (_, source, target)) in links.iter_mut().zip(chosen) {
-                    if let Value::Object(object) = link {
-                        object.insert("sourceNode".into(), nodes.get(source).cloned().unwrap_or(Value::Null));
-                        object.insert("targetNode".into(), nodes.get(target).cloned().unwrap_or(Value::Null));
-                    }
-                }
-                page("neighbors", total as u64, *offset, links)
-            }
-            GraphifyQuery::CommunityMembers { community, offset, limit } => {
-                window(*offset, *limit)?;
-                #[derive(Deserialize)]
-                struct Line {
-                    community: Option<i64>,
-                }
-                let mut members = Vec::new();
-                for (ordinal, line) in lines(&dir.join("nodes.jsonl"))?.enumerate() {
-                    let parsed: Line = serde_json::from_str(&line.map_err(|e| err("Cannot read Graphify snapshot", e))?).map_err(|e| err("Corrupt Graphify snapshot", e))?;
-                    if parsed.community == Some(*community) {
-                        members.push(ordinal as u64);
-                    }
-                }
-                page_of("communityMembers", "nodes", &members, *offset, *limit)
-            }
-            GraphifyQuery::HyperedgesOf { id, offset, limit } => {
-                window(*offset, *limit)?;
-                loaded.node_ordinal(id)?;
-                #[derive(Deserialize)]
-                struct Line {
-                    #[serde(rename = "nodeIds")]
-                    node_ids: Vec<GraphifyRef>,
-                }
-                let mut found = Vec::new();
-                for (ordinal, line) in lines(&dir.join("hyperedges.jsonl"))?.enumerate() {
-                    let parsed: Line = serde_json::from_str(&line.map_err(|e| err("Cannot read Graphify snapshot", e))?).map_err(|e| err("Corrupt Graphify snapshot", e))?;
-                    if parsed.node_ids.contains(id) {
-                        found.push(ordinal as u64);
-                    }
-                }
-                page_of("hyperedgesOf", "hyperedges", &found, *offset, *limit)
-            }
+            GraphifyQuery::Search { text, offset, limit } => query_search(&loaded, text, *offset, *limit),
+            GraphifyQuery::Neighbors { id, direction, offset, limit } => query_neighbors(&loaded, id, direction, *offset, *limit),
+            GraphifyQuery::CommunityMembers { community, offset, limit } => query_community_members(&loaded, *community, *offset, *limit),
+            GraphifyQuery::HyperedgesOf { id, offset, limit } => query_hyperedges_of(&loaded, id, *offset, *limit),
         }
     }
+}
+
+fn query_page(loaded: &Loaded, kind: &'static str, total: u64, offset: usize, items: Vec<Value>) -> Result<GraphifyQueryPage> {
+    let mut page = GraphifyQueryPage { artifact_id: loaded.meta.artifact_id.clone(), artifact_hash: loaded.meta.artifact_hash.clone(), kind, total, offset: offset as u64, items: Vec::new(), next_offset: Some(u64::MAX) };
+    page.items = within_budget(items, encoded_len(&page)?)?;
+    let end = (offset as u64).min(total) + page.items.len() as u64;
+    page.next_offset = (end < total).then_some(end);
+    Ok(page)
+}
+
+/// Pages an ordered list of record ordinals of one section.
+fn query_page_of(loaded: &Loaded, kind: &'static str, section: &str, ordinals: &[u64], offset: usize, limit: usize) -> Result<GraphifyQueryPage> {
+    let total = ordinals.len();
+    let start = offset.min(total);
+    let end = (start + limit).min(total);
+    query_page(loaded, kind, total as u64, offset, read_records(&loaded.dir, section, &ordinals[start..end])?)
+}
+
+fn parse_line<T: serde::de::DeserializeOwned>(line: std::io::Result<String>) -> Result<T> {
+    serde_json::from_str(&line.map_err(|e| err("Cannot read Graphify snapshot", e))?).map_err(|e| err("Corrupt Graphify snapshot", e))
+}
+
+/// Ordinals of the records of one `.jsonl` file whose parsed line satisfies `keep`.
+fn matching_ordinals<T: serde::de::DeserializeOwned>(path: &Path, keep: impl Fn(&T) -> bool) -> Result<Vec<u64>> {
+    let mut found = Vec::new();
+    for (ordinal, line) in lines(path)?.enumerate() {
+        if keep(&parse_line::<T>(line)?) {
+            found.push(ordinal as u64);
+        }
+    }
+    Ok(found)
+}
+
+fn scan_hits(path: &Path, kind: u8, hits: &mut Vec<(u8, u8, u64)>, rank_of: impl Fn(&Value) -> Option<u8>) -> Result<()> {
+    for (ordinal, line) in lines(path)?.enumerate() {
+        if let Some(found) = rank_of(&parse_line::<Value>(line)?) {
+            hits.push((found, kind, ordinal as u64));
+        }
+    }
+    Ok(())
+}
+
+fn search_items(dir: &Path, chosen: &[(u8, u8, u64)]) -> Result<Vec<Value>> {
+    let mut items = Vec::new();
+    for (_, kind, ordinal) in chosen {
+        let section = ["nodes", "hyperedges", "links"][*kind as usize];
+        let value = read_records(dir, section, &[*ordinal])?.pop().ok_or("Graphify search record is missing")?;
+        items.push(match *kind {
+            0 => json!({ "kind": "node", "node": value }),
+            1 => json!({ "kind": "hyperedge", "hyperedge": value }),
+            _ => json!({ "kind": "link", "link": value }),
+        });
+    }
+    Ok(items)
+}
+
+fn query_search(loaded: &Loaded, text: &str, offset: usize, limit: usize) -> Result<GraphifyQueryPage> {
+    window(offset, limit)?;
+    let needle = text.trim();
+    if needle.is_empty() {
+        return Err("Search text is required".into());
+    }
+    let dir = &loaded.dir;
+    let lowered = needle.to_lowercase();
+    let mut hits: Vec<(u8, u8, u64)> = Vec::new();
+    scan_hits(&dir.join("nodes.jsonl"), 0, &mut hits, |value| {
+        let id = value.get("ref").map_or("", |reference| str_of(reference, "id"));
+        let (label, file) = (str_of(value, "label"), str_of(value, "sourceFile"));
+        let community = value.get("attributes").map(|a| str_of(a, "community_name")).unwrap_or("");
+        rank(&[id, label], &[id, label, file, community], needle, &lowered)
+    })?;
+    scan_hits(&dir.join("hyperedges.jsonl"), 1, &mut hits, |value| {
+        let (id, label) = (str_of(value, "id"), str_of(value, "label"));
+        rank(&[id, label], &[id, label], needle, &lowered)
+    })?;
+    scan_hits(&dir.join("links.jsonl"), 2, &mut hits, |value| {
+        let (id, relation, file) = (str_of(value, "id"), str_of(value, "relation"), str_of(value, "sourceFile"));
+        rank(&[id], &[id, relation, file], needle, &lowered).map(|found| found + 3)
+    })?;
+    hits.sort();
+    let total = hits.len();
+    let start = offset.min(total);
+    let end = (start + limit).min(total);
+    query_page(loaded, "search", total as u64, offset, search_items(dir, &hits[start..end])?)
+}
+
+fn link_wanted(direction: &GraphifyDirection, node: u64, source: u64, target: u64, directed: bool) -> bool {
+    match direction {
+        GraphifyDirection::Both => source == node || target == node,
+        GraphifyDirection::Out => source == node || (!directed && target == node),
+        GraphifyDirection::In => target == node || (!directed && source == node),
+    }
+}
+
+/// `(link ordinal, source node, target node)` of every link touching `node` in `direction`.
+fn neighbor_matches(dir: &Path, node: u64, direction: &GraphifyDirection) -> Result<Vec<(u64, u64, u64)>> {
+    let mut matches: Vec<(u64, u64, u64)> = Vec::new();
+    let mut ends = BufReader::new(File::open(dir.join("links.ends")).map_err(|e| err("Cannot read Graphify snapshot", e))?);
+    let mut record = [0u8; 24];
+    let mut ordinal = 0u64;
+    loop {
+        match ends.read_exact(&mut record) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(err("Cannot read Graphify snapshot", e)),
+        }
+        let word = |i: usize| u64::from_le_bytes(record[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+        let (source, target, flags) = (word(0), word(1), word(2));
+        if link_wanted(direction, node, source, target, flags & 1 == 1) {
+            matches.push((ordinal, source, target));
+        }
+        ordinal += 1;
+    }
+    Ok(matches)
+}
+
+/// The link records of `chosen`, each carrying its hydrated `sourceNode` and `targetNode`.
+fn hydrate_neighbors(dir: &Path, chosen: &[(u64, u64, u64)]) -> Result<Vec<Value>> {
+    let mut links = read_records(dir, "links", &chosen.iter().map(|m| m.0).collect::<Vec<_>>())?;
+    let mut wanted_nodes: Vec<u64> = chosen.iter().flat_map(|m| [m.1, m.2]).filter(|n| *n != NO_NODE).collect();
+    wanted_nodes.sort_unstable();
+    wanted_nodes.dedup();
+    let nodes: HashMap<u64, Value> = wanted_nodes.iter().copied().zip(read_records(dir, "nodes", &wanted_nodes)?).collect();
+    for (link, (_, source, target)) in links.iter_mut().zip(chosen) {
+        if let Value::Object(object) = link {
+            object.insert("sourceNode".into(), nodes.get(source).cloned().unwrap_or(Value::Null));
+            object.insert("targetNode".into(), nodes.get(target).cloned().unwrap_or(Value::Null));
+        }
+    }
+    Ok(links)
+}
+
+fn query_neighbors(loaded: &Loaded, id: &GraphifyRef, direction: &GraphifyDirection, offset: usize, limit: usize) -> Result<GraphifyQueryPage> {
+    window(offset, limit)?;
+    let node = loaded.node_ordinal(id)?;
+    let matches = neighbor_matches(&loaded.dir, node, direction)?;
+    let total = matches.len();
+    let start = offset.min(total);
+    let end = (start + limit).min(total);
+    query_page(loaded, "neighbors", total as u64, offset, hydrate_neighbors(&loaded.dir, &matches[start..end])?)
+}
+
+fn query_community_members(loaded: &Loaded, community: i64, offset: usize, limit: usize) -> Result<GraphifyQueryPage> {
+    window(offset, limit)?;
+    #[derive(Deserialize)]
+    struct Line {
+        community: Option<i64>,
+    }
+    let members = matching_ordinals::<Line>(&loaded.dir.join("nodes.jsonl"), |line| line.community == Some(community))?;
+    query_page_of(loaded, "communityMembers", "nodes", &members, offset, limit)
+}
+
+fn query_hyperedges_of(loaded: &Loaded, id: &GraphifyRef, offset: usize, limit: usize) -> Result<GraphifyQueryPage> {
+    window(offset, limit)?;
+    loaded.node_ordinal(id)?;
+    #[derive(Deserialize)]
+    struct Line {
+        #[serde(rename = "nodeIds")]
+        node_ids: Vec<GraphifyRef>,
+    }
+    let found = matching_ordinals::<Line>(&loaded.dir.join("hyperedges.jsonl"), |line| line.node_ids.contains(id))?;
+    query_page_of(loaded, "hyperedgesOf", "hyperedges", &found, offset, limit)
 }

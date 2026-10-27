@@ -393,6 +393,46 @@ pub(crate) fn ensure_producer(registry: &Arc<Registry>) -> Result<DependencyProd
     }
 }
 
+/// Record saved public metadata on the request and return the limitations the prompt must state.
+fn apply_metadata(entry: &mut Entry, insights: &PackageInsightsService, package_id: &str, kind: DependencyJobKind) -> Vec<String> {
+    let mut metadata_limitations = Vec::new();
+    let metadata = match kind {
+        DependencyJobKind::Security => insights.lookup(package_id, GithubMode::Skip, false).map(Some),
+        DependencyJobKind::Usage => insights.cached_only(package_id),
+    };
+    match metadata {
+        Ok(Some(metadata)) => {
+            let request = Arc::make_mut(&mut entry.request);
+            request.newest_version = metadata.newest_version;
+            request.newest_status = metadata.newest_status;
+            request.registry_url = Some(metadata.registry_url);
+            request.repository_url = metadata.repository_url;
+            metadata_limitations.extend(metadata.notes);
+            if let Some(reason) = metadata.repository_reason { metadata_limitations.push(reason); }
+        }
+        Ok(None) => metadata_limitations.push("No saved public metadata for this package; verify its newest release yourself and say so if you cannot.".into()),
+        Err(error) => metadata_limitations.push(format!("Public metadata unavailable: {error}. Inspect project and upstream evidence without guessing a newest release.")),
+    }
+    metadata_limitations
+}
+
+/// The stored admission outcome of preparing and sending the one Architect prompt.
+fn launch_admission(registry: &Registry, id: &str, prepared: Result<(DependencyProducer, String)>) -> StoredAdmission {
+    let (producer, message) = match prepared {
+        Err(error) => return StoredAdmission { request_id: id.to_string(), prompt_sent: Some(false), error: Some(error) },
+        Ok(prepared) => prepared,
+    };
+    // prompt_human_generation uses one lease for the check and control frame, preventing replacement-generation delivery.
+    let outcome = match registry.manager_hub() {
+        Some(hub) => hub.prompt_human_generation(&producer.instance_id, producer.generation, &message),
+        None => Err("manager bridge not initialized".into()),
+    };
+    match outcome {
+        Ok(_) => StoredAdmission { request_id: id.to_string(), prompt_sent: Some(true), error: None },
+        Err(error) => StoredAdmission { request_id: id.to_string(), prompt_sent: None, error: Some(format!("Prompt admission outcome unknown: {error}. {UNKNOWN_ADMISSION}")) },
+    }
+}
+
 impl DependencySecurityService {
     pub fn new(root: PathBuf) -> Self {
         let service = Self {
@@ -450,52 +490,8 @@ impl DependencySecurityService {
         let (mut entry, claimed) = self.claim(key, request, rerun);
         if !claimed { return self.admission(registry, &entry.request.request_id, false); }
         let id = entry.request.request_id.clone();
-        let prepared = (|| -> Result<(DependencyProducer, String)> {
-            let mut metadata_limitations = Vec::new();
-            let metadata = match kind {
-                DependencyJobKind::Security => insights.lookup(package_id, GithubMode::Skip, false).map(Some),
-                DependencyJobKind::Usage => insights.cached_only(package_id),
-            };
-            match metadata {
-                Ok(Some(metadata)) => {
-                    let request = Arc::make_mut(&mut entry.request);
-                    request.newest_version = metadata.newest_version;
-                    request.newest_status = metadata.newest_status;
-                    request.registry_url = Some(metadata.registry_url);
-                    request.repository_url = metadata.repository_url;
-                    metadata_limitations.extend(metadata.notes);
-                    if let Some(reason) = metadata.repository_reason { metadata_limitations.push(reason); }
-                }
-                Ok(None) => metadata_limitations.push("No saved public metadata for this package; verify its newest release yourself and say so if you cannot.".into()),
-                Err(error) => metadata_limitations.push(format!("Public metadata unavailable: {error}. Inspect project and upstream evidence without guessing a newest release.")),
-            }
-            let producer = ensure_producer(registry)?;
-            Arc::make_mut(&mut entry.request).bind(&producer);
-            validate_request(&entry.request, &id)?;
-            self.save_request(&entry.request)?;
-            self.index.lock().admitted.insert(id.clone(), entry.clone());
-            let block = dependency_context::prompt_block(&summary);
-            let message = match kind {
-                DependencyJobKind::Security => review_prompt(&entry.request, &block, &metadata_limitations),
-                DependencyJobKind::Usage => usage_prompt(&entry.request, &block, &metadata_limitations),
-            };
-            Ok((producer, message))
-        })();
-        let admission = match prepared {
-            Err(error) => StoredAdmission { request_id: id.clone(), prompt_sent: Some(false), error: Some(error) },
-            Ok((producer, message)) => {
-                // prompt_human_generation uses one lease for the check and control frame, preventing replacement-generation delivery.
-                let outcome = match registry.manager_hub() {
-                    Some(hub) => hub.prompt_human_generation(&producer.instance_id, producer.generation, &message),
-                    None => Err("manager bridge not initialized".into()),
-                };
-                match outcome {
-                    Ok(_) => StoredAdmission { request_id: id.clone(), prompt_sent: Some(true), error: None },
-                    Err(error) => StoredAdmission { request_id: id.clone(), prompt_sent: None,
-                        error: Some(format!("Prompt admission outcome unknown: {error}. {UNKNOWN_ADMISSION}")) },
-                }
-            }
-        };
+        let prepared = self.prepare_start(registry, insights, kind, package_id, &summary, &mut entry);
+        let admission = launch_admission(registry, &id, prepared);
         // A failed launch still has a readable admitted request, and cannot trigger a resend on the next click.
         if !self.request_path(&id).exists() {
             let _ = self.save_request(&entry.request);
@@ -503,6 +499,24 @@ impl DependencySecurityService {
         }
         self.record_admission(&id, admission);
         self.admission(registry, &id, true)
+    }
+
+    /// Bind the claimed request to the Architect, persist it and build the prompt.
+    fn prepare_start(&self, registry: &Arc<Registry>, insights: &PackageInsightsService, kind: DependencyJobKind, package_id: &str,
+        summary: &dependency_context::DependencyContextSummary, entry: &mut Entry) -> Result<(DependencyProducer, String)> {
+        let id = entry.request.request_id.clone();
+        let metadata_limitations = apply_metadata(entry, insights, package_id, kind);
+        let producer = ensure_producer(registry)?;
+        Arc::make_mut(&mut entry.request).bind(&producer);
+        validate_request(&entry.request, &id)?;
+        self.save_request(&entry.request)?;
+        self.index.lock().admitted.insert(id, entry.clone());
+        let block = dependency_context::prompt_block(summary);
+        let message = match kind {
+            DependencyJobKind::Security => review_prompt(&entry.request, &block, &metadata_limitations),
+            DependencyJobKind::Usage => usage_prompt(&entry.request, &block, &metadata_limitations),
+        };
+        Ok((producer, message))
     }
 
     /// Reuse the latest request for a project-review child, or persist a new bound one. No metadata, prompt or privacy
@@ -616,39 +630,12 @@ impl DependencySecurityService {
         let mut job = JobRead { request: request.clone(), admission: entry.admission.clone(), status: SecurityReviewStatus::Pending,
             error: entry.admission.error.clone(), result: None };
         match self.load_result(&request) {
-            Ok(Some((result, hash))) => {
-                if marker.as_ref().is_some_and(|marker| marker.status == TerminalStatus::Complete && marker.result_hash.as_deref() != Some(hash.as_str())) {
-                    job.status = SecurityReviewStatus::Error;
-                    job.error = Some(format!("The saved {kind} result no longer matches its completion marker."));
-                } else {
-                    if !marker.as_ref().is_some_and(|marker| marker.status == TerminalStatus::Complete) {
-                        // A crash between publication and the marker is recovered from the validated result.
-                        let _ = self.write_terminal(request_id, &Terminal { status: TerminalStatus::Complete, code: None, message: None, result_hash: Some(hash), at: now_ms() });
-                    }
-                    job.status = SecurityReviewStatus::Complete;
-                    job.error = None;
-                    job.result = Some(result);
-                }
-            }
+            Ok(Some((result, hash))) => self.apply_saved_result(request_id, kind, marker.as_ref(), result, hash, &mut job),
             Err(error) => {
                 job.status = SecurityReviewStatus::Error;
                 job.error = Some(format!("Invalid Architect {kind} result: {error}"));
             }
-            Ok(None) => {
-                if marker.as_ref().is_some_and(|marker| marker.status == TerminalStatus::Complete) {
-                    job.status = SecurityReviewStatus::Error;
-                    job.error = Some(format!("The completed {kind} result file is missing."));
-                } else if let Some(marker) = marker.filter(|marker| marker.status == TerminalStatus::Error) {
-                    job.status = SecurityReviewStatus::Error;
-                    job.error = Some(marker.message.unwrap_or_else(|| "The request ended without a result.".into()));
-                } else if entry.admission.prompt_sent == Some(false) {
-                    job.status = SecurityReviewStatus::Error;
-                } else if let Some(message) = self.ended_producer(registry, &request) {
-                    let _ = self.write_terminal(request_id, &Terminal { status: TerminalStatus::Error, code: Some(PRODUCER_ENDED.into()), message: Some(message.clone()), result_hash: None, at: now_ms() });
-                    job.status = SecurityReviewStatus::Error;
-                    job.error = Some(message);
-                }
-            }
+            Ok(None) => self.apply_missing_result(registry, kind, marker, &entry, &mut job),
         }
         if job.status != SecurityReviewStatus::Pending {
             let key = request_key(&request);
@@ -656,6 +643,41 @@ impl DependencySecurityService {
             if index.active.get(&key).is_some_and(|id| id == request_id) { index.active.remove(&key); }
         }
         Ok(job)
+    }
+
+    /// Validate a saved result against its completion marker, recovering a missing marker.
+    fn apply_saved_result(&self, request_id: &str, kind: &str, marker: Option<&Terminal>, result: JobResult, hash: String, job: &mut JobRead) {
+        let complete = marker.is_some_and(|marker| marker.status == TerminalStatus::Complete);
+        if complete && marker.is_some_and(|marker| marker.result_hash.as_deref() != Some(hash.as_str())) {
+            job.status = SecurityReviewStatus::Error;
+            job.error = Some(format!("The saved {kind} result no longer matches its completion marker."));
+            return;
+        }
+        if !complete {
+            // A crash between publication and the marker is recovered from the validated result.
+            let _ = self.write_terminal(request_id, &Terminal { status: TerminalStatus::Complete, code: None, message: None, result_hash: Some(hash), at: now_ms() });
+        }
+        job.status = SecurityReviewStatus::Complete;
+        job.error = None;
+        job.result = Some(result);
+    }
+
+    /// Decide the status of a request that has no result file from its marker, admission and Architect liveness.
+    fn apply_missing_result(&self, registry: &Registry, kind: &str, marker: Option<Terminal>, entry: &Entry, job: &mut JobRead) {
+        let request_id = &entry.request.request_id;
+        if marker.as_ref().is_some_and(|marker| marker.status == TerminalStatus::Complete) {
+            job.status = SecurityReviewStatus::Error;
+            job.error = Some(format!("The completed {kind} result file is missing."));
+        } else if let Some(marker) = marker.filter(|marker| marker.status == TerminalStatus::Error) {
+            job.status = SecurityReviewStatus::Error;
+            job.error = Some(marker.message.unwrap_or_else(|| "The request ended without a result.".into()));
+        } else if entry.admission.prompt_sent == Some(false) {
+            job.status = SecurityReviewStatus::Error;
+        } else if let Some(message) = self.ended_producer(registry, &entry.request) {
+            let _ = self.write_terminal(request_id, &Terminal { status: TerminalStatus::Error, code: Some(PRODUCER_ENDED.into()), message: Some(message.clone()), result_hash: None, at: now_ms() });
+            job.status = SecurityReviewStatus::Error;
+            job.error = Some(message);
+        }
     }
 
     /// `Some(message)` once the Architect launch/session that was asked for the result no longer exists.

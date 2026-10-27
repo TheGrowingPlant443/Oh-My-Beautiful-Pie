@@ -2,6 +2,7 @@
 //! destination rules that keep vaults away from credentials, application data and each other.
 use super::dto::*;
 use super::fsio::{self, err, is_markdown_name, sha256_hex, shown, validate_prefix, validate_relative};
+use super::markdown::Scanner;
 use super::{KnowledgeService, Result, StoredVault};
 use crate::code_quality::snapshot::is_link;
 use std::collections::BTreeSet;
@@ -33,6 +34,13 @@ struct Destination {
     root: PathBuf,
     exists: bool,
     identity: Option<String>,
+}
+
+struct VaultEntryRow {
+    name: String,
+    kind: VaultEntryKind,
+    bytes: u64,
+    mtime: u128,
 }
 
 /// A validated vault capability. It carries the binding revision and root identity it was issued for; every
@@ -155,6 +163,81 @@ fn count_markdown(root: &Path, depth: usize) -> u64 {
     count
 }
 
+fn resolve_destination_root(requested: &Path) -> Result<(PathBuf, bool)> {
+    let mut missing = Vec::new();
+    let mut cursor = requested;
+    let existing_meta = loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(meta) => break meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let name = cursor.file_name().ok_or("The vault folder has no usable name")?;
+                missing.push(name);
+                cursor = cursor.parent().ok_or("The vault folder has no parent")?;
+            }
+            Err(e) => return Err(err("Cannot inspect the vault folder", e)),
+        }
+    };
+    let exists = missing.is_empty();
+    if (exists && is_link(&existing_meta)) || existing_meta.file_type().is_symlink() {
+        return Err("A vault cannot be (or sit inside) a link, junction or reparse point".into());
+    }
+    if !existing_meta.is_dir() {
+        return Err(format!("{} is not a folder", cursor.display()));
+    }
+    let mut root = crate::setup::canonical(cursor).map_err(|e| err("Cannot resolve the vault folder", e))?;
+    if !fsio::same_path(&root, cursor) {
+        return Err("The vault folder resolves through a link or alias; choose its real location".into());
+    }
+    for name in missing.iter().rev() {
+        let name = name.to_str().ok_or("Vault folder names must be Unicode")?;
+        validate_relative(name).map_err(|_| format!("Unsafe vault folder name: {}", shown(name)))?;
+        root.push(name);
+    }
+    Ok((root, exists))
+}
+
+fn vault_entry_row(entry: fs::DirEntry) -> Option<VaultEntryRow> {
+    let name = entry.file_name().into_string().ok()?;
+    if name.starts_with('.') || validate_relative(&name).is_err() {
+        return None;
+    }
+    let meta = fs::symlink_metadata(entry.path()).ok()?;
+    if is_link(&meta) {
+        return None;
+    }
+    let kind = if meta.is_dir() {
+        VaultEntryKind::Folder
+    } else if meta.is_file() && is_markdown_name(&name) {
+        VaultEntryKind::Markdown
+    } else if meta.is_file() {
+        VaultEntryKind::Other
+    } else {
+        return None;
+    };
+    Some(VaultEntryRow { name, kind, bytes: meta.len(), mtime: fsio::mtime_nanos(&meta) })
+}
+
+fn scan_before_offset(reader: &mut fsio::HashedReader, offset: u64) -> Result<(Scanner, bool)> {
+    let mut scanner = Scanner::default();
+    let mut sink = Vec::new();
+    let mut line = Vec::new();
+    let mut first = true;
+    while let Some(read) = reader.next_line(&mut line, 8 * 1024 * 1024).map_err(|e| err("Cannot read note", e))? {
+        if reader.position() > offset {
+            return Ok((scanner, read.start < offset));
+        }
+        let at_start = first;
+        first = false;
+        if !read.too_long {
+            if let Ok(text) = std::str::from_utf8(fsio::trim_line(&line, at_start)) {
+                sink.clear();
+                scanner.feed(text, &mut sink);
+            }
+        }
+    }
+    Ok((Scanner::default(), false))
+}
+
 fn protected_equal_or_ancestor(path: &Path, protected: &Path) -> bool {
     fsio::same_or_inside(path, protected)
 }
@@ -199,66 +282,39 @@ impl KnowledgeService {
         if requested.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
             return Err("The vault folder may not contain '.' or '..' segments".into());
         }
-        let mut missing: Vec<std::ffi::OsString> = Vec::new();
-        let mut cursor = requested.to_path_buf();
-        let existing_meta = loop {
-            match fs::symlink_metadata(&cursor) {
-                Ok(meta) => break meta,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let name = cursor.file_name().ok_or("The vault folder has no usable name")?.to_os_string();
-                    missing.push(name);
-                    cursor = cursor.parent().ok_or("The vault folder has no parent")?.to_path_buf();
-                }
-                Err(e) => return Err(err("Cannot inspect the vault folder", e)),
-            }
-        };
-        let is_target = missing.is_empty();
-        if (is_target && is_link(&existing_meta)) || existing_meta.file_type().is_symlink() {
-            return Err("A vault cannot be (or sit inside) a link, junction or reparse point".into());
-        }
-        if !existing_meta.is_dir() {
-            return Err(format!("{} is not a folder", cursor.display()));
-        }
-        let canonical = crate::setup::canonical(&cursor).map_err(|e| err("Cannot resolve the vault folder", e))?;
-        if !fsio::same_path(&canonical, &cursor) {
-            return Err("The vault folder resolves through a link or alias; choose its real location".into());
-        }
-        let mut root = canonical;
-        for name in missing.iter().rev() {
-            let name = name.to_str().ok_or("Vault folder names must be Unicode")?;
-            validate_relative(name).map_err(|_| format!("Unsafe vault folder name: {}", shown(name)))?;
-            root.push(name);
-        }
+        let (root, exists) = resolve_destination_root(requested)?;
         if root.parent().is_none() {
             return Err("A drive or filesystem root cannot be a vault".into());
         }
+        self.validate_destination_roots(&root, repository)?;
+        for component in root.components() {
+            let Component::Normal(part) = component else { continue };
+            let Some(part) = part.to_str() else { continue };
+            if DENIED_COMPONENTS.iter().any(|denied| part.eq_ignore_ascii_case(denied)) {
+                return Err(format!("A vault cannot be inside a {part} folder"));
+            }
+        }
+        let identity = if exists { fsio::dir_identity(&root) } else { None };
+        Ok(Destination { root, exists, identity })
+    }
+
+    fn validate_destination_roots(&self, root: &Path, repository: Option<&Path>) -> Result<()> {
         for broad in self.broad_roots() {
-            if fsio::same_or_inside(&root, &broad) {
+            if fsio::same_or_inside(root, &broad) {
                 return Err(format!("A vault cannot be, or contain, {}", broad.display()));
             }
         }
         if let Some(repository) = repository {
-            if fsio::same_or_inside(&root, repository) {
+            if fsio::same_or_inside(root, repository) {
                 return Err("A project vault cannot be the repository root or a folder containing it; use a subfolder such as Knowledge".into());
             }
         }
         for protected in self.protected_roots() {
-            if protected_equal_or_ancestor(&root, &protected) || fsio::same_or_inside(&protected, &root) {
+            if protected_equal_or_ancestor(root, &protected) || fsio::same_or_inside(&protected, root) {
                 return Err(format!("A vault cannot overlap application, agent or credential data: {}", protected.display()));
             }
         }
-        for component in root.components() {
-            if let Component::Normal(part) = component {
-                if let Some(part) = part.to_str() {
-                    if DENIED_COMPONENTS.iter().any(|denied| part.eq_ignore_ascii_case(denied)) {
-                        return Err(format!("A vault cannot be inside a {part} folder"));
-                    }
-                }
-            }
-        }
-        let exists = missing.is_empty();
-        let identity = if exists { fsio::dir_identity(&root) } else { None };
-        Ok(Destination { root, exists, identity })
+        Ok(())
     }
 
     fn binding_conflicts(vaults: &[StoredVault], root: &Path, scope: &KnowledgeScope) -> Vec<String> {
@@ -293,16 +349,9 @@ impl KnowledgeService {
         conflicts
     }
 
-    /// Previews a vault destination without changing anything. The token is consumed by [`Self::confirm_knowledge_vault`].
-    pub fn prepare_knowledge_vault(&self, scope: ScopeRequest, folder: Option<&str>, destination: &str, mode: VaultMode) -> Result<VaultPreparation> {
-        if mode == VaultMode::Obsidian {
-            let obsidian = self.probe_obsidian();
-            if obsidian.state != ObsidianState::Installed {
-                return Err("Obsidian is not installed; choose Markdown mode or install Obsidian first".into());
-            }
-        }
-        let (scope, repository) = match scope {
-            ScopeRequest::Global => (KnowledgeScope::Global, None),
+    fn vault_scope(&self, scope: ScopeRequest, folder: Option<&str>) -> Result<(KnowledgeScope, Option<PathBuf>)> {
+        match scope {
+            ScopeRequest::Global => Ok((KnowledgeScope::Global, None)),
             ScopeRequest::Project { repository_root } => {
                 let repository = self.repository_root(folder.ok_or("A project vault needs a project folder")?)?;
                 if let Some(sent) = repository_root.as_deref().filter(|s| !s.is_empty()) {
@@ -311,9 +360,17 @@ impl KnowledgeService {
                     }
                 }
                 let scope = KnowledgeScope::Project { repository_root: repository.to_string_lossy().into_owned() };
-                (scope, Some(repository))
+                Ok((scope, Some(repository)))
             }
-        };
+        }
+    }
+
+    /// Previews a vault destination without changing anything. The token is consumed by [`Self::confirm_knowledge_vault`].
+    pub fn prepare_knowledge_vault(&self, scope: ScopeRequest, folder: Option<&str>, destination: &str, mode: VaultMode) -> Result<VaultPreparation> {
+        if mode == VaultMode::Obsidian && self.probe_obsidian().state != ObsidianState::Installed {
+            return Err("Obsidian is not installed; choose Markdown mode or install Obsidian first".into());
+        }
+        let (scope, repository) = self.vault_scope(scope, folder)?;
         let requested = if destination.trim().is_empty() {
             match &repository {
                 Some(repository) => repository.join("Knowledge"),
@@ -370,12 +427,7 @@ impl KnowledgeService {
         Ok(preparation)
     }
 
-    /// Consumes a preparation token, revalidates the filesystem and registers (or re-binds) the vault.
-    pub fn confirm_knowledge_vault(&self, token: &str) -> Result<VaultBinding> {
-        let pending = {
-            let mut state = self.state.lock();
-            state.pending.remove(token).ok_or("This preparation expired or was already used; prepare the vault again")?
-        };
+    fn validate_preparation(&self, pending: &Pending) -> Result<Destination> {
         if pending.expires <= Instant::now() {
             return Err("This preparation expired; prepare the vault again".into());
         }
@@ -393,6 +445,16 @@ impl KnowledgeService {
         if !fsio::same_path(&resolved.root, &pending.root) || resolved.exists != pending.exists || resolved.identity != pending.identity {
             return Err("The destination changed since it was previewed; prepare the vault again".into());
         }
+        Ok(resolved)
+    }
+
+    /// Consumes a preparation token, revalidates the filesystem and registers (or re-binds) the vault.
+    pub fn confirm_knowledge_vault(&self, token: &str) -> Result<VaultBinding> {
+        let pending = {
+            let mut state = self.state.lock();
+            state.pending.remove(token).ok_or("This preparation expired or was already used; prepare the vault again")?
+        };
+        let resolved = self.validate_preparation(&pending)?;
         let existing = self.state.lock().vaults.iter().find(|v| scope_key(&v.scope) == scope_key(&pending.scope)).map(|v| (v.vault_id.clone(), v.binding_revision));
         let authority = existing.map(|(id, revision)| self.authority(&id, revision));
         let mut rebind = authority.as_ref().map(|a| a.write());
@@ -503,35 +565,14 @@ impl KnowledgeService {
         let (_authority, _root_pins) = vault.pin()?;
         let components = validate_prefix(prefix)?;
         let pinned = fsio::pin_descendants(&vault.root, &components, false, false)?;
-        let dir = pinned.path().to_path_buf();
+        let dir = pinned.path();
         let normalized = components.join("/");
-        struct Row {
-            name: String,
-            kind: VaultEntryKind,
-            bytes: u64,
-            mtime: u128,
-        }
         let mut rows = Vec::new();
-        for entry in fs::read_dir(&dir).map_err(|e| err("Cannot list folder", e))? {
+        for entry in fs::read_dir(dir).map_err(|e| err("Cannot list folder", e))? {
             let entry = entry.map_err(|e| err("Cannot list folder", e))?;
-            let Ok(name) = entry.file_name().into_string() else { continue };
-            if name.starts_with('.') || validate_relative(&name).is_err() {
-                continue;
+            if let Some(row) = vault_entry_row(entry) {
+                rows.push(row);
             }
-            let Ok(meta) = fs::symlink_metadata(entry.path()) else { continue };
-            if is_link(&meta) {
-                continue;
-            }
-            let kind = if meta.is_dir() {
-                VaultEntryKind::Folder
-            } else if meta.is_file() && is_markdown_name(&name) {
-                VaultEntryKind::Markdown
-            } else if meta.is_file() {
-                VaultEntryKind::Other
-            } else {
-                continue;
-            };
-            rows.push(Row { name, kind, bytes: meta.len(), mtime: fsio::mtime_nanos(&meta) });
         }
         rows.sort_by(|a, b| ((a.kind != VaultEntryKind::Folder), a.name.to_lowercase(), &a.name).cmp(&((b.kind != VaultEntryKind::Folder), b.name.to_lowercase(), &b.name)));
         let total = rows.len();
@@ -577,31 +618,9 @@ impl KnowledgeService {
         }
         let mut reader = fsio::HashedReader::new(file);
         reader.capture(offset, PAGE_BYTES + 3);
-        let mut scanner = super::markdown::Scanner::default();
-        let mut sink = Vec::new();
-        let mut line = Vec::new();
-        let (mut fence, mut frontmatter, mut line_number, mut starts_mid_line) = (None, false, 1u64, false);
-        let mut first = true;
-        while let Some(read) = reader.next_line(&mut line, 8 * 1024 * 1024).map_err(|e| err("Cannot read note", e))? {
-            let end = reader.position();
-            if end > offset {
-                fence = scanner.fence();
-                frontmatter = scanner.in_frontmatter();
-                line_number = scanner.lines_seen() + 1;
-                starts_mid_line = read.start < offset;
-                break;
-            }
-            let at_start = first;
-            first = false;
-            if !read.too_long {
-                if let Ok(text) = std::str::from_utf8(fsio::trim_line(&line, at_start)) {
-                    sink.clear();
-                    scanner.feed(text, &mut sink);
-                }
-            }
-        }
+        let (scanner, starts_mid_line) = scan_before_offset(&mut reader, offset)?;
         let (mut digest, file) = reader.finish().map_err(|e| err("Cannot read note", e))?;
-        let buffer = std::mem::take(&mut digest.captured);
+        let mut buffer = std::mem::take(&mut digest.captured);
         if !digest.utf8_ok {
             return Err("The note is not valid UTF-8 and cannot be shown".into());
         }
@@ -620,7 +639,8 @@ impl KnowledgeService {
         while end > 0 && end < buffer.len() && (buffer[end] & 0xC0) == 0x80 {
             end -= 1;
         }
-        let text = String::from_utf8(buffer[..end].to_vec()).map_err(|_| "The note is not valid UTF-8".to_string())?;
+        buffer.truncate(end);
+        let text = String::from_utf8(buffer).map_err(|_| "The note is not valid UTF-8".to_string())?;
         let next = offset + end as u64;
         Ok(VaultDocumentPage {
             vault_id: vault.vault_id.clone(),
@@ -633,9 +653,9 @@ impl KnowledgeService {
             next_offset: (next < length).then_some(next),
             text,
             starts_mid_line,
-            fence,
-            frontmatter,
-            line_number,
+            fence: scanner.fence(),
+            frontmatter: scanner.in_frontmatter(),
+            line_number: scanner.lines_seen() + 1,
         })
     }
 }

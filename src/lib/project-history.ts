@@ -27,8 +27,8 @@ export function isRememberable(folder: string, computed: readonly string[], live
 }
 /** Folders to record when a coordinator's working directory moved: bootstrap temporary and computed shared folders are skipped. */
 export function coordinatorMoveFolders(previous: string, next: string, temporary: readonly string[], computed: readonly string[], live: readonly string[]): string[] {
-  const temporaryKeys = temporary.map(repoKey);
-  return [previous, next].filter(folder => !temporaryKeys.includes(repoKey(folder)) && isRememberable(folder, computed, live, false));
+  const temporaryKeys = new Set(temporary.map(repoKey));
+  return [previous, next].filter(folder => !temporaryKeys.has(repoKey(folder)) && isRememberable(folder, computed, live, false));
 }
 export function rememberFolder(history: readonly string[], folder: string): string[] {
   return folderOptions(history, [], folder);
@@ -37,7 +37,7 @@ export function parseProjectHistory(raw: string | null): { folders: string[]; er
   if (raw === null) return { folders: [], error: null };
   try {
     const value = JSON.parse(raw);
-    if (!value || value.version !== 1 || !Array.isArray(value.folders) || !value.folders.every((path: unknown) => typeof path === "string")) throw new Error("Invalid or unsupported project folder history");
+    if (value?.version !== 1 || !Array.isArray(value.folders) || !value.folders.every((path: unknown) => typeof path === "string")) throw new Error("Invalid or unsupported project folder history");
     return { folders: folderOptions(value.folders, [], ""), error: null };
   } catch (error) { return { folders: [], error: `Project folder history could not be persisted: ${String(error)}` }; }
 }

@@ -92,10 +92,9 @@ fn row(out: &mut String, label: &str, value: &str) {
     let _ = writeln!(out, "<tr><th scope=\"row\">{}</th><td>{}</td></tr>", escape_html(label), escape_html(value));
 }
 
-pub fn render_html(scan: &QualityScan) -> String {
+fn render_head(out: &mut String, scan: &QualityScan) {
     let folder_name = scan.folder.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next().filter(|n| !n.is_empty()).unwrap_or(&scan.folder);
     let (tone, banner_text) = banner(scan);
-    let mut out = String::with_capacity(4096 + scan.findings.len() * 400);
     out.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n");
     out.push_str("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\">\n");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n");
@@ -105,18 +104,22 @@ pub fn render_html(scan: &QualityScan) -> String {
     if let Some(error) = &scan.error {
         let _ = writeln!(out, "<p class=\"err banner\">{}</p>", escape_html(error));
     }
+}
 
+fn render_provenance(out: &mut String, scan: &QualityScan) {
     out.push_str("<h2>Provenance</h2>\n<table>\n");
-    row(&mut out, "Folder", &scan.folder);
-    row(&mut out, "Backend", backend(scan.config.mode));
-    row(&mut out, "Container runtime", scan.config.runtime.label());
-    row(&mut out, "Started", &format_time(scan.started_at));
-    row(&mut out, "Finished", &scan.finished_at.map(format_time).unwrap_or_else(|| "not finished".into()));
-    row(&mut out, "Project key", &scan.project.project_key);
-    row(&mut out, "Snapshot hash", &scan.snapshot_hash);
-    row(&mut out, "Rules hash", &scan.rules_hash);
+    row(out, "Folder", &scan.folder);
+    row(out, "Backend", backend(scan.config.mode));
+    row(out, "Container runtime", scan.config.runtime.label());
+    row(out, "Started", &format_time(scan.started_at));
+    row(out, "Finished", &scan.finished_at.map(format_time).unwrap_or_else(|| "not finished".into()));
+    row(out, "Project key", &scan.project.project_key);
+    row(out, "Snapshot hash", &scan.snapshot_hash);
+    row(out, "Rules hash", &scan.rules_hash);
     out.push_str("</table>\n");
+}
 
+fn render_gate_and_counts(out: &mut String, scan: &QualityScan) {
     out.push_str("<h2>Quality gate</h2>\n");
     let gate = match scan.quality_gate {
         Some(QualityGate::Passed) => "Passed",
@@ -132,35 +135,64 @@ pub fn render_html(scan: &QualityScan) -> String {
         let _ = writeln!(out, "<tr><th scope=\"row\">{label}</th><td>{n}</td></tr>");
     }
     out.push_str("</table>\n");
+}
 
+fn render_tools(out: &mut String, scan: &QualityScan) {
     out.push_str("<h2>Tools</h2>\n");
     if scan.tools.is_empty() {
         out.push_str("<p class=\"muted\">No tool reported an outcome.</p>\n");
-    } else {
-        out.push_str("<table>\n<tr><th>Tool</th><th>Version</th><th>Outcome</th><th>Files analyzed</th><th>Findings</th><th>Error</th></tr>\n");
-        for tool in &scan.tools {
-            let _ = writeln!(
-                out,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape_html(&tool.tool),
-                escape_html(&tool.version),
-                tool_status(tool.status),
-                tool.analyzed_files.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
-                tool.finding_count,
-                escape_html(tool.error.as_deref().unwrap_or("")),
-            );
-        }
-        out.push_str("</table>\n");
+        return;
     }
-
-    if !scan.warnings.is_empty() {
-        out.push_str("<h2>Warnings</h2>\n<ul>\n");
-        for warning in &scan.warnings {
-            let _ = writeln!(out, "<li>{}</li>", escape_html(warning));
-        }
-        out.push_str("</ul>\n");
+    out.push_str("<table>\n<tr><th>Tool</th><th>Version</th><th>Outcome</th><th>Files analyzed</th><th>Findings</th><th>Error</th></tr>\n");
+    for tool in &scan.tools {
+        let _ = writeln!(
+            out,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&tool.tool),
+            escape_html(&tool.version),
+            tool_status(tool.status),
+            tool.analyzed_files.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            tool.finding_count,
+            escape_html(tool.error.as_deref().unwrap_or("")),
+        );
     }
+    out.push_str("</table>\n");
+}
 
+fn render_warnings(out: &mut String, scan: &QualityScan) {
+    if scan.warnings.is_empty() { return; }
+    out.push_str("<h2>Warnings</h2>\n<ul>\n");
+    for warning in &scan.warnings {
+        let _ = writeln!(out, "<li>{}</li>", escape_html(warning));
+    }
+    out.push_str("</ul>\n");
+}
+
+fn finding_location(finding: &QualityFinding) -> String {
+    match (&finding.path, finding.line) {
+        (Some(path), Some(line)) => format!("{}:{line}", escape_html(path)),
+        (Some(path), None) => escape_html(path),
+        (None, _) => "(no file)".into(),
+    }
+}
+
+fn render_finding_row(out: &mut String, finding: &QualityFinding) {
+    let rule = escape_html(&finding.rule_id);
+    let rule_cell = match finding.help_url.as_deref().filter(|u| safe_help_url(u)) {
+        Some(url) => format!("<a href=\"{}\" rel=\"noopener noreferrer\">{rule}</a>", escape_html(url)),
+        None => rule,
+    };
+    let location = finding_location(finding);
+    let hotspot = if finding.hotspot { " <em>(security hotspot)</em>" } else { "" };
+    let _ = writeln!(
+        out,
+        "<tr><td>{rule_cell}</td><td><code>{location}</code></td><td>{}</td><td>{}{hotspot}</td></tr>",
+        escape_html(&finding.tools.join(" + ")),
+        escape_html(&finding.message),
+    );
+}
+
+fn render_findings(out: &mut String, scan: &QualityScan) {
     out.push_str("<h2>Findings</h2>\n");
     if scan.findings.is_empty() {
         let text = if scan.status == QualityScanStatus::Complete { "No findings in the analyzed coverage." } else { "No findings were recorded, but the analysis was not complete." };
@@ -174,26 +206,20 @@ pub fn render_html(scan: &QualityScan) -> String {
         group.sort_by(|a, b| (&a.path, a.line, &a.rule_id).cmp(&(&b.path, b.line, &b.rule_id)));
         let _ = writeln!(out, "<h3>{label} ({})</h3>\n<table>\n<tr><th>Rule</th><th>Location</th><th>Tools</th><th>Message</th></tr>", group.len());
         for finding in group {
-            let rule = escape_html(&finding.rule_id);
-            let rule_cell = match finding.help_url.as_deref().filter(|u| safe_help_url(u)) {
-                Some(url) => format!("<a href=\"{}\" rel=\"noopener noreferrer\">{rule}</a>", escape_html(url)),
-                None => rule,
-            };
-            let location = match (&finding.path, finding.line) {
-                (Some(path), Some(line)) => format!("{}:{line}", escape_html(path)),
-                (Some(path), None) => escape_html(path),
-                (None, _) => "(no file)".into(),
-            };
-            let hotspot = if finding.hotspot { " <em>(security hotspot)</em>" } else { "" };
-            let _ = writeln!(
-                out,
-                "<tr><td>{rule_cell}</td><td><code>{location}</code></td><td>{}</td><td>{}{hotspot}</td></tr>",
-                escape_html(&finding.tools.join(" + ")),
-                escape_html(&finding.message),
-            );
+            render_finding_row(out, finding);
         }
         out.push_str("</table>\n");
     }
+}
+
+pub fn render_html(scan: &QualityScan) -> String {
+    let mut out = String::with_capacity(4096 + scan.findings.len() * 400);
+    render_head(&mut out, scan);
+    render_provenance(&mut out, scan);
+    render_gate_and_counts(&mut out, scan);
+    render_tools(&mut out, scan);
+    render_warnings(&mut out, scan);
+    render_findings(&mut out, scan);
     out.push_str("</body></html>\n");
     out
 }

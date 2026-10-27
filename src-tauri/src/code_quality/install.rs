@@ -169,6 +169,65 @@ fn remaining_workload_names(containers: &[ContainerInfo]) -> Result<()> {
     Err(format!("Code quality containers stopped; the Podman machine was left running because containers are still running: {}. Stop these workloads explicitly, then retry shutdown.", names.join(", ")))
 }
 
+#[cfg(windows)]
+fn selected_stop_connection<'a>(receipt: &'a PodmanReceipt, connection: &'a str) -> Result<&'a str> {
+    if !connection.is_empty() { return Ok(connection); }
+    receipt.connection.as_deref().filter(|name| !name.is_empty()).ok_or_else(|| EXTERNAL_MACHINE_STOP.to_owned())
+}
+
+/// Whether the verified machine is running; a stopped machine needs no shutdown at all.
+#[cfg(windows)]
+fn machine_is_running(machine: &serde_json::Value) -> Result<bool> {
+    match machine["State"].as_str() {
+        Some("stopped") => Ok(false),
+        Some("running") => Ok(true),
+        _ => Err("The Podman machine is in an unknown or transitional state. It was left unchanged; wait for its current operation to finish and retry shutdown.".into()),
+    }
+}
+
+#[cfg(windows)]
+fn store_containers(connection: &str, config_root: &Path, ctl: &Ctl) -> Result<Vec<ContainerInfo>> {
+    let mut cmd = Command::new(podman_program().ok_or("Podman is not installed.")?);
+    cmd.args(["--connection", connection, "ps", "--no-trunc", "--format", "{{.ID}}"]);
+    let out = run_bounded(cmd, None, PROBE_TIMEOUT, ctl)?;
+    out.require_success("Check remaining Podman workloads")?;
+    let engine = CliEngine::new(QualityRuntime::Podman { connection: connection.into() }, config_root)?;
+    let mut containers = Vec::new();
+    for id in out.text().lines().map(str::trim).filter(|id| !id.is_empty()) {
+        // Disappeared containers are safe; an inspection failure is not.
+        if let Some(info) = engine.inspect(id, ctl)? { containers.push(info); }
+    }
+    Ok(containers)
+}
+
+#[cfg(windows)]
+fn remaining_store_containers(connections: [&str; 2], config_root: &Path, ctl: &Ctl) -> Result<Vec<ContainerInfo>> {
+    let mut remaining = Vec::new();
+    for (connection, store) in connections.into_iter().zip(["rootless", "rootful"]) {
+        remaining.extend(store_containers(connection, config_root, ctl).map_err(|_| format!("Cannot verify the Podman machine's {store} container store. Check that connection's engine is reachable and retry shutdown; the VM was left running."))?);
+    }
+    Ok(remaining)
+}
+
+#[cfg(windows)]
+fn stop_verified_machine(receipt: &PodmanReceipt, ctl: &Ctl) -> Result<()> {
+    verified_stop_identity(receipt, &inspect_machine(&receipt.machine, ctl)?)?;
+    if ctl.cancelled() { return Err("Podman server shutdown was cancelled; the machine was left running.".into()); }
+    let mut cmd = Command::new(podman_program().ok_or("Podman is not installed.")?);
+    cmd.args(["machine", "stop", &receipt.machine]);
+    run_machine(cmd, Duration::from_secs(180), ctl)?.require_success("Stop app-owned Podman machine")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let current = inspect_machine(&receipt.machine, ctl)?;
+        verified_stop_identity(receipt, &current)?;
+        if current["State"].as_str() == Some("stopped") { return Ok(()); }
+        if ctl.cancelled() || std::time::Instant::now() >= deadline {
+            return Err("Podman machine stop could not be verified. The server remains suspended; Recheck and retry shutdown before starting it again.".into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Stop only the receipt-proven app VM, after checking *both* stores for remaining
 /// workloads. This never starts a daemon, changes defaults, or removes containers/data.
 #[cfg(windows)]
@@ -178,9 +237,7 @@ pub fn stop_owned_podman_machine(config_root: &Path, runtime: &QualityRuntime, o
     if ctl.cancelled() { return Err("Podman server shutdown was cancelled; the machine was left unchanged.".into()); }
     let receipt = read_receipt(config_root)?.ok_or(EXTERNAL_MACHINE_STOP)?;
     if receipt.stage != "ready" { return Err(EXTERNAL_MACHINE_STOP.into()); }
-    let selected = if connection.is_empty() {
-        receipt.connection.as_deref().filter(|name| !name.is_empty()).ok_or(EXTERNAL_MACHINE_STOP)?
-    } else { connection.as_str() };
+    let selected = selected_stop_connection(&receipt, connection)?;
     validate_selector(selected, "Podman connection")?;
     let machine = inspect_machine(&receipt.machine, ctl)?;
     verified_stop_identity(&receipt, &machine)?;
@@ -190,47 +247,11 @@ pub fn stop_owned_podman_machine(config_root: &Path, runtime: &QualityRuntime, o
     if !entries.iter().any(|entry| entry["Name"].as_str() == Some(selected) && machine_store(entry, &machine).is_some()) {
         return Err(EXTERNAL_MACHINE_STOP.into());
     }
-    match machine["State"].as_str() {
-        Some("stopped") => return Ok(()),
-        Some("running") => {}
-        _ => return Err("The Podman machine is in an unknown or transitional state. It was left unchanged; wait for its current operation to finish and retry shutdown.".into()),
-    }
+    if !machine_is_running(&machine)? { return Ok(()); }
     let connections = shutdown_store_connections(&entries, &machine, selected)?;
-    let mut remaining = Vec::new();
-    for (index, connection) in connections.into_iter().enumerate() {
-        let store = if index == 0 { "rootless" } else { "rootful" };
-        let check = || -> Result<Vec<ContainerInfo>> {
-            let mut cmd = Command::new(podman_program().ok_or("Podman is not installed.")?);
-            cmd.args(["--connection", connection, "ps", "--no-trunc", "--format", "{{.ID}}"]);
-            let out = run_bounded(cmd, None, PROBE_TIMEOUT, ctl)?;
-            out.require_success("Check remaining Podman workloads")?;
-            let engine = CliEngine::new(QualityRuntime::Podman { connection: connection.into() }, config_root)?;
-            let mut containers = Vec::new();
-            for id in out.text().lines().map(str::trim).filter(|id| !id.is_empty()) {
-                // Disappeared containers are safe; an inspection failure is not.
-                if let Some(info) = engine.inspect(id, ctl)? { containers.push(info); }
-            }
-            Ok(containers)
-        };
-        remaining.extend(check().map_err(|_| format!("Cannot verify the Podman machine's {store} container store. Check that connection's engine is reachable and retry shutdown; the VM was left running."))?);
-    }
     // Every remaining container blocks shutdown, including unexpected owned roles.
-    remaining_workload_names(&remaining)?;
-    verified_stop_identity(&receipt, &inspect_machine(&receipt.machine, ctl)?)?;
-    if ctl.cancelled() { return Err("Podman server shutdown was cancelled; the machine was left running.".into()); }
-    let mut cmd = Command::new(podman_program().ok_or("Podman is not installed.")?);
-    cmd.args(["machine", "stop", &receipt.machine]);
-    run_machine(cmd, Duration::from_secs(180), ctl)?.require_success("Stop app-owned Podman machine")?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let current = inspect_machine(&receipt.machine, ctl)?;
-        verified_stop_identity(&receipt, &current)?;
-        if current["State"].as_str() == Some("stopped") { return Ok(()); }
-        if ctl.cancelled() || std::time::Instant::now() >= deadline {
-            return Err("Podman machine stop could not be verified. The server remains suspended; Recheck and retry shutdown before starting it again.".into());
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    remaining_workload_names(&remaining_store_containers(connections, config_root, ctl)?)?;
+    stop_verified_machine(&receipt, ctl)
 }
 fn winget_program() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_default();
@@ -313,6 +334,44 @@ pub fn wsl_features_missing(ctl: &Ctl) -> bool {
 }
 
 #[cfg(windows)]
+fn winget_usable(ctl: &Ctl) -> bool {
+    winget_program().and_then(|program| {
+        let mut cmd = Command::new(program); cmd.arg("--version");
+        run_bounded(cmd, None, PROBE_TIMEOUT, ctl).ok()
+    }).is_some_and(|o| o.status.success())
+}
+
+#[cfg(windows)]
+fn runtime_installed(runtime: &QualityRuntime, running_distros: &[String], ctl: &Ctl) -> bool {
+    match runtime {
+        QualityRuntime::Podman { .. } => podman_program().is_some(),
+        QualityRuntime::DockerDesktop => docker_program().is_some()
+            && program_files().join("Docker/Docker/Docker Desktop.exe").is_file(),
+        QualityRuntime::DockerWsl { distro } => !distro.is_empty() && running_distros.contains(distro)
+            && wsl_command(distro, "/bin/sh", &["-c", "command -v docker >/dev/null 2>&1"])
+                .and_then(|cmd| run_bounded(cmd, None, PROBE_TIMEOUT, ctl))
+                .is_ok_and(|out| out.status.success()),
+    }
+}
+
+#[cfg(windows)]
+fn prerequisite_message(runtime: &QualityRuntime, probe_error: Option<String>, installed: bool, winget_available: bool, distro_error: Option<&String>) -> Option<String> {
+    let message = probe_error.map(|e| explain_failure(&e));
+    match runtime {
+        QualityRuntime::DockerWsl { distro } if distro.is_empty() => Some(distro_error.map(|e| explain_failure(e))
+            .unwrap_or_else(|| "Install and explicitly select a WSL Linux distribution. Automatic Docker installation supports Ubuntu/Debian; existing native engines on other Linux distros are supported.".into())),
+        QualityRuntime::DockerWsl { .. } => message,
+        _ if installed || winget_available => message,
+        _ => {
+            let link = if matches!(runtime, QualityRuntime::DockerDesktop) { "https://www.docker.com/products/docker-desktop/" }
+                else { "https://podman.io/docs/installation" };
+            let hint = format!("winget is unavailable. Install from {link}, then Recheck. No installer was downloaded.");
+            Some(match message { Some(e) => format!("{e}\n{hint}"), None => hint })
+        }
+    }
+}
+
+#[cfg(windows)]
 pub fn probe_prerequisites(config_root: &Path, selected: &QualityRuntime) -> (Vec<Prerequisite>, QualityOptions) {
     let ctl = Ctl::silent();
     let distro_result = wsl_distros(&ctl);
@@ -321,10 +380,7 @@ pub fn probe_prerequisites(config_root: &Path, selected: &QualityRuntime) -> (Ve
     let connections_result = podman_connections(&ctl);
     let connections: Vec<String> = connections_result.as_ref().map(|list| list.iter()
         .filter_map(|v| v["Name"].as_str().map(str::to_owned)).collect()).unwrap_or_default();
-    let winget_available = winget_program().and_then(|program| {
-        let mut cmd = Command::new(program); cmd.arg("--version");
-        run_bounded(cmd, None, PROBE_TIMEOUT, &ctl).ok()
-    }).map(|o| o.status.success()).unwrap_or(false);
+    let winget_available = winget_usable(&ctl);
     let options = QualityOptions { wsl_features_missing: wsl_features_missing(&ctl), wsl_distros: distros.clone(), podman_connections: connections,
         winget_available, podman_app_connection: podman_app_connection(config_root) };
     let podman = match selected {
@@ -338,35 +394,13 @@ pub fn probe_prerequisites(config_root: &Path, selected: &QualityRuntime) -> (Ve
     let runtimes = [podman, QualityRuntime::DockerDesktop, wsl];
     let mut result = Vec::new();
     for runtime in runtimes {
-        let installed = match &runtime {
-            QualityRuntime::Podman { .. } => podman_program().is_some(),
-            QualityRuntime::DockerDesktop => docker_program().is_some()
-                && program_files().join("Docker/Docker/Docker Desktop.exe").is_file(),
-            QualityRuntime::DockerWsl { distro } => {
-                if distro.is_empty() || !running_distros.contains(distro) { false } else {
-                    wsl_command(distro, "/bin/sh", &["-c", "command -v docker >/dev/null 2>&1"])
-                        .and_then(|cmd| run_bounded(cmd, None, PROBE_TIMEOUT, &ctl))
-                        .map(|out| out.status.success()).unwrap_or(false)
-                }
-            }
-        };
+        let installed = runtime_installed(&runtime, &running_distros, &ctl);
         let probe = CliEngine::new(runtime.clone(), config_root).and_then(|engine| engine.probe(&ctl));
         let ready = probe.is_ok();
-        let mut message = probe.err().map(|e| explain_failure(&e));
-        if let QualityRuntime::DockerWsl { distro } = &runtime {
-            if distro.is_empty() {
-                message = Some(distro_result.as_ref().err().map(|e| explain_failure(e))
-                    .unwrap_or_else(|| "Install and explicitly select a WSL Linux distribution. Automatic Docker installation supports Ubuntu/Debian; existing native engines on other Linux distros are supported.".into()));
-            }
-        }
-        if !installed && !winget_available && !matches!(runtime, QualityRuntime::DockerWsl { .. }) {
-            let link = if matches!(runtime, QualityRuntime::DockerDesktop) { "https://www.docker.com/products/docker-desktop/" }
-                else { "https://podman.io/docs/installation" };
-            let hint = format!("winget is unavailable. Install from {link}, then Recheck. No installer was downloaded.");
-            message = Some(match message { Some(e) => format!("{e}\n{hint}"), None => hint });
-        }
-        if pending && !ready { message = Some(format!("{}\nA Windows restart is required; restart manually, then Recheck.", message.unwrap_or_default())); }
-        result.push(Prerequisite { runtime, installed, ready, needs_restart: pending && !ready, message });
+        let message = prerequisite_message(&runtime, probe.err(), installed, winget_available, distro_result.as_ref().err());
+        let needs_restart = pending && !ready;
+        let message = if needs_restart { Some(format!("{}\nA Windows restart is required; restart manually, then Recheck.", message.unwrap_or_default())) } else { message };
+        result.push(Prerequisite { runtime, installed, ready, needs_restart, message });
     }
     (result, options)
 }
@@ -441,20 +475,42 @@ fn run_winget(package: &str, ctl: &Ctl) -> Result<bool> {
     Ok(false)
 }
 
-fn setup_podman(root: &Path, ctl: &Ctl) -> Result<String> {
-    let mut receipt = read_receipt(root)?;
-    let existing = machines(ctl)?.iter().any(|v| v["Name"].as_str() == Some(MACHINE));
+fn prepare_podman_receipt(root: &Path, receipt: Option<PodmanReceipt>, existing: bool) -> Result<PodmanReceipt> {
     if existing && receipt.is_none() {
         return Err("A Podman machine named omp-manager-quality already exists without this app's setup receipt. It will not be adopted or deleted. Select its existing connection explicitly, or resolve the name conflict manually.".into());
     }
-    if receipt.is_none() {
-        let planned = PodmanReceipt { version: 1, machine: MACHINE.into(), provider: "wsl".into(),
-            stage: "creating".into(), connection: None, created: None };
-        // Ownership intent precedes creation; a crash after init remains safely recoverable.
-        save_receipt(root, &planned)?;
-        receipt = Some(planned);
+    if let Some(receipt) = receipt { return Ok(receipt); }
+    let receipt = PodmanReceipt { version: 1, machine: MACHINE.into(), provider: "wsl".into(),
+        stage: "creating".into(), connection: None, created: None };
+    // Ownership intent precedes creation; a crash after init remains safely recoverable.
+    save_receipt(root, &receipt)?;
+    Ok(receipt)
+}
+
+fn record_podman_setup_identity(root: &Path, receipt: &mut PodmanReceipt, inspected: &serde_json::Value) -> Result<()> {
+    if let Some(previous) = &receipt.created {
+        if inspected["Created"].as_str() != Some(previous.as_str()) {
+            return Err("The app-owned Podman machine was replaced since setup. Restore its receipt or select the replacement connection explicitly; it will not be adopted automatically.".into());
+        }
     }
-    let mut receipt = receipt.ok_or("Missing Podman setup receipt.")?;
+    receipt.created = Some(inspected["Created"].as_str().ok_or("Podman omitted the app-machine creation identity; setup ownership cannot be recorded safely.")?.to_owned());
+    save_receipt(root, receipt)
+}
+
+fn setup_rootless_connection<'a>(value: &'a serde_json::Value, port: u64, identity: &str) -> Option<&'a str> {
+    let uri = reqwest::Url::parse(value["URI"].as_str()?).ok()?;
+    let rootless = uri.path().starts_with("/run/user/") && uri.username() != "root";
+    if rootless && uri.port().map(u64::from) == Some(port)
+        && value["Identity"].as_str() == Some(identity)
+        && matches!(uri.host_str(), Some("127.0.0.1" | "localhost" | "[::1]" | "::1")) {
+        value["Name"].as_str()
+    } else { None }
+}
+
+fn setup_podman(root: &Path, ctl: &Ctl) -> Result<String> {
+    let receipt = read_receipt(root)?;
+    let existing = machines(ctl)?.iter().any(|v| v["Name"].as_str() == Some(MACHINE));
+    let mut receipt = prepare_podman_receipt(root, receipt, existing)?;
     if !existing {
         let mut cmd = Command::new(podman_program().ok_or("Podman was not found after installation. Recheck or repair the official installation.")?);
         // Podman 5.8 has no --provider/--update-connection flags: the provider is chosen by this variable.
@@ -466,14 +522,7 @@ fn setup_podman(root: &Path, ctl: &Ctl) -> Result<String> {
         return Err("The app-owned Podman machine is not verified as WSL-backed. It will not be adopted or reconfigured; choose an existing connection explicitly.".into());
     }
     let inspected = inspect_machine(MACHINE, ctl)?;
-    if let Some(previous) = &receipt.created {
-        if inspected["Created"].as_str() != Some(previous.as_str()) {
-            return Err("The app-owned Podman machine was replaced since setup. Restore its receipt or select the replacement connection explicitly; it will not be adopted automatically.".into());
-        }
-    }
-    let created = Some(inspected["Created"].as_str().ok_or("Podman omitted the app-machine creation identity; setup ownership cannot be recorded safely.")?.to_owned());
-    receipt.created = created;
-    save_receipt(root, &receipt)?;
+    record_podman_setup_identity(root, &mut receipt, &inspected)?;
     if inspected["State"].as_str() != Some("running") {
         let mut cmd = Command::new(podman_program().ok_or("Podman is not installed.")?);
         cmd.args(["machine", "start", MACHINE]);
@@ -483,15 +532,8 @@ fn setup_podman(root: &Path, ctl: &Ctl) -> Result<String> {
     let port = inspected.pointer("/SSHConfig/Port").and_then(|v| v.as_u64()).ok_or("Podman machine omitted its SSH port.")?;
     let identity = inspected.pointer("/SSHConfig/IdentityPath").and_then(|v| v.as_str()).ok_or("Podman machine omitted its SSH identity path.")?;
     let connections = podman_connections(ctl)?;
-    let connection = connections.iter().find_map(|value| {
-        let uri = reqwest::Url::parse(value["URI"].as_str()?).ok()?;
-        let rootless = uri.path().starts_with("/run/user/") && uri.username() != "root";
-        if rootless && uri.port().map(u64::from) == Some(port)
-            && value["Identity"].as_str() == Some(identity)
-            && matches!(uri.host_str(), Some("127.0.0.1" | "localhost" | "[::1]" | "::1")) {
-            value["Name"].as_str().map(str::to_owned)
-        } else { None }
-    }).ok_or("The app-owned Podman machine has no verified rootless connection. Repair Podman machine setup, then retry; no ambient/default connection will be used.")?;
+    let connection = connections.iter().find_map(|value| setup_rootless_connection(value, port, identity))
+        .map(str::to_owned).ok_or("The app-owned Podman machine has no verified rootless connection. Repair Podman machine setup, then retry; no ambient/default connection will be used.")?;
     receipt.connection = Some(connection.clone());
     receipt.stage = "ready".into();
     save_receipt(root, &receipt)?;
@@ -500,55 +542,60 @@ fn setup_podman(root: &Path, ctl: &Ctl) -> Result<String> {
 }
 
 #[cfg(windows)]
+fn install_docker_desktop(runtime: &QualityRuntime, config_root: &Path, ctl: &Ctl) -> Result<bool> {
+    let installed = docker_program().is_some() && program_files().join("Docker/Docker/Docker Desktop.exe").is_file();
+    let restart = if installed { false } else { run_winget("Docker.DockerDesktop", ctl)? };
+    if !restart { CliEngine::new(runtime.clone(), config_root)?.ensure_started(ctl).map_err(|e| explain_failure(&e))?; }
+    Ok(restart)
+}
+
+/// Returns whether a restart is pending and the Podman connection that was set up or verified.
+#[cfg(windows)]
+fn install_podman(runtime: &QualityRuntime, selected: &str, config_root: &Path, ctl: &Ctl) -> Result<(bool, Option<String>)> {
+    if podman_program().is_none() && run_winget(PODMAN_PACKAGE, ctl)? { return Ok((true, None)); }
+    if podman_program().is_none() { return Err("Podman installer exited but podman.exe was not found. Repair the official installation and Recheck.".into()); }
+    if selected.is_empty() { return Ok((false, Some(setup_podman(config_root, ctl).map_err(|e| explain_failure(&e))?))); }
+    validate_selector(selected, "Podman connection")?;
+    if !podman_connections(ctl)?.iter().any(|v| v["Name"].as_str() == Some(selected)) {
+        return Err("Selected Podman connection no longer exists; Recheck and explicitly choose an existing connection.".into());
+    }
+    CliEngine::new(runtime.clone(), config_root)?.ensure_started(ctl).map_err(|e| explain_failure(&e))?;
+    Ok((false, Some(selected.to_owned())))
+}
+
+#[cfg(windows)]
+fn install_docker_wsl(runtime: &QualityRuntime, distro: &str, config_root: &Path, ctl: &Ctl) -> Result<()> {
+    validate_selector(distro, "WSL distribution")?;
+    if !wsl_distros(ctl)?.iter().any(|name| name == distro) { return Err("The explicitly selected WSL distribution is not registered. Recheck and select an installed distro.".into()); }
+    // Already usable engines on any distro are supported without trying apt.
+    let engine = CliEngine::new(runtime.clone(), config_root)?;
+    if engine.ensure_started(ctl).is_err() {
+        if ctl.cancelled() { return Err("Runtime setup cancelled before Docker installation.".into()); }
+        let script = materialize(config_root, "install-docker-wsl.sh", WSL_INSTALL)?;
+        ctl.say("Installing Docker Engine as root in the selected Ubuntu/Debian distro using Docker's signed official apt repository. Conflicting packages are refused, never removed.");
+        let cmd = wsl_command(distro, "/bin/sh", &["-s"])?;
+        run_installer(cmd, Some(&script), ctl)?.require_success("Install native Docker Engine in WSL")
+            .map_err(|e| explain_failure(&e))?;
+    }
+    engine.ensure_started(ctl).map_err(|e| explain_failure(&e))
+}
+
+#[cfg(windows)]
+fn record_runtime_restart(config_root: &Path, ctl: &Ctl) -> Result<()> {
+    fs::create_dir_all(config_root.join("setup")).map_err(|e| format!("Record runtime restart requirement: {e}"))?;
+    let receipt = FeatureReceipt { version: 1, needs_restart: true, boot_id: boot_id(ctl) };
+    crate::dependency_security::atomic_json(&config_root.join("setup/runtime-restart.json"), &receipt, JSON_LIMIT)
+}
+
+#[cfg(windows)]
 pub fn install_runtime(config_root: &Path, runtime: &QualityRuntime, ctl: &Ctl) -> Result<InstallOutcome> {
     if ctl.cancelled() { return Err("Runtime installation cancelled before it started.".into()); }
-    let mut connection = None;
-    let restart = match runtime {
-        QualityRuntime::DockerDesktop => {
-            let restart = if docker_program().is_none() || !program_files().join("Docker/Docker/Docker Desktop.exe").is_file() {
-                run_winget("Docker.DockerDesktop", ctl)?
-            } else { false };
-            if !restart { CliEngine::new(runtime.clone(), config_root)?.ensure_started(ctl).map_err(|e| explain_failure(&e))?; }
-            restart
-        }
-        QualityRuntime::Podman { connection: selected } => {
-            let restart = if podman_program().is_none() { run_winget("RedHat.Podman", ctl)? } else { false };
-            if !restart {
-                if podman_program().is_none() { return Err("Podman installer exited but podman.exe was not found. Repair the official installation and Recheck.".into()); }
-                if selected.is_empty() { connection = Some(setup_podman(config_root, ctl).map_err(|e| explain_failure(&e))?); }
-                else {
-                    validate_selector(selected, "Podman connection")?;
-                    if !podman_connections(ctl)?.iter().any(|v| v["Name"].as_str() == Some(selected)) {
-                        return Err("Selected Podman connection no longer exists; Recheck and explicitly choose an existing connection.".into());
-                    }
-                    CliEngine::new(runtime.clone(), config_root)?.ensure_started(ctl).map_err(|e| explain_failure(&e))?;
-                    connection = Some(selected.clone());
-                }
-            }
-            restart
-        }
-        QualityRuntime::DockerWsl { distro } => {
-            validate_selector(distro, "WSL distribution")?;
-            if !wsl_distros(ctl)?.contains(distro) { return Err("The explicitly selected WSL distribution is not registered. Recheck and select an installed distro.".into()); }
-            // Already usable engines on any distro are supported without trying apt.
-            let engine = CliEngine::new(runtime.clone(), config_root)?;
-            if engine.ensure_started(ctl).is_err() {
-                if ctl.cancelled() { return Err("Runtime setup cancelled before Docker installation.".into()); }
-                let script = materialize(config_root, "install-docker-wsl.sh", WSL_INSTALL)?;
-                ctl.say("Installing Docker Engine as root in the selected Ubuntu/Debian distro using Docker's signed official apt repository. Conflicting packages are refused, never removed.");
-                let cmd = wsl_command(distro, "/bin/sh", &["-s"])?;
-                run_installer(cmd, Some(&script), ctl)?.require_success("Install native Docker Engine in WSL")
-                    .map_err(|e| explain_failure(&e))?;
-            }
-            engine.ensure_started(ctl).map_err(|e| explain_failure(&e))?;
-            false
-        }
+    let (restart, connection) = match runtime {
+        QualityRuntime::DockerDesktop => (install_docker_desktop(runtime, config_root, ctl)?, None),
+        QualityRuntime::Podman { connection: selected } => install_podman(runtime, selected, config_root, ctl)?,
+        QualityRuntime::DockerWsl { distro } => { install_docker_wsl(runtime, distro, config_root, ctl)?; (false, None) }
     };
-    if restart {
-        fs::create_dir_all(config_root.join("setup")).map_err(|e| format!("Record runtime restart requirement: {e}"))?;
-        let receipt = FeatureReceipt { version: 1, needs_restart: true, boot_id: boot_id(ctl) };
-        crate::dependency_security::atomic_json(&config_root.join("setup/runtime-restart.json"), &receipt, JSON_LIMIT)?;
-    }
+    if restart { record_runtime_restart(config_root, ctl)?; }
     Ok(InstallOutcome { needs_restart: restart, message: if restart {
         "Runtime installation requires a Windows restart. Restart Windows manually, then Recheck; OMP Manager did not reboot or start another installer.".into()
     } else { "Selected runtime is installed and its Linux daemon is ready. No global engine context/default was changed.".into() }, podman_connection: connection })

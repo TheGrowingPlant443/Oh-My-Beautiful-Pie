@@ -78,56 +78,69 @@ fn redact_step(text: &mut String, step: &JobStep) {
     }
 }
 
+/// Waits for the container; a cancelled or timed-out wait is stopped and inspected, anything else is an error.
+/// Returns `(exit_code, timed_out, cancelled)`.
+fn wait_exit(engine: &dyn Engine, step: &JobStep, id: &str, log_tail: &mut String, ctl: &Ctl, cleanup_ctl: &Ctl) -> Result<(i64, bool, bool)> {
+    let started = Instant::now();
+    match engine.wait(id, step.timeout_secs, ctl) {
+        Ok(code) => Ok((code, false, false)),
+        Err(error) => {
+            let cancelled = ctl.cancelled();
+            let lower = error.to_lowercase();
+            let timed_out = !cancelled && (started.elapsed().as_secs() >= step.timeout_secs
+                || lower.contains("timed out") || lower.contains("timeout"));
+            if !cancelled && !timed_out { return Err(error); }
+            // Wait's cancellation intentionally stops nothing; this must finish before reports.
+            engine.stop(id, 30, cleanup_ctl)?;
+            append_log(log_tail, &error);
+            let code = engine.inspect(id, cleanup_ctl)?.and_then(|info| info.exit_code).unwrap_or(-1);
+            Ok((code, timed_out, cancelled))
+        }
+    }
+}
+
+/// Copies every report out; returns whether a cancellation cut it short.
+fn copy_out_all(engine: &dyn Engine, step: &JobStep, id: &str, exit_code: i64, timed_out: bool, log_tail: &mut String, ctl: &Ctl) -> Result<bool> {
+    for (source, archive) in &step.copy_out {
+        if ctl.cancelled() { return Ok(true); }
+        if let Err(error) = engine.copy_out(id, source, archive, ctl) {
+            if ctl.cancelled() { return Ok(true); }
+            if exit_code == 0 && !timed_out { return Err(error); }
+            append_log(log_tail, &format!("Report unavailable after unsuccessful analysis: {error}"));
+        }
+    }
+    Ok(false)
+}
+
+fn run_steps(engine: &dyn Engine, step: &JobStep, id: &str, ctl: &Ctl, cleanup_ctl: &Ctl) -> Result<JobResult> {
+    for (destination, archive) in &step.copy_in {
+        if ctl.cancelled() { return Err("Source transfer cancelled.".into()); }
+        engine.copy_in(id, destination, archive, ctl)?;
+    }
+    if ctl.cancelled() { return Err("Scan cancelled before container start.".into()); }
+    engine.start(id, ctl)?;
+    let mut log_tail = String::new();
+    let (exit_code, timed_out, mut cancelled) = wait_exit(engine, step, id, &mut log_tail, ctl, cleanup_ctl)?;
+    cancelled |= ctl.cancelled();
+    if !cancelled {
+        cancelled = copy_out_all(engine, step, id, exit_code, timed_out, &mut log_tail, ctl)?;
+    }
+    // Logs are diagnostic only, not a substitute for a machine report.
+    match engine.logs(id, 1000, cleanup_ctl) {
+        Ok(text) => append_log(&mut log_tail, &text),
+        Err(error) => append_log(&mut log_tail, &format!("Container diagnostics unavailable: {error}")),
+    }
+    redact_step(&mut log_tail, step);
+    Ok(JobResult { exit_code, log_tail, timed_out, cancelled })
+}
+
 pub fn run_job(engine: &dyn Engine, step: &JobStep, on_container: &dyn Fn(&str), ctl: &Ctl) -> Result<JobResult> {
     if ctl.cancelled() { return Err("Code quality scan cancelled before container creation.".into()); }
     let id = engine.create(&step.spec, ctl)?;
     let cleanup_ctl = Ctl::new(ctl.log.clone());
     let mut cleanup = Cleanup { engine, id, ctl: cleanup_ctl.clone(), finished: false };
     on_container(&cleanup.id);
-    let result = (|| -> Result<JobResult> {
-        for (destination, archive) in &step.copy_in {
-            if ctl.cancelled() { return Err("Source transfer cancelled.".into()); }
-            engine.copy_in(&cleanup.id, destination, archive, ctl)?;
-        }
-        if ctl.cancelled() { return Err("Scan cancelled before container start.".into()); }
-        engine.start(&cleanup.id, ctl)?;
-        let started = Instant::now();
-        let mut log_tail = String::new();
-        let mut timed_out = false;
-        let mut cancelled = false;
-        let exit_code = match engine.wait(&cleanup.id, step.timeout_secs, ctl) {
-            Ok(code) => code,
-            Err(error) => {
-                cancelled = ctl.cancelled();
-                let lower = error.to_lowercase();
-                timed_out = !cancelled && (started.elapsed().as_secs() >= step.timeout_secs
-                    || lower.contains("timed out") || lower.contains("timeout"));
-                if !cancelled && !timed_out { return Err(error); }
-                // Wait's cancellation intentionally stops nothing; this must finish before reports.
-                engine.stop(&cleanup.id, 30, &cleanup_ctl)?;
-                append_log(&mut log_tail, &error);
-                engine.inspect(&cleanup.id, &cleanup_ctl)?.and_then(|info| info.exit_code).unwrap_or(-1)
-            }
-        };
-        cancelled |= ctl.cancelled();
-        if !cancelled {
-            for (source, archive) in &step.copy_out {
-                if ctl.cancelled() { cancelled = true; break; }
-                if let Err(error) = engine.copy_out(&cleanup.id, source, archive, ctl) {
-                    if ctl.cancelled() { cancelled = true; break; }
-                    if exit_code == 0 && !timed_out { return Err(error); }
-                    append_log(&mut log_tail, &format!("Report unavailable after unsuccessful analysis: {error}"));
-                }
-            }
-        }
-        // Logs are diagnostic only, not a substitute for a machine report.
-        match engine.logs(&cleanup.id, 1000, &cleanup_ctl) {
-            Ok(text) => append_log(&mut log_tail, &text),
-            Err(error) => append_log(&mut log_tail, &format!("Container diagnostics unavailable: {error}")),
-        }
-        redact_step(&mut log_tail, step);
-        Ok(JobResult { exit_code, log_tail, timed_out, cancelled })
-    })();
+    let result = run_steps(engine, step, &cleanup.id, ctl, &cleanup_ctl);
     let result = match result {
         Err(mut error) if ctl.cancelled() => {
             redact_step(&mut error, step);

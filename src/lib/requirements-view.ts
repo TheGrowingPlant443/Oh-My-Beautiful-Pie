@@ -25,11 +25,13 @@ export function groupRequirements(items: readonly RequirementItem[]): Requiremen
   return groups;
 }
 
+const NEED_LABEL: Record<RequirementItem["need"], string> = { required: "Required", optional: "Optional", unknown: "Need unknown" };
+const ENVIRONMENT_LABEL: Record<RequirementItem["environment"], string> = { host: "This computer", wsl: "WSL", container: "Container" };
 export function needLabel(need: RequirementItem["need"]): string {
-  return need === "required" ? "Required" : need === "optional" ? "Optional" : "Need unknown";
+  return NEED_LABEL[need] ?? "Need unknown";
 }
 export function environmentLabel(environment: RequirementItem["environment"]): string {
-  return environment === "host" ? "This computer" : environment === "wsl" ? "WSL" : "Container";
+  return ENVIRONMENT_LABEL[environment] ?? "Container";
 }
 export function detectedLabel(detected: RequirementItem["detected"]): string {
   if (detected.state === "found") return detected.version ? `Found ${detected.version}` : "Found";

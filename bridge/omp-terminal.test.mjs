@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {mkdtemp,rm} from 'node:fs/promises';
+import {mkdir,mkdtemp,rm,writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -70,11 +70,29 @@ const nativeSkip = !process.env.OMP_SDK_DIR ? 'Set OMP_SDK_DIR to run isolated n
 test('native Bash/Eval execution is streamed, kept alive through background jobs and services, and killed with an agent interrupt', { skip: nativeSkip, timeout: 240000 }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'omp-terminal-commands-'));
   try {
+    const agent = path.join(root, 'agent');
+    await mkdir(agent);
+    await writeFile(path.join(agent, 'models.yml'), `providers:
+  terminal-offline:
+    api: openai-completions
+    baseUrl: http://127.0.0.1:9/v1
+    apiKey: terminal-fixture-key
+    models:
+      - id: fixture
+`);
+    await writeFile(path.join(agent, 'config.yml'), 'modelRoles:\n  default: terminal-offline/fixture\n');
     const {stdout} = await promisify(execFile)(process.env.OMP_BIN || 'omp', [
       '--mode','rpc','--no-ui','--no-session','--no-title','--no-extensions','--no-skills','--no-rules','--no-lsp','--auto-approve','--cwd',root,
       '--extension',fileURLToPath(new URL('./fixtures/terminal-commands-scenario.mjs', import.meta.url)),
     ], {
-      env:{...process.env,BROWSER_TEST_ROOT:root,USERPROFILE:root,HOME:root,PI_CODING_AGENT_DIR:path.join(root,'agent'),PI_NATIVES_DIR:process.env.PI_NATIVES_DIR||path.join(os.homedir(),'.omp','natives')},
+      env:{
+        ...process.env,
+        BROWSER_TEST_ROOT:root, USERPROFILE:root, HOME:root,
+        PI_CODING_AGENT_DIR:agent, PI_CONFIG_DIR:'.omp', PI_CONFIG_FILES:'', OMP_PROFILE:'default',
+        XDG_CONFIG_HOME:path.join(root,'config'), XDG_DATA_HOME:path.join(root,'data'),
+        XDG_STATE_HOME:path.join(root,'state'), XDG_CACHE_HOME:path.join(root,'cache'),
+        PI_NATIVES_DIR:process.env.PI_NATIVES_DIR||path.join(os.homedir(),'.omp','natives'),
+      },
       timeout: 230000, maxBuffer: 4 * 1024 * 1024,
     });
     assert.match(stdout, /Terminal command observer verified/);

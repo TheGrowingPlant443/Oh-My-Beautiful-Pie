@@ -1,6 +1,6 @@
 import { writable, type Readable } from "svelte/store";
 import type {
-  GraphifyArtifact, GraphifyCommunity, GraphifyHyperedge, GraphifyLink, GraphifyNode, GraphifyRef, GraphifySearchItem, GraphifySection, KnowledgeApi,
+  GraphifyArtifact, GraphifyCommunity, GraphifyHyperedge, GraphifyLink, GraphifyNode, GraphifyRef, GraphifySearchItem, KnowledgeApi,
 } from "./knowledge";
 import type { GraphifyStats } from "./knowledge-graph";
 import type { IndexClient, IndexJob, IndexResult } from "./knowledge-index";
@@ -12,7 +12,10 @@ import type { GraphModel } from "./system-graph";
 // It runs no Graphify, no extraction and no model, and never touches the repository's `graph.html`.
 
 const PAGE = 200;
-const errorText = (error: unknown): string => error instanceof Error ? error.message : typeof error === "string" ? error : JSON.stringify(error);
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === "string" ? error : JSON.stringify(error);
+}
 /** The backend's wording when a live output was replaced or removed after it was admitted. */
 export const isGone = (message: string): boolean => /no longer available/i.test(message);
 export const REPLACED_TEXT = "New Graphify output available — Refresh";
@@ -64,6 +67,21 @@ const initial = (): GraphifyState => ({
 
 export const refKey = (ref: GraphifyRef): string => `${ref.idKind}:${ref.id}`;
 
+type GraphifyRecord = GraphifyNode | GraphifyLink | GraphifyHyperedge | GraphifyCommunity;
+interface Collected { nodes: GraphifyNode[]; links: GraphifyLink[]; hyperedges: GraphifyHyperedge[]; communities: GraphifyCommunity[] }
+type SectionKey = keyof Collected;
+const SECTIONS: readonly SectionKey[] = ["communities", "nodes", "links", "hyperedges"];
+
+/** Keeps one page for the finished view and streams it to the index worker. */
+function collect(into: Collected, job: IndexJob, key: SectionKey, items: GraphifyRecord[]): void {
+  switch (key) {
+    case "nodes": into.nodes.push(...(items as GraphifyNode[])); job.push({ section: "graphifyNodes", items: items as GraphifyNode[] }); return;
+    case "links": into.links.push(...(items as GraphifyLink[])); job.push({ section: "graphifyLinks", items: items as GraphifyLink[] }); return;
+    case "hyperedges": into.hyperedges.push(...(items as GraphifyHyperedge[])); job.push({ section: "graphifyHyperedges", items: items as GraphifyHyperedge[] }); return;
+    case "communities": into.communities.push(...(items as GraphifyCommunity[])); job.push({ section: "graphifyCommunities", items: items as GraphifyCommunity[] }); return;
+  }
+}
+
 export function createGraphifyStore(options: { api: GraphifyApi; indexClient: Pick<IndexClient, "begin" | "cancel" | "dispose"> }): GraphifyStore {
   const { api, indexClient } = options;
   let state = initial();
@@ -79,6 +97,26 @@ export function createGraphifyStore(options: { api: GraphifyApi; indexClient: Pi
     indexClient.cancel();
     commit({ status: state.result ? "ready" : "error", stale: REPLACED_TEXT, error: state.result ? null : message });
   };
+
+  function failWith(error: unknown, otherwise: (message: string) => Partial<GraphifyState>): void {
+    const message = errorText(error);
+    if (isGone(message)) gone(message);
+    else commit(otherwise(message));
+  }
+
+  async function readSection(artifact: GraphifyArtifact, job: IndexJob, into: Collected, key: SectionKey, mine: number): Promise<boolean> {
+    let offset = 0;
+    for (;;) {
+      const page = await api.readGraphify<GraphifyRecord>(artifact.artifactId, key, offset, PAGE);
+      if (mine !== seq) { job.cancel(); return false; }
+      // Pages of another build are never mixed in: the hash, not only the id, must match.
+      if (page.artifactId !== artifact.artifactId || page.artifactHash !== artifact.artifactHash) throw new Error("A page of a different Graphify build arrived; reading stopped so builds are not mixed.");
+      collect(into, job, key, page.items);
+      commit({ progress: { ...state.progress, [key]: { loaded: offset + page.items.length, total: page.total } } });
+      if (page.nextOffset === null) return true;
+      offset = page.nextOffset;
+    }
+  }
 
   async function open(folder: string): Promise<void> {
     const mine = ++seq;
@@ -96,35 +134,17 @@ export function createGraphifyStore(options: { api: GraphifyApi; indexClient: Pi
         progress: { communities: { loaded: 0, total: artifact.counts.communities }, nodes: { loaded: 0, total: artifact.counts.nodes }, links: { loaded: 0, total: artifact.counts.links }, hyperedges: { loaded: 0, total: artifact.counts.hyperedges } },
       });
       job = indexClient.begin("graphify");
-      const nodes: GraphifyNode[] = [], links: GraphifyLink[] = [], hyperedges: GraphifyHyperedge[] = [], communities: GraphifyCommunity[] = [];
-      const plan: { section: GraphifySection; key: "communities" | "nodes" | "links" | "hyperedges" }[] = [
-        { section: "communities", key: "communities" }, { section: "nodes", key: "nodes" }, { section: "links", key: "links" }, { section: "hyperedges", key: "hyperedges" },
-      ];
-      for (const { section, key } of plan) {
-        let offset = 0;
-        for (;;) {
-          const page = await api.readGraphify<GraphifyNode | GraphifyLink | GraphifyHyperedge | GraphifyCommunity>(artifact.artifactId, section, offset, PAGE);
-          if (mine !== seq) { job.cancel(); return; }
-          // Pages of another build are never mixed in: the hash, not only the id, must match.
-          if (page.artifactId !== artifact.artifactId || page.artifactHash !== artifact.artifactHash) throw new Error("A page of a different Graphify build arrived; reading stopped so builds are not mixed.");
-          if (key === "nodes") { nodes.push(...(page.items as GraphifyNode[])); job.push({ section: "graphifyNodes", items: page.items as GraphifyNode[] }); }
-          else if (key === "links") { links.push(...(page.items as GraphifyLink[])); job.push({ section: "graphifyLinks", items: page.items as GraphifyLink[] }); }
-          else if (key === "hyperedges") { hyperedges.push(...(page.items as GraphifyHyperedge[])); job.push({ section: "graphifyHyperedges", items: page.items as GraphifyHyperedge[] }); }
-          else { communities.push(...(page.items as GraphifyCommunity[])); job.push({ section: "graphifyCommunities", items: page.items as GraphifyCommunity[] }); }
-          commit({ progress: { ...state.progress, [key]: { loaded: offset + page.items.length, total: page.total } } });
-          if (page.nextOffset === null) break;
-          offset = page.nextOffset;
-        }
+      const into: Collected = { nodes: [], links: [], hyperedges: [], communities: [] };
+      for (const key of SECTIONS) {
+        if (!await readSection(artifact, job, into, key, mine)) return;
       }
       const built: IndexResult | null = await job.finish();
-      if (mine !== seq || built === null || built.kind !== "graphify") return;
-      commit({ status: "ready", nodes, links, hyperedges, communities, result: { model: built.model, stats: built.stats } });
+      if (mine !== seq || built?.kind !== "graphify") return;
+      commit({ status: "ready", ...into, result: { model: built.model, stats: built.stats } });
     } catch (error) {
       job?.cancel();
       if (mine !== seq) return;
-      const message = errorText(error);
-      if (isGone(message)) gone(message);
-      else commit({ status: "error", error: message });
+      failWith(error, message => ({ status: "error", error: message }));
     }
   }
 
@@ -141,49 +161,63 @@ export function createGraphifyStore(options: { api: GraphifyApi; indexClient: Pi
     }
   }
 
-  async function runSearch(text: string, more: boolean): Promise<void> {
-    const artifact = state.artifact;
+  function searchStale(mine: number, sequence: number): boolean { return mine !== seq || sequence !== searchSeq; }
+  function neighborsStale(mine: number, sequence: number): boolean { return mine !== seq || sequence !== neighborSeq; }
+
+  async function runSearch(artifact: GraphifyArtifact, trimmed: string, more: boolean): Promise<void> {
     const sequence = more ? searchSeq : ++searchSeq;
-    const trimmed = text.trim();
-    if (!artifact || !trimmed) { if (!more) { searchSeq++; commit({ search: blankSearch() }); } return; }
     const previous = state.search;
     const continuing = more && previous.text === trimmed;
     if (continuing && previous.nextOffset === null) return;
-    const offset = continuing ? previous.nextOffset ?? 0 : 0;
+    const base = continuing ? previous : blankSearch();
     const mine = seq;
-    commit({ search: { ...(continuing ? previous : blankSearch()), text: trimmed, status: "loading", error: null } });
+    commit({ search: { ...base, text: trimmed, status: "loading", error: null } });
     try {
-      const page = await api.queryGraphify(artifact.artifactId, { kind: "search", text: trimmed, offset, limit: PAGE });
-      if (mine !== seq || sequence !== searchSeq || page.artifactId !== artifact.artifactId) return;
-      commit({ search: { text: trimmed, status: "ready", items: continuing ? [...previous.items, ...(page.items as GraphifySearchItem[])] : (page.items as GraphifySearchItem[]), total: page.total, nextOffset: page.nextOffset, error: null } });
+      const page = await api.queryGraphify(artifact.artifactId, { kind: "search", text: trimmed, offset: base.nextOffset ?? 0, limit: PAGE });
+      if (searchStale(mine, sequence) || page.artifactId !== artifact.artifactId) return;
+      commit({ search: { text: trimmed, status: "ready", items: [...base.items, ...(page.items as GraphifySearchItem[])], total: page.total, nextOffset: page.nextOffset, error: null } });
     } catch (error) {
-      if (mine !== seq || sequence !== searchSeq) return;
-      const message = errorText(error);
-      if (isGone(message)) gone(message); else commit({ search: { ...state.search, status: "error", error: message } });
+      if (searchStale(mine, sequence)) return;
+      failWith(error, message => ({ search: { ...state.search, status: "error", error: message } }));
+    }
+  }
+
+  /** A continued list keeps the groups it already has; the first page asks for them. */
+  async function neighborGroups(artifact: GraphifyArtifact, ref: GraphifyRef, continuing: boolean, known: GraphifyHyperedge[]): Promise<GraphifyHyperedge[]> {
+    if (continuing) return known;
+    return (await api.queryGraphify(artifact.artifactId, { kind: "hyperedgesOf", id: ref, offset: 0, limit: PAGE })).items as GraphifyHyperedge[];
+  }
+
+  async function loadNeighbors(artifact: GraphifyArtifact, ref: GraphifyRef, more: boolean): Promise<void> {
+    const sequence = more ? neighborSeq : ++neighborSeq;
+    const key = refKey(ref);
+    const previous = state.neighbors;
+    const continuing = more && previous.key === key;
+    if (continuing && previous.nextOffset === null) return;
+    const base = continuing ? previous : blankNeighbors();
+    const mine = seq;
+    commit({ neighbors: { ...base, key, status: "loading", error: null } });
+    try {
+      const page = await api.queryGraphify(artifact.artifactId, { kind: "neighbors", id: ref, direction: "both", offset: base.nextOffset ?? 0, limit: PAGE });
+      if (neighborsStale(mine, sequence) || page.artifactId !== artifact.artifactId) return;
+      const groups = await neighborGroups(artifact, ref, continuing, previous.groups);
+      if (neighborsStale(mine, sequence)) return;
+      commit({ neighbors: { key, status: "ready", items: [...base.items, ...(page.items as GraphifyLink[])], total: page.total, nextOffset: page.nextOffset, error: null, groups } });
+    } catch (error) {
+      if (neighborsStale(mine, sequence)) return;
+      failWith(error, message => ({ neighbors: { ...state.neighbors, status: "error", error: message } }));
     }
   }
 
   async function inspect(ref: GraphifyRef | null, more = false): Promise<void> {
     const artifact = state.artifact;
-    const sequence = more ? neighborSeq : ++neighborSeq;
-    if (ref === null || !artifact) { if (!more) commit({ neighbors: blankNeighbors() }); return; }
-    const key = refKey(ref);
-    const previous = state.neighbors;
-    const continuing = more && previous.key === key;
-    if (continuing && previous.nextOffset === null) return;
-    const offset = continuing ? previous.nextOffset ?? 0 : 0;
-    const mine = seq;
-    commit({ neighbors: { ...(continuing ? previous : blankNeighbors()), key, status: "loading", error: null } });
-    try {
-      const page = await api.queryGraphify(artifact.artifactId, { kind: "neighbors", id: ref, direction: "both", offset, limit: PAGE });
-      if (mine !== seq || sequence !== neighborSeq || page.artifactId !== artifact.artifactId) return;
-      const groups = continuing ? previous.groups : (await api.queryGraphify(artifact.artifactId, { kind: "hyperedgesOf", id: ref, offset: 0, limit: PAGE })).items as GraphifyHyperedge[];
-      if (mine !== seq || sequence !== neighborSeq) return;
-      commit({ neighbors: { key, status: "ready", items: continuing ? [...previous.items, ...(page.items as GraphifyLink[])] : (page.items as GraphifyLink[]), total: page.total, nextOffset: page.nextOffset, error: null, groups } });
-    } catch (error) {
-      if (mine !== seq || sequence !== neighborSeq) return;
-      const message = errorText(error);
-      if (isGone(message)) gone(message); else commit({ neighbors: { ...state.neighbors, status: "error", error: message } });
+    if (ref !== null && artifact) {
+      await loadNeighbors(artifact, ref, more);
+      return;
+    }
+    if (!more) {
+      neighborSeq++;
+      commit({ neighbors: blankNeighbors() });
     }
   }
 
@@ -191,8 +225,11 @@ export function createGraphifyStore(options: { api: GraphifyApi; indexClient: Pi
     subscribe: store.subscribe,
     open,
     check,
-    setSearch: text => runSearch(text, false),
-    searchMore: () => runSearch(state.search.text, true),
+    setSearch: async text => {
+      if (state.artifact && text.trim()) await runSearch(state.artifact, text.trim(), false);
+      else { searchSeq++; commit({ search: blankSearch() }); }
+    },
+    searchMore: async () => { if (state.artifact && state.search.text) await runSearch(state.artifact, state.search.text, true); },
     inspect,
     selectGroup(id) { commit({ selectedGroup: id }); },
     setCamera(camera) { commit({ camera }); },
