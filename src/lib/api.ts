@@ -104,7 +104,7 @@ export interface CreateInstanceInput {
 export type PtyChunk = ArrayBuffer;
 export interface GlobalConfigInfo { path: string | null; error: string | null; }
 export interface ConfigPreview { yaml: string; modelRoles: Record<string, string | null>; omitted: string[]; }
-export type SetupScope = "global" | "manager" | "architect" | "repository";
+export type SetupScope = "global" | "manager" | "architect" | "local_ai" | "repository";
 export type SetupKind = "agents" | "rules" | "skill" | "tool" | "workflow" | "plugin" | "profile";
 export type ScriptLanguage = "python" | "bash" | "typescript";
 export interface SetupItem { kind: SetupKind; name: string; description: string; language?: ScriptLanguage; }
@@ -113,7 +113,7 @@ export interface SetupDraft { scope: SetupScope | null; kinds: SetupKind[]; item
 export interface PlanSessionAdmission { planner: Instance; promptSent: boolean | null; error: string | null; }
 export interface HelperAdmission { helper: Instance; promptSent: boolean | null; error: string | null; }
 export interface ClassifyAdmission { architect: Instance | null; promptSent: boolean | null; requested: number; error: string | null; }
-export interface SetupPaths { globalOmpFolder: string; globalAgentFolder: string; managerFolder: string; architectFolder: string; }
+export interface SetupPaths { globalOmpFolder: string; globalAgentFolder: string; managerFolder: string; architectFolder: string; localAiFolder: string; }
 export interface SetupAdmission { instance: Instance; promptSent: boolean | null; error: string | null; }
 export interface SavedConfig { path: string; modifiedMs: number; }
 export interface SavedConfigs { current: string | null; snapshots: SavedConfig[]; nativeGlobal: string | null; error: string | null; }

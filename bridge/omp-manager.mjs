@@ -446,6 +446,16 @@ export default function managerBridge(pi) {
     });
   }
   pi.on('session_start', (_event, ctx) => {
+    if (process.env.OMP_MANAGER_LOCAL_AI_SETUP_DIR) {
+      const guard = globalThis[Symbol.for('omp-manager.local-ai-guard-ready')];
+      const local = process.env.OMP_MANAGER_LOCAL_AI_SETUP_MODE === 'local';
+      if (!guard || guard.root !== process.env.OMP_MANAGER_LOCAL_AI_SETUP_DIR || guard.enabled !== local ||
+          (local && !pi.pi?.ModelRegistry?.prototype[Symbol.for('omp-manager.local-ai-model-policy')])) {
+        process.stderr.write('OMP Manager Local AI guard is unavailable; startup stopped before bridge readiness.\\n');
+        process.exit(78);
+      }
+      guard.checkSession(ctx);
+    }
     if (!adoptContext(ctx)) return;
     connect();
     if (!timer) timer = ctx.setInterval(connect, 1000);

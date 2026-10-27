@@ -91,6 +91,19 @@ pub struct Pty {
 impl Pty {
     pub fn spawn(definition: &Definition, bridge: &BridgeLaunch) -> Result<Self, String> {
         let input = &definition.input;
+        let app_root = bridge.extension_path.parent().ok_or("invalid bridge directory")?;
+        // Read-only helpers keep their restricted tool surface, regardless of their model.
+        let has_local_assets = definition.helper.is_none()
+            && ["AGENTS.md", "RULES.md", "SKILLS.md", "agent-instructions", "rules", "skills", "tools", "extensions"]
+                .iter().any(|name| bridge.local_ai_setup_dir.join(name).exists());
+        let local = if has_local_assets {
+            crate::config::native_request(app_root, &bridge.home_dir, serde_json::json!({
+                "action": "local_setup", "cwd": input.project_path, "profile": input.profile,
+                "configFiles": input.configs, "model": input.model,
+                "sessionPath": definition.session_path.as_ref().filter(|p| p.is_file())
+            }))?
+        } else { serde_json::json!({"local": false}) };
+        let local_enabled = local["local"] == true;
 
         let program = crate::toolchain::omp_program();
         let mut cmd = CommandBuilder::new(program);
@@ -108,7 +121,13 @@ impl Pty {
             cmd.arg("--config");
             cmd.arg(config);
         }
-        if !input.model.is_empty() {
+        if local_enabled {
+            let selector = local["selector"].as_str().ok_or("Local AI setup model resolution is unavailable")?;
+            cmd.args(["--model", selector]);
+            if let Some(thinking) = local["thinkingLevel"].as_str() {
+                cmd.args(["--thinking", thinking]);
+            }
+        } else if !input.model.is_empty() {
             cmd.args(["--model", &input.model]);
         }
         // OMP creates sessions lazily: a path reported before the first message has no file to resume.
@@ -125,6 +144,18 @@ impl Pty {
         if helper.is_some() {
             cmd.arg("--no-tools");
         }
+        cmd.env("OMP_MANAGER_LOCAL_AI_SETUP_DIR", &bridge.local_ai_setup_dir);
+        cmd.env("OMP_MANAGER_LOCAL_AI_SETUP_MODE", if local_enabled { "local" } else { "ordinary" });
+        cmd.arg("--extension");
+        cmd.arg(app_root.join("local-ai-guard.ts"));
+        if local_enabled {
+            cmd.arg("--extension");
+            cmd.arg(&bridge.local_ai_setup_dir);
+            for package in crate::setup::scoped_plugin_paths(&bridge.local_ai_setup_dir, "Local AI models")? {
+                cmd.arg("--extension");
+                cmd.arg(package);
+            }
+        }
         cmd.arg("--extension");
         cmd.arg(&bridge.extension_path);
         cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_DIR");
@@ -140,7 +171,8 @@ impl Pty {
             cmd.env("OMP_MANAGER_PRIVATE_SETUP_DIR", root);
             cmd.env("OMP_MANAGER_PRIVATE_SETUP_ROLE", role);
             // Private packages remain confined to their coordinator's directory.
-            for package in crate::setup::private_plugin_paths(root, definition.kind)? {
+            let label = if definition.kind == InstanceKind::Manager { "Manager" } else { "Architect" };
+            for package in crate::setup::scoped_plugin_paths(root, label)? {
                 cmd.arg("--extension");
                 cmd.arg(package);
             }

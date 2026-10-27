@@ -29,6 +29,7 @@ pub enum SetupScope {
     Global,
     Manager,
     Architect,
+    LocalAi,
     Repository,
 }
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Debug)]
@@ -71,6 +72,7 @@ pub struct SetupPaths {
     pub global_agent_folder: PathBuf,
     pub manager_folder: PathBuf,
     pub architect_folder: PathBuf,
+    pub local_ai_folder: PathBuf,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,11 +172,23 @@ impl SetupRequest {
 }
 
 pub fn materialize(root: &Path) -> Result<()> {
-    let source = include_str!("../../bridge/coordinator-setup.ts");
-    for role in ["manager", "architect"] {
+    for (role, source) in [
+        ("manager", include_str!("../../bridge/coordinator-setup.ts")),
+        ("architect", include_str!("../../bridge/coordinator-setup.ts")),
+        ("local-ai", include_str!("../../bridge/local-ai-setup.ts")),
+    ] {
         let folder = root.join(format!("{role}-setup"));
         fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
         let file = folder.join("index.ts");
+        if fs::read_to_string(&file).ok().as_deref() != Some(source) {
+            fs::write(file, source).map_err(|e| e.to_string())?;
+        }
+    }
+    for (name, source) in [
+        ("local-ai-guard.ts", include_str!("../../bridge/local-ai-guard.ts")),
+        ("local-ai-models.mjs", include_str!("../../bridge/local-ai-models.mjs")),
+    ] {
+        let file = root.join(name);
         if fs::read_to_string(&file).ok().as_deref() != Some(source) {
             fs::write(file, source).map_err(|e| e.to_string())?;
         }
@@ -207,6 +221,7 @@ pub fn paths(registry: &Registry) -> Result<SetupPaths> {
         global_agent_folder,
         manager_folder: registry.config_root().join("manager-setup"),
         architect_folder: registry.config_root().join("architect-setup"),
+        local_ai_folder: registry.config_root().join("local-ai-setup"),
     })
 }
 
@@ -312,13 +327,8 @@ fn discoverable_module(package: &Path, module: &Path) -> bool {
             && is_script(module))
 }
 
-/// Validated role-private packages loaded through native directory discovery.
-pub fn private_plugin_paths(root: &Path, role: InstanceKind) -> Result<Vec<PathBuf>> {
-    let role = match role {
-        InstanceKind::Manager => "Manager",
-        InstanceKind::Architect => "Architect",
-        _ => return Err("Private plugins require a coordinator role".into()),
-    };
+/// Validated scoped packages loaded through native directory discovery.
+pub fn scoped_plugin_paths(root: &Path, role: &str) -> Result<Vec<PathBuf>> {
     let folder = root.join("extensions");
     let entries = match fs::read_dir(&folder) {
         Ok(entries) => entries,
@@ -499,6 +509,7 @@ pub fn open_folder(registry: &Registry, scope: SetupScope, project_instance_id: 
         SetupScope::Global => paths(registry)?.global_omp_folder,
         SetupScope::Manager => registry.config_root().join("manager-setup"),
         SetupScope::Architect => registry.config_root().join("architect-setup"),
+        SetupScope::LocalAi => registry.config_root().join("local-ai-setup"),
         SetupScope::Repository => repository_root(registry, project_instance_id.ok_or("Repository setup requires a project")?)?,
     };
     open_editor_folder(&folder)
@@ -590,6 +601,7 @@ fn prompt_with_routes(request: &SetupRequest, paths: &SetupPaths, repository_roo
         SetupScope::Global => &paths.global_agent_folder,
         SetupScope::Manager => &paths.manager_folder,
         SetupScope::Architect => &paths.architect_folder,
+        SetupScope::LocalAi => &paths.local_ai_folder,
         SetupScope::Repository => {
             repository_target = repository_folder(repository_root.ok_or("Repository setup requires a project")?)?;
             &repository_target
@@ -659,6 +671,7 @@ fn prompt_with_routes(request: &SetupRequest, paths: &SetupPaths, repository_roo
         match item.kind {
             SetupKind::Agents if item.name.is_empty() => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
             SetupKind::Rules => text.push_str("Surgically merge requested instructions; preserve existing unrelated policy. RULES.md is sticky.\n"),
+            SetupKind::Agents if request.scope == SetupScope::LocalAi => text.push_str("Create a standalone named instruction file, not merged into AGENTS.md. It is not automatically loaded and is outside this GUI's unrestricted Persona catalog. Use it only inside an explicitly local-only guarded process; never append it to an unrestricted or hosted session. No frontmatter is required.\n"),
             SetupKind::Agents if request.scope == SetupScope::Repository => text.push_str("Create a standalone named instruction file, not merged into AGENTS.md. It is not automatically loaded and is not in this GUI's Persona catalog. Use it through an explicit --append-system-prompt file argument. No frontmatter is required.\n"),
             SetupKind::Agents => text.push_str("Create a standalone, named instruction file with plain Markdown instructions for an agent. Do not merge it into the scope's AGENTS.md. OMP does not load it automatically: the user selects it per dashboard instance, and OMP appends it to that session's system prompt. No frontmatter is required.\n"),
             SetupKind::Profile => text.push_str(&format!("Create the native OMP profile `{name}` at {root}/profiles/{name}/agent/. This overrides the general rule against modifying config.yml: write that profile's config.yml with native OMP settings that implement the description (for example plan.enabled: true and plan.defaultOnStartup: true start sessions in plan mode; modelRoles select models). Validate that it loads with native Settings.loadReadOnly using that agent directory. Add AGENTS.md, rules, skills or tools inside that profile only if the description asks. Never create or copy credentials or agent.db and never modify the default profile; tell the human the profile has its own login (run /login inside it). If the profile already exists read it first and make only surgical changes.\n", name = item.name, root = paths.global_omp_folder.display())),
@@ -674,6 +687,8 @@ fn prompt_with_routes(request: &SetupRequest, paths: &SetupPaths, repository_roo
     }
     if request.scope == SetupScope::Repository {
         text.push_str("After native plan approval, write only the requested assets under this repository's .omp folder. Read existing files first and preserve unrelated content. Validate native discovery with cwd equal to the repository root. Never modify Global/Manager/Architect setup or copy credentials. Existing project processes are not reloaded or restarted automatically. A nested cwd or nearer .omp can change discovery; use or reopen OMP from the repository root for root-scoped rules/tools. This session is human-controlled: wait for human plan review.");
+    } else if request.scope == SetupScope::LocalAi {
+        text.push_str("After native plan approval, write only the requested assets under the Local AI models setup root above (or the explicitly routed Markdown source folder). Never edit the setup root's index.ts loader, local-ai-guard.ts, local-ai-models.mjs, global configuration/auth, credentials, other scopes, or installed SDK/binaries. Requested tool/plugin index.ts modules in their own subfolders are allowed. These assets are loaded only by a fresh local-only guarded process with a concrete resolved loopback HTTP(S) model endpoint; hosted, unknown and gateway/transport endpoints must not load them. The process guard blocks hosted fallback, child/advisor/compaction model requests. Switching modes requires a fresh process/conversation; guarded sessions cannot later resume unrestricted. Root instructions reload each local turn; skill/tool/rule/plugin catalog changes need native reload or an explicit user reopen. Plugins are trusted code, not a network sandbox. Do not restart existing processes automatically. This session is human-controlled: wait for human plan review.");
     } else {
         let role = match request.scope {
             SetupScope::Manager => Some("Manager"),
@@ -741,6 +756,7 @@ impl SetupService {
             SetupScope::Global => "Agent setup — Global".into(),
             SetupScope::Manager => "Agent setup — The Manager".into(),
             SetupScope::Architect => "Agent setup — The Architect".into(),
+            SetupScope::LocalAi => "Agent setup — Local AI models".into(),
             SetupScope::Repository => {
                 let root = repository_root.as_ref().ok_or("Repository setup requires a project")?;
                 let basename = root.file_name().map(|name| name.to_string_lossy()).unwrap_or_else(|| root.to_string_lossy());
@@ -934,8 +950,10 @@ mod tests {
             global_agent_folder: root.join("global/agent"),
             manager_folder: root.join("manager-setup"),
             architect_folder: root.join("architect-setup"),
+            local_ai_folder: root.join("local-ai-setup"),
         };
         touch(&paths.global_agent_folder.join("agent-instructions/beta/AGENTS.md"));
+        touch(&paths.local_ai_folder.join("agent-instructions/local-only/AGENTS.md"));
         touch(&paths.global_agent_folder.join("agent-instructions/alpha/AGENTS.md"));
         touch(&paths.manager_folder.join("agent-instructions/alpha/AGENTS.md"));
         touch(&paths.global_agent_folder.join("agent-instructions/empty/other.md"));
@@ -1054,7 +1072,7 @@ mod tests {
         assert!(request.clone().normalize().is_err());
         request.project_instance_id = Some("project-a".into());
         assert_eq!(request.clone().normalize().unwrap().project_instance_id.as_deref(), Some("project-a"));
-        for scope in [SetupScope::Global, SetupScope::Manager, SetupScope::Architect] {
+        for scope in [SetupScope::Global, SetupScope::Manager, SetupScope::Architect, SetupScope::LocalAi] {
             let mut ordinary = request.clone();
             ordinary.scope = scope;
             assert_eq!(ordinary.normalize().unwrap().project_instance_id, None);
@@ -1063,10 +1081,33 @@ mod tests {
         assert_eq!(request.normalize().unwrap_err(), "OMP profiles are global; choose the Global scope");
     }
     #[test]
+    fn local_scope_supports_all_assets_except_profiles_without_creating_destinations() {
+        let root = std::env::temp_dir().join(format!("omp-local-setup-{}", uuid::Uuid::new_v4()));
+        let paths = SetupPaths {
+            global_omp_folder: root.join("global"),
+            global_agent_folder: root.join("global/agent"),
+            manager_folder: root.join("manager-setup"),
+            architect_folder: root.join("architect-setup"),
+            local_ai_folder: root.join("local-ai-setup"),
+        };
+        let mut request = requests(SetupScope::LocalAi, vec![
+            item(SetupKind::Agents, ""), item(SetupKind::Agents, "reviewer"),
+            item(SetupKind::Rules, ""), item(SetupKind::Skill, "review"),
+            item(SetupKind::Workflow, "review"), item(SetupKind::Plugin, "helper"),
+            SetupItem { language: Some(ScriptLanguage::Python), ..item(SetupKind::Tool, "helper") },
+        ]);
+        request.project_instance_id = Some("ignored".into());
+        let request = request.normalize().unwrap();
+        assert_eq!(request.project_instance_id, None);
+        prompt(&request, &paths, None).unwrap();
+        assert!(!root.exists());
+        assert!(requests(SetupScope::LocalAi, vec![item(SetupKind::Profile, "plan")]).normalize().is_err());
+    }
+    #[test]
     fn repository_prompt_targets_every_asset_inside_the_bound_repo() {
         let root = std::env::temp_dir().join(format!("omp-repo-prompt-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let paths = SetupPaths { global_omp_folder: root.join("global"), global_agent_folder: root.join("global/agent"), manager_folder: root.join("manager"), architect_folder: root.join("architect-setup") };
+        let paths = SetupPaths { global_omp_folder: root.join("global"), global_agent_folder: root.join("global/agent"), manager_folder: root.join("manager"), architect_folder: root.join("architect-setup"), local_ai_folder: root.join("local-ai-setup") };
         let mut request = requests(SetupScope::Repository, vec![
             item(SetupKind::Agents, ""), item(SetupKind::Agents, "reviewer"),
             item(SetupKind::Rules, ""), item(SetupKind::Skill, "review"),
@@ -1093,6 +1134,7 @@ mod tests {
             global_agent_folder: PathBuf::from("/g/.omp/agent"),
             manager_folder: PathBuf::from("/m/manager-setup"),
             architect_folder: PathBuf::from("/m/architect-setup"),
+            local_ai_folder: PathBuf::from("/m/local-ai-setup"),
         };
         let text = prompt(
             &requests(
@@ -1124,6 +1166,7 @@ mod tests {
             global_agent_folder: root.join("global/agent"),
             manager_folder: root.join("manager-setup"),
             architect_folder: root.join("architect-setup"),
+            local_ai_folder: root.join("local-ai-setup"),
         };
         let mut manager_request = request(SetupKind::Rules, "");
         manager_request.scope = SetupScope::Manager;
@@ -1203,7 +1246,7 @@ mod tests {
         bound.scope = SetupScope::Repository;
         bound.project_instance_id = Some(source_a.id.clone());
         service.jobs.lock().map_err(|error| error.to_string())?.insert(row.id.clone(), Job {
-            request: bound.clone(), paths: SetupPaths { global_omp_folder: root.join("global"), global_agent_folder: root.join("global/agent"), manager_folder: root.join("manager-setup"), architect_folder: root.join("architect-setup") },
+            request: bound.clone(), paths: SetupPaths { global_omp_folder: root.join("global"), global_agent_folder: root.join("global/agent"), manager_folder: root.join("manager-setup"), architect_folder: root.join("architect-setup"), local_ai_folder: root.join("local-ai-setup") },
             repository_root: Some(canonical(&repo_a).unwrap()), admission: Some(false), sending: false,
         });
         let mut changed = bound.clone();
@@ -1231,7 +1274,7 @@ mod tests {
     fn plugins_are_available_in_every_scope_while_profiles_stay_global() {
         let parsed: SetupRequest = serde_json::from_str(r#"{"scope":"manager","items":[{"kind":"plugin","name":"Release Notes","description":"Summarise changes"}]}"#).unwrap();
         assert_eq!(parsed.normalize().unwrap().items[0].name, "release-notes");
-        for scope in [SetupScope::Global, SetupScope::Manager, SetupScope::Architect, SetupScope::Repository] {
+        for scope in [SetupScope::Global, SetupScope::Manager, SetupScope::Architect, SetupScope::Repository, SetupScope::LocalAi] {
             let mut plugin = requests(scope, vec![item(SetupKind::Plugin, "release-notes"), item(SetupKind::Skill, "release-notes")]);
             plugin.project_instance_id = Some("project".into());
             plugin.items[0].language = Some(ScriptLanguage::Python);
@@ -1249,8 +1292,8 @@ mod tests {
     }
     #[test]
     fn plugin_prompts_target_the_scope_extensions_folder() {
-        let paths = SetupPaths { global_omp_folder: "G".into(), global_agent_folder: PathBuf::from("G").join("agent"), manager_folder: PathBuf::from("M"), architect_folder: PathBuf::from("A") };
-        for (scope, target) in [(SetupScope::Global, PathBuf::from("G").join("agent")), (SetupScope::Manager, PathBuf::from("M")), (SetupScope::Architect, PathBuf::from("A"))] {
+        let paths = SetupPaths { global_omp_folder: "G".into(), global_agent_folder: PathBuf::from("G").join("agent"), manager_folder: PathBuf::from("M"), architect_folder: PathBuf::from("A"), local_ai_folder: PathBuf::from("L") };
+        for (scope, target) in [(SetupScope::Global, PathBuf::from("G").join("agent")), (SetupScope::Manager, PathBuf::from("M")), (SetupScope::Architect, PathBuf::from("A")), (SetupScope::LocalAi, PathBuf::from("L"))] {
             let text = prompt(&requests(scope, vec![item(SetupKind::Plugin, "release-notes")]), &paths, None).unwrap();
             assert!(text.contains(&target.display().to_string()));
             assert!(text.contains("extensions/release-notes/package.json and extensions/release-notes/index.ts"));
@@ -1260,7 +1303,7 @@ mod tests {
     #[test]
     fn manager_plugins_are_validated_and_ordered_without_executing_them() {
         let root = std::env::temp_dir().join(format!("omp-manager-plugins-{}", uuid::Uuid::new_v4()));
-        assert!(private_plugin_paths(&root, InstanceKind::Manager).unwrap().is_empty());
+        assert!(scoped_plugin_paths(&root, "Manager").unwrap().is_empty());
         let extensions = root.join("extensions");
         let write = |relative: &str, text: &str| {
             let file = extensions.join(relative);
@@ -1276,9 +1319,9 @@ mod tests {
         write("loose/index.ts", "");
         write("note.txt", "");
         let names = |paths: Vec<PathBuf>| paths.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
-        assert_eq!(names(private_plugin_paths(&root, InstanceKind::Manager).unwrap()), ["alpha", "zeta"]);
-        assert_eq!(names(private_plugin_paths(&root, InstanceKind::Architect).unwrap()), ["alpha", "zeta"]);
-        assert!(private_plugin_paths(&root, InstanceKind::Instance).is_err());
+        for label in ["Manager", "Architect", "Local AI models"] {
+            assert_eq!(names(scoped_plugin_paths(&root, label).unwrap()), ["alpha", "zeta"]);
+        }
         for (text, expected) in [
             ("{", "package.json is invalid"),
             (r#"{"omp":{"extensions":["missing.ts"]}}"#, "declares a missing extension module"),
@@ -1287,7 +1330,7 @@ mod tests {
         ] {
             write("bad/package.json", text);
             write("bad/src/main.ts", "");
-            let error = private_plugin_paths(&root, InstanceKind::Manager).unwrap_err();
+            let error = scoped_plugin_paths(&root, "Manager").unwrap_err();
             assert!(error.starts_with("Manager plugin bad") && error.contains(expected), "{error}");
         }
         fs::remove_dir_all(root).unwrap();
