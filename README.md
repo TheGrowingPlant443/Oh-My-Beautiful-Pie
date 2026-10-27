@@ -24,6 +24,16 @@ cargo tauri build --no-bundle -- --locked
 
 Output: `src-tauri/target/release/omp-manager.exe`. It embeds the UI; no Vite server is needed for the release executable.
 
+### macOS release downloads
+
+The [GitHub releases](https://github.com/TheGrowingPlant443/Oh-My-Beautiful-Pie/releases) provide native `.app` ZIPs for **macOS 15 or later**: `arm64` for Apple Silicon and `x86_64` for Intel. Extract the matching ZIP and move **OMP Manager.app** into Applications. These downloads do not require Nix; the Nix packages below are a separate installation path.
+
+The app is ad-hoc signed, not Apple Developer ID signed or notarized. Gatekeeper may require approval in **System Settings → Privacy & Security** after the first launch attempt; managed Macs may prohibit it. Do not disable Gatekeeper globally.
+
+Install **OMP 18.12.6**, its matching SDK, Bun and Node.js separately; these downloads embed the UI and bridge scripts, not those runtimes. Finder launch uses the same executable/SDK discovery described below. Optional parser, browser, container and local-knowledge features retain their documented prerequisites. Terminal launch with overrides is available through `/Applications/OMP Manager.app/Contents/MacOS/omp-manager`.
+
+Maintainers: manually run **macOS app** in GitHub Actions on the release commit. It builds on native Apple Silicon and Intel macOS 15 runners, materializes locked frontend/Cargo dependencies through Nix, compiles with the runner's native Rust/Apple toolchain, runs backend tests, checks the packaged CLI and system-library linkage, and uploads one ZIP per architecture. Attach both ZIPs and their SHA-256 checksums to a release targeting that same commit. The workflow does not publish automatically, and its headless checks do not verify Finder interaction, Keychain prompts or container integration; releases remain previews until those are checked on a real Mac.
+
 ### Linux and macOS
 
 The flake exposes native `x86_64-linux`, `aarch64-linux`, `x86_64-darwin` and `aarch64-darwin` packages. Build on the target OS/architecture (or use a matching Nix remote builder); Linux cannot runtime-test the macOS app. macOS builds, Finder launch, Keychain prompts and Podman-machine integration require verification on a real Mac; they are not claimed tested by a Linux build.
