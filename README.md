@@ -24,6 +24,18 @@ cargo tauri build --no-bundle -- --locked
 
 Output: `src-tauri/target/release/omp-manager.exe`. It embeds the UI; no Vite server is needed for the release executable.
 
+Maintainers: manually run **Native apps** in GitHub Actions, choosing the branch/commit to check. Its Windows x64 job builds the embedded frontend and release executable with the native MSVC toolchain, runs the backend tests, and uploads `OMP-Manager-windows-x64.zip`. The workflow runs only through **Run workflow**, never automatically on pushes or pull requests. Download the ZIP from the run's **Artifacts**; it is unsigned and still requires the Windows runtime prerequisites above. This also runs the existing macOS build alongside Windows.
+
+### macOS release downloads
+
+The [GitHub releases](https://github.com/TheGrowingPlant443/Oh-My-Beautiful-Pie/releases) provide a native **Apple Silicon (arm64)** `.app` ZIP for **macOS 15 or later**. Extract the ZIP and move **OMP Manager.app** into Applications. This download does not require Nix; the Nix packages below are a separate installation path. Intel release downloads are not provided.
+
+The app is ad-hoc signed, not Apple Developer ID signed or notarized. Gatekeeper may require approval in **System Settings → Privacy & Security** after the first launch attempt; managed Macs may prohibit it. Do not disable Gatekeeper globally.
+
+Install **OMP 18.12.6**, its matching SDK, Bun and Node.js separately; these downloads embed the UI and bridge scripts, not those runtimes. Finder launch uses the same executable/SDK discovery described below. Optional parser, browser, container and local-knowledge features retain their documented prerequisites. Terminal launch with overrides is available through `/Applications/OMP Manager.app/Contents/MacOS/omp-manager`.
+
+Maintainers: manually run **Native apps** in GitHub Actions on the release commit. It builds on a native Apple Silicon macOS 15 runner, materializes locked frontend/Cargo dependencies through Nix, compiles with the runner's native Rust/Apple toolchain, runs backend tests, checks the packaged CLI and system-library linkage, and uploads the arm64 ZIP. Attach the ZIP and its SHA-256 checksum to a release targeting that same commit. The workflow does not publish automatically, and its headless checks do not verify Finder interaction, Keychain prompts or container integration; releases remain previews until those are checked on a real Mac.
+
 ### Linux and macOS
 
 The flake exposes native `x86_64-linux`, `aarch64-linux`, `x86_64-darwin` and `aarch64-darwin` packages. Build on the target OS/architecture (or use a matching Nix remote builder); Linux cannot runtime-test the macOS app. macOS builds, Finder launch, Keychain prompts and Podman-machine integration require verification on a real Mac; they are not claimed tested by a Linux build.
@@ -346,6 +358,7 @@ Set `OMP_BROWSER_NATIVE=1` in the same environment to exercise the Rust supervis
 Rust's instrumented build cache stays in the per-user cache (`XDG_CACHE_HOME`, or `~/.cache`), not in the checkout or Nix flake input; Python coverage includes subprocesses, combines their real measurements, and does not write source-tree bytecode.
 
 Reports are `.quality-coverage/javascript.lcov`, `.quality-coverage/python.xml` and `.quality-coverage/rust.lcov`, using original repository source paths. `sonar-project.properties` declares their [supported SonarQube import formats](https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/test-coverage/test-coverage-parameters). Snapshots include explicitly declared, regular relative coverage files even when gitignored, without admitting linked files, protected metadata or explicitly excluded paths. Failed suites remove the final report set; no synthetic coverage, source exclusions or quality-gate changes are used.
+On macOS, first canonicalize the temporary-directory alias so security-sensitive fixtures use real paths: `TMPDIR="$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.gettempdir()))')"; export TMPDIR`. The macOS release workflow applies this before running the complete Rust suite, including a native process-identity/cancellation smoke check. The package-insights deadline regression holds the second response behind a bounded channel rather than requiring the first response to land within a narrow sleep-based window.
 
 Exercised on Windows: independent real OMP children; terminal handshake, input and response; preview-only startup; stop/restart and saved conversation continuity; application close/reopen with no autostart; native folder picker; native reconnect listing; plan viewing; compact tree with no dashboard terminals; and responsive preview sizing.
 

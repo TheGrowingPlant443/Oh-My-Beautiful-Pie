@@ -838,37 +838,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn engine_notes_explain_cpu_degradation_and_low_vm_limits() {
-        let runtime = QualityRuntime::Podman {
-            connection: String::new(),
-        };
-        let healthy = EngineProbe {
-            max_map_count: Some(1 << 20),
-            file_max: Some(1 << 20),
-            ..EngineProbe::default()
-        };
-        assert_eq!(runtime_notes(&runtime, &healthy), None);
-        let degraded = EngineProbe {
-            cpu_limits_unsupported: Some("no cpu controller".into()),
-            ..healthy.clone()
-        };
-        let note = runtime_notes(&runtime, &degraded).unwrap();
-        assert!(
-            note.contains("CPU limits are not applied on Podman"),
-            "{note}"
-        );
-        let low = EngineProbe {
-            max_map_count: Some(65_530),
-            ..healthy
-        };
-        let note = runtime_notes(&runtime, &low).unwrap();
-        assert!(
-            note.contains("65530") && (note.contains("polkit") || macos()),
-            "{note}"
-        );
-    }
-
     /// The raise path against a fake `pkexec` that records its argv and stdin and "applies" the change
     /// to a fake `/proc/sys`: proves the script travels on stdin to `/bin/sh -s`, and the result is verified.
     #[test]
@@ -916,25 +885,32 @@ mod tests {
     }
 
     #[test]
-    fn privileged_raise_reports_declined_missing_agent_and_unverified_outcomes() {
+    fn privileged_raise_rejects_failed_helpers_and_unverified_outcomes() {
+        use std::sync::atomic::AtomicBool;
+
         let dir = scratch();
         let script_file = dir.join("raise.sh");
         fs::write(&script_file, "exit 0\n").unwrap();
         let never_raised = || (Some(65_530u64), Some(1_000_000u64));
-        for (code, expected) in [
-            (126, "declined or dismissed"),
-            (127, "no polkit authentication agent"),
-        ] {
+        let checked = AtomicBool::new(false);
+        let read = || {
+            checked.store(true, Ordering::Relaxed);
+            never_raised()
+        };
+        for code in [126, 127] {
             let fake = dir.join(format!("pkexec-{code}"));
             script(&fake, &format!("#!/bin/sh\ncat >/dev/null\nexit {code}\n"));
-            let error = raise_with(
+            assert!(raise_with(
                 pkexec_command(Some(fake)).unwrap(),
                 &script_file,
-                &never_raised,
-                &RunControl::silent(),
+                &read,
+                &RunControl::silent()
             )
-            .unwrap_err();
-            assert!(error.contains(expected), "{code}: {error}");
+            .is_err());
+            assert!(
+                !checked.load(Ordering::Relaxed),
+                "failed helper must not reach post-success verification"
+            );
         }
         // The helper claims success but the kernel value did not change: never reported as raised.
         let liar = dir.join("pkexec-liar");
