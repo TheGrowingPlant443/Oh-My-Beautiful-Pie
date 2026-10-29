@@ -31,7 +31,7 @@ const EMPTY_HASH = sha256('');
 
 const HEADING = /^ {0,3}#{1,6}[ \t]+\S/m;
 const FENCE_START = /^ {0,3}([`~])/gm;
-const TREE_PREFIXES = ['|--', '+--', '`--', '\\--'];
+const TREE_PREFIXES = ['|--', '+--', '`--', String.raw`\--`];
 const PATH_COMMENTS = ['#', '//', '<-', '--', '—'];
 const pathCharacter = value => value !== undefined && /[\w.@~-]/.test(value);
 

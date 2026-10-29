@@ -4,12 +4,15 @@
 //!
 //! The index is built by streaming each note (no whole-file load, no note-size cap). Links are discovered outside
 //! fenced code, inline code spans and front matter. Nothing here writes to the vault.
-use super::dto::*;
-use super::fsio::{self, err, is_markdown_name, now_ms, percent_decode, validate_relative, HashedReader};
-use super::markdown::{looks_external, slug, split_fragment, Event, Heading, RawLink, Scanner};
+use super::dto::{
+    VaultLinkKind, VaultLinkQuery, VaultLinkRecord, VaultLinkStatus, VaultNoteRecord,
+    VaultQueryAnswer, VaultQueryPage, VaultRefresh, VaultResolution, VaultSearchHit,
+};
+use super::fsio::{self, HashedReader};
+use super::markdown::{self, Event, Heading, RawLink, Scanner};
 use super::vault::VaultRoot;
 use super::{KnowledgeService, Result};
-use crate::code_quality::snapshot::is_link;
+use crate::code_quality::snapshot;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -119,17 +122,24 @@ pub(crate) struct Resolved {
 }
 
 fn walk(root: &Path, components: &mut Vec<String>, out: &mut Walked) -> Result<()> {
-    let dir = components.iter().fold(root.to_path_buf(), |path, c| path.join(c));
+    let dir = components
+        .iter()
+        .fold(root.to_path_buf(), |path, c| path.join(c));
     let _directory_pin = fsio::pin_directory(&dir)?;
-    let entries = fs::read_dir(&dir).map_err(|e| err("Cannot list the vault", e))?;
+    let entries = fs::read_dir(&dir).map_err(|e| fsio::err("Cannot list the vault", e))?;
     for entry in entries {
-        let entry = entry.map_err(|e| err("Cannot list the vault", e))?;
+        let entry = entry.map_err(|e| fsio::err("Cannot list the vault", e))?;
         walk_entry(root, components, &entry, out)?;
     }
     Ok(())
 }
 
-fn walk_entry(root: &Path, components: &mut Vec<String>, entry: &fs::DirEntry, out: &mut Walked) -> Result<()> {
+fn walk_entry(
+    root: &Path,
+    components: &mut Vec<String>,
+    entry: &fs::DirEntry,
+    out: &mut Walked,
+) -> Result<()> {
     let Ok(name) = entry.file_name().into_string() else {
         out.skipped_unsafe += 1;
         return Ok(());
@@ -141,13 +151,13 @@ fn walk_entry(root: &Path, components: &mut Vec<String>, entry: &fs::DirEntry, o
         out.skipped_unsafe += 1;
         return Ok(());
     };
-    if is_link(&meta) {
+    if snapshot::is_link(&meta) {
         out.skipped_links += 1;
         return Ok(());
     }
     components.push(name.clone());
     let relative = components.join("/");
-    if validate_relative(&relative).is_err() {
+    if fsio::validate_relative(&relative).is_err() {
         out.skipped_unsafe += 1;
     } else if meta.is_dir() {
         if components.len() >= MAX_DEPTH {
@@ -155,8 +165,13 @@ fn walk_entry(root: &Path, components: &mut Vec<String>, entry: &fs::DirEntry, o
         } else {
             walk(root, components, out)?;
         }
-    } else if meta.is_file() && is_markdown_name(&name) {
-        out.candidates.push(Candidate { path: relative, components: components.clone(), bytes: meta.len(), mtime: fsio::mtime_nanos(&meta) });
+    } else if meta.is_file() && fsio::is_markdown_name(&name) {
+        out.candidates.push(Candidate {
+            path: relative,
+            components: components.clone(),
+            bytes: meta.len(),
+            mtime: fsio::mtime_nanos(&meta),
+        });
     }
     components.pop();
     Ok(())
@@ -164,14 +179,20 @@ fn walk_entry(root: &Path, components: &mut Vec<String>, entry: &fs::DirEntry, o
 
 fn scan_note(root: &Path, candidate: &Candidate) -> std::result::Result<Note, String> {
     let (file, _) = fsio::open_components(root, &candidate.components)?;
-    let length = file.metadata().map_err(|e| err("Cannot inspect note", e))?.len();
+    let length = file
+        .metadata()
+        .map_err(|e| fsio::err("Cannot inspect note", e))?
+        .len();
     let mut reader = HashedReader::new(file);
     let mut scanner = Scanner::default();
     let mut events = Vec::new();
     let mut line = Vec::new();
     let mut first = true;
     let mut long_lines = 0u64;
-    while let Some(read) = reader.next_line(&mut line, MAX_LINE).map_err(|e| err("Cannot read note", e))? {
+    while let Some(read) = reader
+        .next_line(&mut line, MAX_LINE)
+        .map_err(|e| fsio::err("Cannot read note", e))?
+    {
         let at_start = first;
         first = false;
         if read.too_long {
@@ -184,11 +205,16 @@ fn scan_note(root: &Path, candidate: &Candidate) -> std::result::Result<Note, St
         }
     }
     scanner.finish(&mut events);
-    let (digest, file) = reader.finish().map_err(|e| err("Cannot read note", e))?;
+    let (digest, file) = reader
+        .finish()
+        .map_err(|e| fsio::err("Cannot read note", e))?;
     if !digest.utf8_ok {
         return Err("not valid UTF-8".into());
     }
-    let after = file.metadata().map_err(|e| err("Cannot inspect note", e))?.len();
+    let after = file
+        .metadata()
+        .map_err(|e| fsio::err("Cannot inspect note", e))?
+        .len();
     if digest.bytes != length || after != length {
         return Err("changed while it was being indexed".into());
     }
@@ -198,7 +224,11 @@ fn scan_note(root: &Path, candidate: &Candidate) -> std::result::Result<Note, St
         bytes: length,
         hash: digest.hash,
         mtime: candidate.mtime,
-        state: if long_lines > 0 { NoteState::LineTooLong } else { NoteState::Indexed },
+        state: if long_lines > 0 {
+            NoteState::LineTooLong
+        } else {
+            NoteState::Indexed
+        },
         headings: Vec::new(),
         blocks: HashSet::new(),
         links: Vec::new(),
@@ -212,10 +242,15 @@ fn scan_note(root: &Path, candidate: &Candidate) -> std::result::Result<Note, St
             }
         }
     }
-    note.title = note.headings.iter().find(|h| h.level == 1 && !h.text.is_empty()).map(|h| h.text.clone()).unwrap_or_else(|| {
-        let name = candidate.path.rsplit('/').next().unwrap_or(&candidate.path);
-        name[..name.len() - 3].to_string()
-    });
+    note.title = note
+        .headings
+        .iter()
+        .find(|h| h.level == 1 && !h.text.is_empty())
+        .map(|h| h.text.clone())
+        .unwrap_or_else(|| {
+            let name = candidate.path.rsplit('/').next().unwrap_or(&candidate.path);
+            name[..name.len() - 3].to_string()
+        });
     Ok(note)
 }
 
@@ -233,9 +268,18 @@ fn scan_vault(root: &Path, previous: Option<&VaultIndex>) -> Result<Built> {
     let mut unreadable = 0u64;
     let mut hasher = Sha256::new();
     for candidate in &walked.candidates {
-        let reusable = previous.and_then(|p| p.by_path.get(&candidate.path).map(|i| (p, p.notes[*i].clone()))).filter(|(p, note)| {
-            candidate.mtime > 0 && note.bytes == candidate.bytes && note.mtime == candidate.mtime && u128::from(p.built_ms) * 1_000_000 >= candidate.mtime + RACY_NANOS
-        });
+        let reusable = previous
+            .and_then(|p| {
+                p.by_path
+                    .get(&candidate.path)
+                    .map(|i| (p, p.notes[*i].clone()))
+            })
+            .filter(|(p, note)| {
+                candidate.mtime > 0
+                    && note.bytes == candidate.bytes
+                    && note.mtime == candidate.mtime
+                    && u128::from(p.built_ms) * 1_000_000 >= candidate.mtime + RACY_NANOS
+            });
         let note = match reusable {
             Some((_, note)) => Ok(note),
             None => scan_note(root, candidate).map(Arc::new),
@@ -256,19 +300,46 @@ fn scan_vault(root: &Path, previous: Option<&VaultIndex>) -> Result<Built> {
         }
     }
     if walked.skipped_links > 0 {
-        warn(format!("{} linked/reparse-point entries were skipped", walked.skipped_links), &mut warnings);
+        warn(
+            format!(
+                "{} linked/reparse-point entries were skipped",
+                walked.skipped_links
+            ),
+            &mut warnings,
+        );
     }
     if walked.skipped_unsafe > 0 {
-        warn(format!("{} entries with unsafe or non-Unicode names were skipped", walked.skipped_unsafe), &mut warnings);
+        warn(
+            format!(
+                "{} entries with unsafe or non-Unicode names were skipped",
+                walked.skipped_unsafe
+            ),
+            &mut warnings,
+        );
     }
     if walked.too_deep > 0 {
-        warn(format!("{} folders deeper than {MAX_DEPTH} levels were skipped", walked.too_deep), &mut warnings);
+        warn(
+            format!(
+                "{} folders deeper than {MAX_DEPTH} levels were skipped",
+                walked.too_deep
+            ),
+            &mut warnings,
+        );
     }
-    Ok(Built { notes, unreadable, warnings, hash: fsio::hex(hasher.finalize()) })
+    Ok(Built {
+        notes,
+        unreadable,
+        warnings,
+        hash: fsio::hex(hasher.finalize()),
+    })
 }
 
 fn normalize_join(base: &str, relative: &str) -> Option<String> {
-    let mut parts: Vec<&str> = if relative.starts_with('/') || base.is_empty() { Vec::new() } else { base.split('/').collect() };
+    let mut parts: Vec<&str> = if relative.starts_with('/') || base.is_empty() {
+        Vec::new()
+    } else {
+        base.split('/').collect()
+    };
     for segment in relative.trim_start_matches('/').split('/') {
         match segment {
             "" | "." => {}
@@ -282,20 +353,34 @@ fn normalize_join(base: &str, relative: &str) -> Option<String> {
 }
 
 fn found_note(index: usize) -> Resolved {
-    Resolved { status: VaultLinkStatus::Resolved, target: Some(index), candidates: Vec::new() }
+    Resolved {
+        status: VaultLinkStatus::Resolved,
+        target: Some(index),
+        candidates: Vec::new(),
+    }
 }
 
 fn unique_or_ambiguous(list: &[usize]) -> Resolved {
     match list {
         [only] => found_note(*only),
-        _ => Resolved { status: VaultLinkStatus::Ambiguous, target: None, candidates: list.to_vec() },
+        _ => Resolved {
+            status: VaultLinkStatus::Ambiguous,
+            target: None,
+            candidates: list.to_vec(),
+        },
     }
 }
 
 fn has_other_extension(name: &str) -> bool {
     let last = name.rsplit('/').next().unwrap_or(name);
     match last.rsplit_once('.') {
-        Some((stem, ext)) => !stem.is_empty() && !ext.is_empty() && ext.len() <= 10 && ext.chars().all(|c| c.is_ascii_alphanumeric()) && !ext.eq_ignore_ascii_case("md"),
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 10
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && !ext.eq_ignore_ascii_case("md")
+        }
         None => false,
     }
 }
@@ -324,12 +409,15 @@ impl VaultIndex {
                 }
             }
             let name = note.path.rsplit('/').next().unwrap_or(&note.path);
-            by_filename_lower.entry(name.to_lowercase()).or_default().push(i);
+            by_filename_lower
+                .entry(name.to_lowercase())
+                .or_default()
+                .push(i);
         }
         let mut index = Self {
             revision,
             hash: built.hash,
-            built_ms: now_ms(),
+            built_ms: fsio::now_ms(),
             outgoing: vec![Vec::new(); built.notes.len()],
             incoming: vec![Vec::new(); built.notes.len()],
             notes: built.notes,
@@ -361,9 +449,15 @@ impl VaultIndex {
         if let Some(block) = fragment.strip_prefix('^') {
             return note.blocks.contains(block);
         }
-        let wanted = fragment.rsplit('#').find(|s| !s.trim().is_empty()).unwrap_or(fragment).trim();
-        let wanted_slug = slug(wanted);
-        note.headings.iter().any(|h| h.text == wanted || h.text.eq_ignore_ascii_case(wanted) || h.slug == wanted_slug)
+        let wanted = fragment
+            .rsplit('#')
+            .find(|s| !s.trim().is_empty())
+            .unwrap_or(fragment)
+            .trim();
+        let wanted_slug = markdown::slug(wanted);
+        note.headings.iter().any(|h| {
+            h.text == wanted || h.text.eq_ignore_ascii_case(wanted) || h.slug == wanted_slug
+        })
     }
 
     fn link_record(&self, source: usize, ordinal: usize, raw: &RawLink) -> Link {
@@ -386,7 +480,10 @@ impl VaultIndex {
         } else if raw.anchor_only {
             link.status = VaultLinkStatus::Anchor;
             link.raw = format!("#{}", raw.fragment.as_deref().unwrap_or(""));
-            link.anchor_missing = raw.fragment.as_deref().is_some_and(|f| !self.anchor_exists(source, f));
+            link.anchor_missing = raw
+                .fragment
+                .as_deref()
+                .is_some_and(|f| !self.anchor_exists(source, f));
         } else {
             let resolved = self.resolve_target(&note.path, &raw.target);
             link.status = resolved.status;
@@ -404,22 +501,42 @@ impl VaultIndex {
     /// without a folder only). The `.md` extension is optional. Several matches are `Ambiguous`; none are `Missing`, or
     /// `NonDocument` when the target names another kind of file.
     pub(crate) fn resolve_target(&self, from: &str, target: &str) -> Resolved {
-        let decoded = percent_decode(target).unwrap_or_else(|| target.to_string()).replace('\\', "/");
+        let decoded = fsio::percent_decode(target)
+            .unwrap_or_else(|| target.to_string())
+            .replace('\\', "/");
         let decoded = decoded.trim();
         if !decoded.is_empty() {
             if let Some(resolved) = self.lookup_named(from, decoded) {
                 return resolved;
             }
         }
-        let status = if has_other_extension(decoded) { VaultLinkStatus::NonDocument } else { VaultLinkStatus::Missing };
-        Resolved { status, target: None, candidates: Vec::new() }
+        let status = if has_other_extension(decoded) {
+            VaultLinkStatus::NonDocument
+        } else {
+            VaultLinkStatus::Missing
+        };
+        Resolved {
+            status,
+            target: None,
+            candidates: Vec::new(),
+        }
     }
 
     fn lookup_named(&self, from: &str, decoded: &str) -> Option<Resolved> {
-        let named = if is_markdown_name(decoded) { decoded.to_string() } else { format!("{decoded}.md") };
+        let named = if fsio::is_markdown_name(decoded) {
+            decoded.to_string()
+        } else {
+            format!("{decoded}.md")
+        };
         let directory = from.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        let by_path = |joined: Option<String>| joined.and_then(|p| self.by_path.get(&p).copied()).map(found_note);
-        if let Some(resolved) = by_path(normalize_join(directory, &named)).or_else(|| by_path(normalize_join("", &named))) {
+        let by_path = |joined: Option<String>| {
+            joined
+                .and_then(|p| self.by_path.get(&p).copied())
+                .map(found_note)
+        };
+        if let Some(resolved) = by_path(normalize_join(directory, &named))
+            .or_else(|| by_path(normalize_join("", &named)))
+        {
             return Some(resolved);
         }
         let suffix = named.trim_start_matches("./").trim_start_matches('/');
@@ -429,11 +546,16 @@ impl VaultIndex {
         if suffix.contains('/') {
             return None;
         }
-        self.by_filename_lower.get(&suffix.to_lowercase()).map(|list| unique_or_ambiguous(list))
+        self.by_filename_lower
+            .get(&suffix.to_lowercase())
+            .map(|list| unique_or_ambiguous(list))
     }
 
     fn note_index(&self, path: &str) -> Result<usize> {
-        self.by_path.get(path).copied().ok_or_else(|| format!("Not a note in this vault: {}", fsio::shown(path)))
+        self.by_path
+            .get(path)
+            .copied()
+            .ok_or_else(|| format!("Not a note in this vault: {}", fsio::shown(path)))
     }
 
     fn link_dto(&self, i: usize) -> VaultLinkRecord {
@@ -445,22 +567,48 @@ impl VaultIndex {
             kind: link.kind,
             status: link.status,
             raw: display_prefix(&link.raw, MAX_TARGET_BYTES).to_string(),
-            label: link.label.as_deref().map(|s| display_prefix(s, MAX_TARGET_BYTES).to_string()),
-            fragment: link.fragment.as_deref().map(|s| display_prefix(s, MAX_TARGET_BYTES).to_string()),
+            label: link
+                .label
+                .as_deref()
+                .map(|s| display_prefix(s, MAX_TARGET_BYTES).to_string()),
+            fragment: link
+                .fragment
+                .as_deref()
+                .map(|s| display_prefix(s, MAX_TARGET_BYTES).to_string()),
             line: link.line,
-            candidates: link.candidates.iter().take(MAX_LIMIT).map(|c| self.notes[*c].path.clone()).collect(),
+            candidates: link
+                .candidates
+                .iter()
+                .take(MAX_LIMIT)
+                .map(|c| self.notes[*c].path.clone())
+                .collect(),
             anchor_missing: link.anchor_missing,
             raw_truncated: link.raw.len() > MAX_TARGET_BYTES,
-            label_truncated: link.label.as_ref().is_some_and(|s| s.len() > MAX_TARGET_BYTES),
-            fragment_truncated: link.fragment.as_ref().is_some_and(|s| s.len() > MAX_TARGET_BYTES),
+            label_truncated: link
+                .label
+                .as_ref()
+                .is_some_and(|s| s.len() > MAX_TARGET_BYTES),
+            fragment_truncated: link
+                .fragment
+                .as_ref()
+                .is_some_and(|s| s.len() > MAX_TARGET_BYTES),
             candidate_total: link.candidates.len() as u64,
             candidates_truncated: link.candidates.len() > MAX_LIMIT,
         }
     }
 
     fn counts(&self, note: usize) -> (u64, u64) {
-        let outgoing = self.outgoing[note].iter().filter(|l| self.links[**l].status == VaultLinkStatus::Resolved && self.links[**l].target != Some(note)).count();
-        let incoming = self.incoming[note].iter().filter(|l| self.links[**l].source != note).count();
+        let outgoing = self.outgoing[note]
+            .iter()
+            .filter(|l| {
+                self.links[**l].status == VaultLinkStatus::Resolved
+                    && self.links[**l].target != Some(note)
+            })
+            .count();
+        let incoming = self.incoming[note]
+            .iter()
+            .filter(|l| self.links[**l].source != note)
+            .count();
         (outgoing as u64, incoming as u64)
     }
 
@@ -479,9 +627,12 @@ impl VaultIndex {
     }
 
     pub(crate) fn note_hash(&self, path: &str) -> Option<(&str, u64)> {
-        self.by_path.get(path).map(|i| (self.notes[*i].hash.as_str(), self.notes[*i].bytes))
+        self.by_path
+            .get(path)
+            .map(|i| (self.notes[*i].hash.as_str(), self.notes[*i].bytes))
     }
 
+    #[must_use]
     pub(crate) fn link_total(&self) -> u64 {
         self.links.len() as u64
     }
@@ -518,11 +669,25 @@ fn serialized_size(value: &impl serde::Serialize) -> Result<usize> {
     Ok(count.0)
 }
 
-fn paged<T: serde::Serialize>(vault_id: &str, revision: u64, total: usize, offset: usize, limit: usize, make: impl Fn(usize) -> T) -> Result<VaultQueryPage<T>> {
+fn paged<T: serde::Serialize>(
+    vault_id: &str,
+    revision: u64,
+    total: usize,
+    offset: usize,
+    limit: usize,
+    make: impl Fn(usize) -> T,
+) -> Result<VaultQueryPage<T>> {
     window(offset, limit)?;
     let start = offset.min(total);
     let end = (start + limit).min(total);
-    let mut page = VaultQueryPage { vault_id: vault_id.to_string(), revision, total: total as u64, offset: offset as u64, items: Vec::new(), next_offset: None };
+    let mut page = VaultQueryPage {
+        vault_id: vault_id.to_string(),
+        revision,
+        total: total as u64,
+        offset: offset as u64,
+        items: Vec::new(),
+        next_offset: None,
+    };
     let envelope_bytes = serialized_size(&page)? - serialized_size(&Option::<u64>::None)?;
     page.next_offset = (start < total).then_some(start as u64);
     let mut item_bytes = 0;
@@ -532,7 +697,9 @@ fn paged<T: serde::Serialize>(vault_id: &str, revision: u64, total: usize, offse
         // Start with the empty-page envelope, substituting the exact next offset at this prefix length.
         // The untagged VaultQueryAnswer adds no outer bytes.
         let next_offset = (i + 1 < total).then_some((i + 1) as u64);
-        if envelope_bytes + serialized_size(&next_offset)? + item_bytes + additional > MAX_PAGE_BYTES {
+        if envelope_bytes + serialized_size(&next_offset)? + item_bytes + additional
+            > MAX_PAGE_BYTES
+        {
             if page.items.is_empty() {
                 return Err("One query row exceeds the 1 MiB transport limit".into());
             }
@@ -549,38 +716,101 @@ fn paged<T: serde::Serialize>(vault_id: &str, revision: u64, total: usize, offse
 }
 
 impl VaultIndex {
-    pub(crate) fn answer(&self, vault_id: &str, query: &VaultLinkQuery) -> Result<VaultQueryAnswer> {
+    pub(crate) fn answer(
+        &self,
+        vault_id: &str,
+        query: &VaultLinkQuery,
+    ) -> Result<VaultQueryAnswer> {
         let revision = self.revision;
         match query {
-            VaultLinkQuery::Notes { offset, limit } => Ok(VaultQueryAnswer::Notes(paged(vault_id, revision, self.notes.len(), *offset, *limit, |i| self.note_dto(i))?)),
-            VaultLinkQuery::Links { offset, limit } => Ok(VaultQueryAnswer::Links(paged(vault_id, revision, self.links.len(), *offset, *limit, |i| self.link_dto(i))?)),
-            VaultLinkQuery::Backlinks { path, offset, limit } => {
+            VaultLinkQuery::Notes { offset, limit } => Ok(VaultQueryAnswer::Notes(paged(
+                vault_id,
+                revision,
+                self.notes.len(),
+                *offset,
+                *limit,
+                |i| self.note_dto(i),
+            )?)),
+            VaultLinkQuery::Links { offset, limit } => Ok(VaultQueryAnswer::Links(paged(
+                vault_id,
+                revision,
+                self.links.len(),
+                *offset,
+                *limit,
+                |i| self.link_dto(i),
+            )?)),
+            VaultLinkQuery::Backlinks {
+                path,
+                offset,
+                limit,
+            } => {
                 let note = self.note_index(path)?;
-                let rows: Vec<usize> = self.incoming[note].iter().copied().filter(|l| self.links[*l].source != note).collect();
-                Ok(VaultQueryAnswer::Links(paged(vault_id, revision, rows.len(), *offset, *limit, |i| self.link_dto(rows[i]))?))
+                let rows: Vec<usize> = self.incoming[note]
+                    .iter()
+                    .copied()
+                    .filter(|l| self.links[*l].source != note)
+                    .collect();
+                Ok(VaultQueryAnswer::Links(paged(
+                    vault_id,
+                    revision,
+                    rows.len(),
+                    *offset,
+                    *limit,
+                    |i| self.link_dto(rows[i]),
+                )?))
             }
-            VaultLinkQuery::Neighbors { path, offset, limit } => {
+            VaultLinkQuery::Neighbors {
+                path,
+                offset,
+                limit,
+            } => {
                 let note = self.note_index(path)?;
-                let mut rows: Vec<usize> = self.outgoing[note].iter().chain(self.incoming[note].iter()).copied().collect();
+                let mut rows: Vec<usize> = self.outgoing[note]
+                    .iter()
+                    .chain(self.incoming[note].iter())
+                    .copied()
+                    .collect();
                 rows.sort_unstable();
                 rows.dedup();
-                Ok(VaultQueryAnswer::Links(paged(vault_id, revision, rows.len(), *offset, *limit, |i| self.link_dto(rows[i]))?))
+                Ok(VaultQueryAnswer::Links(paged(
+                    vault_id,
+                    revision,
+                    rows.len(),
+                    *offset,
+                    *limit,
+                    |i| self.link_dto(rows[i]),
+                )?))
             }
-            VaultLinkQuery::Search { text, offset, limit } => {
+            VaultLinkQuery::Search {
+                text,
+                offset,
+                limit,
+            } => {
                 window(*offset, *limit)?;
                 let hits = self.search(text)?;
-                Ok(VaultQueryAnswer::Search(paged(vault_id, revision, hits.len(), *offset, *limit, |i| hits[i].clone())?))
+                Ok(VaultQueryAnswer::Search(paged(
+                    vault_id,
+                    revision,
+                    hits.len(),
+                    *offset,
+                    *limit,
+                    |i| hits[i].clone(),
+                )?))
             }
             VaultLinkQuery::Resolve { from_path, targets } => {
                 if targets.len() > MAX_LIMIT {
-                    return Err(format!("At most {MAX_LIMIT} targets can be resolved at once"));
+                    return Err(format!(
+                        "At most {MAX_LIMIT} targets can be resolved at once"
+                    ));
                 }
                 if !from_path.is_empty() {
-                    validate_relative(from_path)?;
+                    fsio::validate_relative(from_path)?;
                 }
                 for target in targets {
                     if target.len() > MAX_TARGET_BYTES {
-                        return Err(format!("Each resolve target must be at most {MAX_TARGET_BYTES} UTF-8 bytes"));
+                        return Err(format!(
+                            "Each resolve target must be at most {MAX_TARGET_BYTES} UTF-8 bytes"
+                        ));
                     }
                 }
                 #[derive(serde::Serialize)]
@@ -590,25 +820,50 @@ impl VaultIndex {
                     from_path: &'a str,
                     targets: &'a [String],
                 }
-                if serialized_size(&ResolveTransport { kind: "resolve", from_path, targets })? > MAX_PAGE_BYTES {
+                if serialized_size(&ResolveTransport {
+                    kind: "resolve",
+                    from_path,
+                    targets,
+                })? > MAX_PAGE_BYTES
+                {
                     return Err("Resolve query exceeds the 1 MiB transport limit".into());
                 }
                 if targets.is_empty() {
                     return Ok(VaultQueryAnswer::Resolve(VaultQueryPage {
-                        vault_id: vault_id.to_string(), revision, total: 0, offset: 0, items: Vec::new(), next_offset: None,
+                        vault_id: vault_id.to_string(),
+                        revision,
+                        total: 0,
+                        offset: 0,
+                        items: Vec::new(),
+                        next_offset: None,
                     }));
                 }
-                Ok(VaultQueryAnswer::Resolve(paged(vault_id, revision, targets.len(), 0, targets.len(), |i| self.resolve_written(from_path, &targets[i]))?))
+                Ok(VaultQueryAnswer::Resolve(paged(
+                    vault_id,
+                    revision,
+                    targets.len(),
+                    0,
+                    targets.len(),
+                    |i| self.resolve_written(from_path, &targets[i]),
+                )?))
             }
         }
     }
 
     fn resolve_written(&self, from: &str, raw: &str) -> VaultResolution {
-        let (target, _fragment) = split_fragment(raw);
-        let outcome = if looks_external(&target) {
-            Resolved { status: VaultLinkStatus::External, target: None, candidates: Vec::new() }
+        let (target, _fragment) = markdown::split_fragment(raw);
+        let outcome = if markdown::looks_external(&target) {
+            Resolved {
+                status: VaultLinkStatus::External,
+                target: None,
+                candidates: Vec::new(),
+            }
         } else if target.is_empty() {
-            Resolved { status: VaultLinkStatus::Anchor, target: None, candidates: Vec::new() }
+            Resolved {
+                status: VaultLinkStatus::Anchor,
+                target: None,
+                candidates: Vec::new(),
+            }
         } else {
             self.resolve_target(from, &target)
         };
@@ -616,7 +871,12 @@ impl VaultIndex {
             raw: raw.to_string(),
             status: outcome.status,
             path: outcome.target.map(|t| self.notes[t].path.clone()),
-            candidates: outcome.candidates.iter().take(MAX_LIMIT).map(|c| self.notes[*c].path.clone()).collect(),
+            candidates: outcome
+                .candidates
+                .iter()
+                .take(MAX_LIMIT)
+                .map(|c| self.notes[*c].path.clone())
+                .collect(),
             candidate_total: outcome.candidates.len() as u64,
             candidates_truncated: outcome.candidates.len() > MAX_LIMIT,
         }
@@ -625,7 +885,9 @@ impl VaultIndex {
     /// Path/title/heading search; every note (isolated ones included) is reachable.
     fn search(&self, text: &str) -> Result<Vec<VaultSearchHit>> {
         if text.len() > MAX_SEARCH_BYTES {
-            return Err(format!("Search text must be at most {MAX_SEARCH_BYTES} UTF-8 bytes"));
+            return Err(format!(
+                "Search text must be at most {MAX_SEARCH_BYTES} UTF-8 bytes"
+            ));
         }
         let needle = text.trim();
         if needle.is_empty() {
@@ -634,17 +896,23 @@ impl VaultIndex {
         let lowered = needle.to_lowercase();
         let mut hits: Vec<(u8, usize, VaultSearchHit)> = Vec::new();
         for (i, note) in self.notes.iter().enumerate() {
-            let Some((rank, line, snippet)) = best_hit(note, needle, &lowered) else { continue };
-            hits.push((rank, i, VaultSearchHit {
-                path: note.path.clone(),
-                title: display_prefix(&note.title, MAX_DISPLAY_BYTES).to_string(),
-                title_truncated: note.title.len() > MAX_DISPLAY_BYTES,
-                line,
-                snippet: display_prefix(snippet, MAX_DISPLAY_BYTES).to_string(),
-                snippet_truncated: snippet.len() > MAX_DISPLAY_BYTES,
-            }));
+            let Some((rank, line, snippet)) = best_hit(note, needle, &lowered) else {
+                continue;
+            };
+            hits.push((
+                rank,
+                i,
+                VaultSearchHit {
+                    path: note.path.clone(),
+                    title: display_prefix(&note.title, MAX_DISPLAY_BYTES).to_string(),
+                    title_truncated: note.title.len() > MAX_DISPLAY_BYTES,
+                    line,
+                    snippet: display_prefix(snippet, MAX_DISPLAY_BYTES).to_string(),
+                    snippet_truncated: snippet.len() > MAX_DISPLAY_BYTES,
+                },
+            ));
         }
-        hits.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        hits.sort_by_key(|hit| (hit.0, hit.1));
         Ok(hits.into_iter().map(|(_, _, hit)| hit).collect())
     }
 }
@@ -654,12 +922,30 @@ fn name_match<'a>(note: &'a Note, needle: &str, lowered: &str) -> Option<(u8, &'
     let name = note.path.rsplit('/').next().unwrap_or(&note.path);
     let stem = &name[..name.len() - 3];
     let (title_lower, path_lower) = (note.title.to_lowercase(), note.path.to_lowercase());
-    if stem == needle || note.title == needle || stem.to_lowercase() == lowered || title_lower == lowered {
+    if stem == needle
+        || note.title == needle
+        || stem.to_lowercase() == lowered
+        || title_lower == lowered
+    {
         Some((0, &note.title))
     } else if note.path.contains(needle) || note.title.contains(needle) {
-        Some((1, if note.title.contains(needle) { &note.title } else { &note.path }))
+        Some((
+            1,
+            if note.title.contains(needle) {
+                &note.title
+            } else {
+                &note.path
+            },
+        ))
     } else if path_lower.contains(lowered) || title_lower.contains(lowered) {
-        Some((2, if title_lower.contains(lowered) { &note.title } else { &note.path }))
+        Some((
+            2,
+            if title_lower.contains(lowered) {
+                &note.title
+            } else {
+                &note.path
+            },
+        ))
     } else {
         None
     }
@@ -670,7 +956,10 @@ fn best_hit<'a>(note: &'a Note, needle: &str, lowered: &str) -> Option<(u8, Opti
     if let Some((rank, snippet)) = name_match(note, needle, lowered) {
         return Some((rank, None, snippet));
     }
-    note.headings.iter().find(|heading| heading.text.to_lowercase().contains(lowered)).map(|heading| (3, Some(heading.line), heading.text.as_str()))
+    note.headings
+        .iter()
+        .find(|heading| heading.text.to_lowercase().contains(lowered))
+        .map(|heading| (3, Some(heading.line), heading.text.as_str()))
 }
 
 fn refresh_dto(vault_id: &str, index: &VaultIndex, changed: bool) -> VaultRefresh {
@@ -688,7 +977,11 @@ fn refresh_dto(vault_id: &str, index: &VaultIndex, changed: bool) -> VaultRefres
 
 impl KnowledgeService {
     fn slot(&self, vault_id: &str) -> Arc<Slot> {
-        self.indexes.lock().entry(vault_id.to_string()).or_default().clone()
+        self.indexes
+            .lock()
+            .entry(vault_id.to_string())
+            .or_default()
+            .clone()
     }
 
     pub(crate) fn drop_index(&self, vault_id: &str) {
@@ -697,11 +990,18 @@ impl KnowledgeService {
 
     /// The current index revision, 0 until the vault was indexed.
     pub(crate) fn current_revision(&self, vault_id: &str) -> u64 {
-        self.indexes.lock().get(vault_id).and_then(|slot| slot.current.lock().as_ref().map(|i| i.revision)).unwrap_or(0)
+        self.indexes
+            .lock()
+            .get(vault_id)
+            .and_then(|slot| slot.current.lock().as_ref().map(|i| i.revision))
+            .unwrap_or(0)
     }
 
     pub(crate) fn cached_index(&self, vault_id: &str) -> Option<Arc<VaultIndex>> {
-        self.indexes.lock().get(vault_id).and_then(|slot| slot.current.lock().clone())
+        self.indexes
+            .lock()
+            .get(vault_id)
+            .and_then(|slot| slot.current.lock().clone())
     }
 
     fn build_index(&self, vault: &VaultRoot) -> Result<(Arc<VaultIndex>, bool)> {
@@ -740,7 +1040,11 @@ impl KnowledgeService {
     }
 
     /// Strict, paged link/graph/search queries over the vault index (built on first use).
-    pub fn query_vault_links(&self, vault_id: &str, query: &VaultLinkQuery) -> Result<VaultQueryAnswer> {
+    pub fn query_vault_links(
+        &self,
+        vault_id: &str,
+        query: &VaultLinkQuery,
+    ) -> Result<VaultQueryAnswer> {
         let vault = self.vault_root(vault_id)?;
         let index = self.index_for(&vault)?;
         let _authority_and_root_pins = vault.pin()?;
@@ -748,14 +1052,24 @@ impl KnowledgeService {
     }
 
     /// Hash and size of a note when the cached index still describes it.
-    pub(crate) fn indexed_note(&self, vault_id: &str, path: &str, bytes: u64, mtime: u128) -> Option<String> {
+    pub(crate) fn indexed_note(
+        &self,
+        vault_id: &str,
+        path: &str,
+        bytes: u64,
+        mtime: u128,
+    ) -> Option<String> {
         let index = self.cached_index(vault_id)?;
         let i = *index.by_path.get(path)?;
         let note = &index.notes[i];
-        (note.bytes == bytes && note.mtime == mtime && mtime > 0 && u128::from(index.built_ms) * 1_000_000 >= mtime + RACY_NANOS).then(|| note.hash.clone())
+        (note.bytes == bytes
+            && note.mtime == mtime
+            && mtime > 0
+            && u128::from(index.built_ms) * 1_000_000 >= mtime + RACY_NANOS)
+            .then(|| note.hash.clone())
     }
 }
 
 #[cfg(test)]
 #[path = "index_regression.rs"]
-mod regression;
+mod tests;

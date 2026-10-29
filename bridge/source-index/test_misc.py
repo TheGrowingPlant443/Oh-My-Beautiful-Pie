@@ -286,6 +286,21 @@ class JuliaRecipe(unittest.TestCase):
         self.assertIn(("K", "variable"), decls(by(syms, kind="module")[0]))
         unique_ids(self, res)
 
+    def test_parameter_defaults_keep_calls_and_scope(self):
+        res, _ = self.go(
+            "function defaults(a::Int=seed(); kw::Int=option(), callback=x -> wrap(x))\n"
+            "  a = update(a)\nend\n"
+        )
+        fun = by(res["symbols"], kind="function", name="defaults")[0]
+        self.assertEqual(decls(fun), [("a", "parameter"), ("kw", "parameter"), ("callback", "parameter"), ("a", "assignment")])
+        params = [d for d in fun["bindings"]["declarations"] if d["kind"] == "parameter"]
+        scope = (fun["span"]["byteStart"], fun["span"]["byteEnd"])
+        self.assertTrue(all((d["scopeStart"], d["scopeEnd"]) == scope for d in params))
+        lam = by(res["symbols"], kind="lambda")[0]
+        self.assertIn(("x", "parameter"), decls(lam))
+        callers = {s["raw"]: s["callerId"] for s in by(res["sites"], relation="calls")}
+        self.assertEqual(callers, {"seed": fun["id"], "option": fun["id"], "wrap": lam["id"], "update": fun["id"]})
+
     def test_imports_and_include(self):
         res, _ = self.go(self.SRC + "include(joinpath(d, \"x.jl\"))\ninclude(dyn)\n")
         imps = by(res["sites"], relation="imports")

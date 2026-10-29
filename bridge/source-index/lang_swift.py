@@ -378,13 +378,12 @@ class _Walker:
         return True
 
     def enter_computed_property(self, node):
-        if node.parent is None or node.parent.type != "property_declaration":
-            return True
-        pat = node.parent.child_by_field_name("name")
-        names = self.bound_names(pat) if pat is not None else []
-        nm = self.ctx.text(names[0]) if names else ""
-        sym = self.ctx.add_symbol("accessor", nm, node, bindings={"accessor": "get", "computedProperty": True})
-        self.push(node, sym, nm, "accessor")
+        if node.parent is not None and node.parent.type == "property_declaration":
+            pat = node.parent.child_by_field_name("name")
+            names = self.bound_names(pat) if pat is not None else []
+            nm = self.ctx.text(names[0]) if names else ""
+            sym = self.ctx.add_symbol("accessor", nm, node, bindings={"accessor": "get", "computedProperty": True})
+            self.push(node, sym, nm, "accessor")
         return True
 
     def enter_observer(self, node):

@@ -283,11 +283,9 @@ export function proposedTree(payload: StructurePayload | null): ProposedTree {
     const parentId = parentOf.get(id) ?? null;
     const linked = parentId !== null && parentId !== id;
     const parent = linked ? nodes.get(parentId) : undefined;
-    if (parent) parent.children.push(node);
-    else {
-      roots.push(node);
-      if (linked) issues.push(`Entry ${id} names a missing parent ${parentId}`);
-    }
+    if (parent) { parent.children.push(node); continue; }
+    roots.push(node);
+    if (linked) issues.push(`Entry ${id} names a missing parent ${parentId}`);
   }
   const reached = new Set<string>();
   const reach = (start: ProposedNode): void => {

@@ -5,7 +5,7 @@ import {readFile} from 'node:fs/promises';
 import path from 'node:path';
 import {installTerminalBrowserBridge} from '../omp-browser.mjs';
 import {profileDirectory} from '../omp-browser-service.mjs';
-import {TestNativeHost} from './native-host.mjs';
+import {TestNativeHost,openManualTabs} from './native-host.mjs';
 
 // Loaded as an explicit extension by the real OMP CLI. A tab opened by hand in the terminal's Chrome must be
 // attached to the agent session automatically, controllable, renameable, and must not break the AI's own tab.
@@ -67,8 +67,7 @@ export default async function tabsScenario(pi) {
       assert.deepEqual(opened.names,['browser']);
       // The user opens a tab by hand; Chrome activates it, hiding the AI's own tab.
       const {port}=await chromePages();
-      const created=await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent('data:text/html,<title>User tab</title>theirs')}`,{method:'PUT'});
-      assert.equal(created.ok,true);
+      await openManualTabs(port,['data:text/html,<title>User tab</title>theirs']);
       const seen=await cell('var rows=await browser.tabs();print("FLOW:"+JSON.stringify({rows:rows.map(t=>({name:t.name,title:t.title,kind:t.kind}))}));');
       assert.deepEqual(seen.rows.map(row=>row.name),['browser','tab-1'],'The hand-opened tab must be attached automatically');
       assert.equal(seen.rows[1].title,'User tab');

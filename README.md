@@ -44,6 +44,8 @@ nix run .
 
 `packages.default` is `omp-manager`; `packages.frontend` contains the generated UI, and `packages.sdk` contains the pinned bridge SDK. The Rust package builds with `tauri/custom-protocol` so the UI, bridge modules, source-index scripts, scanner assets and SRS templates are embedded. Source filtering excludes `target`, `node_modules`, `dist`, worktrees and unrelated root files. Linux uses GTK 3/WebKitGTK 4.1 and bundled GIO/schema paths; macOS uses native WebKit/frameworks from the Nix stdenv's Apple SDK. This is a Nix package, not an AppImage, DMG, signed/notarized installer or cross-platform executable.
 
+The frontend and compiled Cargo dependencies have separate Nix cache boundaries. Rust, bridge and resource edits reuse an unchanged frontend; application and frontend edits reuse compiled Rust dependencies through pinned [Crane](https://github.com/ipetkov/crane). Cargo manifests/lockfile, toolchain, features/profile and native build inputs still invalidate the dependency cache. The first build seeds it; an unchanged build reuses the complete package. Changed application code still compiles and links with the existing full release LTO and one codegen unit. Nix garbage collection can remove cached build outputs, requiring them to be rebuilt.
+
 #### OMP executable and SDK
 
 The package wrapper supplies Bun, Node.js, Git, the existing Tree-sitter Python environment, and an immutable **`@oh-my-pi/pi-coding-agent` 18.12.6** SDK and CLI. The SDK is built from `nix/omp-sdk/package.json` plus its integrity-pinned, hydrated `registry-lock.json`. Lifecycle scripts are disabled, including optional native/ONNX download hooks; no package is installed at app startup. The bridge imports SDK source, and its matching CLI runs through the packaged Bun without changing agent-tool `PATH` precedence. `BUN_BIN` can override that interpreter.
@@ -312,6 +314,18 @@ Pending human decisions are the running sessions' live native requests, held in 
 - Human decision answers and the native Agent Hub use authenticated, main-window-only commands and the app's own bridge; the installed OMP SDK's files are never modified, and the in-memory hooks the bridge installs for them are removed when it shuts down. The Manager and models cannot answer a human-only confirmation, open the hub or select a target Markdown.
 - System overview runs a local Python parser process over an app-owned copy of the repository: no network, nothing from the repository is executed, built or imported, and no package is installed. It is not an OS sandbox. An Architect-generated diagram is a model interpretation of source and configuration, never proof of runtime behaviour.
 
+## Rust coding standard
+
+The backend follows the [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html) in its application-code context. Chromium/Fuchsia-specific build, layout, concurrency and test-framework rules do not apply to this Cargo/Tauri application. Keep conventional Cargo layout, serialized DTOs and IPC contracts stable; use the guide's explicit exceptions where shared ownership or direct application APIs are clearer than additional abstractions.
+
+Use the pinned stable formatter; `src-tauri/rustfmt.toml` sets 100-column formatting and lowercase hexadecimal literals:
+
+```sh
+nix develop path:. -c cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+```
+
+Single-module imports, justified unsafe boundaries, borrowing, meaningful error/invariant context and API naming are reviewed in the source. Unstable rustfmt options are not enabled; the guide permits omitting formatting options unavailable on stable Rust.
+
 ## Verification
 
 ```sh
@@ -327,7 +341,8 @@ On Linux/macOS, run the full JavaScript/TypeScript, Python and Rust suites with 
 nix develop path:. -c npm run test:coverage
 ```
 
-The shell supplies locked frontend dependencies, the pinned SDK and CLI, available parser grammars, and a matched upstream Rust/LLVM coverage toolchain through Nix. The runner links Nix dependencies when `node_modules` is absent, preserves an existing dependency tree, and uses Nix-vendored Cargo dependencies offline. Native SDK tests require the native-addon cache; browser and target-OS integration checks retain their explicit prerequisites. Grammar-dependent Python tests report explicit skips when their binding is unavailable.
+The shell supplies locked frontend dependencies, the pinned SDK and CLI, all declared parser grammars, and a matched upstream Rust/LLVM coverage toolchain through Nix. Groovy and Kotlin use the upstream schemas required by the visitors; PHP uses its original dual-entry-point Python binding. The runner links Nix dependencies when `node_modules` is absent, preserves an existing dependency tree, and uses Nix-vendored Cargo dependencies offline. Native SDK tests require the native-addon cache. Set `PUPPETEER_EXECUTABLE_PATH` to an installed Chrome executable (or its platform GPU wrapper) to enable the isolated browser integration cases; target-OS checks retain their explicit prerequisites.
+Set `OMP_BROWSER_NATIVE=1` in the same environment to exercise the Rust supervisor's real-browser ownership, helper-crash retirement, profile-lease and revocation proof as well; it is separate from the JavaScript fixture's native-host harness.
 Rust's instrumented build cache stays in the per-user cache (`XDG_CACHE_HOME`, or `~/.cache`), not in the checkout or Nix flake input; Python coverage includes subprocesses, combines their real measurements, and does not write source-tree bytecode.
 
 Reports are `.quality-coverage/javascript.lcov`, `.quality-coverage/python.xml` and `.quality-coverage/rust.lcov`, using original repository source paths. `sonar-project.properties` declares their [supported SonarQube import formats](https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/test-coverage/test-coverage-parameters). Snapshots include explicitly declared, regular relative coverage files even when gitignored, without admitting linked files, protected metadata or explicitly excluded paths. Failed suites remove the final report set; no synthetic coverage, source exclusions or quality-gate changes are used.
@@ -351,7 +366,7 @@ Controller authorization is not a filesystem sandbox: OMP's ordinary tools retai
 ```sh
 "$LOCALAPPDATA/Graphify/venv/Scripts/python.exe" -I -B -m unittest discover -s bridge/source-index -p "test_*.py"
 OMP_SDK_DIR=<installed @oh-my-pi/pi-coding-agent> node --experimental-strip-types --no-warnings --test bridge/omp-native-ui.test.mjs
-OMP_HOST_MONITOR_NATIVE=1 cargo test --manifest-path src-tauri/Cargo.toml --locked host_monitor::tests::native_snapshot_smoke
+OMP_HOST_MONITOR_NATIVE=1 cargo test --manifest-path src-tauri/Cargo.toml --locked host_monitor::host_monitor_service::tests::native_snapshot_smoke
 ```
 
 The Python command runs the parser, resolver and language-profile tests with hermetic fixtures, here with the Graphify interpreter the app picks by default on Windows; substitute any interpreter that has the Tree-sitter grammar packages (the one `OMP_SYSTEM_OVERVIEW_PYTHON` would name). A grammar that is not installed makes its tests report as skipped with *grammar unavailable for <language>* and the real reason; skips are not passes. The second command, and the installed-SDK local-paste proof in `bridge/omp-structure-sources.test.mjs`, are opt-in: without `OMP_SDK_DIR` they are skipped. With it they run the real SDK's interactive UI against scratch `PI_CODING_AGENT_DIR`/`PI_CONFIG_DIR` roots, exercising the raw-UI capture, handler proxies and approve/select/input/editor/Ask settlement rather than plain mocks. The other bridge tests (`omp-agent-hub`, `omp-visualization-guard`, `omp-system-overview`, `omp-project-insight`, `omp-structure-sources`) and the pure `src/lib` tests (decision store, tabs, projections and layout, structure view, visualization tickets) run with the Node command above. These tests use fixtures and do not call a model; they do not replace a native WebView walk-through.

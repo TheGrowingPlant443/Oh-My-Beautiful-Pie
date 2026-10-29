@@ -1,22 +1,35 @@
 import { spawn, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 // TEST HARNESS ONLY. Stands in for the Rust supervisor's private browser_spawn / browser_ready / browser_retire
 // actions so the Bun helper can be exercised with real Chrome outside the Tauri app. It mirrors the native contract
 // (one slot per instance, operation tombstones, helperSession scoping, loopback-only endpoint, contained retirement via
 // taskkill /T on Windows and dedicated process groups on Unix), but it is NOT the proof of native retirement:
-// src-tauri's browser::tests::native_tests::native_owned_browser_lifecycle is, with real leases and owned children.
+// src-tauri's browser::browser_supervisor::tests::native_tests::native_owned_browser_lifecycle is, with real leases and owned children.
 const ENDPOINT = /DevTools listening on (ws:\/\/127\.0\.0\.1:[1-9]\d{0,4}\/devtools\/browser\/[0-9A-Za-z-]+)/;
 const fail = (code, message) => Object.assign(new Error(message.startsWith(code) ? message : `${code}: ${message}`), { code });
 // Absolute path: a writable PATH entry must not substitute taskkill.
-const taskkill = path.win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe');
+const taskkill = path.win32.join(process.env.SystemRoot ?? String.raw`C:\Windows`, 'System32', 'taskkill.exe');
 const retireProcessTree = pid => {
   if (process.platform === 'win32') return new Promise(resolve => execFile(taskkill, ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve()));
   try { process.kill(-pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') return Promise.reject(error); }
   return Promise.resolve();
 };
 const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+export async function openManualTabs(port, urls) {
+  const { loadPuppeteer } = await import(pathToFileURL(path.join(process.env.OMP_SDK_DIR, 'src/tools/browser/launch.ts')).href);
+  const browser = await (await loadPuppeteer()).connect({ browserURL: `http://127.0.0.1:${port}`, defaultViewport: null, protocolTimeout: 15000 });
+  try {
+    for (const url of urls) {
+      const page = await browser.newPage();
+      await page.goto(url);
+      await page.bringToFront();
+    }
+  } finally { await browser.disconnect(); }
+}
 
 export class TestNativeHost {
   constructor(root) { this.root = root; this.slots = new Map(); this.tombstones = new Set(); this.calls = []; }

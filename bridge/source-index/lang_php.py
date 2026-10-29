@@ -309,16 +309,16 @@ class _Walker:
             binding["name"] = "<anonymous class>"
             binding["anonymous"] = True
             return "new class", False, "unsupported"
-        if target.type in ("name", "qualified_name"):
+        if target.type in ("name", "qualified_name", "relative_scope"):
             text = ctx.text(target)
-            prefix, last = _split(text)
-            binding["name"], binding["receiver"] = last, prefix
-            binding["receiverKind"] = "path" if prefix else None
-            return "new " + text, False, None
-        if target.type == "relative_scope":
-            text = ctx.text(target)
-            binding["name"] = text
-            binding["receiverKind"] = "super" if text == "parent" else "self"
+            scope_kind = self._scope_kind(target, text)
+            if scope_kind in ("self", "super"):
+                binding["name"] = text
+                binding["receiverKind"] = scope_kind
+            else:
+                prefix, last = _split(text)
+                binding["name"], binding["receiver"] = last, prefix
+                binding["receiverKind"] = "path" if prefix else None
             return "new " + text, False, None
         binding["kind"] = "dynamic"
         binding["dynamic"] = True
@@ -364,8 +364,10 @@ class _Walker:
 
     @staticmethod
     def _scope_kind(scope, stext):
-        if scope is not None and scope.type == "relative_scope":
-            return "super" if stext == "parent" else "self"
+        if scope is not None and scope.type in ("name", "relative_scope"):
+            keyword = stext.lower()
+            if keyword in ("self", "parent", "static"):
+                return "super" if keyword == "parent" else "self"
         if scope is not None and scope.type in ("name", "qualified_name"):
             return "path"
         return "expression"

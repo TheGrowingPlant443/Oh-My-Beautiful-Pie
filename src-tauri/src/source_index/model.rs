@@ -1,11 +1,11 @@
 //! Wire types of the repository source index, their validation and the in-memory lookup tables.
 //! Everything here is plain data: no repository code is ever interpreted.
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 pub(crate) type Result<T, E = String> = std::result::Result<T, E>;
 
@@ -15,10 +15,15 @@ pub(crate) const MAX_OUTPUT_BYTES: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_SAVED_BYTES: u64 = MAX_OUTPUT_BYTES + 64 * 1024 * 1024;
 
 fn text_limit(value: &str, label: &str, max: usize) -> Result<()> {
-    if value.len() > max { Err(format!("Source index {label} exceeds {max} bytes")) } else { Ok(()) }
+    if value.len() > max {
+        Err(format!("Source index {label} exceeds {max} bytes"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Length-delimited SHA-256 of the parts; identical to `common.stable_id` in the worker scripts.
+#[must_use]
 pub(crate) fn stable_id(parts: &[&str]) -> String {
     let mut hash = Sha256::new();
     for part in parts {
@@ -28,18 +33,35 @@ pub(crate) fn stable_id(parts: &[&str]) -> String {
     format!("{:x}", hash.finalize())
 }
 
-pub(crate) fn file_id(path: &str) -> String { stable_id(&["file", path]) }
+#[must_use]
+pub(crate) fn file_id(path: &str) -> String {
+    stable_id(&["file", path])
+}
 
 // ---- statuses --------------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum SourceIndexState { Inventory, Parsing, Resolving, Complete, Partial, Failed, Cancelled }
+pub enum SourceIndexState {
+    Inventory,
+    Parsing,
+    Resolving,
+    Complete,
+    Partial,
+    Failed,
+    Cancelled,
+}
 
 impl SourceIndexState {
-    pub fn is_active(self) -> bool { matches!(self, Self::Inventory | Self::Parsing | Self::Resolving) }
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Inventory | Self::Parsing | Self::Resolving)
+    }
     /// States whose job directory holds a loadable `index.json`.
-    pub fn has_index(self) -> bool { matches!(self, Self::Complete | Self::Partial) }
+    #[must_use]
+    pub fn has_index(self) -> bool {
+        matches!(self, Self::Complete | Self::Partial)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,17 +124,35 @@ pub struct SourceIndexSelection {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum FileStatus { Parsed, Partial, Failed, Skipped, Unsupported }
+pub enum FileStatus {
+    Parsed,
+    Partial,
+    Failed,
+    Skipped,
+    Unsupported,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
-pub enum Resolution { ResolvedStatic, Candidate, Dynamic, External, Unresolved, Unsupported }
+pub enum Resolution {
+    ResolvedStatic,
+    Candidate,
+    Dynamic,
+    External,
+    Unresolved,
+    Unsupported,
+}
 
 impl Resolution {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ResolvedStatic => "resolvedStatic", Self::Candidate => "candidate", Self::Dynamic => "dynamic",
-            Self::External => "external", Self::Unresolved => "unresolved", Self::Unsupported => "unsupported",
+            Self::ResolvedStatic => "resolvedStatic",
+            Self::Candidate => "candidate",
+            Self::Dynamic => "dynamic",
+            Self::External => "external",
+            Self::Unresolved => "unresolved",
+            Self::Unsupported => "unsupported",
         }
     }
 }
@@ -205,7 +245,10 @@ pub struct SourceEdge {
 
 /// Position of a node in the file/symbol arrays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Node { File(u32), Symbol(u32) }
+pub(crate) enum Node {
+    File(u32),
+    Symbol(u32),
+}
 
 /// Derived tables; rebuilt on every load and never serialized.
 #[derive(Default)]
@@ -219,12 +262,16 @@ pub(crate) struct Lookup {
     pub symbols_by_file: HashMap<String, Vec<u32>>,
     pub sites_by_caller: HashMap<String, Vec<u32>>,
     pub sites_by_file: HashMap<String, Vec<u32>>,
-    pub overviews: Mutex<HashMap<(super::query::Level, super::query::GroupBy), Arc<super::query::Overview>>>,
+    pub overviews:
+        Mutex<HashMap<(super::query::Level, super::query::GroupBy), Arc<super::query::Overview>>>,
 }
 
 impl Lookup {
     pub fn node(&self, id: &str) -> Option<Node> {
-        self.files.get(id).map(|i| Node::File(*i)).or_else(|| self.symbols.get(id).map(|i| Node::Symbol(*i)))
+        self.files
+            .get(id)
+            .map(|i| Node::File(*i))
+            .or_else(|| self.symbols.get(id).map(|i| Node::Symbol(*i)))
     }
 }
 
@@ -265,35 +312,71 @@ pub(crate) struct ManifestFile {
 }
 
 /// What an index must agree with: the immutable inventory of its snapshot.
-pub(crate) struct Expected<'a> {
-    pub snapshot_id: &'a str,
-    pub folder: &'a str,
-    pub source_hash: &'a str,
-    pub files: &'a [ManifestFile],
-    pub directories: &'a [String],
+pub(crate) struct Expected<'inventory> {
+    pub snapshot_id: &'inventory str,
+    pub folder: &'inventory str,
+    pub source_hash: &'inventory str,
+    pub files: &'inventory [ManifestFile],
+    pub directories: &'inventory [String],
 }
 
 impl SourceGraphIndex {
-    pub fn file(&self, id: &str) -> Option<&SourceFile> { self.lookup.files.get(id).map(|i| &self.files[*i as usize]) }
-    pub fn symbol(&self, id: &str) -> Option<&SourceSymbol> { self.lookup.symbols.get(id).map(|i| &self.symbols[*i as usize]) }
-    pub fn site(&self, id: &str) -> Option<&SourceSite> { self.lookup.sites.get(id).map(|i| &self.sites[*i as usize]) }
+    pub fn file(&self, id: &str) -> Option<&SourceFile> {
+        self.lookup.files.get(id).map(|i| &self.files[*i as usize])
+    }
+    pub fn symbol(&self, id: &str) -> Option<&SourceSymbol> {
+        self.lookup
+            .symbols
+            .get(id)
+            .map(|i| &self.symbols[*i as usize])
+    }
+    pub fn site(&self, id: &str) -> Option<&SourceSite> {
+        self.lookup.sites.get(id).map(|i| &self.sites[*i as usize])
+    }
 
     /// Inventory-only index for snapshots the parser could not (fully) process; every row says why.
-    pub fn inventory_only(expected: &Expected, status: FileStatus, file_reason: &str, limitation: &str, limitations: Vec<String>) -> Result<Self> {
-        let files = expected.files.iter().map(|f| {
-            let skipped = f.status == "skipped";
-            SourceFile {
-                id: f.id.clone(), path: f.path.clone(), sha256: f.sha256.clone(), bytes: f.bytes, language: None,
-                status: if skipped { FileStatus::Skipped } else { status },
-                diagnostics: if skipped { f.diagnostics.clone() } else { vec![file_reason.to_string()] },
-                extra: Map::new(),
-            }
-        }).collect();
+    pub(crate) fn inventory_only(
+        expected: &Expected,
+        status: FileStatus,
+        file_reason: &str,
+        limitation: &str,
+        limitations: Vec<String>,
+    ) -> Result<Self> {
+        let files = expected
+            .files
+            .iter()
+            .map(|f| {
+                let skipped = f.status == "skipped";
+                SourceFile {
+                    id: f.id.clone(),
+                    path: f.path.clone(),
+                    sha256: f.sha256.clone(),
+                    bytes: f.bytes,
+                    language: None,
+                    status: if skipped { FileStatus::Skipped } else { status },
+                    diagnostics: if skipped {
+                        f.diagnostics.clone()
+                    } else {
+                        vec![file_reason.to_string()]
+                    },
+                    extra: Map::new(),
+                }
+            })
+            .collect();
         let mut index = SourceGraphIndex {
-            schema_version: 1, snapshot_id: expected.snapshot_id.into(), folder: expected.folder.into(), source_hash: expected.source_hash.into(),
-            extractor_versions: Map::new(), files, directories: expected.directories.to_vec(), symbols: Vec::new(), sites: Vec::new(), edges: Vec::new(),
+            schema_version: 1,
+            snapshot_id: expected.snapshot_id.into(),
+            folder: expected.folder.into(),
+            source_hash: expected.source_hash.into(),
+            extractor_versions: Map::new(),
+            files,
+            directories: expected.directories.to_vec(),
+            symbols: Vec::new(),
+            sites: Vec::new(),
+            edges: Vec::new(),
             coverage: json!({ "languages": [], "lastFullyProcessedFile": null, "partial": true }),
-            limitations, lookup: Lookup::default(),
+            limitations,
+            lookup: Lookup::default(),
         };
         index.limitations.push(limitation.to_string());
         index.finish(expected)?;
@@ -302,7 +385,7 @@ impl SourceGraphIndex {
 
     /// Validates every fact against the inventory and builds the lookup tables. After success the index is
     /// internally consistent: every reference resolves, spans lie inside their file and the counts are derived.
-    pub fn finish(&mut self, expected: &Expected) -> Result<()> {
+    pub(crate) fn finish(&mut self, expected: &Expected) -> Result<()> {
         self.check_header(expected)?;
         let mut lookup = Lookup::default();
         let mut ids: HashSet<&str> = HashSet::new();
@@ -312,39 +395,76 @@ impl SourceGraphIndex {
         self.index_sites(&mut lookup, &mut ids)?;
         self.check_site_targets(&lookup)?;
         self.index_edges(&mut lookup, &ids)?;
-        for limitation in &self.limitations { text_limit(limitation, "limitation", 8 * 1024)?; }
+        for limitation in &self.limitations {
+            text_limit(limitation, "limitation", 8 * 1024)?;
+        }
         self.derive_coverage()?;
         self.lookup = lookup;
         Ok(())
     }
 
     fn check_header(&self, expected: &Expected) -> Result<()> {
-        if self.schema_version != 1 { return Err(format!("Unsupported source index schema version {}", self.schema_version)); }
-        if self.snapshot_id != expected.snapshot_id || self.folder != expected.folder || self.source_hash != expected.source_hash {
+        if self.schema_version != 1 {
+            return Err(format!(
+                "Unsupported source index schema version {}",
+                self.schema_version
+            ));
+        }
+        if self.snapshot_id != expected.snapshot_id
+            || self.folder != expected.folder
+            || self.source_hash != expected.source_hash
+        {
             return Err("The source index does not belong to this snapshot".into());
         }
-        if self.files.len() != expected.files.len() { return Err(format!("The source index lists {} files but the snapshot admitted {}", self.files.len(), expected.files.len())); }
-        if self.directories != expected.directories { return Err("The source index directory list differs from the snapshot inventory".into()); }
+        if self.files.len() != expected.files.len() {
+            return Err(format!(
+                "The source index lists {} files but the snapshot admitted {}",
+                self.files.len(),
+                expected.files.len()
+            ));
+        }
+        if self.directories != expected.directories {
+            return Err(
+                "The source index directory list differs from the snapshot inventory".into(),
+            );
+        }
         Ok(())
     }
 
-    fn index_files<'a>(&'a self, expected: &Expected, lookup: &mut Lookup, ids: &mut HashSet<&'a str>) -> Result<()> {
-        for (position, (file, wanted)) in self.files.iter().zip(expected.files).enumerate() {
+    fn index_files<'a>(
+        &'a self,
+        expected: &Expected,
+        lookup: &mut Lookup,
+        ids: &mut HashSet<&'a str>,
+    ) -> Result<()> {
+        let files = self.files.iter().zip(expected.files).enumerate();
+        for (position, (file, wanted)) in files {
             check_file(file, wanted)?;
             ids.insert(&file.id);
             lookup.files.insert(file.id.clone(), position as u32);
-            lookup.files_by_path.insert(file.path.clone(), position as u32);
+            lookup
+                .files_by_path
+                .insert(file.path.clone(), position as u32);
         }
         Ok(())
     }
 
     fn index_symbols<'a>(&'a self, lookup: &mut Lookup, ids: &mut HashSet<&'a str>) -> Result<()> {
-        for (position, symbol) in self.symbols.iter().enumerate() {
-            if !ids.insert(&symbol.id) { return Err(format!("Duplicate source index id {}", symbol.id)); }
-            let Some(file_position) = lookup.files.get(&symbol.file_id) else { return Err(format!("Symbol {} names an unknown file", symbol.id)); };
+        let symbols = self.symbols.iter().enumerate();
+        for (position, symbol) in symbols {
+            if !ids.insert(&symbol.id) {
+                return Err(format!("Duplicate source index id {}", symbol.id));
+            }
+            let Some(file_position) = lookup.files.get(&symbol.file_id) else {
+                return Err(format!("Symbol {} names an unknown file", symbol.id));
+            };
             check_symbol(symbol, &self.files[*file_position as usize])?;
             lookup.symbols.insert(symbol.id.clone(), position as u32);
-            lookup.symbols_by_file.entry(symbol.file_id.clone()).or_default().push(position as u32);
+            lookup
+                .symbols_by_file
+                .entry(symbol.file_id.clone())
+                .or_default()
+                .push(position as u32);
         }
         Ok(())
     }
@@ -352,7 +472,9 @@ impl SourceGraphIndex {
     /// Containment must be a forest: every owner exists, lives in the same file and never loops.
     fn check_containment(&self, lookup: &Lookup) -> Result<()> {
         let mut state = vec![0u8; self.symbols.len()];
-        for start in 0..self.symbols.len() { self.walk_owners(start, &mut state, lookup)?; }
+        for start in 0..self.symbols.len() {
+            self.walk_owners(start, &mut state, lookup)?;
+        }
         Ok(())
     }
 
@@ -362,7 +484,12 @@ impl SourceGraphIndex {
         loop {
             match state[current] {
                 2 => break,
-                1 => return Err(format!("Symbol containment cycle at {}", self.symbols[current].id)),
+                1 => {
+                    return Err(format!(
+                        "Symbol containment cycle at {}",
+                        self.symbols[current].id
+                    ))
+                }
                 _ => {}
             }
             state[current] = 1;
@@ -372,32 +499,60 @@ impl SourceGraphIndex {
                 None => break,
             }
         }
-        for item in chain { state[item] = 2; }
+        for item in chain {
+            state[item] = 2;
+        }
         Ok(())
     }
 
     fn owner_of(&self, current: usize, lookup: &Lookup) -> Result<Option<usize>> {
         let symbol = &self.symbols[current];
-        let Some(owner) = &symbol.owner_id else { return Ok(None) };
-        let Some(next) = lookup.symbols.get(owner) else { return Err(format!("Symbol {} names an unknown owner", symbol.id)); };
-        if self.symbols[*next as usize].file_id != symbol.file_id { return Err(format!("Symbol {} is owned across files", symbol.id)); }
+        let Some(owner) = &symbol.owner_id else {
+            return Ok(None);
+        };
+        let Some(next) = lookup.symbols.get(owner) else {
+            return Err(format!("Symbol {} names an unknown owner", symbol.id));
+        };
+        if self.symbols[*next as usize].file_id != symbol.file_id {
+            return Err(format!("Symbol {} is owned across files", symbol.id));
+        }
         Ok(Some(*next as usize))
     }
 
     fn index_sites<'a>(&'a self, lookup: &mut Lookup, ids: &mut HashSet<&'a str>) -> Result<()> {
-        for (position, site) in self.sites.iter().enumerate() {
-            if !ids.insert(&site.id) { return Err(format!("Duplicate source index id {}", site.id)); }
-            let Some(file_position) = lookup.files.get(&site.file_id) else { return Err(format!("Site {} names an unknown file", site.id)); };
+        let sites = self.sites.iter().enumerate();
+        for (position, site) in sites {
+            if !ids.insert(&site.id) {
+                return Err(format!("Duplicate source index id {}", site.id));
+            }
+            let Some(file_position) = lookup.files.get(&site.file_id) else {
+                return Err(format!("Site {} names an unknown file", site.id));
+            };
             check_site(site, &self.files[*file_position as usize])?;
             if let Some(caller) = &site.caller_id {
-                let Some(symbol) = lookup.symbols.get(caller) else { return Err(format!("Site {} names an unknown caller", site.id)); };
-                if self.symbols[*symbol as usize].file_id != site.file_id { return Err(format!("Site {} caller is in another file", site.id)); }
-                lookup.sites_by_caller.entry(caller.clone()).or_default().push(position as u32);
+                let Some(symbol) = lookup.symbols.get(caller) else {
+                    return Err(format!("Site {} names an unknown caller", site.id));
+                };
+                if self.symbols[*symbol as usize].file_id != site.file_id {
+                    return Err(format!("Site {} caller is in another file", site.id));
+                }
+                lookup
+                    .sites_by_caller
+                    .entry(caller.clone())
+                    .or_default()
+                    .push(position as u32);
             }
-            lookup.sites_by_file.entry(site.file_id.clone()).or_default().push(position as u32);
+            lookup
+                .sites_by_file
+                .entry(site.file_id.clone())
+                .or_default()
+                .push(position as u32);
             // Only a proven static target may be set; name matches and candidates never carry one.
             if (site.resolution == Resolution::ResolvedStatic) != site.target_id.is_some() {
-                return Err(format!("Site {} must carry a target exactly when it is resolvedStatic", site.id));
+                return Err(format!(
+                    "Site {} must carry a target exactly when it is resolvedStatic",
+                    site.id
+                ));
             }
             lookup.sites.insert(site.id.clone(), position as u32);
         }
@@ -406,8 +561,11 @@ impl SourceGraphIndex {
 
     fn check_site_targets(&self, lookup: &Lookup) -> Result<()> {
         for site in &self.sites {
-            for target in site.target_id.iter().chain(&site.candidate_ids) {
-                if lookup.node(target).is_none() { return Err(format!("Site {} names an unknown target", site.id)); }
+            let targets = site.target_id.iter().chain(&site.candidate_ids);
+            for target in targets {
+                if lookup.node(target).is_none() {
+                    return Err(format!("Site {} names an unknown target", site.id));
+                }
             }
         }
         Ok(())
@@ -415,23 +573,54 @@ impl SourceGraphIndex {
 
     fn index_edges(&self, lookup: &mut Lookup, ids: &HashSet<&str>) -> Result<()> {
         let mut edge_ids: HashSet<&str> = HashSet::new();
-        for (position, edge) in self.edges.iter().enumerate() {
-            if !edge_ids.insert(&edge.id) || ids.contains(edge.id.as_str()) { return Err(format!("Duplicate source index id {}", edge.id)); }
+        let edges = self.edges.iter().enumerate();
+        for (position, edge) in edges {
+            if !edge_ids.insert(&edge.id) || ids.contains(edge.id.as_str()) {
+                return Err(format!("Duplicate source index id {}", edge.id));
+            }
             self.check_edge(edge, lookup)?;
-            lookup.edges_out.entry(edge.source_id.clone()).or_default().push(position as u32);
-            lookup.edges_in.entry(edge.target_id.clone()).or_default().push(position as u32);
+            lookup
+                .edges_out
+                .entry(edge.source_id.clone())
+                .or_default()
+                .push(position as u32);
+            lookup
+                .edges_in
+                .entry(edge.target_id.clone())
+                .or_default()
+                .push(position as u32);
         }
         Ok(())
     }
 
     fn check_edge(&self, edge: &SourceEdge, lookup: &Lookup) -> Result<()> {
-        let (Some(source), Some(_)) = (lookup.node(&edge.source_id), lookup.node(&edge.target_id)) else { return Err(format!("Edge {} names a missing endpoint", edge.id)); };
-        if edge.relation.is_empty() || edge.relation.len() > 64 { return Err(format!("Edge {} has an invalid relation", edge.id)); }
-        if edge.evidence_ids.is_empty() { return Err(format!("Edge {} has no site evidence", edge.id)); }
-        let source_file = match source { Node::File(i) => i, Node::Symbol(i) => *lookup.files.get(&self.symbols[i as usize].file_id).unwrap_or(&u32::MAX) };
+        let (Some(source), Some(_)) = (lookup.node(&edge.source_id), lookup.node(&edge.target_id))
+        else {
+            return Err(format!("Edge {} names a missing endpoint", edge.id));
+        };
+        if edge.relation.is_empty() || edge.relation.len() > 64 {
+            return Err(format!("Edge {} has an invalid relation", edge.id));
+        }
+        if edge.evidence_ids.is_empty() {
+            return Err(format!("Edge {} has no site evidence", edge.id));
+        }
+        let source_file = match source {
+            Node::File(i) => i,
+            Node::Symbol(i) => *lookup
+                .files
+                .get(&self.symbols[i as usize].file_id)
+                .unwrap_or(&u32::MAX),
+        };
         for evidence in &edge.evidence_ids {
-            let Some(site) = lookup.sites.get(evidence).map(|i| &self.sites[*i as usize]) else { return Err(format!("Edge {} cites unknown site {evidence}", edge.id)); };
-            if lookup.files.get(&site.file_id) != Some(&source_file) { return Err(format!("Edge {} cites a site outside its source file", edge.id)); }
+            let Some(site) = lookup.sites.get(evidence).map(|i| &self.sites[*i as usize]) else {
+                return Err(format!("Edge {} cites unknown site {evidence}", edge.id));
+            };
+            if lookup.files.get(&site.file_id) != Some(&source_file) {
+                return Err(format!(
+                    "Edge {} cites a site outside its source file",
+                    edge.id
+                ));
+            }
             check_evidence(edge, site)?;
         }
         Ok(())
@@ -440,81 +629,161 @@ impl SourceGraphIndex {
     /// Counts that follow directly from the validated rows replace whatever the parser reported; the parser's
     /// per-language rows and `lastFullyProcessedFile` are kept.
     fn derive_coverage(&mut self) -> Result<()> {
-        let Value::Object(coverage) = &mut self.coverage else { return Err("Source index coverage must be an object".into()); };
-        let count = |status: FileStatus| self.files.iter().filter(|f| f.status == status).count() as u64;
-        let resolved = |wanted: Resolution| self.sites.iter().filter(|s| s.resolution == wanted).count() as u64;
+        let Value::Object(coverage) = &mut self.coverage else {
+            return Err("Source index coverage must be an object".into());
+        };
+        let count =
+            |status: FileStatus| self.files.iter().filter(|f| f.status == status).count() as u64;
+        let resolved = |wanted: Resolution| {
+            self.sites.iter().filter(|s| s.resolution == wanted).count() as u64
+        };
         coverage.insert("admittedFiles".into(), json!(self.files.len()));
         coverage.insert("parsedFiles".into(), json!(count(FileStatus::Parsed)));
         coverage.insert("partialFiles".into(), json!(count(FileStatus::Partial)));
         coverage.insert("failedFiles".into(), json!(count(FileStatus::Failed)));
         coverage.insert("skippedFiles".into(), json!(count(FileStatus::Skipped)));
-        coverage.insert("unsupportedFiles".into(), json!(count(FileStatus::Unsupported)));
+        coverage.insert(
+            "unsupportedFiles".into(),
+            json!(count(FileStatus::Unsupported)),
+        );
         coverage.insert("encounteredSites".into(), json!(self.sites.len()));
-        coverage.insert("resolvedSites".into(), json!(resolved(Resolution::ResolvedStatic)));
+        coverage.insert(
+            "resolvedSites".into(),
+            json!(resolved(Resolution::ResolvedStatic)),
+        );
         coverage.insert("dynamicSites".into(), json!(resolved(Resolution::Dynamic)));
-        coverage.insert("unresolvedSites".into(), json!(resolved(Resolution::Unresolved) + resolved(Resolution::Unsupported) + resolved(Resolution::Candidate)));
-        coverage.insert("externalSites".into(), json!(resolved(Resolution::External)));
+        coverage.insert(
+            "unresolvedSites".into(),
+            json!(
+                resolved(Resolution::Unresolved)
+                    + resolved(Resolution::Unsupported)
+                    + resolved(Resolution::Candidate)
+            ),
+        );
+        coverage.insert(
+            "externalSites".into(),
+            json!(resolved(Resolution::External)),
+        );
         coverage.entry("languages").or_insert_with(|| json!([]));
-        coverage.entry("lastFullyProcessedFile").or_insert(Value::Null);
+        coverage
+            .entry("lastFullyProcessedFile")
+            .or_insert(Value::Null);
         match coverage.get("partial") {
             Some(Value::Bool(_)) => {}
-            None => { coverage.insert("partial".into(), Value::Bool(false)); }
+            None => {
+                coverage.insert("partial".into(), Value::Bool(false));
+            }
             Some(_) => return Err("Source index coverage.partial must be a boolean".into()),
         }
         Ok(())
     }
 
-    pub fn is_partial(&self) -> bool { self.coverage.get("partial").and_then(Value::as_bool).unwrap_or(false) }
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        self.coverage
+            .get("partial")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
 }
 
 fn check_file(file: &SourceFile, wanted: &ManifestFile) -> Result<()> {
-    if file.path != wanted.path || file.id != wanted.id || file.sha256 != wanted.sha256 || file.bytes != wanted.bytes {
-        return Err(format!("The source index file {} differs from the snapshot inventory", file.path));
+    if file.path != wanted.path
+        || file.id != wanted.id
+        || file.sha256 != wanted.sha256
+        || file.bytes != wanted.bytes
+    {
+        return Err(format!(
+            "The source index file {} differs from the snapshot inventory",
+            file.path
+        ));
     }
-    if wanted.status == "skipped" && file.status != FileStatus::Skipped { return Err(format!("The source index re-labelled skipped file {}", file.path)); }
-    if file.language.as_ref().is_some_and(|l| l.len() > 64) { return Err("Source index language name is too long".into()); }
-    for line in &file.diagnostics { text_limit(line, "file diagnostic", 8 * 1024)?; }
+    if wanted.status == "skipped" && file.status != FileStatus::Skipped {
+        return Err(format!(
+            "The source index re-labelled skipped file {}",
+            file.path
+        ));
+    }
+    if file.language.as_ref().is_some_and(|l| l.len() > 64) {
+        return Err("Source index language name is too long".into());
+    }
+    for line in &file.diagnostics {
+        text_limit(line, "file diagnostic", 8 * 1024)?;
+    }
     Ok(())
 }
 
 fn check_symbol(symbol: &SourceSymbol, file: &SourceFile) -> Result<()> {
-    if file.path != symbol.path { return Err(format!("Symbol {} path differs from its file", symbol.id)); }
+    if file.path != symbol.path {
+        return Err(format!("Symbol {} path differs from its file", symbol.id));
+    }
     check_span(&symbol.span, file.bytes, &symbol.id)?;
-    if symbol.kind.is_empty() || symbol.kind.len() > 64 { return Err(format!("Symbol {} has an invalid kind", symbol.id)); }
+    if symbol.kind.is_empty() || symbol.kind.len() > 64 {
+        return Err(format!("Symbol {} has an invalid kind", symbol.id));
+    }
     text_limit(&symbol.name, "symbol name", 4 * 1024)?;
     text_limit(&symbol.qualified_name, "qualified name", 8 * 1024)
 }
 
 fn check_site(site: &SourceSite, file: &SourceFile) -> Result<()> {
-    if file.path != site.path { return Err(format!("Site {} path differs from its file", site.id)); }
+    if file.path != site.path {
+        return Err(format!("Site {} path differs from its file", site.id));
+    }
     check_span(&site.span, file.bytes, &site.id)?;
-    if site.relation.is_empty() || site.relation.len() > 64 { return Err(format!("Site {} has an invalid relation", site.id)); }
-    if let Some(raw) = &site.raw { text_limit(raw, "raw site text", 64 * 1024)?; }
+    if site.relation.is_empty() || site.relation.len() > 64 {
+        return Err(format!("Site {} has an invalid relation", site.id));
+    }
+    if let Some(raw) = &site.raw {
+        text_limit(raw, "raw site text", 64 * 1024)?;
+    }
     Ok(())
 }
 
 fn check_evidence(edge: &SourceEdge, site: &SourceSite) -> Result<()> {
     match edge.resolution {
-        Resolution::ResolvedStatic if site.resolution != Resolution::ResolvedStatic || site.target_id.as_deref() != Some(edge.target_id.as_str()) => {
-            Err(format!("Edge {} is not backed by a resolved site for its target", edge.id))
+        Resolution::ResolvedStatic
+            if site.resolution != Resolution::ResolvedStatic
+                || site.target_id.as_deref() != Some(edge.target_id.as_str()) =>
+        {
+            Err(format!(
+                "Edge {} is not backed by a resolved site for its target",
+                edge.id
+            ))
         }
-        Resolution::Candidate if site.resolution != Resolution::Candidate || !site.candidate_ids.contains(&edge.target_id) => {
-            Err(format!("Edge {} is not backed by a candidate site for its target", edge.id))
+        Resolution::Candidate
+            if site.resolution != Resolution::Candidate
+                || !site.candidate_ids.contains(&edge.target_id) =>
+        {
+            Err(format!(
+                "Edge {} is not backed by a candidate site for its target",
+                edge.id
+            ))
         }
         _ => Ok(()),
     }
 }
 
 fn check_span(span: &Span, file_bytes: u64, id: &str) -> Result<()> {
-    if span.byte_start > span.byte_end || span.byte_end > file_bytes || span.line_start == 0 || span.line_end < span.line_start {
-        return Err(format!("Source index record {id} has an invalid source span"));
+    if span.byte_start > span.byte_end
+        || span.byte_end > file_bytes
+        || span.line_start == 0
+        || span.line_end < span.line_start
+    {
+        return Err(format!(
+            "Source index record {id} has an invalid source span"
+        ));
     }
     Ok(())
 }
 
 impl std::fmt::Debug for SourceGraphIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SourceGraphIndex").field("snapshotId", &self.snapshot_id).field("files", &self.files.len()).field("symbols", &self.symbols.len())
-            .field("sites", &self.sites.len()).field("edges", &self.edges.len()).finish()
+        f.debug_struct("SourceGraphIndex")
+            .field("snapshotId", &self.snapshot_id)
+            .field("files", &self.files.len())
+            .field("symbols", &self.symbols.len())
+            .field("sites", &self.sites.len())
+            .field("edges", &self.edges.len())
+            .finish()
     }
 }

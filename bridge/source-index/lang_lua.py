@@ -27,6 +27,7 @@ PROFILES = {
 }
 
 RAW_CAP = 4096
+ANONYMOUS = "<anonymous>"
 LOADERS = {"require": False, "dofile": True, "loadfile": True}
 DYNAMIC_FUNCS = {"load", "loadstring", "getfenv", "setfenv", "loadfile_dynamic"}
 CONDITIONAL = {
@@ -247,7 +248,7 @@ class _Walker:
                 name = self.ctx.text(name_node)
                 bindings.update(assignedTo=name, tableField=True)
                 return "function", name, None, None
-        return "lambda", "<anonymous>", None, None
+        return "lambda", ANONYMOUS, None, None
 
     def assigned_function(self, node, parent, bindings):
         stmt = parent.parent
@@ -255,7 +256,7 @@ class _Walker:
         vlist = [c for c in vars_.named_children if c.type != "attribute"] if vars_ is not None and vars_.type == "variable_list" else []
         idx = list(parent.named_children).index(node) if node in parent.named_children else -1
         if not 0 <= idx < len(vlist):
-            return "lambda", "<anonymous>", None, None
+            return "lambda", ANONYMOUS, None, None
         target = vlist[idx]
         full = self.ctx.text(target)
         if target.type == "identifier":
@@ -266,7 +267,7 @@ class _Walker:
         if target.type == "dot_index_expression":
             bindings.update(assignedTo=full, receiver=self.ctx.text(target.child_by_field_name("table")), static=True)
             return "function", self.ctx.text(target.child_by_field_name("field")), full, None
-        return "lambda", "<anonymous>", None, None
+        return "lambda", ANONYMOUS, None, None
 
     def assignment(self, node):
         """Declarations introduced by `local a, b = ...` / `a = ...` (functions/requires are bound at their value)."""

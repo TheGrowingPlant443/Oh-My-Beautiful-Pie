@@ -3,7 +3,7 @@
 //! lying buffer yields a partial/error result instead of an out-of-bounds read.
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use super::types::*;
+use super::types::{AddressScope, Direction, DirectionEvidence, Endpoint, Family, Protocol};
 
 const TCP4_ROW: usize = 24;
 const TCP6_ROW: usize = 56;
@@ -55,7 +55,11 @@ fn scope(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32_le(bytes, at)).filter(|scope| *scope != 0)
 }
 
-fn table(buffer: &[u8], row_len: usize, decode: impl Fn(&[u8]) -> RawSocket) -> Result<ParsedTable, String> {
+fn table(
+    buffer: &[u8],
+    row_len: usize,
+    decode: impl Fn(&[u8]) -> RawSocket,
+) -> Result<ParsedTable, String> {
     if buffer.len() < 4 {
         return Err("socket table is shorter than its header".into());
     }
@@ -77,7 +81,11 @@ fn peer(address: String, port: u16, scope_id: Option<u32>) -> Option<Endpoint> {
     if wildcard && port == 0 {
         None
     } else {
-        Some(Endpoint { address, port, scope_id })
+        Some(Endpoint {
+            address,
+            port,
+            scope_id,
+        })
     }
 }
 
@@ -86,7 +94,11 @@ pub fn parse_tcp4(buffer: &[u8]) -> Result<ParsedTable, String> {
         family: Family::Ipv4,
         protocol: Protocol::Tcp,
         pid: u32_le(row, 20),
-        local: Endpoint { address: v4(row, 4), port: port_be(row, 8), scope_id: None },
+        local: Endpoint {
+            address: v4(row, 4),
+            port: port_be(row, 8),
+            scope_id: None,
+        },
         remote: peer(v4(row, 12), port_be(row, 16), None),
         tcp_state: Some(u32_le(row, 0)),
     })
@@ -97,7 +109,11 @@ pub fn parse_tcp6(buffer: &[u8]) -> Result<ParsedTable, String> {
         family: Family::Ipv6,
         protocol: Protocol::Tcp,
         pid: u32_le(row, 52),
-        local: Endpoint { address: v6(row, 0), port: port_be(row, 20), scope_id: scope(row, 16) },
+        local: Endpoint {
+            address: v6(row, 0),
+            port: port_be(row, 20),
+            scope_id: scope(row, 16),
+        },
         remote: peer(v6(row, 24), port_be(row, 44), scope(row, 40)),
         tcp_state: Some(u32_le(row, 48)),
     })
@@ -108,7 +124,11 @@ pub fn parse_udp4(buffer: &[u8]) -> Result<ParsedTable, String> {
         family: Family::Ipv4,
         protocol: Protocol::Udp,
         pid: u32_le(row, 8),
-        local: Endpoint { address: v4(row, 0), port: port_be(row, 4), scope_id: None },
+        local: Endpoint {
+            address: v4(row, 0),
+            port: port_be(row, 4),
+            scope_id: None,
+        },
         remote: None,
         tcp_state: None,
     })
@@ -119,12 +139,17 @@ pub fn parse_udp6(buffer: &[u8]) -> Result<ParsedTable, String> {
         family: Family::Ipv6,
         protocol: Protocol::Udp,
         pid: u32_le(row, 24),
-        local: Endpoint { address: v6(row, 0), port: port_be(row, 20), scope_id: scope(row, 16) },
+        local: Endpoint {
+            address: v6(row, 0),
+            port: port_be(row, 20),
+            scope_id: scope(row, 16),
+        },
         remote: None,
         tcp_state: None,
     })
 }
 
+#[must_use]
 pub fn tcp_state_name(state: u32) -> String {
     match state {
         1 => "CLOSED".into(),
@@ -145,6 +170,7 @@ pub fn tcp_state_name(state: u32) -> String {
 
 /// Only handshake states reveal who initiated a connection; ESTABLISHED and closing states do not, and the table
 /// cannot be used to carry a direction across snapshots because tuples are reused.
+#[must_use]
 pub fn direction_of(state: u32) -> (Direction, DirectionEvidence) {
     match state {
         TCP_LISTEN => (Direction::Listener, DirectionEvidence::Listen),
@@ -164,7 +190,11 @@ fn scope_v4(ip: Ipv4Addr) -> AddressScope {
         AddressScope::LinkLocal
     } else if ip.is_private() {
         AddressScope::Private
-    } else if ip.is_broadcast() || ip.is_multicast() || a >= 240 || (a == 100 && (64..128).contains(&b)) {
+    } else if ip.is_broadcast()
+        || ip.is_multicast()
+        || a >= 240
+        || (a == 100 && (64..128).contains(&b))
+    {
         AddressScope::Other
     } else {
         AddressScope::Public
@@ -172,11 +202,14 @@ fn scope_v4(ip: Ipv4Addr) -> AddressScope {
 }
 
 /// Classification of a textual address as produced by this module; unparsable text is `Other`.
+#[must_use]
 pub fn address_scope(address: &str) -> AddressScope {
     if let Ok(ip) = address.parse::<Ipv4Addr>() {
         return scope_v4(ip);
     }
-    let Ok(ip) = address.parse::<Ipv6Addr>() else { return AddressScope::Other };
+    let Ok(ip) = address.parse::<Ipv6Addr>() else {
+        return AddressScope::Other;
+    };
     if let Some(mapped) = ip.to_ipv4_mapped() {
         return scope_v4(mapped);
     }
@@ -197,8 +230,14 @@ pub fn address_scope(address: &str) -> AddressScope {
 }
 
 /// Remote peer that is neither a wildcard nor loopback. Private LAN peers count as external.
+#[must_use]
 pub fn is_external(remote: Option<&Endpoint>) -> bool {
-    remote.is_some_and(|peer| !matches!(address_scope(&peer.address), AddressScope::Loopback | AddressScope::Unspecified))
+    remote.is_some_and(|peer| {
+        !matches!(
+            address_scope(&peer.address),
+            AddressScope::Loopback | AddressScope::Unspecified
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -243,7 +282,8 @@ fn proc_endpoint(text: &str, family: Family) -> Option<(String, u16)> {
     }
     let port = u16::from_str_radix(port, 16).ok()?;
     let word = |chunk: &str| -> Option<[u8; 4]> {
-        (chunk.len() == 8 && chunk.bytes().all(|b| b.is_ascii_hexdigit())).then(|| u32::from_str_radix(chunk, 16).ok().map(u32::to_ne_bytes))?
+        (chunk.len() == 8 && chunk.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| u32::from_str_radix(chunk, 16).ok().map(u32::to_ne_bytes))?
     };
     let address = match family {
         Family::Ipv4 => Ipv4Addr::from(word(address)?).to_string(),
@@ -253,7 +293,8 @@ fn proc_endpoint(text: &str, family: Family) -> Option<(String, u16)> {
             }
             let mut octets = [0u8; 16];
             for (index, chunk) in address.as_bytes().chunks(8).enumerate() {
-                octets[index * 4..index * 4 + 4].copy_from_slice(&word(std::str::from_utf8(chunk).ok()?)?);
+                octets[index * 4..index * 4 + 4]
+                    .copy_from_slice(&word(std::str::from_utf8(chunk).ok()?)?);
             }
             Ipv6Addr::from(octets).to_string()
         }
@@ -263,6 +304,7 @@ fn proc_endpoint(text: &str, family: Family) -> Option<(String, u16)> {
 
 /// Linux TCP state number (`include/net/tcp_states.h`) to the Windows MIB number the rest of the monitor uses.
 #[cfg(any(target_os = "linux", test))]
+#[must_use]
 pub fn tcp_state_from_linux(state: u8) -> u32 {
     match state {
         0x01 => 5,  // ESTABLISHED
@@ -275,8 +317,8 @@ pub fn tcp_state_from_linux(state: u8) -> u32 {
         0x08 => 8,  // CLOSE_WAIT
         0x09 => 10, // LAST_ACK
         0x0a => TCP_LISTEN,
-        0x0b => 9,  // CLOSING
-        0x0c => 4,  // NEW_SYN_RECV: a request socket still in the handshake
+        0x0b => 9, // CLOSING
+        0x0c => 4, // NEW_SYN_RECV: a request socket still in the handshake
         _ => 0,
     }
 }
@@ -284,13 +326,22 @@ pub fn tcp_state_from_linux(state: u8) -> u32 {
 #[cfg(any(target_os = "linux", test))]
 fn proc_row(line: &str, family: Family, protocol: Protocol) -> Option<ProcSocket> {
     let mut fields = line.split_ascii_whitespace();
-    let (_slot, local, remote, state) = (fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+    let (_slot, local, remote, state) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
     // Skipped columns: tx_queue:rx_queue, tr:tm->when, retrnsmt, uid, timeout; then the inode.
     let inode: u64 = fields.nth(5)?.parse().ok()?;
     let (local_address, local_port) = proc_endpoint(local, family)?;
     let (remote_address, remote_port) = proc_endpoint(remote, family)?;
     let tcp_state = match protocol {
-        Protocol::Tcp => Some(tcp_state_from_linux(u8::from_str_radix(state, 16).ok().filter(|_| state.len() == 2)?)),
+        Protocol::Tcp => Some(tcp_state_from_linux(
+            u8::from_str_radix(state, 16)
+                .ok()
+                .filter(|_| state.len() == 2)?,
+        )),
         Protocol::Udp => None,
     };
     Some(ProcSocket {
@@ -298,7 +349,11 @@ fn proc_row(line: &str, family: Family, protocol: Protocol) -> Option<ProcSocket
             family,
             protocol,
             pid: 0,
-            local: Endpoint { address: local_address, port: local_port, scope_id: None },
+            local: Endpoint {
+                address: local_address,
+                port: local_port,
+                scope_id: None,
+            },
             // UDP carries no peer here, exactly like the Windows UDP table: connected UDP sockets list their local side only.
             remote: match protocol {
                 Protocol::Tcp => peer(remote_address, remote_port, None),
@@ -312,10 +367,17 @@ fn proc_row(line: &str, family: Family, protocol: Protocol) -> Option<ProcSocket
 
 /// `Ok(None)` is end of input; an over-long line yields `Some(None)` after its remainder was discarded.
 #[cfg(any(target_os = "linux", test))]
-fn next_line(reader: &mut impl std::io::BufRead, buffer: &mut Vec<u8>) -> Result<Option<Option<()>>, String> {
+fn next_line(
+    reader: &mut impl std::io::BufRead,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<Option<()>>, String> {
     use std::io::{BufRead, Read};
     buffer.clear();
-    let read = reader.by_ref().take(PROC_LINE_LIMIT as u64 + 1).read_until(b'\n', buffer).map_err(|e| e.to_string())?;
+    let read = reader
+        .by_ref()
+        .take(PROC_LINE_LIMIT as u64 + 1)
+        .read_until(b'\n', buffer)
+        .map_err(|e| e.to_string())?;
     if read == 0 {
         return Ok(None);
     }
@@ -323,9 +385,14 @@ fn next_line(reader: &mut impl std::io::BufRead, buffer: &mut Vec<u8>) -> Result
         return Ok(Some(Some(())));
     }
     // Discard the rest of an over-long line without keeping it.
+    let mut sink = Vec::with_capacity(PROC_LINE_LIMIT);
     loop {
-        let mut sink = Vec::new();
-        let read = reader.by_ref().take(PROC_LINE_LIMIT as u64).read_until(b'\n', &mut sink).map_err(|e| e.to_string())?;
+        sink.clear();
+        let read = reader
+            .by_ref()
+            .take(PROC_LINE_LIMIT as u64)
+            .read_until(b'\n', &mut sink)
+            .map_err(|e| e.to_string())?;
         if read == 0 || sink.last() == Some(&b'\n') {
             break;
         }
@@ -335,20 +402,30 @@ fn next_line(reader: &mut impl std::io::BufRead, buffer: &mut Vec<u8>) -> Result
 
 /// Reads one `/proc/net` table. The first line must be the column header; rows that do not decode are counted.
 #[cfg(any(target_os = "linux", test))]
-pub fn parse_proc_net(mut reader: impl std::io::BufRead, family: Family, protocol: Protocol) -> Result<ParsedProcTable, String> {
+pub fn parse_proc_net(
+    mut reader: impl std::io::BufRead,
+    family: Family,
+    protocol: Protocol,
+) -> Result<ParsedProcTable, String> {
     let mut buffer = Vec::with_capacity(256);
     match next_line(&mut reader, &mut buffer)? {
         Some(Some(())) if buffer.trim_ascii_start().starts_with(b"sl") => {}
         None => return Err("table is empty".into()),
         _ => return Err("table header is not the expected one".into()),
     }
-    let mut parsed = ParsedProcTable { rows: Vec::new(), truncated: false, malformed: 0 };
+    let mut parsed = ParsedProcTable {
+        rows: Vec::new(),
+        truncated: false,
+        malformed: 0,
+    };
     while let Some(line) = next_line(&mut reader, &mut buffer)? {
         if parsed.rows.len() >= PROC_ROW_LIMIT {
             parsed.truncated = true;
             break;
         }
-        let row = line.and_then(|_| std::str::from_utf8(&buffer).ok()).and_then(|text| proc_row(text, family, protocol));
+        let row = line
+            .and_then(|_| std::str::from_utf8(&buffer).ok())
+            .and_then(|text| proc_row(text, family, protocol));
         match row {
             Some(row) => parsed.rows.push(row),
             None if buffer.trim_ascii().is_empty() => {}
@@ -387,12 +464,20 @@ pub fn parse_proc_stat(text: &str) -> Option<ProcStat> {
     let parent_pid = rest.next()?.parse().ok()?;
     let threads = rest.nth(15)?.parse().ok()?;
     let start_ticks = rest.nth(1)?.parse().ok()?;
-    Some(ProcStat { name: text[open + 1..close].to_string(), state, parent_pid, threads, start_ticks })
+    Some(ProcStat {
+        name: text[open + 1..close].to_string(),
+        state,
+        parent_pid,
+        threads,
+        start_ticks,
+    })
 }
 
 /// Start time in the monitor's 100 ns identity unit. Only equality and order matter, so ticks since boot are kept
 /// instead of an absolute time that a clock adjustment could shift under a stored identity.
 #[cfg(any(target_os = "linux", test))]
+#[must_use]
 pub fn ticks_to_100ns(ticks: u64, ticks_per_second: u64) -> u64 {
-    (u128::from(ticks) * 10_000_000 / u128::from(ticks_per_second.max(1))).min(u128::from(u64::MAX)) as u64
+    (u128::from(ticks) * 10_000_000 / u128::from(ticks_per_second.max(1))).min(u128::from(u64::MAX))
+        as u64
 }

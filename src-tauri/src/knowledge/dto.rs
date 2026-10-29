@@ -12,7 +12,11 @@ pub enum VaultMode {
 
 /// Where a vault applies. Only the backend derives `repository_root` (from `setup::find_repository_root`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum KnowledgeScope {
     Global,
     Project { repository_root: String },
@@ -20,7 +24,11 @@ pub enum KnowledgeScope {
 
 /// The scope a human asks for. A project's repository root is derived from `folder`; one that is sent must agree.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ScopeRequest {
     Global,
     Project {
@@ -322,14 +330,40 @@ pub struct VaultResolution {
 
 /// Strict query union (unknown kinds/fields are rejected).
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum VaultLinkQuery {
-    Notes { offset: usize, limit: usize },
-    Links { offset: usize, limit: usize },
-    Search { text: String, offset: usize, limit: usize },
-    Backlinks { path: String, offset: usize, limit: usize },
-    Neighbors { path: String, offset: usize, limit: usize },
-    Resolve { from_path: String, targets: Vec<String> },
+    Notes {
+        offset: usize,
+        limit: usize,
+    },
+    Links {
+        offset: usize,
+        limit: usize,
+    },
+    Search {
+        text: String,
+        offset: usize,
+        limit: usize,
+    },
+    Backlinks {
+        path: String,
+        offset: usize,
+        limit: usize,
+    },
+    Neighbors {
+        path: String,
+        offset: usize,
+        limit: usize,
+    },
+    Resolve {
+        from_path: String,
+        targets: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -405,13 +439,37 @@ pub enum GraphifyDirection {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum GraphifyQuery {
-    Search { text: String, offset: usize, limit: usize },
-    Neighbors { id: GraphifyRef, direction: GraphifyDirection, offset: usize, limit: usize },
-    Node { id: GraphifyRef },
-    CommunityMembers { community: i64, offset: usize, limit: usize },
-    HyperedgesOf { id: GraphifyRef, offset: usize, limit: usize },
+    Search {
+        text: String,
+        offset: usize,
+        limit: usize,
+    },
+    Neighbors {
+        id: GraphifyRef,
+        direction: GraphifyDirection,
+        offset: usize,
+        limit: usize,
+    },
+    Node {
+        id: GraphifyRef,
+    },
+    CommunityMembers {
+        community: i64,
+        offset: usize,
+        limit: usize,
+    },
+    HyperedgesOf {
+        id: GraphifyRef,
+        offset: usize,
+        limit: usize,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]

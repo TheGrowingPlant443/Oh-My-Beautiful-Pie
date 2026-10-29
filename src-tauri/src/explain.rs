@@ -2,12 +2,14 @@
 //!
 //! The material is plain Git output (no external diff, no textconv). The model is asked once, headless, with no
 //! tools and no extensions, so nothing can be changed and nothing else is loaded.
-use crate::code_diff::{failure_text, git_timed, no_console, repository_root, run_timed, valid_commit};
+use crate::code_diff;
 use crate::instance::{Origin, Registry};
 use std::ffi::OsStr;
 use std::fs;
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::Chars;
 use std::time::Duration;
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
@@ -34,14 +36,36 @@ fn cut(mut text: String, max: usize, note: &str) -> String {
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Result<String> {
-    Ok(String::from_utf8_lossy(&git_timed(root, args, None, GIT_SECS)?).into_owned())
+    Ok(String::from_utf8_lossy(&code_diff::git_timed(root, args, None, GIT_SECS)?).into_owned())
 }
 
 /// Stat and patch of `from..to`; a root commit (`from == None`) is shown as everything it added.
 fn changes(root: &Path, from: Option<&str>, to: &str) -> Result<String> {
     let run = |flag: &str| match from {
-        Some(from) => git_text(root, &["diff", "--no-ext-diff", "--no-textconv", "-M", flag, from, to]),
-        None => git_text(root, &["show", "--no-ext-diff", "--no-textconv", "-M", "--format=", flag, to]),
+        Some(from) => git_text(
+            root,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "-M",
+                flag,
+                from,
+                to,
+            ],
+        ),
+        None => git_text(
+            root,
+            &[
+                "show",
+                "--no-ext-diff",
+                "--no-textconv",
+                "-M",
+                "--format=",
+                flag,
+                to,
+            ],
+        ),
     };
     let stat = cut(run("--stat")?, STAT_LIMIT, "\n[stat truncated]");
     let patch = cut(run("--patch")?, PATCH_LIMIT, "\n[patch truncated]");
@@ -49,7 +73,10 @@ fn changes(root: &Path, from: Option<&str>, to: &str) -> Result<String> {
 }
 
 fn header(root: &Path, commit: &str) -> Result<String> {
-    git_text(root, &["log", "-1", "--format=%H%n%an%n%aI%n%s%n%n%b", commit])
+    git_text(
+        root,
+        &["log", "-1", "--format=%H%n%an%n%aI%n%s%n%n%b", commit],
+    )
 }
 
 fn parents(root: &Path, commit: &str) -> Result<Vec<String>> {
@@ -60,11 +87,21 @@ fn parents(root: &Path, commit: &str) -> Result<Vec<String>> {
 /// The text the model reads. `kind` is `pr` (a merge commit: what it brought into its first parent), `commit`
 /// or `range` (`base` is the older commit, `target` the newer one).
 pub fn material(root: &Path, kind: &str, base: Option<&str>, target: &str) -> Result<String> {
-    valid_commit(root, target)?;
+    code_diff::valid_commit(root, target)?;
     match (kind, base) {
         ("range", Some(base)) => {
-            valid_commit(root, base)?;
-            let log = git_text(root, &["log", "--no-merges", "-n", "100", "--format=%h %an: %s", &format!("{base}..{target}")])?;
+            code_diff::valid_commit(root, base)?;
+            let log = git_text(
+                root,
+                &[
+                    "log",
+                    "--no-merges",
+                    "-n",
+                    "100",
+                    "--format=%h %an: %s",
+                    &format!("{base}..{target}"),
+                ],
+            )?;
             Ok(format!("Difference between two commits, {base} to {target}.\n\n## Commits in between\n{log}\n{}", changes(root, Some(base), target)?))
         }
         ("range", None) => Err("A commit range needs two commits".into()),
@@ -74,12 +111,30 @@ pub fn material(root: &Path, kind: &str, base: Option<&str>, target: &str) -> Re
             if parents.len() < 2 {
                 return Err("Not a merge commit".into());
             }
-            let log = git_text(root, &["log", "--no-merges", "-n", "100", "--format=%h %an: %s", &format!("{}..{target}", parents[0])])?;
-            Ok(format!("Merged pull request, merge commit:\n{}\n## Commits brought in\n{log}\n{}", header(root, target)?, changes(root, Some(&parents[0]), target)?))
+            let log = git_text(
+                root,
+                &[
+                    "log",
+                    "--no-merges",
+                    "-n",
+                    "100",
+                    "--format=%h %an: %s",
+                    &format!("{}..{target}", parents[0]),
+                ],
+            )?;
+            Ok(format!(
+                "Merged pull request, merge commit:\n{}\n## Commits brought in\n{log}\n{}",
+                header(root, target)?,
+                changes(root, Some(&parents[0]), target)?
+            ))
         }
         ("commit", None) => {
             let parents = parents(root, target)?;
-            Ok(format!("Commit:\n{}\n{}", header(root, target)?, changes(root, parents.first().map(String::as_str), target)?))
+            Ok(format!(
+                "Commit:\n{}\n{}",
+                header(root, target)?,
+                changes(root, parents.first().map(String::as_str), target)?
+            ))
         }
         _ => Err(format!("Unknown explanation kind: {kind}")),
     }
@@ -94,7 +149,7 @@ fn instruction(kind: &str) -> &'static str {
 }
 
 /// Consumes the rest of an escape sequence whose ESC byte was just read.
-fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+fn skip_escape(chars: &mut Peekable<Chars<'_>>) {
     match chars.next() {
         Some('[') => {
             for next in chars.by_ref() {
@@ -137,26 +192,55 @@ impl Drop for Remove {
 
 /// Runs the model once over `material` and returns its first non-empty line.
 #[allow(clippy::too_many_arguments)]
-pub fn explain_with(program: &OsStr, folder: &Path, profile: &str, configs: &[PathBuf], model: &str, kind: &str, material: &str, limit: Duration) -> Result<String> {
+pub fn explain_with(
+    program: &OsStr,
+    folder: &Path,
+    profile: &str,
+    configs: &[PathBuf],
+    model: &str,
+    kind: &str,
+    material: &str,
+    limit: Duration,
+) -> Result<String> {
     fs::create_dir_all(folder).map_err(|e| e.to_string())?;
     let file = folder.join(format!("{}.md", uuid::Uuid::new_v4()));
     fs::write(&file, material).map_err(|e| e.to_string())?;
-    let _cleanup = Remove(file.clone());
+    let material_file = Remove(file);
     let mut cmd = Command::new(program);
-    cmd.args(["-p", "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-rules", "--no-lsp", "--no-title", "--max-time=120", "--cwd"])
-        .arg(folder)
-        .args(["--profile", if profile.is_empty() { "default" } else { profile }]);
+    cmd.args([
+        "-p",
+        "--no-session",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-rules",
+        "--no-lsp",
+        "--no-title",
+        "--max-time=120",
+        "--cwd",
+    ])
+    .arg(folder)
+    .args([
+        "--profile",
+        if profile.is_empty() {
+            "default"
+        } else {
+            profile
+        },
+    ]);
     for config in configs {
         cmd.arg("--config").arg(config);
     }
     if !model.is_empty() {
         cmd.args(["--model", model]);
     }
-    cmd.arg(format!("@{}", file.display())).arg(instruction(kind)).current_dir(folder);
-    no_console(&mut cmd);
-    let output = run_timed(cmd, None, limit, NOT_FOUND)?;
+    cmd.arg(format!("@{}", material_file.0.display()))
+        .arg(instruction(kind))
+        .current_dir(folder);
+    code_diff::no_console(&mut cmd);
+    let output = code_diff::run_timed(cmd, None, limit, NOT_FOUND)?;
     if !output.status.success() {
-        return Err(failure_text(&output));
+        return Err(code_diff::failure_text(&output));
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -166,13 +250,28 @@ pub fn explain_with(program: &OsStr, folder: &Path, profile: &str, configs: &[Pa
         .ok_or_else(|| "The model returned no explanation".into())
 }
 
-pub fn explain(registry: &Registry, id: &str, kind: &str, base: Option<&str>, target: &str) -> Result<String> {
+pub fn explain(
+    registry: &Registry,
+    id: &str,
+    kind: &str,
+    base: Option<&str>,
+    target: &str,
+) -> Result<String> {
     let row = registry.inspect(id, Origin::Human)?;
-    let root = repository_root(Path::new(&row.project_path))?;
+    let root = code_diff::repository_root(Path::new(&row.project_path))?;
     let material = material(&root, kind, base, target)?;
     let program = crate::toolchain::omp_program();
     let folder = registry.config_root().join("git-explain");
-    explain_with(&program, &folder, &row.profile, &row.configs, &row.model, kind, &material, Duration::from_secs(MODEL_SECS))
+    explain_with(
+        &program,
+        &folder,
+        &row.profile,
+        &row.configs,
+        &row.model,
+        kind,
+        &material,
+        Duration::from_secs(MODEL_SECS),
+    )
 }
 
 #[cfg(test)]
@@ -182,7 +281,8 @@ mod tests {
     struct Repo(PathBuf);
     impl Repo {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("omp-explain-{name}-{}", uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("omp-explain-{name}-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&dir).unwrap();
             let repo = Repo(dir);
             repo.git(&["init", "-q"]);
@@ -190,12 +290,26 @@ mod tests {
         }
         fn git(&self, args: &[&str]) -> String {
             let out = Command::new("git")
-                .arg("-C").arg(&self.0)
-                .args(["-c", "user.name=Tester", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
+                .arg("-C")
+                .arg(&self.0)
+                .args([
+                    "-c",
+                    "user.name=Tester",
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.autocrlf=false",
+                ])
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
         fn commit(&self, file: &str, body: &str, message: &str) -> String {
@@ -219,21 +333,45 @@ mod tests {
         repo.git(&["checkout", "-q", "-b", "feature"]);
         repo.commit("b.txt", "feature file\n", "add feature");
         repo.git(&["checkout", "-q", "-"]);
-        repo.git(&["merge", "--no-ff", "-q", "-m", "Merge pull request #1 from x/feature", "feature"]);
+        repo.git(&[
+            "merge",
+            "--no-ff",
+            "-q",
+            "-m",
+            "Merge pull request #1 from x/feature",
+            "feature",
+        ]);
         let merge = repo.git(&["rev-parse", "HEAD"]);
         let root = repo.0.as_path();
 
         let root_commit = material(root, "commit", None, &first).unwrap();
-        assert!(root_commit.contains("first") && root_commit.contains("+one"), "a root commit shows what it added: {root_commit}");
+        assert!(
+            root_commit.contains("first") && root_commit.contains("+one"),
+            "a root commit shows what it added: {root_commit}"
+        );
         let plain = material(root, "commit", None, &second).unwrap();
         assert!(plain.contains("a.txt") && plain.contains("+two"));
         let range = material(root, "range", Some(&first), &second).unwrap();
-        assert!(range.contains("second") && range.contains("+two") && !range.contains("+one\n"), "the range diff holds only what changed between the two");
+        assert!(
+            range.contains("second") && range.contains("+two") && !range.contains("+one\n"),
+            "the range diff holds only what changed between the two"
+        );
         let pr = material(root, "pr", None, &merge).unwrap();
-        assert!(pr.contains("Merge pull request #1") && pr.contains("add feature") && pr.contains("b.txt") && pr.contains("+feature file"));
+        assert!(
+            pr.contains("Merge pull request #1")
+                && pr.contains("add feature")
+                && pr.contains("b.txt")
+                && pr.contains("+feature file")
+        );
         let merged_commit = material(root, "commit", None, &merge).unwrap();
-        assert!(merged_commit.contains("+feature file"), "a merge commit is diffed against its first parent");
-        assert_eq!(material(root, "pr", None, &second).unwrap_err(), "Not a merge commit");
+        assert!(
+            merged_commit.contains("+feature file"),
+            "a merge commit is diffed against its first parent"
+        );
+        assert_eq!(
+            material(root, "pr", None, &second).unwrap_err(),
+            "Not a merge commit"
+        );
         assert!(material(root, "range", None, &second).is_err());
         assert!(material(root, "commit", Some(&first), &second).is_err());
         assert!(material(root, "commit", None, "--output=x").is_err());
@@ -258,7 +396,10 @@ mod tests {
 
     #[test]
     fn answers_are_one_plain_line() {
-        assert_eq!(strip_ansi("\u{1b}[1mbold\u{1b}[0m and \u{1b}]0;title\u{7}plain"), "bold and plain");
+        assert_eq!(
+            strip_ansi("\u{1b}[1mbold\u{1b}[0m and \u{1b}]0;title\u{7}plain"),
+            "bold and plain"
+        );
     }
 
     #[cfg(windows)]
@@ -266,40 +407,77 @@ mod tests {
         use super::*;
 
         fn script(name: &str, body: &str) -> (PathBuf, PathBuf) {
-            let dir = std::env::temp_dir().join(format!("omp-explain-stub-{name}-{}", uuid::Uuid::new_v4()));
+            let dir = std::env::temp_dir()
+                .join(format!("omp-explain-stub-{name}-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&dir).unwrap();
             let file = dir.join("omp.cmd");
             fs::write(&file, body).unwrap();
             (dir, file)
         }
         fn run(program: &Path, folder: &Path, limit: Duration) -> Result<String> {
-            explain_with(program.as_os_str(), folder, "", &[PathBuf::from("C:/cfg/a.yml")], "m1", "pr", "material text", limit)
+            explain_with(
+                program.as_os_str(),
+                folder,
+                "",
+                &[PathBuf::from("C:/cfg/a.yml")],
+                "m1",
+                "pr",
+                "material text",
+                limit,
+            )
         }
 
         #[test]
-        fn the_first_non_empty_line_is_returned_without_escape_codes_and_the_material_file_is_removed() {
+        fn the_first_non_empty_line_is_returned_without_escape_codes_and_the_material_file_is_removed(
+        ) {
             let (dir, program) = script("ok", "@echo off\r\necho %* > \"%~dp0args.txt\"\r\necho.\r\necho \u{1b}[1mOne line.\u{1b}[0m\r\necho second\r\n");
             let folder = dir.join("work");
-            assert_eq!(run(&program, &folder, Duration::from_secs(20)).unwrap(), "One line.");
+            assert_eq!(
+                run(&program, &folder, Duration::from_secs(20)).unwrap(),
+                "One line."
+            );
             let args = fs::read_to_string(dir.join("args.txt")).unwrap();
-            for part in ["-p", "--no-session", "--no-tools", "--no-extensions", "--profile default", "--config C:/cfg/a.yml", "--model m1", "@"] {
+            for part in [
+                "-p",
+                "--no-session",
+                "--no-tools",
+                "--no-extensions",
+                "--profile default",
+                "--config C:/cfg/a.yml",
+                "--model m1",
+                "@",
+            ] {
                 assert!(args.contains(part), "{part} missing from {args}");
             }
-            assert_eq!(fs::read_dir(&folder).unwrap().count(), 0, "the material file is deleted");
+            assert_eq!(
+                fs::read_dir(&folder).unwrap().count(),
+                0,
+                "the material file is deleted"
+            );
             fs::remove_dir_all(dir).unwrap();
         }
 
         #[test]
         fn failures_and_timeouts_are_reported() {
-            let (dir, fail) = script("fail", "@echo off\r\necho model unavailable 1>&2\r\nexit /b 3\r\n");
-            assert!(run(&fail, &dir.join("work"), Duration::from_secs(20)).unwrap_err().contains("model unavailable"));
+            let (dir, fail) = script(
+                "fail",
+                "@echo off\r\necho model unavailable 1>&2\r\nexit /b 3\r\n",
+            );
+            assert!(run(&fail, &dir.join("work"), Duration::from_secs(20))
+                .unwrap_err()
+                .contains("model unavailable"));
             let (slow_dir, slow) = script("slow", "@echo off\r\nping -n 20 127.0.0.1 >nul\r\n");
             let started = std::time::Instant::now();
-            assert!(run(&slow, &slow_dir.join("work"), Duration::from_secs(1)).unwrap_err().contains("Timed out"));
+            assert!(run(&slow, &slow_dir.join("work"), Duration::from_secs(1))
+                .unwrap_err()
+                .contains("Timed out"));
             assert!(started.elapsed() < Duration::from_secs(15));
             assert_eq!(fs::read_dir(slow_dir.join("work")).unwrap().count(), 0);
             let (empty_dir, empty) = script("empty", "@echo off\r\n");
-            assert_eq!(run(&empty, &empty_dir.join("work"), Duration::from_secs(20)).unwrap_err(), "The model returned no explanation");
+            assert_eq!(
+                run(&empty, &empty_dir.join("work"), Duration::from_secs(20)).unwrap_err(),
+                "The model returned no explanation"
+            );
             // The killed shell's child may still hold its folder for a moment.
             for d in [dir, slow_dir, empty_dir] {
                 let _ = fs::remove_dir_all(d);

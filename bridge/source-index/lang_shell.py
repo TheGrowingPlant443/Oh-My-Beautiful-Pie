@@ -65,7 +65,7 @@ PS_WRAPPERS = {
     "logical_expression", "pipeline_chain", "pipeline", "parenthesized_expression",
 }
 PS_SCOPE_PREFIX = re.compile(r"^(global|script|local|private):", re.IGNORECASE)
-PS_PATHLIKE = re.compile(r"(?:[\\/])|(?:\.(?:psm1|psd1|ps1|dll)$)", re.IGNORECASE)
+PS_MODULE_EXTENSION = re.compile(r"\.(?:psm1|psd1|ps1|dll)$", re.IGNORECASE)
 PS_SCRIPT_ROOT = "$psscriptroot"
 
 
@@ -368,7 +368,7 @@ class _Ps(_Base):
             target = next((a for a in args if a["param"] is None), None)
         spec, rel = self.expr_literal(target["node"]) if target is not None else (None, None)
         binding = _import_binding("import", spec, loader="Import-Module", relativeTo=rel,
-                                  pathLike=bool(spec and PS_PATHLIKE.search(spec)))
+                                  pathLike=bool(spec and ("/" in spec or "\\" in spec or PS_MODULE_EXTENSION.search(spec))))
         self.import_site(node, binding, spec, cond)
 
     def named_call(self, node, name, low, op, raw, cond):

@@ -8,7 +8,7 @@ const POLL_MS = 50;
 
 // Everything except ordinary newline/tab is shown as visible text, so saved or model-written text cannot drive the terminal.
 export function escapeTerminal(value) {
-  return String(value).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/g, ch => '\\u' + ch.codePointAt(0).toString(16).padStart(4, '0'));
+  return String(value).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/g, ch => String.raw`\u` + ch.codePointAt(0).toString(16).padStart(4, '0'));
 }
 
 const SEPARATOR = '\n';

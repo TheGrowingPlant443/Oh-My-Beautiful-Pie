@@ -15,34 +15,34 @@ mod dependency_project_review;
 mod dependency_security;
 mod dependency_updates;
 mod derived_standard;
-mod inhouse;
-mod known_standard;
 mod explain;
 mod git_graph;
 mod helper_agent;
-mod instance;
-mod manager;
-mod pty;
-mod plan;
-mod package_insights;
-mod project_insight;
-mod project_requirements;
-mod session;
-mod setup;
 mod host_monitor;
+mod inhouse;
+mod instance;
 mod knowledge;
-mod srs;
-mod source_index;
-mod system_overview;
-mod terminal;
-mod toolchain;
-mod workspace;
-mod workspace_native;
+mod known_standard;
+mod manager;
+mod package_insights;
+mod plan;
 #[cfg(windows)]
 mod process_tree;
 #[cfg(unix)]
 #[path = "process_tree_unix.rs"]
 mod process_tree;
+mod project_insight;
+mod project_requirements;
+mod pty;
+mod session;
+mod setup;
+mod source_index;
+mod srs;
+mod system_overview;
+mod terminal;
+mod toolchain;
+mod workspace;
+mod workspace_native;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -84,6 +84,8 @@ fn main() {
         std::process::exit(exit_code);
     }
     #[cfg(windows)]
+    // SAFETY: The Windows loader API has no safe equivalent; this valid flag needs no pointers
+    // and is set before the application starts worker threads.
     unsafe {
         use windows_sys::Win32::System::LibraryLoader::{
             SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
@@ -115,7 +117,9 @@ fn main() {
             let browser_host = Arc::new(browser_window::BrowserHost::default());
             #[cfg(windows)]
             browser_host.start(app.handle().clone(), browser.clone());
-            registry.install_browser_supervisor(browser.clone()).map_err(std::io::Error::other)?;
+            registry
+                .install_browser_supervisor(browser.clone())
+                .map_err(std::io::Error::other)?;
             let extension = folder.join("omp-manager-bridge.mjs");
             let source = include_str!("../../bridge/omp-manager.mjs");
             if std::fs::read_to_string(&extension).ok().as_deref() != Some(source) {
@@ -127,30 +131,56 @@ fn main() {
             code_quality::materialize_bridge(&folder).map_err(std::io::Error::other)?;
             architect::materialize(&folder).map_err(std::io::Error::other)?;
             workspace_native::materialize(&folder).map_err(std::io::Error::other)?;
-            terminals.bind_app(app.handle().clone()).map_err(std::io::Error::other)?;
+            terminals
+                .bind_app(app.handle().clone())
+                .map_err(std::io::Error::other)?;
             let hub = manager::ManagerHub::bind(extension).map_err(std::io::Error::other)?;
-            hub.bind_app(app.handle().clone()).map_err(std::io::Error::other)?;
+            hub.bind_app(app.handle().clone())
+                .map_err(std::io::Error::other)?;
             hub.bind_registry(Arc::downgrade(&registry))
                 .map_err(std::io::Error::other)?;
-            terminals.bind_registry(Arc::downgrade(&registry)).map_err(std::io::Error::other)?;
-            hub.install_browser_supervisor(browser.clone()).map_err(std::io::Error::other)?;
-            hub.install_terminal_service(terminals.clone()).map_err(std::io::Error::other)?;
-            registry.install_terminal_service(terminals.clone()).map_err(std::io::Error::other)?;
+            terminals
+                .bind_registry(Arc::downgrade(&registry))
+                .map_err(std::io::Error::other)?;
+            hub.install_browser_supervisor(browser.clone())
+                .map_err(std::io::Error::other)?;
+            hub.install_terminal_service(terminals.clone())
+                .map_err(std::io::Error::other)?;
+            registry
+                .install_terminal_service(terminals.clone())
+                .map_err(std::io::Error::other)?;
             registry
                 .install_manager_hub(hub.clone())
                 .map_err(std::io::Error::other)?;
-            let workspace = workspace::WorkspaceService::new(registry.clone(), hub.clone(), folder.clone());
-            workspace.bind_app(app.handle().clone()).map_err(std::io::Error::other)?;
-            hub.install_workspace_service(Arc::downgrade(&workspace)).map_err(std::io::Error::other)?;
-            let dependency_updates = Arc::new(dependency_updates::DependencyUpdateService::new(folder.clone()));
-            dependency_updates.bind_workspace(workspace.clone()).map_err(std::io::Error::other)?;
-            workspace.bind_dependency_updates(Arc::downgrade(&dependency_updates)).map_err(std::io::Error::other)?;
+            let workspace =
+                workspace::WorkspaceService::new(registry.clone(), hub.clone(), folder.clone());
+            workspace
+                .bind_app(app.handle().clone())
+                .map_err(std::io::Error::other)?;
+            hub.install_workspace_service(Arc::downgrade(&workspace))
+                .map_err(std::io::Error::other)?;
+            let dependency_updates = Arc::new(dependency_updates::DependencyUpdateService::new(
+                folder.clone(),
+            ));
+            dependency_updates
+                .bind_workspace(workspace.clone())
+                .map_err(std::io::Error::other)?;
+            workspace
+                .bind_dependency_updates(Arc::downgrade(&dependency_updates))
+                .map_err(std::io::Error::other)?;
             registry.refresh().map_err(std::io::Error::other)?;
-            if let Err(error) = workspace.reconcile_computed_folders() { eprintln!("Reconciling computed workspace folders: {error}"); }
+            if let Err(error) = workspace.reconcile_computed_folders() {
+                eprintln!("Reconciling computed workspace folders: {error}");
+            }
             let closing = Arc::new(AtomicBool::new(false));
-            commands::tick(app.handle().clone(), registry.clone(), terminals.clone(), closing.clone());
+            commands::tick(
+                app.handle().clone(),
+                registry.clone(),
+                terminals.clone(),
+                closing.clone(),
+            );
             let package_insights = Arc::new(
-                package_insights::PackageInsightsService::new(folder.clone())
+                package_insights::PackageInsightsService::try_new(folder.clone())
                     .map_err(std::io::Error::other)?,
             );
             let dependency_security = Arc::new(
@@ -159,25 +189,42 @@ fn main() {
             let inhouse = Arc::new(inhouse::InhouseService::new(folder.clone()));
             let code_quality = code_quality::CodeQualityService::new(folder.clone());
             code_quality.reconcile_on_start();
-            hub.install_code_quality_service(Arc::downgrade(&code_quality)).map_err(std::io::Error::other)?;
+            hub.install_code_quality_service(Arc::downgrade(&code_quality))
+                .map_err(std::io::Error::other)?;
             let source_index = source_index::SourceIndexService::new(folder.clone());
-            let project_insight = Arc::new(project_insight::ProjectInsightService::new(folder.clone()));
+            let project_insight =
+                Arc::new(project_insight::ProjectInsightService::new(folder.clone()));
             project_insight.bind_source_facts(source_index.clone());
             let knowledge = knowledge::KnowledgeService::new(folder.clone(), registry.home.clone());
             let setup_service = Arc::new(setup::SetupService::new(folder.clone()));
-            let agent_markdown = agent_markdown::AgentMarkdownService::new(registry.config_root().to_path_buf(), knowledge.clone());
-            setup_service.install_markdown(agent_markdown.clone()).map_err(std::io::Error::other)?;
+            let agent_markdown = agent_markdown::AgentMarkdownService::new(
+                registry.config_root().to_path_buf(),
+                knowledge.clone(),
+            );
+            setup_service
+                .install_markdown(agent_markdown.clone())
+                .map_err(std::io::Error::other)?;
             let srs = srs::SrsService::new(folder.clone(), knowledge.clone());
             {
                 use tauri::Emitter;
                 let handle = app.handle().clone();
-                srs.set_notifier(Box::new(move |status| { let _ = handle.emit("srs_job", status); })).map_err(std::io::Error::other)?;
+                srs.set_notifier(Box::new(move |status| {
+                    let _ = handle.emit("srs_job", status);
+                }))
+                .map_err(std::io::Error::other)?;
             }
-            srs.bind_registry(Arc::downgrade(&registry)).map_err(std::io::Error::other)?;
-            hub.install_srs_service(Arc::downgrade(&srs)).map_err(std::io::Error::other)?;
+            srs.bind_registry(Arc::downgrade(&registry))
+                .map_err(std::io::Error::other)?;
+            hub.install_srs_service(Arc::downgrade(&srs))
+                .map_err(std::io::Error::other)?;
             let host_monitor = host_monitor::HostMonitorService::new(registry.clone());
-            hub.install_host_monitor_service(Arc::downgrade(&host_monitor)).map_err(std::io::Error::other)?;
-            agent_markdown.install_boundary(Arc::new(manager::HubMarkdownBoundary(Arc::downgrade(&registry)))).map_err(std::io::Error::other)?;
+            hub.install_host_monitor_service(Arc::downgrade(&host_monitor))
+                .map_err(std::io::Error::other)?;
+            agent_markdown
+                .install_boundary(Arc::new(manager::HubMarkdownBoundary(Arc::downgrade(
+                    &registry,
+                ))))
+                .map_err(std::io::Error::other)?;
             app.manage(AppState {
                 registry,
                 workspace,
@@ -192,8 +239,12 @@ fn main() {
                 terminals,
                 package_insights,
                 dependency_security,
-                dependency_context: Arc::new(dependency_context::DependencyContextService::new(folder.clone())),
-                dependency_project_review: Arc::new(dependency_project_review::DependencyProjectReviewService::new(folder.clone())),
+                dependency_context: Arc::new(dependency_context::DependencyContextService::new(
+                    folder.clone(),
+                )),
+                dependency_project_review: Arc::new(
+                    dependency_project_review::DependencyProjectReviewService::new(folder.clone()),
+                ),
                 dependency_updates,
                 project_insight,
                 source_index,

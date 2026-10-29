@@ -82,8 +82,8 @@ function wikilinkRule(state: StateInline, silent: boolean): boolean {
   if (!inner.trim() || inner.includes("\n") || inner.includes("[") || inner.includes("]")) return false;
   let bar = -1;
   for (let i = 0; i < inner.length; i++) if (inner[i] === "|" && inner[i - 1] !== "\\") { bar = i; break; }
-  const targetPart = (bar < 0 ? inner : inner.slice(0, bar)).replaceAll("\\|", "|");
-  const label = bar < 0 ? null : inner.slice(bar + 1).replaceAll("\\|", "|").trim() || null;
+  const targetPart = (bar < 0 ? inner : inner.slice(0, bar)).replaceAll(String.raw`\|`, "|");
+  const label = bar < 0 ? null : inner.slice(bar + 1).replaceAll(String.raw`\|`, "|").trim() || null;
   const hash = targetPart.indexOf("#");
   const target = (hash < 0 ? targetPart : targetPart.slice(0, hash)).trim();
   const fragment = hash < 0 ? null : targetPart.slice(hash + 1).trim() || null;

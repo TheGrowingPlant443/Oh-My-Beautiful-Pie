@@ -2,11 +2,11 @@
 //! YAML front matter excluded. The same state machine tells a document page which fence it starts inside, so the
 //! index and the paged reader never disagree about what is code.
 use super::dto::{FenceState, VaultLinkKind};
-use super::fsio::percent_decode;
+use super::fsio;
 
 const FRONTMATTER_LOOKAHEAD: usize = 1000;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Fence {
     pub marker: char,
     pub length: usize,
@@ -58,6 +58,7 @@ pub(crate) struct Scanner {
     pending: Vec<(u64, String)>,
 }
 
+#[must_use]
 pub(crate) fn slug(text: &str) -> String {
     let mut out = String::new();
     for c in text.chars() {
@@ -72,14 +73,21 @@ pub(crate) fn slug(text: &str) -> String {
     out
 }
 
+#[must_use]
 pub(crate) fn looks_external(target: &str) -> bool {
     if target.starts_with("//") {
         return true;
     }
-    let Some(colon) = target.find(':') else { return false };
+    let Some(colon) = target.find(':') else {
+        return false;
+    };
     let scheme = &target[..colon];
     // A single letter is a Windows drive, not a URL scheme.
-    scheme.len() >= 2 && scheme.starts_with(|c: char| c.is_ascii_alphabetic()) && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    scheme.len() >= 2
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 fn opening_fence(trimmed: &str) -> Option<Fence> {
@@ -114,12 +122,16 @@ fn block_id(line: &str) -> Option<String> {
     }
 }
 
+#[must_use]
 pub(crate) fn split_fragment(target: &str) -> (String, Option<String>) {
     match target.find('#') {
         Some(at) => {
             let fragment = target[at + 1..].trim();
-            let fragment = percent_decode(fragment).unwrap_or_else(|| fragment.to_string());
-            (target[..at].trim().to_string(), (!fragment.is_empty()).then_some(fragment))
+            let fragment = fsio::percent_decode(fragment).unwrap_or_else(|| fragment.to_string());
+            (
+                target[..at].trim().to_string(),
+                (!fragment.is_empty()).then_some(fragment),
+            )
         }
         None => (target.trim().to_string(), None),
     }
@@ -138,19 +150,27 @@ fn link(kind: VaultLinkKind, line: u64, target_text: &str, label: Option<&str>) 
         external,
         target,
         fragment,
-        label: label.map(str::trim).filter(|l| !l.is_empty()).map(str::to_string),
+        label: label
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string),
     })
 }
 
 impl Scanner {
     pub(crate) fn fence(&self) -> Option<FenceState> {
-        self.fence.as_ref().map(|f| FenceState { marker: f.marker.to_string(), length: f.length as u64 })
+        self.fence.as_ref().map(|f| FenceState {
+            marker: f.marker.to_string(),
+            length: f.length as u64,
+        })
     }
 
+    #[must_use]
     pub(crate) fn in_frontmatter(&self) -> bool {
         self.front == Front::In
     }
 
+    #[must_use]
     pub(crate) fn lines_seen(&self) -> u64 {
         self.line_no
     }
@@ -238,7 +258,12 @@ fn heading(trimmed: &str, indent: usize, number: u64) -> Option<Heading> {
     if stripped.len() < text.len() && (stripped.is_empty() || stripped.ends_with([' ', '\t'])) {
         text = stripped.trim_end();
     }
-    Some(Heading { level: hashes as u8, text: text.to_string(), slug: slug(text), line: number })
+    Some(Heading {
+        level: hashes as u8,
+        text: text.to_string(),
+        slug: slug(text),
+        line: number,
+    })
 }
 
 /// A `[label]: destination` reference definition; `true` when the line is one (it holds no inline links).
@@ -246,14 +271,19 @@ fn reference_definition(trimmed: &str, indent: usize, number: u64, out: &mut Vec
     if indent > 3 || !trimmed.starts_with('[') || trimmed.starts_with("[[") {
         return false;
     }
-    let Some(close) = trimmed.find("]:") else { return false };
+    let Some(close) = trimmed.find("]:") else {
+        return false;
+    };
     let label = &trimmed[1..close];
     if label.is_empty() || label.starts_with('^') || label.contains('[') {
         return false;
     }
     let rest = trimmed[close + 2..].trim_start();
     let destination = rest.split_whitespace().next().unwrap_or("");
-    let destination = destination.strip_prefix('<').and_then(|d| d.strip_suffix('>')).unwrap_or(destination);
+    let destination = destination
+        .strip_prefix('<')
+        .and_then(|d| d.strip_suffix('>'))
+        .unwrap_or(destination);
     if let Some(found) = link(VaultLinkKind::Markdown, number, destination, Some(label)) {
         out.push(Event::Link(found));
     }
@@ -285,8 +315,10 @@ fn scan_inline(line: &str, number: u64, out: &mut Vec<Event>) {
         match bytes[i] {
             b'\\' => i += 2,
             b'`' => i = skip_code_span(bytes, i),
-            b'!' if bytes.get(i + 1) == Some(&b'[') => i = bracket(line, i + 1, true, number, out).max(i + 1),
-            b'[' => i = bracket(line, i, false, number, out).max(i + 1),
+            b'!' if bytes.get(i + 1) == Some(&b'[') => {
+                i = bracket(line, i + 1, /* embed */ true, number, out).max(i + 1)
+            }
+            b'[' => i = bracket(line, i, /* embed */ false, number, out).max(i + 1),
             _ => i += 1,
         }
     }
@@ -302,14 +334,20 @@ fn skip_blanks(bytes: &[u8], mut k: usize) -> usize {
 /// `[[target|label]]` / `![[target]]` opening at `start`; returns the index to continue scanning from.
 fn wiki_link(line: &str, start: usize, embed: bool, number: u64, out: &mut Vec<Event>) -> usize {
     let rest = &line[start + 2..];
-    let Some(close) = rest.find("]]") else { return start + 1 };
+    let Some(close) = rest.find("]]") else {
+        return start + 1;
+    };
     let inner = &rest[..close];
     if !inner.contains("[[") {
         let (target, label) = match inner.find('|') {
             Some(bar) => (inner[..bar].trim_end_matches('\\'), Some(&inner[bar + 1..])),
             None => (inner, None),
         };
-        let kind = if embed { VaultLinkKind::Embed } else { VaultLinkKind::Wiki };
+        let kind = if embed {
+            VaultLinkKind::Embed
+        } else {
+            VaultLinkKind::Wiki
+        };
         if let Some(found) = link(kind, number, target, label) {
             out.push(Event::Link(found));
         }
@@ -366,7 +404,9 @@ fn link_destination(line: &str, k: usize) -> Option<(&str, usize)> {
 /// Skips an optional quoted or parenthesised title (and trailing blanks) at `k`; `None` when it never closes.
 fn skip_title(line: &str, k: usize) -> Option<usize> {
     let bytes = line.as_bytes();
-    let Some(&quote) = bytes.get(k).filter(|q| matches!(**q, b'"' | b'\'' | b'(')) else { return Some(k) };
+    let Some(&quote) = bytes.get(k).filter(|q| matches!(**q, b'"' | b'\'' | b'(')) else {
+        return Some(k);
+    };
     let closing = if quote == b'(' { b')' } else { quote };
     let end = line[k + 1..].find(closing as char)?;
     Some(skip_blanks(bytes, k + 1 + end + 1))
@@ -384,12 +424,20 @@ fn bracket(line: &str, start: usize, embed: bool, number: u64, out: &mut Vec<Eve
         return start + 1;
     }
     let label = &line[start + 1..j];
-    let Some((destination, k)) = link_destination(line, skip_blanks(bytes, j + 2)) else { return start + 1 };
-    let Some(k) = skip_title(line, skip_blanks(bytes, k)) else { return start + 1 };
+    let Some((destination, k)) = link_destination(line, skip_blanks(bytes, j + 2)) else {
+        return start + 1;
+    };
+    let Some(k) = skip_title(line, skip_blanks(bytes, k)) else {
+        return start + 1;
+    };
     if bytes.get(k) != Some(&b')') {
         return start + 1;
     }
-    let kind = if embed { VaultLinkKind::Embed } else { VaultLinkKind::Markdown };
+    let kind = if embed {
+        VaultLinkKind::Embed
+    } else {
+        VaultLinkKind::Markdown
+    };
     if let Some(found) = link(kind, number, destination, Some(label)) {
         out.push(Event::Link(found));
     }
@@ -398,6 +446,7 @@ fn bracket(line: &str, start: usize, embed: bool, number: u64, out: &mut Vec<Eve
 
 /// Scans a whole text (used by tests and small in-memory callers).
 #[cfg(test)]
+#[must_use]
 pub(crate) fn scan_text(text: &str) -> Vec<Event> {
     let mut scanner = Scanner::default();
     let mut out = Vec::new();

@@ -1,7 +1,10 @@
 //! Deterministic recovery regressions for the private publication journal. Every fixture is a throwaway folder; the
 //! on-disk states a crash can leave behind are staged with plain file operations, no foreign processes involved.
 use super::fsio::{self, sha256_hex};
-use super::publication_journal::*;
+use super::publication_journal::{
+    backup_name, conflicted, finish, needs_recovery, recover_publications, reservation_name, save,
+    InFlight, PublicationJournal,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,14 +16,19 @@ struct Temp(PathBuf);
 
 impl Temp {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("omp publication recovery ø {}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "omp publication recovery ø {}",
+            uuid::Uuid::new_v4()
+        ));
         fs::create_dir_all(&path).unwrap();
         Self(crate::setup::canonical(&path).unwrap())
     }
 }
 
 impl Drop for Temp {
-    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 struct Fixture {
@@ -37,19 +45,41 @@ fn fixture(parents: &[&str]) -> Fixture {
     let journal = temp.0.join("private").join("journal");
     let parents: Vec<String> = parents.iter().map(|p| p.to_string()).collect();
     let mut dir = root.clone();
-    for parent in &parents { dir.push(parent); }
+    for parent in &parents {
+        dir.push(parent);
+    }
     fs::create_dir_all(&dir).unwrap();
     let id = uuid::Uuid::new_v4().to_string();
     write_backup(&journal, &id, BASE);
     let identity = fsio::dir_identity(&root).unwrap();
-    let record = prepared(&id, &root, &identity, &parents, "note.md", &sha256_hex(BASE), &sha256_hex(NEW));
+    let record = prepared(
+        &id,
+        &root,
+        &identity,
+        &parents,
+        "note.md",
+        &sha256_hex(BASE),
+        &sha256_hex(NEW),
+    );
     save(&journal, &record).unwrap();
-    Fixture { _temp: temp, root, journal, dir, record }
+    Fixture {
+        _temp: temp,
+        root,
+        journal,
+        dir,
+        record,
+    }
 }
 
-fn put(dir: &Path, name: &str, bytes: &[u8]) { fs::write(dir.join(name), bytes).unwrap(); }
-fn exists(dir: &Path, name: &str) -> bool { fs::symlink_metadata(dir.join(name)).is_ok() }
-fn read(dir: &Path, name: &str) -> Vec<u8> { fs::read(dir.join(name)).unwrap() }
+fn put(dir: &Path, name: &str, bytes: &[u8]) {
+    fs::write(dir.join(name), bytes).unwrap();
+}
+fn exists(dir: &Path, name: &str) -> bool {
+    fs::symlink_metadata(dir.join(name)).is_ok()
+}
+fn read(dir: &Path, name: &str) -> Vec<u8> {
+    fs::read(dir.join(name)).unwrap()
+}
 
 fn write_backup(journal: &Path, id: &str, bytes: &[u8]) {
     fs::create_dir_all(journal).unwrap();
@@ -57,7 +87,15 @@ fn write_backup(journal: &Path, id: &str, bytes: &[u8]) {
 }
 
 /// The staged name carries its own uuid, independent of the publication id.
-fn prepared(id: &str, root: &Path, identity: &str, parents: &[String], name: &str, base: &str, new: &str) -> PublicationJournal {
+fn prepared(
+    id: &str,
+    root: &Path,
+    identity: &str,
+    parents: &[String],
+    name: &str,
+    base: &str,
+    new: &str,
+) -> PublicationJournal {
     PublicationJournal {
         version: 1,
         id: id.to_string(),
@@ -79,7 +117,15 @@ fn prepared(id: &str, root: &Path, identity: &str, parents: &[String], name: &st
 fn record_serializes_camel_case_and_validates_names() {
     let f = fixture(&["notes"]);
     let text = fs::read_to_string(f.journal.join(format!("{}.json", f.record.id))).unwrap();
-    for key in ["rootIdentity", "baseHash", "newHash", "reservation", "staged", "backup", "parents"] {
+    for key in [
+        "rootIdentity",
+        "baseHash",
+        "newHash",
+        "reservation",
+        "staged",
+        "backup",
+        "parents",
+    ] {
         assert!(text.contains(&format!("\"{key}\"")), "{key}");
     }
     let mut bad = f.record.clone();
@@ -102,12 +148,28 @@ fn journal_must_stay_outside_the_vault_and_match_the_backup() {
     let inside = f.root.join("journal");
     let id = uuid::Uuid::new_v4().to_string();
     write_backup(&inside, &id, BASE);
-    let record = prepared(&id, &f.root, &f.record.root_identity, &[], "note.md", &sha256_hex(BASE), &sha256_hex(NEW));
+    let record = prepared(
+        &id,
+        &f.root,
+        &f.record.root_identity,
+        &[],
+        "note.md",
+        &sha256_hex(BASE),
+        &sha256_hex(NEW),
+    );
     assert!(save(&inside, &record).is_err());
     // A backup holding other bytes than the recorded base hash is refused.
     let other = uuid::Uuid::new_v4().to_string();
     write_backup(&f.journal, &other, b"different");
-    let record = prepared(&other, &f.root, &f.record.root_identity, &[], "note.md", &sha256_hex(BASE), &sha256_hex(NEW));
+    let record = prepared(
+        &other,
+        &f.root,
+        &f.record.root_identity,
+        &[],
+        "note.md",
+        &sha256_hex(BASE),
+        &sha256_hex(NEW),
+    );
     assert!(save(&f.journal, &record).is_err());
     let mut bad = f.record.clone();
     bad.staged = ".omp-not-a-uuid.tmp".into();
@@ -122,7 +184,10 @@ fn finish_removes_only_the_record_and_is_repeatable() {
     finish(&f.journal, &f.record.id).unwrap();
     finish(&f.journal, &f.record.id).unwrap();
     assert!(!needs_recovery(&f.journal).unwrap());
-    assert!(f.journal.join(&f.record.backup).exists(), "the caller owns the backup");
+    assert!(
+        f.journal.join(&f.record.backup).exists(),
+        "the caller owns the backup"
+    );
     assert!(finish(&f.journal, "../escape").is_err());
 }
 
@@ -132,7 +197,10 @@ fn needs_recovery_reads_only_and_skips_in_flight_ids() {
     let missing = temp.0.join("never created");
     assert!(!needs_recovery(&missing).unwrap());
     recover_publications(&missing).unwrap();
-    assert!(!missing.exists(), "an empty journal must not create anything");
+    assert!(
+        !missing.exists(),
+        "an empty journal must not create anything"
+    );
     let f = fixture(&[]);
     {
         let _guard = InFlight::begin(&f.record.id);
@@ -140,7 +208,10 @@ fn needs_recovery_reads_only_and_skips_in_flight_ids() {
         put(&f.dir, &f.record.reservation, BASE);
         put(&f.dir, &f.record.staged, NEW);
         recover_publications(&f.journal).unwrap();
-        assert!(exists(&f.dir, &f.record.reservation), "a live writer's reservation must not be recovered");
+        assert!(
+            exists(&f.dir, &f.record.reservation),
+            "a live writer's reservation must not be recovered"
+        );
         assert!(exists(&f.dir, &f.record.staged));
     }
     assert!(needs_recovery(&f.journal).unwrap());
@@ -243,7 +314,10 @@ mod windows {
         put(&f.dir, &f.record.reservation, FOREIGN);
         put(&f.dir, &f.record.staged, FOREIGN);
         recover_publications(&f.journal).unwrap();
-        assert!(!exists(&f.dir, "note.md"), "a foreign reservation is never promoted to the name");
+        assert!(
+            !exists(&f.dir, "note.md"),
+            "a foreign reservation is never promoted to the name"
+        );
         assert_eq!(read(&f.dir, &f.record.reservation), FOREIGN);
         assert_eq!(read(&f.dir, &f.record.staged), FOREIGN);
         assert_eq!(conflicted(&f.journal).unwrap().len(), 1);
@@ -274,7 +348,10 @@ mod windows {
         assert!(!exists(&f.root.join("notes"), "note.md"));
         assert!(exists(&moved.join("notes"), &f.record.reservation));
         assert!(exists(&moved.join("notes"), &f.record.staged));
-        assert!(needs_recovery(&f.journal).unwrap(), "the record stays pending for a later retry");
+        assert!(
+            needs_recovery(&f.journal).unwrap(),
+            "the record stays pending for a later retry"
+        );
         // The identity string itself is verified, not only the path.
         fs::remove_dir_all(&f.root).unwrap();
         fs::rename(&moved, &f.root).unwrap();
@@ -294,12 +371,17 @@ mod windows {
         put(&f.dir, &f.record.reservation, BASE);
         // Tampered: reservation points at a sibling that does not carry this id.
         let path = f.journal.join(format!("{}.json", f.record.id));
-        let text = fs::read_to_string(&path).unwrap().replace(&f.record.reservation, "note.md");
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace(&f.record.reservation, "note.md");
         fs::write(&path, text).unwrap();
         assert!(recover_publications(&f.journal).is_err());
         assert!(!path.exists());
         assert!(f.journal.join(format!("{}.rejected", f.record.id)).exists());
-        assert!(exists(&f.dir, &f.record.reservation), "an untrusted record never causes file operations");
+        assert!(
+            exists(&f.dir, &f.record.reservation),
+            "an untrusted record never causes file operations"
+        );
         recover_publications(&f.journal).unwrap();
     }
 }

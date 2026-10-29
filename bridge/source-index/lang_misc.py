@@ -731,7 +731,10 @@ class _Elixir(_Base):
         if an == "behaviour" and aargs is not None:
             for a in aargs.named_children:
                 txt = self.text(a)
-                self.ctx.add_site("references", txt, a, binding=_role_binding(txt, "behaviour"))
+                self.ctx.add_site("references", txt, a, binding={
+                    "kind": "path" if "." in txt else "identifier", "name": txt.rsplit(".", 1)[-1],
+                    "receiver": txt.rsplit(".", 1)[0] if "." in txt else None,
+                    "receiverKind": "path" if "." in txt else None, "role": "behaviour"})
             return False
         if an in EX_SKIP_ATTRS:
             return False
@@ -837,10 +840,11 @@ class _Julia(_Base):
             return "<callable>", typ
         return None, None
 
-    @staticmethod
-    def param_node(node, wrappers):
-        if node.type in wrappers:
-            return node.named_children[0] if node.named_children else None
+    def param_node(self, node, wrappers):
+        while node is not None and node.type in wrappers:
+            if node.type == "assignment":
+                self.skip_nodes.add(node.id)  # defaults bind parameters, but their expressions are still traversed
+            node = node.named_children[0] if node.named_children else None
         return node
 
     def params_of(self, call):
@@ -849,7 +853,7 @@ class _Julia(_Base):
         if arg_list is None:
             return out
         for p in arg_list.named_children:
-            q = self.param_node(p, ("named_argument", "typed_expression", "splat_expression", "optional_parameter", "typed_parameter"))
+            q = self.param_node(p, ("assignment", "named_argument", "typed_expression", "splat_expression", "optional_parameter", "typed_parameter"))
             if q is None:
                 continue
             if q.type == "identifier":
@@ -861,7 +865,7 @@ class _Julia(_Base):
     def nested_params(self, arg_list):
         out = []
         for r in arg_list.named_children:
-            rr = self.param_node(r, ("named_argument", "typed_expression"))
+            rr = self.param_node(r, ("assignment", "named_argument", "typed_expression"))
             if rr is not None and rr.type == "identifier":
                 out.append(rr)
         return out
@@ -994,12 +998,14 @@ class _Julia(_Base):
 
     def macro_site(self, node):
         ctx = self.ctx
-        mid = next((c for c in node.named_children if c.type == "macro_identifier"), None)
-        if mid is None:
+        head = node.named_children[0] if node.named_children else None
+        if head is None:
+            return
+        mid = head.named_children[-1] if head.type == "field_expression" and head.named_children else head
+        if mid.type != "macro_identifier":
             return
         name = self.text(mid).lstrip("@")
-        idx = node.named_children.index(mid)
-        recv = self.text(node.named_children[idx - 1]) if idx > 0 and node.named_children[idx - 1].type in ("identifier", "field_expression") else None
+        recv = self.text(head.named_children[0]) if head.type == "field_expression" else None
         binding = {"kind": "macro", "name": name, "receiver": recv, "receiverKind": "path" if recv else None}
         dynamic = name in ("eval",)
         if dynamic:
@@ -1088,6 +1094,8 @@ class _Julia(_Base):
         return left.type == "typed_expression" and bool(left.named_children) and left.named_children[0].type == "call_expression"
 
     def enter_assignment(self, node):
+        if node.id in self.skip_nodes:
+            return
         left = node.named_children[0] if node.named_children else None
         right = node.named_children[-1] if node.named_children else None
         if left is None:
@@ -1121,7 +1129,7 @@ class _Julia(_Base):
         self.push(node, sym, None, "lambda")
         for p in self.arrow_params(node):
             self.declare(self.text(p), "parameter", node.start_byte, node.end_byte, node=p)
-        if parent is not None and parent.type == "assignment":
+        if parent is not None and parent.type == "assignment" and parent.id not in self.skip_nodes:
             lhs = parent.named_children[0] if parent.named_children else None
             if lhs is not None and lhs.type == "identifier":
                 nm = self.text(lhs)

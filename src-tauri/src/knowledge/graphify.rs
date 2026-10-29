@@ -15,20 +15,21 @@
 //! Records keep their raw fields (`attributes`); numeric and text ids stay distinct; parallel edges, self-loops,
 //! directedness, communities, provenance and hyperedges are kept as found, never merged or invented. The repository's
 //! `graph.html` is never read. The artifact hash proves byte identity of `graph.json`, not freshness against source.
-use super::dto::*;
-use super::fsio::{self, err, now_ms, sha256_hex, shown};
+use super::dto::{
+    GraphifyCapability, GraphifyDirection, GraphifyIdKind, GraphifyPage, GraphifyQuery,
+    GraphifyQueryPage, GraphifyRef, GraphifySection, GraphifyState, KnowledgeCapabilities,
+};
+use super::fsio;
 use super::{KnowledgeService, Result};
-use crate::code_quality::snapshot::is_link;
+use crate::code_quality::snapshot;
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 const MAX_GRAPH_BYTES: u64 = 1024 * 1024 * 1024;
@@ -40,9 +41,7 @@ const MAX_PAGE_BYTES: usize = 1024 * 1024;
 const NO_NODE: u64 = u64::MAX;
 const CACHED_ARTIFACTS: usize = 4;
 
-type NodeKey = (bool, String);
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphifyCounts {
     pub nodes: u64,
@@ -121,7 +120,7 @@ struct Source {
 pub(crate) struct Loaded {
     dir: PathBuf,
     meta: GraphifyArtifact,
-    node_ordinals: OnceLock<std::result::Result<HashMap<NodeKey, u64>, String>>,
+    node_ordinals: OnceLock<std::result::Result<HashMap<GraphifyRef, u64>, String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -142,7 +141,11 @@ pub(crate) struct Located {
 enum Eval {
     Absent,
     Found(Located),
-    Bad { state: GraphifyState, message: String, source_root: Option<String> },
+    Bad {
+        state: GraphifyState,
+        message: String,
+        source_root: Option<String>,
+    },
 }
 
 pub(crate) struct Probe {
@@ -151,13 +154,19 @@ pub(crate) struct Probe {
 }
 
 fn bad(state: GraphifyState, message: impl Into<String>) -> Eval {
-    Eval::Bad { state, message: message.into(), source_root: None }
+    Eval::Bad {
+        state,
+        message: message.into(),
+        source_root: None,
+    }
 }
 
 fn marker_matches(claimed: &str, repository: &Path) -> bool {
     let path = Path::new(claimed);
     if path.exists() {
-        crate::setup::canonical(path).map(|canonical| fsio::same_path(&canonical, repository)).unwrap_or(false)
+        crate::setup::canonical(path)
+            .map(|canonical| fsio::same_path(&canonical, repository))
+            .unwrap_or(false)
     } else {
         fsio::same_path(path, repository)
     }
@@ -176,66 +185,139 @@ fn read_marker(out_dir: &Path) -> std::result::Result<Option<String>, String> {
         Err(e) => return Err(e),
     };
     let mut bytes = Vec::new();
-    (&mut file).take(4097).read_to_end(&mut bytes).map_err(|e| err("Cannot read .graphify_root", e))?;
+    (&mut file)
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|e| fsio::err("Cannot read .graphify_root", e))?;
     if bytes.len() > 4096 {
         return Err(".graphify_root is unexpectedly large".into());
     }
-    let text = String::from_utf8(bytes).map_err(|_| ".graphify_root is not valid UTF-8".to_string())?;
-    let line = text.trim_start_matches('\u{feff}').lines().next().unwrap_or("").trim().to_string();
+    let text =
+        String::from_utf8(bytes).map_err(|_| ".graphify_root is not valid UTF-8".to_string())?;
+    let line = text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     Ok((!line.is_empty()).then_some(line))
 }
 
-fn evaluate_output(repository: &Path, out_dir: &Path, require_marker: bool, kind: &'static str) -> Eval {
+fn evaluate_output(
+    repository: &Path,
+    out_dir: &Path,
+    require_marker: bool,
+    kind: &'static str,
+) -> Eval {
     match fs::symlink_metadata(out_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return if require_marker { bad(GraphifyState::Unavailable, "The registered Graphify output folder no longer exists") } else { Eval::Absent };
+            return if require_marker {
+                bad(
+                    GraphifyState::Unavailable,
+                    "The registered Graphify output folder no longer exists",
+                )
+            } else {
+                Eval::Absent
+            };
         }
-        Err(e) => return bad(GraphifyState::Unavailable, format!("The Graphify output folder cannot be inspected: {e}")),
-        Ok(meta) if is_link(&meta) => return bad(GraphifyState::Unavailable, "The Graphify output folder is a link or reparse point and is not read"),
-        Ok(meta) if !meta.is_dir() => return bad(GraphifyState::Unavailable, "The Graphify output path is not a folder"),
+        Err(e) => {
+            return bad(
+                GraphifyState::Unavailable,
+                format!("The Graphify output folder cannot be inspected: {e}"),
+            )
+        }
+        Ok(meta) if snapshot::is_link(&meta) => {
+            return bad(
+                GraphifyState::Unavailable,
+                "The Graphify output folder is a link or reparse point and is not read",
+            )
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return bad(
+                GraphifyState::Unavailable,
+                "The Graphify output path is not a folder",
+            )
+        }
         Ok(_) => {}
     }
     let components = vec!["graph.json".to_string()];
     let (mut file, graph_path) = match fsio::open_components(out_dir, &components) {
         Ok(opened) => opened,
         Err(e) if e.starts_with("Not found") => {
-            return if require_marker { bad(GraphifyState::Unavailable, "The registered Graphify output has no graph.json any more") } else { Eval::Absent };
+            return if require_marker {
+                bad(
+                    GraphifyState::Unavailable,
+                    "The registered Graphify output has no graph.json any more",
+                )
+            } else {
+                Eval::Absent
+            };
         }
-        Err(e) => return bad(GraphifyState::Unavailable, format!("graph.json cannot be read safely: {e}")),
+        Err(e) => {
+            return bad(
+                GraphifyState::Unavailable,
+                format!("graph.json cannot be read safely: {e}"),
+            )
+        }
     };
     let meta = match file.metadata() {
         Ok(meta) => meta,
-        Err(e) => return bad(GraphifyState::Unavailable, format!("graph.json cannot be inspected: {e}")),
+        Err(e) => {
+            return bad(
+                GraphifyState::Unavailable,
+                format!("graph.json cannot be inspected: {e}"),
+            )
+        }
     };
     if meta.len() == 0 {
         return bad(GraphifyState::Malformed, "graph.json is empty");
     }
     if meta.len() > MAX_GRAPH_BYTES {
-        return bad(GraphifyState::Unavailable, format!("graph.json is larger than {MAX_GRAPH_BYTES} bytes and is not opened"));
+        return bad(
+            GraphifyState::Unavailable,
+            format!("graph.json is larger than {MAX_GRAPH_BYTES} bytes and is not opened"),
+        );
     }
     let mut head = [0u8; 4096];
     let read = file.read(&mut head).unwrap_or(0);
-    let head = head[..read].strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&head[..read]);
+    let head = head[..read]
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(&head[..read]);
     if head.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
-        return bad(GraphifyState::Malformed, "graph.json is not a JSON object; rebuild the Graphify output");
+        return bad(
+            GraphifyState::Malformed,
+            "graph.json is not a JSON object; rebuild the Graphify output",
+        );
     }
     let claimed = match read_marker(out_dir) {
         Ok(claimed) => claimed,
-        Err(e) => return bad(GraphifyState::Unavailable, format!("The Graphify provenance marker cannot be read: {e}")),
+        Err(e) => {
+            return bad(
+                GraphifyState::Unavailable,
+                format!("The Graphify provenance marker cannot be read: {e}"),
+            )
+        }
     };
     let provenance = match &claimed {
         Some(claimed) if marker_matches(claimed, repository) => Provenance::Verified,
         Some(claimed) => {
             return Eval::Bad {
                 state: GraphifyState::Foreign,
-                message: format!("Foreign Graphify output: it was built for {}, not for this project, so it is not shown.", shown(claimed)),
+                message: format!("Foreign Graphify output: it was built for {}, not for this project, so it is not shown.", fsio::shown(claimed)),
                 source_root: Some(claimed.clone()),
             };
         }
         None if require_marker => return bad(GraphifyState::Unavailable, "The registered Graphify output has no .graphify_root, so it cannot be tied to this project"),
         None => Provenance::Unverified,
     };
-    Eval::Found(Located { graph_path, kind, provenance, claimed_root: claimed, fingerprint: fingerprint(&meta) })
+    Eval::Found(Located {
+        graph_path,
+        kind,
+        provenance,
+        claimed_root: claimed,
+        fingerprint: fingerprint(&meta),
+    })
 }
 
 fn probe_graphify(repository: &Path, registered: Option<&Path>) -> Probe {
@@ -248,14 +330,48 @@ fn probe_graphify(repository: &Path, registered: Option<&Path>) -> Probe {
         (local, _) => local,
     };
     match chosen {
-        Eval::Absent => Probe { capability: GraphifyCapability { present: false, state: GraphifyState::Absent, source_root: None, artifact_id: None, artifact_hash: None, message: None }, located: None },
-        Eval::Bad { state, message, source_root } => Probe { capability: GraphifyCapability { present: true, state, source_root, artifact_id: None, artifact_hash: None, message: Some(message) }, located: None },
+        Eval::Absent => Probe {
+            capability: GraphifyCapability {
+                present: false,
+                state: GraphifyState::Absent,
+                source_root: None,
+                artifact_id: None,
+                artifact_hash: None,
+                message: None,
+            },
+            located: None,
+        },
+        Eval::Bad {
+            state,
+            message,
+            source_root,
+        } => Probe {
+            capability: GraphifyCapability {
+                present: true,
+                state,
+                source_root,
+                artifact_id: None,
+                artifact_hash: None,
+                message: Some(message),
+            },
+            located: None,
+        },
         Eval::Found(found) => {
             let (state, message) = match found.provenance {
                 Provenance::Verified => (GraphifyState::Present, None),
                 Provenance::Unverified => (GraphifyState::Unverified, Some("This Graphify output has no .graphify_root, so it cannot be tied to this project; it is shown as unverified.".to_string())),
             };
-            Probe { capability: GraphifyCapability { present: true, state, source_root: found.claimed_root.clone(), artifact_id: None, artifact_hash: None, message }, located: Some(found) }
+            Probe {
+                capability: GraphifyCapability {
+                    present: true,
+                    state,
+                    source_root: found.claimed_root.clone(),
+                    artifact_id: None,
+                    artifact_hash: None,
+                    message,
+                },
+                located: Some(found),
+            }
         }
     }
 }
@@ -270,14 +386,25 @@ struct Spool {
 }
 
 impl Spool {
-    fn create(dir: &Path, name: &str) -> Result<Self> {
-        let open = |file: String| File::create(dir.join(file)).map(BufWriter::new).map_err(|e| err("Cannot create Graphify snapshot", e));
-        Ok(Self { data: open(format!("{name}.jsonl"))?, index: open(format!("{name}.idx"))?, offset: 0, count: 0 })
+    fn try_new(dir: &Path, name: &str) -> Result<Self> {
+        let open = |file: String| {
+            File::create(dir.join(file))
+                .map(BufWriter::new)
+                .map_err(|e| fsio::err("Cannot create Graphify snapshot", e))
+        };
+        Ok(Self {
+            data: open(format!("{name}.jsonl"))?,
+            index: open(format!("{name}.idx"))?,
+            offset: 0,
+            count: 0,
+        })
     }
 
     fn push(&mut self, line: &[u8]) -> Result<()> {
-        let io = |e: std::io::Error| err("Cannot write Graphify snapshot", e);
-        self.index.write_all(&self.offset.to_le_bytes()).map_err(io)?;
+        let io = |e: std::io::Error| fsio::err("Cannot write Graphify snapshot", e);
+        self.index
+            .write_all(&self.offset.to_le_bytes())
+            .map_err(io)?;
         self.data.write_all(line).map_err(io)?;
         self.data.write_all(b"\n").map_err(io)?;
         self.offset += line.len() as u64 + 1;
@@ -286,7 +413,7 @@ impl Spool {
     }
 
     fn flush(&mut self) -> Result<()> {
-        let io = |e: std::io::Error| err("Cannot write Graphify snapshot", e);
+        let io = |e: std::io::Error| fsio::err("Cannot write Graphify snapshot", e);
         self.data.flush().map_err(io)?;
         self.index.flush().map_err(io)
     }
@@ -321,7 +448,10 @@ struct ByteCount(usize);
 
 impl Write for ByteCount {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| std::io::Error::other("Serialized Graphify response is too large"))?;
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("Serialized Graphify response is too large"))?;
         Ok(bytes.len())
     }
 
@@ -336,21 +466,24 @@ fn encoded_len(value: &impl Serialize) -> Result<usize> {
     Ok(count.0)
 }
 
-struct HashRead {
-    file: File,
-    shared: Rc<RefCell<(Sha256, u64, BufWriter<File>)>>,
+struct HashRead<'source> {
+    file: &'source mut File,
+    hash: &'source mut Sha256,
+    bytes: &'source mut u64,
+    copy: &'source mut BufWriter<File>,
 }
 
-impl Read for HashRead {
+impl Read for HashRead<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.file.read(buffer)?;
-        let mut shared = self.shared.borrow_mut();
-        shared.0.update(&buffer[..read]);
-        shared.1 += read as u64;
-        if shared.1 > MAX_GRAPH_BYTES {
-            return Err(std::io::Error::other("graph.json grew beyond the supported size while it was read"));
+        self.hash.update(&buffer[..read]);
+        *self.bytes += read as u64;
+        if *self.bytes > MAX_GRAPH_BYTES {
+            return Err(std::io::Error::other(
+                "graph.json grew beyond the supported size while it was read",
+            ));
         }
-        shared.2.write_all(&buffer[..read])?;
+        self.copy.write_all(&buffer[..read])?;
         Ok(read)
     }
 }
@@ -365,17 +498,21 @@ impl Issues {
     fn add(&mut self, severity: &str, section: &str, ordinal: Option<u64>, message: String) {
         self.total += 1;
         if self.list.len() < MAX_ISSUES {
-            self.list.push(GraphifyIssue { severity: severity.into(), section: section.into(), ordinal, message });
+            self.list.push(GraphifyIssue {
+                severity: severity.into(),
+                section: section.into(),
+                ordinal,
+                message,
+            });
         }
     }
 }
 
 struct Normalizer {
-
     nodes: Spool,
     links_raw: BufWriter<File>,
     hyper_raw: BufWriter<File>,
-    node_refs: HashMap<NodeKey, u64>,
+    node_refs: HashMap<GraphifyRef, u64>,
     communities: BTreeMap<i64, (u64, BTreeSet<String>)>,
     seen: [bool; 3],
     top_keys: HashSet<String>,
@@ -392,14 +529,16 @@ struct Normalizer {
 
 fn ref_of(value: &Value) -> Option<GraphifyRef> {
     match value {
-        Value::String(text) if !text.is_empty() => Some(GraphifyRef { id: text.clone(), id_kind: GraphifyIdKind::Text }),
-        Value::Number(number) if number.is_i64() || number.is_u64() => Some(GraphifyRef { id: number.to_string(), id_kind: GraphifyIdKind::Number }),
+        Value::String(text) if !text.is_empty() => Some(GraphifyRef {
+            id: text.clone(),
+            id_kind: GraphifyIdKind::Text,
+        }),
+        Value::Number(number) if number.is_i64() || number.is_u64() => Some(GraphifyRef {
+            id: number.to_string(),
+            id_kind: GraphifyIdKind::Number,
+        }),
         _ => None,
     }
-}
-
-fn key_of(reference: &GraphifyRef) -> NodeKey {
-    (reference.id_kind == GraphifyIdKind::Number, reference.id.clone())
 }
 
 fn take_string(object: &mut Map<String, Value>, key: &str) -> Option<String> {
@@ -420,7 +559,11 @@ fn take_i64(object: &mut Map<String, Value>, key: &str) -> Option<i64> {
 
 fn take_confidence(object: &mut Map<String, Value>) -> Option<String> {
     match object.get("confidence") {
-        Some(Value::String(text)) if matches!(text.as_str(), "EXTRACTED" | "INFERRED" | "AMBIGUOUS") => take_string(object, "confidence"),
+        Some(Value::String(text))
+            if matches!(text.as_str(), "EXTRACTED" | "INFERRED" | "AMBIGUOUS") =>
+        {
+            take_string(object, "confidence")
+        }
         _ => None,
     }
 }
@@ -437,7 +580,9 @@ fn native_id(object: &mut Map<String, Value>, key: &str) -> Option<String> {
 fn line_of(value: &Value, what: &str) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     if bytes.len() > MAX_RECORD_BYTES {
-        return Err(format!("{what} is larger than the {MAX_RECORD_BYTES}-byte record limit"));
+        return Err(format!(
+            "{what} is larger than the {MAX_RECORD_BYTES}-byte record limit"
+        ));
     }
     Ok(bytes)
 }
@@ -455,7 +600,11 @@ impl Normalizer {
             _ => 2,
         };
         if self.seen[slot] {
-            let message = if slot == 1 { "graph.json has both \"links\" and \"edges\" (or repeats one); the edge list is ambiguous".to_string() } else { format!("graph.json has more than one \"{key}\" section") };
+            let message = if slot == 1 {
+                "graph.json has both \"links\" and \"edges\" (or repeats one); the edge list is ambiguous".to_string()
+            } else {
+                format!("graph.json has more than one \"{key}\" section")
+            };
             return Err(self.fail(message));
         }
         self.seen[slot] = true;
@@ -470,11 +619,21 @@ impl Normalizer {
             "nodes" => self.node_record(value),
             "hyperedges" => {
                 self.hyper_count += 1;
-                line_of(&value, &format!("Hyperedge #{}", self.hyper_count - 1)).and_then(|line| self.hyper_raw.write_all(&line).and_then(|_| self.hyper_raw.write_all(b"\n")).map_err(|e| err("Cannot write Graphify snapshot", e)))
+                line_of(&value, &format!("Hyperedge #{}", self.hyper_count - 1)).and_then(|line| {
+                    self.hyper_raw
+                        .write_all(&line)
+                        .and_then(|_| self.hyper_raw.write_all(b"\n"))
+                        .map_err(|e| fsio::err("Cannot write Graphify snapshot", e))
+                })
             }
             _ => {
                 self.link_count += 1;
-                line_of(&value, &format!("Link #{}", self.link_count - 1)).and_then(|line| self.links_raw.write_all(&line).and_then(|_| self.links_raw.write_all(b"\n")).map_err(|e| err("Cannot write Graphify snapshot", e)))
+                line_of(&value, &format!("Link #{}", self.link_count - 1)).and_then(|line| {
+                    self.links_raw
+                        .write_all(&line)
+                        .and_then(|_| self.links_raw.write_all(b"\n"))
+                        .map_err(|e| fsio::err("Cannot write Graphify snapshot", e))
+                })
             }
         };
         outcome.map_err(|message| self.fail(message))
@@ -482,14 +641,21 @@ impl Normalizer {
 
     fn node_record(&mut self, value: Value) -> Result<()> {
         let ordinal = self.nodes.count;
-        let Value::Object(mut object) = value else { return Err(format!("Node #{ordinal} is not an object")) };
-        let id = object.remove("id").ok_or_else(|| format!("Node #{ordinal} has no id"))?;
-        let reference = ref_of(&id).ok_or_else(|| format!("Node #{ordinal} has an unusable id (it must be a non-empty string or an integer)"))?;
-        let key = key_of(&reference);
-        if let Some(previous) = self.node_refs.get(&key) {
-            return Err(format!("Duplicate node id {} (nodes #{previous} and #{ordinal}); node names are never merged", shown(&reference.id)));
+        let Value::Object(mut object) = value else {
+            return Err(format!("Node #{ordinal} is not an object"));
+        };
+        let id = object
+            .remove("id")
+            .ok_or_else(|| format!("Node #{ordinal} has no id"))?;
+        let reference = ref_of(&id).ok_or_else(|| {
+            format!(
+                "Node #{ordinal} has an unusable id (it must be a non-empty string or an integer)"
+            )
+        })?;
+        if let Some(previous) = self.node_refs.get(&reference) {
+            return Err(format!("Duplicate node id {} (nodes #{previous} and #{ordinal}); node names are never merged", fsio::shown(&reference.id)));
         }
-        self.node_refs.insert(key, ordinal);
+        self.node_refs.insert(reference.clone(), ordinal);
         let label = take_string(&mut object, "label");
         let file_type = take_string(&mut object, "file_type");
         let source_file = take_string(&mut object, "source_file");
@@ -554,7 +720,10 @@ fn custom<E: serde::de::Error>(message: String) -> E {
 
 impl<'de, 'a> DeserializeSeed<'de> for Top<'a> {
     type Value = ();
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> std::result::Result<(), D::Error> {
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<(), D::Error> {
         deserializer.deserialize_map(self)
     }
 }
@@ -567,10 +736,13 @@ impl<'de, 'a> Visitor<'de> for Top<'a> {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<(), A::Error> {
         while let Some(key) = map.next_key::<String>()? {
             if !self.0.top_keys.insert(key.clone()) {
-                return Err(custom(self.0.fail(format!("graph.json repeats the top-level field \"{}\"; metadata and graph semantics must be unambiguous", shown(&key)))));
+                return Err(custom(self.0.fail(format!("graph.json repeats the top-level field \"{}\"; metadata and graph semantics must be unambiguous", fsio::shown(&key)))));
             }
             match key.as_str() {
-                "nodes" | "links" | "edges" | "hyperedges" => map.next_value_seed(Section { sink: &mut *self.0, key })?,
+                "nodes" | "links" | "edges" | "hyperedges" => map.next_value_seed(Section {
+                    sink: &mut *self.0,
+                    key,
+                })?,
                 _ => {
                     let value: Value = map.next_value()?;
                     self.0.top_level(key, value).map_err(custom::<A::Error>)?;
@@ -583,7 +755,10 @@ impl<'de, 'a> Visitor<'de> for Top<'a> {
 
 impl<'de, 'a> DeserializeSeed<'de> for Section<'a> {
     type Value = ();
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> std::result::Result<(), D::Error> {
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<(), D::Error> {
         deserializer.deserialize_any(self)
     }
 }
@@ -595,15 +770,21 @@ impl<'de, 'a> Visitor<'de> for Section<'a> {
     }
     fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<(), E> {
         if self.key == "nodes" {
-            let message = self.sink.fail("graph.json \"nodes\" must be an array".into());
+            let message = self
+                .sink
+                .fail("graph.json \"nodes\" must be an array".into());
             return Err(custom(message));
         }
         self.sink.begin_section(&self.key).map_err(custom::<E>)
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(), A::Error> {
-        self.sink.begin_section(&self.key).map_err(custom::<A::Error>)?;
+        self.sink
+            .begin_section(&self.key)
+            .map_err(custom::<A::Error>)?;
         while let Some(value) = seq.next_element::<Value>()? {
-            self.sink.record(&self.key, value).map_err(custom::<A::Error>)?;
+            self.sink
+                .record(&self.key, value)
+                .map_err(custom::<A::Error>)?;
         }
         Ok(())
     }
@@ -611,17 +792,16 @@ impl<'de, 'a> Visitor<'de> for Section<'a> {
 
 struct Normalized {
     hash: String,
-    bytes: u64,
     meta: GraphifyArtifact,
 }
 
 fn lines(path: &Path) -> Result<impl Iterator<Item = std::io::Result<String>>> {
-    let file = File::open(path).map_err(|e| err("Cannot read Graphify snapshot", e))?;
+    let file = File::open(path).map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
     Ok(BufReader::new(file).lines())
 }
 
 fn write_ends(writer: &mut BufWriter<File>, source: u64, target: u64, flags: u64) -> Result<()> {
-    let io = |e: std::io::Error| err("Cannot write Graphify snapshot", e);
+    let io = |e: std::io::Error| fsio::err("Cannot write Graphify snapshot", e);
     writer.write_all(&source.to_le_bytes()).map_err(io)?;
     writer.write_all(&target.to_le_bytes()).map_err(io)?;
     writer.write_all(&flags.to_le_bytes()).map_err(io)
@@ -633,30 +813,54 @@ fn count_of(counts: &mut Map<String, Value>, key: &str) {
 }
 
 fn create_snapshot_file(dir: &Path, name: &str) -> Result<BufWriter<File>> {
-    File::create(dir.join(name)).map(BufWriter::new).map_err(|e| err("Cannot create Graphify snapshot", e))
+    File::create(dir.join(name))
+        .map(BufWriter::new)
+        .map_err(|e| fsio::err("Cannot create Graphify snapshot", e))
 }
 
 fn write_failed(e: std::io::Error) -> String {
-    err("Cannot write Graphify snapshot", e)
+    fsio::err("Cannot write Graphify snapshot", e)
 }
 
 /// Pass 1: streams `graph.json` once, retaining a byte-exact copy and feeding the normalizer. Returns the file hash and byte count.
-fn read_graph(normalizer: &mut Normalizer, source: File, expected_len: u64, dir: &Path) -> Result<(String, u64)> {
-    let check = source.try_clone().map_err(|e| err("Cannot inspect graph.json", e))?;
-    let shared = Rc::new(RefCell::new((Sha256::new(), 0u64, create_snapshot_file(dir, "graph.json")?)));
-    let reader = BufReader::with_capacity(256 * 1024, HashRead { file: source, shared: shared.clone() });
+fn read_graph(
+    normalizer: &mut Normalizer,
+    mut source: File,
+    expected_len: u64,
+    dir: &Path,
+) -> Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut bytes = 0;
+    let mut copy = create_snapshot_file(dir, "graph.json")?;
+    let reader = BufReader::with_capacity(
+        256 * 1024,
+        HashRead {
+            file: &mut source,
+            hash: &mut hasher,
+            bytes: &mut bytes,
+            copy: &mut copy,
+        },
+    );
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
-    let parsed = Top(&mut *normalizer).deserialize(&mut deserializer).and_then(|()| deserializer.end());
+    let parsed = Top(&mut *normalizer)
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end());
     if let Err(e) = parsed {
-        return Err(normalizer.failure.take().unwrap_or_else(|| format!("graph.json is not a valid Graphify graph: {e}")));
+        return Err(normalizer
+            .failure
+            .take()
+            .unwrap_or_else(|| format!("graph.json is not a valid Graphify graph: {e}")));
     }
     drop(deserializer);
-    let (hasher, bytes) = {
-        let mut shared = shared.borrow_mut();
-        shared.2.flush().map_err(|e| err("Cannot retain the original graph.json", e))?;
-        (std::mem::replace(&mut shared.0, Sha256::new()), shared.1)
-    };
-    if bytes != expected_len || check.metadata().map_err(|e| err("Cannot inspect graph.json", e))?.len() != expected_len {
+    copy.flush()
+        .map_err(|e| fsio::err("Cannot retain the original graph.json", e))?;
+    if bytes != expected_len
+        || source
+            .metadata()
+            .map_err(|e| fsio::err("Cannot inspect graph.json", e))?
+            .len()
+            != expected_len
+    {
         return Err("graph.json changed while it was being read; try again".into());
     }
     let hash = fsio::hex(hasher.finalize());
@@ -664,7 +868,13 @@ fn read_graph(normalizer: &mut Normalizer, source: File, expected_len: u64, dir:
         return Err("graph.json has no \"nodes\" array".into());
     }
     if !normalizer.seen[1] {
-        normalizer.issues.add("warning", "links", None, "graph.json has no \"links\" (or legacy \"edges\") array; the graph has no links".into());
+        normalizer.issues.add(
+            "warning",
+            "links",
+            None,
+            "graph.json has no \"links\" (or legacy \"edges\") array; the graph has no links"
+                .into(),
+        );
     }
     Ok((hash, bytes))
 }
@@ -679,16 +889,24 @@ struct LinkStats {
 }
 
 /// One raw spool line as a JSON object; `what` names the record kind in the error.
-fn object_of_line(text: std::io::Result<String>, what: &str, ordinal: u64) -> Result<Map<String, Value>> {
-    let text = text.map_err(|e| err("Cannot read Graphify snapshot", e))?;
-    match serde_json::from_str::<Value>(&text).map_err(|e| err("Cannot read Graphify snapshot", e))? {
+fn object_of_line(
+    text: std::io::Result<String>,
+    what: &str,
+    ordinal: u64,
+) -> Result<Map<String, Value>> {
+    let text = text.map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
+    match serde_json::from_str::<Value>(&text)
+        .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?
+    {
         Value::Object(object) => Ok(object),
         _ => Err(format!("{what} #{ordinal} is not an object")),
     }
 }
 
 fn link_endpoint(object: &mut Map<String, Value>, ordinal: u64, name: &str) -> Result<GraphifyRef> {
-    let value = object.remove(name).ok_or_else(|| format!("Link #{ordinal} has no {name}"))?;
+    let value = object
+        .remove(name)
+        .ok_or_else(|| format!("Link #{ordinal} has no {name}"))?;
     ref_of(&value).ok_or_else(|| format!("Link #{ordinal} has an unusable {name} id (it must be a non-empty string or an integer)"))
 }
 
@@ -719,11 +937,29 @@ fn take_number(object: &mut Map<String, Value>, key: &str) -> Option<Value> {
 }
 
 /// The record id: its native id when unique and not reserved, otherwise the internal one (reported as an issue).
-fn assign_id(issues: &mut Issues, used: &mut HashSet<String>, native: Option<&str>, internal: String, section: &str, noun: &str, ordinal: u64) -> String {
+fn assign_id(
+    issues: &mut Issues,
+    used: &mut HashSet<String>,
+    native: Option<&str>,
+    internal: String,
+    section: &str,
+    noun: &str,
+    ordinal: u64,
+) -> String {
     match native {
-        Some(native) if !native.starts_with("graphify:") && used.insert(native.to_string()) => native.to_string(),
+        Some(native) if !native.starts_with("graphify:") && used.insert(native.to_string()) => {
+            native.to_string()
+        }
         Some(native) => {
-            issues.add("warning", section, Some(ordinal), format!("The {noun} id {} is reused or reserved; its internal id is used", shown(native)));
+            issues.add(
+                "warning",
+                section,
+                Some(ordinal),
+                format!(
+                    "The {noun} id {} is reused or reserved; its internal id is used",
+                    fsio::shown(native)
+                ),
+            );
             internal
         }
         None => internal,
@@ -731,13 +967,28 @@ fn assign_id(issues: &mut Issues, used: &mut HashSet<String>, native: Option<&st
 }
 
 /// Resolves both endpoints; counts and reports dangling links and self-loops.
-fn resolve_link_nodes(normalizer: &mut Normalizer, stats: &mut LinkStats, ordinal: u64, source: &GraphifyRef, target: &GraphifyRef) -> (Option<u64>, Option<u64>, bool) {
-    let source_node = normalizer.node_refs.get(&key_of(source)).copied();
-    let target_node = normalizer.node_refs.get(&key_of(target)).copied();
+fn resolve_link_nodes(
+    normalizer: &mut Normalizer,
+    stats: &mut LinkStats,
+    ordinal: u64,
+    source: &GraphifyRef,
+    target: &GraphifyRef,
+) -> (Option<u64>, Option<u64>, bool) {
+    let source_node = normalizer.node_refs.get(source).copied();
+    let target_node = normalizer.node_refs.get(target).copied();
     let dangling = source_node.is_none() || target_node.is_none();
     if dangling {
         stats.dangling_links += 1;
-        normalizer.issues.add("warning", "links", Some(ordinal), format!("The link references a node that does not exist ({} → {})", shown(&source.id), shown(&target.id)));
+        normalizer.issues.add(
+            "warning",
+            "links",
+            Some(ordinal),
+            format!(
+                "The link references a node that does not exist ({} → {})",
+                fsio::shown(&source.id),
+                fsio::shown(&target.id)
+            ),
+        );
     }
     if source_node.is_some() && source_node == target_node {
         stats.self_loops += 1;
@@ -746,12 +997,25 @@ fn resolve_link_nodes(normalizer: &mut Normalizer, stats: &mut LinkStats, ordina
 }
 
 /// Builds the link record and its `links.ends` words `[source, target, flags]`.
-fn normalize_link(normalizer: &mut Normalizer, stats: &mut LinkStats, used: &mut HashSet<String>, hash: &str, directed: bool, ordinal: u64, mut object: Map<String, Value>) -> Result<(Value, [u64; 3])> {
+fn normalize_link(
+    normalizer: &mut Normalizer,
+    stats: &mut LinkStats,
+    used: &mut HashSet<String>,
+    hash: &str,
+    directed: bool,
+    ordinal: u64,
+    mut object: Map<String, Value>,
+) -> Result<(Value, [u64; 3])> {
     let source_ref = link_endpoint(&mut object, ordinal, "source")?;
     let target_ref = link_endpoint(&mut object, ordinal, "target")?;
     let relation = take_string(&mut object, "relation");
     if relation.is_none() {
-        normalizer.issues.add("warning", "links", Some(ordinal), "The link has no text \"relation\"".into());
+        normalizer.issues.add(
+            "warning",
+            "links",
+            Some(ordinal),
+            "The link has no text \"relation\"".into(),
+        );
     }
     let link_directed = take_link_directed(&mut object, directed);
     let key = take_link_key(&mut object);
@@ -761,10 +1025,25 @@ fn normalize_link(normalizer: &mut Normalizer, stats: &mut LinkStats, used: &mut
     let source_file = take_string(&mut object, "source_file");
     let source_location = take_string(&mut object, "source_location");
     let origin = take_string(&mut object, "_origin");
-    let (source_node, target_node, dangling) = resolve_link_nodes(normalizer, stats, ordinal, &source_ref, &target_ref);
-    let id = assign_id(&mut normalizer.issues, used, native.as_deref(), format!("graphify:{hash}:link:{ordinal}"), "links", "link", ordinal);
-    count_of(&mut stats.provenance_counts, confidence.as_deref().unwrap_or("none"));
-    count_of(&mut stats.origin_counts, origin.as_deref().unwrap_or("none"));
+    let (source_node, target_node, dangling) =
+        resolve_link_nodes(normalizer, stats, ordinal, &source_ref, &target_ref);
+    let id = assign_id(
+        &mut normalizer.issues,
+        used,
+        native.as_deref(),
+        format!("graphify:{hash}:link:{ordinal}"),
+        "links",
+        "link",
+        ordinal,
+    );
+    count_of(
+        &mut stats.provenance_counts,
+        confidence.as_deref().unwrap_or("none"),
+    );
+    count_of(
+        &mut stats.origin_counts,
+        origin.as_deref().unwrap_or("none"),
+    );
     let dto = json!({
         "ordinal": ordinal,
         "id": id,
@@ -782,21 +1061,35 @@ fn normalize_link(normalizer: &mut Normalizer, stats: &mut LinkStats, used: &mut
         "attributes": object,
         "dangling": dangling,
     });
-    Ok((dto, [source_node.unwrap_or(NO_NODE), target_node.unwrap_or(NO_NODE), u64::from(link_directed) | (u64::from(dangling) << 1)]))
+    Ok((
+        dto,
+        [
+            source_node.unwrap_or(NO_NODE),
+            target_node.unwrap_or(NO_NODE),
+            u64::from(link_directed) | (u64::from(dangling) << 1),
+        ],
+    ))
 }
 
 /// Pass 2: links (need the node table and the artifact hash).
-fn normalize_links(normalizer: &mut Normalizer, dir: &Path, hash: &str, directed: bool) -> Result<LinkStats> {
+fn normalize_links(
+    normalizer: &mut Normalizer,
+    dir: &Path,
+    hash: &str,
+    directed: bool,
+) -> Result<LinkStats> {
     normalizer.links_raw.flush().map_err(write_failed)?;
     normalizer.hyper_raw.flush().map_err(write_failed)?;
-    let mut links = Spool::create(dir, "links")?;
+    let mut links = Spool::try_new(dir, "links")?;
     let mut ends = create_snapshot_file(dir, "links.ends")?;
     let mut used: HashSet<String> = HashSet::new();
     let mut stats = LinkStats::default();
     for (ordinal, text) in lines(&dir.join("links.raw"))?.enumerate() {
         let ordinal = ordinal as u64;
         let object = object_of_line(text, "Link", ordinal)?;
-        let (dto, [source, target, flags]) = normalize_link(normalizer, &mut stats, &mut used, hash, directed, ordinal, object)?;
+        let (dto, [source, target, flags]) = normalize_link(
+            normalizer, &mut stats, &mut used, hash, directed, ordinal, object,
+        )?;
         links.push(&line_of(&dto, &format!("Link #{ordinal}"))?)?;
         write_ends(&mut ends, source, target, flags)?;
     }
@@ -806,8 +1099,16 @@ fn normalize_links(normalizer: &mut Normalizer, dir: &Path, hash: &str, directed
 }
 
 /// The member references of a hyperedge and how many of them name no known node.
-fn hyperedge_members(normalizer: &Normalizer, object: &mut Map<String, Value>, ordinal: u64) -> Result<(Vec<GraphifyRef>, u64)> {
-    let list_key = if object.get("nodes").is_some_and(Value::is_array) { "nodes" } else { "members" };
+fn hyperedge_members(
+    normalizer: &Normalizer,
+    object: &mut Map<String, Value>,
+    ordinal: u64,
+) -> Result<(Vec<GraphifyRef>, u64)> {
+    let list_key = if object.get("nodes").is_some_and(Value::is_array) {
+        "nodes"
+    } else {
+        "members"
+    };
     let members = match object.remove(list_key) {
         Some(Value::Array(members)) => members,
         _ => return Err(format!("Hyperedge #{ordinal} has no node list")),
@@ -815,8 +1116,9 @@ fn hyperedge_members(normalizer: &Normalizer, object: &mut Map<String, Value>, o
     let mut node_ids = Vec::with_capacity(members.len());
     let mut unresolved = 0u64;
     for member in &members {
-        let reference = ref_of(member).ok_or_else(|| format!("Hyperedge #{ordinal} has a member that is not a node id"))?;
-        if !normalizer.node_refs.contains_key(&key_of(&reference)) {
+        let reference = ref_of(member)
+            .ok_or_else(|| format!("Hyperedge #{ordinal} has a member that is not a node id"))?;
+        if !normalizer.node_refs.contains_key(&reference) {
             unresolved += 1;
         }
         node_ids.push(reference);
@@ -824,17 +1126,36 @@ fn hyperedge_members(normalizer: &Normalizer, object: &mut Map<String, Value>, o
     Ok((node_ids, unresolved))
 }
 
-fn normalize_hyperedge(normalizer: &mut Normalizer, used: &mut HashSet<String>, hash: &str, ordinal: u64, mut object: Map<String, Value>) -> Result<Value> {
+fn normalize_hyperedge(
+    normalizer: &mut Normalizer,
+    used: &mut HashSet<String>,
+    hash: &str,
+    ordinal: u64,
+    mut object: Map<String, Value>,
+) -> Result<Value> {
     let native = native_id(&mut object, "id");
     let (node_ids, unresolved) = hyperedge_members(normalizer, &mut object, ordinal)?;
     if unresolved > 0 {
-        normalizer.issues.add("warning", "hyperedges", Some(ordinal), format!("The hyperedge lists {unresolved} nodes that do not exist"));
+        normalizer.issues.add(
+            "warning",
+            "hyperedges",
+            Some(ordinal),
+            format!("The hyperedge lists {unresolved} nodes that do not exist"),
+        );
     }
     let label = take_string(&mut object, "label");
     let relation = take_string(&mut object, "relation");
     let confidence = take_confidence(&mut object);
     let source_file = take_string(&mut object, "source_file");
-    let id = assign_id(&mut normalizer.issues, used, native.as_deref(), format!("graphify:{hash}:hyperedge:{ordinal}"), "hyperedges", "hyperedge", ordinal);
+    let id = assign_id(
+        &mut normalizer.issues,
+        used,
+        native.as_deref(),
+        format!("graphify:{hash}:hyperedge:{ordinal}"),
+        "hyperedges",
+        "hyperedge",
+        ordinal,
+    );
     Ok(json!({
         "id": id,
         "ordinal": ordinal,
@@ -851,7 +1172,7 @@ fn normalize_hyperedge(normalizer: &mut Normalizer, used: &mut HashSet<String>, 
 
 /// Hyperedges stay separate group records.
 fn normalize_hyperedges(normalizer: &mut Normalizer, dir: &Path, hash: &str) -> Result<u64> {
-    let mut hyperedges = Spool::create(dir, "hyperedges")?;
+    let mut hyperedges = Spool::try_new(dir, "hyperedges")?;
     let mut used = HashSet::new();
     for (ordinal, text) in lines(&dir.join("hyperedges.raw"))?.enumerate() {
         let ordinal = ordinal as u64;
@@ -863,24 +1184,42 @@ fn normalize_hyperedges(normalizer: &mut Normalizer, dir: &Path, hash: &str) -> 
 }
 
 fn write_communities(normalizer: &Normalizer, dir: &Path) -> Result<u64> {
-    let mut communities = Spool::create(dir, "communities")?;
+    let mut communities = Spool::try_new(dir, "communities")?;
     for (id, (size, names)) in &normalizer.communities {
-        let label = if names.len() == 1 { names.iter().next().cloned() } else { None };
-        communities.push(&serde_json::to_vec(&json!({ "id": id, "label": label, "size": size })).map_err(|e| e.to_string())?)?;
+        let label = if names.len() == 1 {
+            names.iter().next().cloned()
+        } else {
+            None
+        };
+        communities.push(
+            &serde_json::to_vec(&json!({ "id": id, "label": label, "size": size }))
+                .map_err(|e| e.to_string())?,
+        )?;
     }
     communities.finish()?;
     Ok(normalizer.communities.len() as u64)
 }
 
 /// Retains the full top-level metadata in `metadata.json`; the inline map is emptied when it exceeds the response budget.
-fn retain_metadata(normalizer: &mut Normalizer, dir: &Path) -> Result<(Map<String, Value>, Option<GraphifyMetadataReceipt>)> {
+fn retain_metadata(
+    normalizer: &mut Normalizer,
+    dir: &Path,
+) -> Result<(Map<String, Value>, Option<GraphifyMetadataReceipt>)> {
     let mut metadata = std::mem::take(&mut normalizer.extras);
     if let Some(graph) = normalizer.graph_attributes.take() {
         metadata.insert("graph".into(), graph);
     }
-    let mut metadata_file = SnapshotWriter { file: create_snapshot_file(dir, "metadata.json")?, hash: Sha256::new(), bytes: 0 };
-    serde_json::to_writer(&mut metadata_file, &metadata).map_err(|e| err("Cannot retain Graphify metadata", e))?;
-    metadata_file.file.flush().map_err(|e| err("Cannot retain Graphify metadata", e))?;
+    let mut metadata_file = SnapshotWriter {
+        file: create_snapshot_file(dir, "metadata.json")?,
+        hash: Sha256::new(),
+        bytes: 0,
+    };
+    serde_json::to_writer(&mut metadata_file, &metadata)
+        .map_err(|e| fsio::err("Cannot retain Graphify metadata", e))?;
+    metadata_file
+        .file
+        .flush()
+        .map_err(|e| fsio::err("Cannot retain Graphify metadata", e))?;
     if metadata_file.bytes <= MAX_INLINE_METADATA_BYTES as u64 {
         return Ok((metadata, None));
     }
@@ -896,9 +1235,15 @@ fn retain_metadata(normalizer: &mut Normalizer, dir: &Path) -> Result<(Map<Strin
 }
 
 /// Streams `graph.json` into the snapshot directory `dir`. Returns the finished metadata (artifact id not yet set).
-fn normalize(source: File, expected_len: u64, dir: &Path, folder: &str, located: &Located) -> Result<Normalized> {
+fn normalize(
+    source: File,
+    expected_len: u64,
+    dir: &Path,
+    folder: &str,
+    located: &Located,
+) -> Result<Normalized> {
     let mut normalizer = Normalizer {
-        nodes: Spool::create(dir, "nodes")?,
+        nodes: Spool::try_new(dir, "nodes")?,
         links_raw: create_snapshot_file(dir, "links.raw")?,
         hyper_raw: create_snapshot_file(dir, "hyperedges.raw")?,
         node_refs: HashMap::new(),
@@ -931,15 +1276,30 @@ fn normalize(source: File, expected_len: u64, dir: &Path, folder: &str, located:
         artifact_hash: hash.clone(),
         folder: folder.to_string(),
         source_root: located.claimed_root.clone(),
-        provenance: if located.provenance == Provenance::Verified { "verified" } else { "unverified" }.into(),
+        provenance: if located.provenance == Provenance::Verified {
+            "verified"
+        } else {
+            "unverified"
+        }
+        .into(),
         directed,
         multigraph,
-        counts: GraphifyCounts { nodes: node_total, links: links.total, hyperedges: hyper_total, communities: community_total },
+        counts: GraphifyCounts {
+            nodes: node_total,
+            links: links.total,
+            hyperedges: hyper_total,
+            communities: community_total,
+        },
         metadata,
         metadata_receipt,
         bytes,
         output_kind: located.kind.into(),
-        schema: if normalizer.legacy_edges { "legacyEdges" } else { "nodeLink" }.into(),
+        schema: if normalizer.legacy_edges {
+            "legacyEdges"
+        } else {
+            "nodeLink"
+        }
+        .into(),
         directed_declared: normalizer.directed.is_some(),
         multigraph_declared: normalizer.multigraph.is_some(),
         provenance_counts: links.provenance_counts,
@@ -947,24 +1307,28 @@ fn normalize(source: File, expected_len: u64, dir: &Path, folder: &str, located:
         self_loops: links.self_loops,
         dangling_links: links.dangling_links,
         issue_count: normalizer.issues.total,
-        issues: normalizer.issues.list.clone(),
-        admitted_ms: now_ms(),
+        issues: normalizer.issues.list,
+        admitted_ms: fsio::now_ms(),
     };
     if encoded_len(&meta)? > MAX_RECORD_BYTES - 32 {
         return Err(format!("Graphify artifact descriptors exceed the {MAX_RECORD_BYTES}-byte response limit; shorten unusually large provenance/origin labels or metadata descriptors before admission"));
     }
 
-    Ok(Normalized { hash, bytes, meta })
+    Ok(Normalized { hash, meta })
 }
 
 // ---------- service ----------
 
 fn valid_artifact_id(id: &str) -> bool {
-    id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn artifact_id(project_key: &str, hash: &str) -> String {
-    sha256_hex(format!("omp-graphify-artifact\0{project_key}\0{hash}").as_bytes())[..32].to_string()
+    fsio::sha256_hex(format!("omp-graphify-artifact\0{project_key}\0{hash}").as_bytes())[..32]
+        .to_string()
 }
 
 fn unavailable(id: &str) -> String {
@@ -973,15 +1337,25 @@ fn unavailable(id: &str) -> String {
 
 fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fsio::read_regular_bounded(path, 8 * 1024 * 1024)?;
-    serde_json::from_slice(&bytes).map_err(|e| err(&format!("Invalid {}", path.display()), e))
+    serde_json::from_slice(&bytes).map_err(|e| fsio::err(&format!("Invalid {}", path.display()), e))
 }
 
 /// Removes abandoned `.incoming-*` snapshot folders (crashed admissions) older than an hour.
 pub(crate) fn cleanup_incoming(root: &Path) {
-    let Ok(entries) = fs::read_dir(root) else { return };
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
     for entry in entries.flatten() {
-        let stale = entry.file_name().to_str().is_some_and(|n| n.starts_with(".incoming-"))
-            && entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() > 3600);
+        let stale = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(".incoming-"))
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age.as_secs() > 3600);
         if stale {
             let _ = fs::remove_dir_all(entry.path());
         }
@@ -989,15 +1363,21 @@ pub(crate) fn cleanup_incoming(root: &Path) {
 }
 
 fn read_index(dir: &Path, name: &str, ordinal: u64) -> Result<u64> {
-    let mut file = File::open(dir.join(format!("{name}.idx"))).map_err(|e| err("Cannot read Graphify snapshot", e))?;
-    file.seek(SeekFrom::Start(ordinal * 8)).map_err(|e| err("Cannot read Graphify snapshot", e))?;
+    let mut file = File::open(dir.join(format!("{name}.idx")))
+        .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
+    file.seek(SeekFrom::Start(ordinal * 8))
+        .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
     let mut bytes = [0u8; 8];
-    file.read_exact(&mut bytes).map_err(|_| "Graphify record is out of range".to_string())?;
+    file.read_exact(&mut bytes)
+        .map_err(|_| "Graphify record is out of range".to_string())?;
     Ok(u64::from_le_bytes(bytes))
 }
 
 fn record_count(dir: &Path, name: &str) -> Result<u64> {
-    Ok(fs::metadata(dir.join(format!("{name}.idx"))).map_err(|e| err("Cannot read Graphify snapshot", e))?.len() / 8)
+    Ok(fs::metadata(dir.join(format!("{name}.idx")))
+        .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?
+        .len()
+        / 8)
 }
 
 fn section_name(section: GraphifySection) -> &'static str {
@@ -1016,12 +1396,16 @@ fn read_run(dir: &Path, name: &str, start: u64, count: usize) -> Result<Vec<Valu
         return Ok(Vec::new());
     }
     let offset = read_index(dir, name, start)?;
-    let mut file = File::open(dir.join(format!("{name}.jsonl"))).map_err(|e| err("Cannot read Graphify snapshot", e))?;
-    file.seek(SeekFrom::Start(offset)).map_err(|e| err("Cannot read Graphify snapshot", e))?;
+    let mut file = File::open(dir.join(format!("{name}.jsonl")))
+        .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
     let mut out = Vec::with_capacity(count);
     for line in BufReader::new(file).lines().take(count) {
-        let line = line.map_err(|e| err("Cannot read Graphify snapshot", e))?;
-        out.push(serde_json::from_str(&line).map_err(|e| err("Corrupt Graphify snapshot", e))?);
+        let line = line.map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
+        out.push(
+            serde_json::from_str(&line).map_err(|e| fsio::err("Corrupt Graphify snapshot", e))?,
+        );
     }
     Ok(out)
 }
@@ -1031,17 +1415,30 @@ fn read_records(dir: &Path, name: &str, ordinals: &[u64]) -> Result<Vec<Value>> 
     if ordinals.is_empty() {
         return Ok(Vec::new());
     }
-    let mut index = File::open(dir.join(format!("{name}.idx"))).map_err(|e| err("Cannot read Graphify snapshot", e))?;
-    let mut data = BufReader::new(File::open(dir.join(format!("{name}.jsonl"))).map_err(|e| err("Cannot read Graphify snapshot", e))?);
+    let mut index = File::open(dir.join(format!("{name}.idx")))
+        .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
+    let mut data = BufReader::new(
+        File::open(dir.join(format!("{name}.jsonl")))
+            .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?,
+    );
     let mut out = Vec::with_capacity(ordinals.len());
     for ordinal in ordinals {
-        index.seek(SeekFrom::Start(ordinal * 8)).map_err(|e| err("Cannot read Graphify snapshot", e))?;
+        index
+            .seek(SeekFrom::Start(ordinal * 8))
+            .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
         let mut bytes = [0u8; 8];
-        index.read_exact(&mut bytes).map_err(|_| "Graphify record is out of range".to_string())?;
-        data.seek(SeekFrom::Start(u64::from_le_bytes(bytes))).map_err(|e| err("Cannot read Graphify snapshot", e))?;
+        index
+            .read_exact(&mut bytes)
+            .map_err(|_| "Graphify record is out of range".to_string())?;
+        data.seek(SeekFrom::Start(u64::from_le_bytes(bytes)))
+            .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
         let mut line = String::new();
-        data.read_line(&mut line).map_err(|e| err("Cannot read Graphify snapshot", e))?;
-        out.push(serde_json::from_str(line.trim_end()).map_err(|e| err("Corrupt Graphify snapshot", e))?);
+        data.read_line(&mut line)
+            .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
+        out.push(
+            serde_json::from_str(line.trim_end())
+                .map_err(|e| fsio::err("Corrupt Graphify snapshot", e))?,
+        );
     }
     Ok(out)
 }
@@ -1078,13 +1475,16 @@ fn window(offset: usize, limit: usize) -> Result<()> {
 }
 
 fn rank(exact: &[&str], haystacks: &[&str], needle: &str, lowered: &str) -> Option<u8> {
-    if exact.iter().any(|h| *h == needle) {
+    if exact.contains(&needle) {
         return Some(0);
     }
     if haystacks.iter().any(|h| h.contains(needle)) {
         return Some(1);
     }
-    haystacks.iter().any(|h| h.to_lowercase().contains(lowered)).then_some(2)
+    haystacks
+        .iter()
+        .any(|h| h.to_lowercase().contains(lowered))
+        .then_some(2)
 }
 
 fn str_of<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -1097,7 +1497,9 @@ fn hash_live_graph(file: &mut File, before: &fs::Metadata) -> Result<String> {
     let mut bytes = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let count = file.read(&mut buffer).map_err(|e| err("Cannot compare graph.json", e))?;
+        let count = file
+            .read(&mut buffer)
+            .map_err(|e| fsio::err("Cannot compare graph.json", e))?;
         if count == 0 {
             break;
         }
@@ -1107,7 +1509,9 @@ fn hash_live_graph(file: &mut File, before: &fs::Metadata) -> Result<String> {
         }
         hash.update(&buffer[..count]);
     }
-    let after = file.metadata().map_err(|e| err("Cannot inspect graph.json", e))?;
+    let after = file
+        .metadata()
+        .map_err(|e| fsio::err("Cannot inspect graph.json", e))?;
     if bytes != before.len() || fingerprint(before) != fingerprint(&after) {
         return Err("graph.json changed during comparison".into());
     }
@@ -1124,14 +1528,18 @@ impl Loaded {
             }
             let mut map = HashMap::new();
             for (ordinal, line) in lines(&self.dir.join("nodes.jsonl"))?.enumerate() {
-                let line = line.map_err(|e| err("Cannot read Graphify snapshot", e))?;
-                let parsed: Line = serde_json::from_str(&line).map_err(|e| err("Corrupt Graphify snapshot", e))?;
-                map.insert(key_of(&parsed.reference), ordinal as u64);
+                let line = line.map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?;
+                let parsed: Line = serde_json::from_str(&line)
+                    .map_err(|e| fsio::err("Corrupt Graphify snapshot", e))?;
+                map.insert(parsed.reference, ordinal as u64);
             }
             Ok(map)
         });
         match map {
-            Ok(map) => map.get(&key_of(reference)).copied().ok_or_else(|| format!("Graphify node not found: {}", shown(&reference.id))),
+            Ok(map) => map
+                .get(reference)
+                .copied()
+                .ok_or_else(|| format!("Graphify node not found: {}", fsio::shown(&reference.id))),
             Err(e) => Err(e.clone()),
         }
     }
@@ -1143,15 +1551,32 @@ impl KnowledgeService {
     }
 
     fn registered_output(&self, repository: &Path) -> Option<PathBuf> {
-        self.state.lock().integrations.graphify_outputs.get(&fsio::norm(repository)).map(PathBuf::from)
+        self.state
+            .lock()
+            .integrations
+            .graphify_outputs
+            .get(&fsio::norm(repository))
+            .map(PathBuf::from)
     }
 
     /// Passive: stats and sniffs files only. Never creates a snapshot.
     pub(crate) fn graphify_capability(&self, folder: Option<&str>) -> GraphifyCapability {
-        let absent = |state: GraphifyState, message: Option<String>| GraphifyCapability { present: false, state, source_root: None, artifact_id: None, artifact_hash: None, message };
-        let Some(folder) = folder else { return absent(GraphifyState::Absent, None) };
+        let absent = |state: GraphifyState, message: Option<String>| GraphifyCapability {
+            present: false,
+            state,
+            source_root: None,
+            artifact_id: None,
+            artifact_hash: None,
+            message,
+        };
+        let Some(folder) = folder else {
+            return absent(GraphifyState::Absent, None);
+        };
         match self.repository_root(folder) {
-            Ok(repository) => probe_graphify(&repository, self.registered_output(&repository).as_deref()).capability,
+            Ok(repository) => {
+                probe_graphify(&repository, self.registered_output(&repository).as_deref())
+                    .capability
+            }
             Err(message) => absent(GraphifyState::Unavailable, Some(message)),
         }
     }
@@ -1161,23 +1586,38 @@ impl KnowledgeService {
         let repository = self.repository_root(folder)?;
         let probe = probe_graphify(&repository, self.registered_output(&repository).as_deref());
         let Some(located) = probe.located else {
-            return Err(probe.capability.message.unwrap_or_else(|| "This project has no Graphify output".to_string()));
+            return Err(probe
+                .capability
+                .message
+                .unwrap_or_else(|| "This project has no Graphify output".to_string()));
         };
         let project_key = fsio::norm(&repository);
         let root = self.graphify_root();
-        fs::create_dir_all(&root).map_err(|e| err("Cannot create the Graphify store", e))?;
+        fs::create_dir_all(&root).map_err(|e| fsio::err("Cannot create the Graphify store", e))?;
         cleanup_incoming(&root);
         let (file, _) = {
-            let parent = located.graph_path.parent().ok_or("graph.json has no folder")?;
+            let parent = located
+                .graph_path
+                .parent()
+                .ok_or("graph.json has no folder")?;
             fsio::open_components(parent, &["graph.json".to_string()])?
         };
-        let before = file.metadata().map_err(|e| err("Cannot inspect graph.json", e))?;
+        let before = file
+            .metadata()
+            .map_err(|e| fsio::err("Cannot inspect graph.json", e))?;
         if fingerprint(&before) != located.fingerprint {
             return Err("graph.json changed while it was being opened; try again".into());
         }
         let incoming = root.join(format!(".incoming-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&incoming).map_err(|e| err("Cannot create the Graphify snapshot", e))?;
-        let outcome = normalize(file, before.len(), &incoming, &repository.to_string_lossy(), &located);
+        fs::create_dir(&incoming)
+            .map_err(|e| fsio::err("Cannot create the Graphify snapshot", e))?;
+        let outcome = normalize(
+            file,
+            before.len(),
+            &incoming,
+            &repository.to_string_lossy(),
+            &located,
+        );
         let normalized = match outcome {
             Ok(normalized) => normalized,
             Err(message) => {
@@ -1187,30 +1627,57 @@ impl KnowledgeService {
         };
         let id = artifact_id(&project_key, &normalized.hash);
         let final_dir = root.join(&id);
-        let source = Source { graph_path: located.graph_path.to_string_lossy().into_owned(), fingerprint: located.fingerprint.clone(), project_key: project_key.clone(), admitted_ms: now_ms() };
+        let source = Source {
+            graph_path: located.graph_path.to_string_lossy().into_owned(),
+            fingerprint: located.fingerprint,
+            project_key,
+            admitted_ms: fsio::now_ms(),
+        };
         let mut meta = normalized.meta;
         meta.artifact_id = id.clone();
-        let _ = normalized.bytes;
         let published = (|| -> Result<GraphifyArtifact> {
-            if final_dir.join("meta.json").is_file() && final_dir.join("graph.json").is_file() && final_dir.join("metadata.json").is_file() {
+            if final_dir.join("meta.json").is_file()
+                && final_dir.join("graph.json").is_file()
+                && final_dir.join("metadata.json").is_file()
+            {
                 // Same bytes for the same project: the immutable snapshot already exists; only its live pointer moves.
                 let existing: GraphifyArtifact = read_json_file(&final_dir.join("meta.json"))?;
-                crate::dependency_security::atomic_json(&final_dir.join("source.json"), &source, 1024 * 1024)?;
+                crate::dependency_security::atomic_json(
+                    &final_dir.join("source.json"),
+                    &source,
+                    1024 * 1024,
+                )?;
                 return Ok(existing);
             }
             if final_dir.join("meta.json").is_file() {
                 // A legacy snapshot of the same bytes lacks the byte-exact original and complete metadata; this complete one replaces it.
-                fs::remove_dir_all(&final_dir).map_err(|e| err("Cannot replace the legacy Graphify snapshot", e))?;
+                fs::remove_dir_all(&final_dir)
+                    .map_err(|e| fsio::err("Cannot replace the legacy Graphify snapshot", e))?;
             }
-            crate::dependency_security::atomic_json(&incoming.join("meta.json"), &meta, 8 * 1024 * 1024)?;
-            crate::dependency_security::atomic_json(&incoming.join("source.json"), &source, 1024 * 1024)?;
+            crate::dependency_security::atomic_json(
+                &incoming.join("meta.json"),
+                &meta,
+                8 * 1024 * 1024,
+            )?;
+            crate::dependency_security::atomic_json(
+                &incoming.join("source.json"),
+                &source,
+                1024 * 1024,
+            )?;
             match fs::rename(&incoming, &final_dir) {
-                Ok(()) => Ok(meta.clone()),
-                Err(_) if final_dir.join("meta.json").is_file() && final_dir.join("graph.json").is_file() => {
-                    crate::dependency_security::atomic_json(&final_dir.join("source.json"), &source, 1024 * 1024)?;
+                Ok(()) => Ok(meta),
+                Err(_)
+                    if final_dir.join("meta.json").is_file()
+                        && final_dir.join("graph.json").is_file() =>
+                {
+                    crate::dependency_security::atomic_json(
+                        &final_dir.join("source.json"),
+                        &source,
+                        1024 * 1024,
+                    )?;
                     read_json_file(&final_dir.join("meta.json"))
                 }
-                Err(e) => Err(err("Cannot publish the Graphify snapshot", e)),
+                Err(e) => Err(fsio::err("Cannot publish the Graphify snapshot", e)),
             }
         })();
         let _ = fs::remove_dir_all(&incoming);
@@ -1220,18 +1687,28 @@ impl KnowledgeService {
     }
 
     /// Associates an external Graphify output folder with the project, but only when its `.graphify_root` names it.
-    pub fn register_graphify_output(&self, folder: &str, directory: &str) -> Result<KnowledgeCapabilities> {
+    pub fn register_graphify_output(
+        &self,
+        folder: &str,
+        directory: &str,
+    ) -> Result<KnowledgeCapabilities> {
         let repository = self.repository_root(folder)?;
         let chosen = Path::new(directory.trim());
         if !chosen.is_absolute() {
             return Err("Choose an absolute Graphify output folder".into());
         }
-        let meta = fs::symlink_metadata(chosen).map_err(|e| err("Cannot inspect the Graphify folder", e))?;
-        if !meta.is_dir() || is_link(&meta) {
+        let meta = fs::symlink_metadata(chosen)
+            .map_err(|e| fsio::err("Cannot inspect the Graphify folder", e))?;
+        if !meta.is_dir() || snapshot::is_link(&meta) {
             return Err("The Graphify output must be a plain folder".into());
         }
-        let canonical = crate::setup::canonical(chosen).map_err(|e| err("Cannot resolve the Graphify folder", e))?;
-        let output = if canonical.join("graph.json").exists() { canonical.clone() } else { canonical.join("graphify-out") };
+        let canonical = crate::setup::canonical(chosen)
+            .map_err(|e| fsio::err("Cannot resolve the Graphify folder", e))?;
+        let output = if canonical.join("graph.json").exists() {
+            canonical
+        } else {
+            canonical.join("graphify-out")
+        };
         match evaluate_output(&repository, &output, true, "registered") {
             Eval::Found(_) => {}
             Eval::Bad { message, .. } => return Err(message),
@@ -1243,7 +1720,10 @@ impl KnowledgeService {
                 return Err(format!("Integration settings are unreadable: {error}"));
             }
             let mut settings = state.integrations.clone();
-            settings.graphify_outputs.insert(fsio::norm(&repository), output.to_string_lossy().into_owned());
+            settings.graphify_outputs.insert(
+                fsio::norm(&repository),
+                output.to_string_lossy().into_owned(),
+            );
             self.save_integrations(&settings)?;
             state.integrations = settings;
         }
@@ -1259,11 +1739,16 @@ impl KnowledgeService {
         if let Some(loaded) = self.graphify_cache.lock().get(id) {
             return Ok(loaded.clone());
         }
-        let meta: GraphifyArtifact = read_json_file(&dir.join("meta.json")).map_err(|_| unavailable(id))?;
+        let meta: GraphifyArtifact =
+            read_json_file(&dir.join("meta.json")).map_err(|_| unavailable(id))?;
         if meta.artifact_id != id {
             return Err(unavailable(id));
         }
-        let loaded = Arc::new(Loaded { dir, meta, node_ordinals: OnceLock::new() });
+        let loaded = Arc::new(Loaded {
+            dir,
+            meta,
+            node_ordinals: OnceLock::new(),
+        });
         let mut cache = self.graphify_cache.lock();
         if cache.len() >= CACHED_ARTIFACTS {
             cache.clear();
@@ -1276,27 +1761,44 @@ impl KnowledgeService {
     fn compare_live_graphify(&self, loaded: &Loaded, artifact_id: &str) -> Result<bool> {
         let source: Source = read_json_file(&loaded.dir.join("source.json"))?;
         let repository = self.repository_root(&loaded.meta.folder)?;
-        if source.project_key != fsio::norm(&repository) || artifact_id != self::artifact_id(&source.project_key, &loaded.meta.artifact_hash) {
+        if source.project_key != fsio::norm(&repository)
+            || artifact_id != self::artifact_id(&source.project_key, &loaded.meta.artifact_hash)
+        {
             return Err("The snapshot project identity no longer matches this repository".into());
         }
         let probe = probe_graphify(&repository, self.registered_output(&repository).as_deref());
-        let located = probe.located.ok_or_else(|| probe.capability.message.unwrap_or_else(|| "The live Graphify output is absent".into()))?;
-        let parent = located.graph_path.parent().ok_or("graph.json has no folder")?;
+        let located = probe.located.ok_or_else(|| {
+            probe
+                .capability
+                .message
+                .unwrap_or_else(|| "The live Graphify output is absent".into())
+        })?;
+        let parent = located
+            .graph_path
+            .parent()
+            .ok_or("graph.json has no folder")?;
         let (mut file, _) = fsio::open_components(parent, &["graph.json".to_string()])?;
-        let before = file.metadata().map_err(|e| err("Cannot inspect graph.json", e))?;
+        let before = file
+            .metadata()
+            .map_err(|e| fsio::err("Cannot inspect graph.json", e))?;
         if fingerprint(&before) != located.fingerprint {
             return Err("graph.json changed while it was being opened".into());
         }
         let hash = hash_live_graph(&mut file, &before)?;
         Ok(hash == loaded.meta.artifact_hash
             && located.claimed_root == loaded.meta.source_root
-            && (located.provenance == Provenance::Verified) == (loaded.meta.provenance == "verified"))
+            && (located.provenance == Provenance::Verified)
+                == (loaded.meta.provenance == "verified"))
     }
 
     /// Passive full-hash comparison. Does not admit, mutate, prune or invalidate any snapshot.
     pub fn check_graphify_artifact(&self, artifact_id: &str) -> Result<GraphifyArtifactCheck> {
         let loaded = self.loaded_graphify(artifact_id)?;
-        let result = |current, message: Option<String>| GraphifyArtifactCheck { artifact_id: artifact_id.to_string(), current, message };
+        let result = |current, message: Option<String>| GraphifyArtifactCheck {
+            artifact_id: artifact_id.to_string(),
+            current,
+            message,
+        };
         Ok(match self.compare_live_graphify(&loaded, artifact_id) {
             Ok(true) => result(true, None),
             Ok(false) => result(false, Some("New Graphify output available — Refresh. This immutable snapshot remains readable.".into())),
@@ -1305,11 +1807,24 @@ impl KnowledgeService {
     }
 
     /// One strict page of a snapshot section.
-    pub fn read_graphify_graph(&self, artifact_id: &str, section: GraphifySection, offset: usize, limit: usize) -> Result<GraphifyPage> {
+    pub fn read_graphify_graph(
+        &self,
+        artifact_id: &str,
+        section: GraphifySection,
+        offset: usize,
+        limit: usize,
+    ) -> Result<GraphifyPage> {
         window(offset, limit)?;
         let loaded = self.loaded_graphify(artifact_id)?;
         let (total, items) = match section {
-            GraphifySection::Metadata => (1u64, if offset == 0 { vec![serde_json::to_value(&loaded.meta).map_err(|e| e.to_string())?] } else { Vec::new() }),
+            GraphifySection::Metadata => (
+                1u64,
+                if offset == 0 {
+                    vec![serde_json::to_value(&loaded.meta).map_err(|e| e.to_string())?]
+                } else {
+                    Vec::new()
+                },
+            ),
             _ => {
                 let name = section_name(section);
                 let total = record_count(&loaded.dir, name)?;
@@ -1334,23 +1849,62 @@ impl KnowledgeService {
     }
 
     /// Exact search, neighbourhoods and lookups over a snapshot. Strict query union; nothing is guessed or merged.
-    pub fn query_graphify_graph(&self, artifact_id: &str, query: &GraphifyQuery) -> Result<GraphifyQueryPage> {
+    pub fn query_graphify_graph(
+        &self,
+        artifact_id: &str,
+        query: &GraphifyQuery,
+    ) -> Result<GraphifyQueryPage> {
         let loaded = self.loaded_graphify(artifact_id)?;
         match query {
             GraphifyQuery::Node { id } => {
                 let ordinal = loaded.node_ordinal(id)?;
-                query_page(&loaded, "node", 1, 0, read_records(&loaded.dir, "nodes", &[ordinal])?)
+                query_page(
+                    &loaded,
+                    "node",
+                    1,
+                    0,
+                    read_records(&loaded.dir, "nodes", &[ordinal])?,
+                )
             }
-            GraphifyQuery::Search { text, offset, limit } => query_search(&loaded, text, *offset, *limit),
-            GraphifyQuery::Neighbors { id, direction, offset, limit } => query_neighbors(&loaded, id, direction, *offset, *limit),
-            GraphifyQuery::CommunityMembers { community, offset, limit } => query_community_members(&loaded, *community, *offset, *limit),
-            GraphifyQuery::HyperedgesOf { id, offset, limit } => query_hyperedges_of(&loaded, id, *offset, *limit),
+            GraphifyQuery::Search {
+                text,
+                offset,
+                limit,
+            } => query_search(&loaded, text, *offset, *limit),
+            GraphifyQuery::Neighbors {
+                id,
+                direction,
+                offset,
+                limit,
+            } => query_neighbors(&loaded, id, direction, *offset, *limit),
+            GraphifyQuery::CommunityMembers {
+                community,
+                offset,
+                limit,
+            } => query_community_members(&loaded, *community, *offset, *limit),
+            GraphifyQuery::HyperedgesOf { id, offset, limit } => {
+                query_hyperedges_of(&loaded, id, *offset, *limit)
+            }
         }
     }
 }
 
-fn query_page(loaded: &Loaded, kind: &'static str, total: u64, offset: usize, items: Vec<Value>) -> Result<GraphifyQueryPage> {
-    let mut page = GraphifyQueryPage { artifact_id: loaded.meta.artifact_id.clone(), artifact_hash: loaded.meta.artifact_hash.clone(), kind, total, offset: offset as u64, items: Vec::new(), next_offset: Some(u64::MAX) };
+fn query_page(
+    loaded: &Loaded,
+    kind: &'static str,
+    total: u64,
+    offset: usize,
+    items: Vec<Value>,
+) -> Result<GraphifyQueryPage> {
+    let mut page = GraphifyQueryPage {
+        artifact_id: loaded.meta.artifact_id.clone(),
+        artifact_hash: loaded.meta.artifact_hash.clone(),
+        kind,
+        total,
+        offset: offset as u64,
+        items: Vec::new(),
+        next_offset: Some(u64::MAX),
+    };
     page.items = within_budget(items, encoded_len(&page)?)?;
     let end = (offset as u64).min(total) + page.items.len() as u64;
     page.next_offset = (end < total).then_some(end);
@@ -1358,19 +1912,36 @@ fn query_page(loaded: &Loaded, kind: &'static str, total: u64, offset: usize, it
 }
 
 /// Pages an ordered list of record ordinals of one section.
-fn query_page_of(loaded: &Loaded, kind: &'static str, section: &str, ordinals: &[u64], offset: usize, limit: usize) -> Result<GraphifyQueryPage> {
+fn query_page_of(
+    loaded: &Loaded,
+    kind: &'static str,
+    section: &str,
+    ordinals: &[u64],
+    offset: usize,
+    limit: usize,
+) -> Result<GraphifyQueryPage> {
     let total = ordinals.len();
     let start = offset.min(total);
     let end = (start + limit).min(total);
-    query_page(loaded, kind, total as u64, offset, read_records(&loaded.dir, section, &ordinals[start..end])?)
+    query_page(
+        loaded,
+        kind,
+        total as u64,
+        offset,
+        read_records(&loaded.dir, section, &ordinals[start..end])?,
+    )
 }
 
 fn parse_line<T: serde::de::DeserializeOwned>(line: std::io::Result<String>) -> Result<T> {
-    serde_json::from_str(&line.map_err(|e| err("Cannot read Graphify snapshot", e))?).map_err(|e| err("Corrupt Graphify snapshot", e))
+    serde_json::from_str(&line.map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?)
+        .map_err(|e| fsio::err("Corrupt Graphify snapshot", e))
 }
 
 /// Ordinals of the records of one `.jsonl` file whose parsed line satisfies `keep`.
-fn matching_ordinals<T: serde::de::DeserializeOwned>(path: &Path, keep: impl Fn(&T) -> bool) -> Result<Vec<u64>> {
+fn matching_ordinals<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    keep: impl Fn(&T) -> bool,
+) -> Result<Vec<u64>> {
     let mut found = Vec::new();
     for (ordinal, line) in lines(path)?.enumerate() {
         if keep(&parse_line::<T>(line)?) {
@@ -1380,7 +1951,12 @@ fn matching_ordinals<T: serde::de::DeserializeOwned>(path: &Path, keep: impl Fn(
     Ok(found)
 }
 
-fn scan_hits(path: &Path, kind: u8, hits: &mut Vec<(u8, u8, u64)>, rank_of: impl Fn(&Value) -> Option<u8>) -> Result<()> {
+fn scan_hits(
+    path: &Path,
+    kind: u8,
+    hits: &mut Vec<(u8, u8, u64)>,
+    rank_of: impl Fn(&Value) -> Option<u8>,
+) -> Result<()> {
     for (ordinal, line) in lines(path)?.enumerate() {
         if let Some(found) = rank_of(&parse_line::<Value>(line)?) {
             hits.push((found, kind, ordinal as u64));
@@ -1393,7 +1969,9 @@ fn search_items(dir: &Path, chosen: &[(u8, u8, u64)]) -> Result<Vec<Value>> {
     let mut items = Vec::new();
     for (_, kind, ordinal) in chosen {
         let section = ["nodes", "hyperedges", "links"][*kind as usize];
-        let value = read_records(dir, section, &[*ordinal])?.pop().ok_or("Graphify search record is missing")?;
+        let value = read_records(dir, section, &[*ordinal])?
+            .pop()
+            .ok_or("Graphify search record is missing")?;
         items.push(match *kind {
             0 => json!({ "kind": "node", "node": value }),
             1 => json!({ "kind": "hyperedge", "hyperedge": value }),
@@ -1403,7 +1981,12 @@ fn search_items(dir: &Path, chosen: &[(u8, u8, u64)]) -> Result<Vec<Value>> {
     Ok(items)
 }
 
-fn query_search(loaded: &Loaded, text: &str, offset: usize, limit: usize) -> Result<GraphifyQueryPage> {
+fn query_search(
+    loaded: &Loaded,
+    text: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<GraphifyQueryPage> {
     window(offset, limit)?;
     let needle = text.trim();
     if needle.is_empty() {
@@ -1413,27 +1996,53 @@ fn query_search(loaded: &Loaded, text: &str, offset: usize, limit: usize) -> Res
     let lowered = needle.to_lowercase();
     let mut hits: Vec<(u8, u8, u64)> = Vec::new();
     scan_hits(&dir.join("nodes.jsonl"), 0, &mut hits, |value| {
-        let id = value.get("ref").map_or("", |reference| str_of(reference, "id"));
+        let id = value
+            .get("ref")
+            .map_or("", |reference| str_of(reference, "id"));
         let (label, file) = (str_of(value, "label"), str_of(value, "sourceFile"));
-        let community = value.get("attributes").map(|a| str_of(a, "community_name")).unwrap_or("");
-        rank(&[id, label], &[id, label, file, community], needle, &lowered)
+        let community = value
+            .get("attributes")
+            .map(|a| str_of(a, "community_name"))
+            .unwrap_or("");
+        rank(
+            &[id, label],
+            &[id, label, file, community],
+            needle,
+            &lowered,
+        )
     })?;
     scan_hits(&dir.join("hyperedges.jsonl"), 1, &mut hits, |value| {
         let (id, label) = (str_of(value, "id"), str_of(value, "label"));
         rank(&[id, label], &[id, label], needle, &lowered)
     })?;
     scan_hits(&dir.join("links.jsonl"), 2, &mut hits, |value| {
-        let (id, relation, file) = (str_of(value, "id"), str_of(value, "relation"), str_of(value, "sourceFile"));
+        let (id, relation, file) = (
+            str_of(value, "id"),
+            str_of(value, "relation"),
+            str_of(value, "sourceFile"),
+        );
         rank(&[id], &[id, relation, file], needle, &lowered).map(|found| found + 3)
     })?;
     hits.sort();
     let total = hits.len();
     let start = offset.min(total);
     let end = (start + limit).min(total);
-    query_page(loaded, "search", total as u64, offset, search_items(dir, &hits[start..end])?)
+    query_page(
+        loaded,
+        "search",
+        total as u64,
+        offset,
+        search_items(dir, &hits[start..end])?,
+    )
 }
 
-fn link_wanted(direction: &GraphifyDirection, node: u64, source: u64, target: u64, directed: bool) -> bool {
+fn link_wanted(
+    direction: &GraphifyDirection,
+    node: u64,
+    source: u64,
+    target: u64,
+    directed: bool,
+) -> bool {
     match direction {
         GraphifyDirection::Both => source == node || target == node,
         GraphifyDirection::Out => source == node || (!directed && target == node),
@@ -1442,18 +2051,26 @@ fn link_wanted(direction: &GraphifyDirection, node: u64, source: u64, target: u6
 }
 
 /// `(link ordinal, source node, target node)` of every link touching `node` in `direction`.
-fn neighbor_matches(dir: &Path, node: u64, direction: &GraphifyDirection) -> Result<Vec<(u64, u64, u64)>> {
+fn neighbor_matches(
+    dir: &Path,
+    node: u64,
+    direction: &GraphifyDirection,
+) -> Result<Vec<(u64, u64, u64)>> {
     let mut matches: Vec<(u64, u64, u64)> = Vec::new();
-    let mut ends = BufReader::new(File::open(dir.join("links.ends")).map_err(|e| err("Cannot read Graphify snapshot", e))?);
+    let mut ends = BufReader::new(
+        File::open(dir.join("links.ends"))
+            .map_err(|e| fsio::err("Cannot read Graphify snapshot", e))?,
+    );
     let mut record = [0u8; 24];
     let mut ordinal = 0u64;
     loop {
         match ends.read_exact(&mut record) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(err("Cannot read Graphify snapshot", e)),
+            Err(e) => return Err(fsio::err("Cannot read Graphify snapshot", e)),
         }
-        let word = |i: usize| u64::from_le_bytes(record[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+        let word =
+            |i: usize| u64::from_le_bytes(record[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
         let (source, target, flags) = (word(0), word(1), word(2));
         if link_wanted(direction, node, source, target, flags & 1 == 1) {
             matches.push((ordinal, source, target));
@@ -1465,41 +2082,83 @@ fn neighbor_matches(dir: &Path, node: u64, direction: &GraphifyDirection) -> Res
 
 /// The link records of `chosen`, each carrying its hydrated `sourceNode` and `targetNode`.
 fn hydrate_neighbors(dir: &Path, chosen: &[(u64, u64, u64)]) -> Result<Vec<Value>> {
-    let mut links = read_records(dir, "links", &chosen.iter().map(|m| m.0).collect::<Vec<_>>())?;
-    let mut wanted_nodes: Vec<u64> = chosen.iter().flat_map(|m| [m.1, m.2]).filter(|n| *n != NO_NODE).collect();
+    let mut links = read_records(
+        dir,
+        "links",
+        &chosen.iter().map(|m| m.0).collect::<Vec<_>>(),
+    )?;
+    let mut wanted_nodes: Vec<u64> = chosen
+        .iter()
+        .flat_map(|m| [m.1, m.2])
+        .filter(|n| *n != NO_NODE)
+        .collect();
     wanted_nodes.sort_unstable();
     wanted_nodes.dedup();
-    let nodes: HashMap<u64, Value> = wanted_nodes.iter().copied().zip(read_records(dir, "nodes", &wanted_nodes)?).collect();
+    let nodes: HashMap<u64, Value> = wanted_nodes
+        .iter()
+        .copied()
+        .zip(read_records(dir, "nodes", &wanted_nodes)?)
+        .collect();
     for (link, (_, source, target)) in links.iter_mut().zip(chosen) {
         if let Value::Object(object) = link {
-            object.insert("sourceNode".into(), nodes.get(source).cloned().unwrap_or(Value::Null));
-            object.insert("targetNode".into(), nodes.get(target).cloned().unwrap_or(Value::Null));
+            object.insert(
+                "sourceNode".into(),
+                nodes.get(source).cloned().unwrap_or(Value::Null),
+            );
+            object.insert(
+                "targetNode".into(),
+                nodes.get(target).cloned().unwrap_or(Value::Null),
+            );
         }
     }
     Ok(links)
 }
 
-fn query_neighbors(loaded: &Loaded, id: &GraphifyRef, direction: &GraphifyDirection, offset: usize, limit: usize) -> Result<GraphifyQueryPage> {
+fn query_neighbors(
+    loaded: &Loaded,
+    id: &GraphifyRef,
+    direction: &GraphifyDirection,
+    offset: usize,
+    limit: usize,
+) -> Result<GraphifyQueryPage> {
     window(offset, limit)?;
     let node = loaded.node_ordinal(id)?;
     let matches = neighbor_matches(&loaded.dir, node, direction)?;
     let total = matches.len();
     let start = offset.min(total);
     let end = (start + limit).min(total);
-    query_page(loaded, "neighbors", total as u64, offset, hydrate_neighbors(&loaded.dir, &matches[start..end])?)
+    query_page(
+        loaded,
+        "neighbors",
+        total as u64,
+        offset,
+        hydrate_neighbors(&loaded.dir, &matches[start..end])?,
+    )
 }
 
-fn query_community_members(loaded: &Loaded, community: i64, offset: usize, limit: usize) -> Result<GraphifyQueryPage> {
+fn query_community_members(
+    loaded: &Loaded,
+    community: i64,
+    offset: usize,
+    limit: usize,
+) -> Result<GraphifyQueryPage> {
     window(offset, limit)?;
     #[derive(Deserialize)]
     struct Line {
         community: Option<i64>,
     }
-    let members = matching_ordinals::<Line>(&loaded.dir.join("nodes.jsonl"), |line| line.community == Some(community))?;
+    let members = matching_ordinals::<Line>(&loaded.dir.join("nodes.jsonl"), |line| {
+        line.community == Some(community)
+    })?;
     query_page_of(loaded, "communityMembers", "nodes", &members, offset, limit)
 }
 
-fn query_hyperedges_of(loaded: &Loaded, id: &GraphifyRef, offset: usize, limit: usize) -> Result<GraphifyQueryPage> {
+fn query_hyperedges_of(
+    loaded: &Loaded,
+    id: &GraphifyRef,
+    offset: usize,
+    limit: usize,
+) -> Result<GraphifyQueryPage> {
     window(offset, limit)?;
     loaded.node_ordinal(id)?;
     #[derive(Deserialize)]
@@ -1507,6 +2166,8 @@ fn query_hyperedges_of(loaded: &Loaded, id: &GraphifyRef, offset: usize, limit: 
         #[serde(rename = "nodeIds")]
         node_ids: Vec<GraphifyRef>,
     }
-    let found = matching_ordinals::<Line>(&loaded.dir.join("hyperedges.jsonl"), |line| line.node_ids.contains(id))?;
+    let found = matching_ordinals::<Line>(&loaded.dir.join("hyperedges.jsonl"), |line| {
+        line.node_ids.contains(id)
+    })?;
     query_page_of(loaded, "hyperedgesOf", "hyperedges", &found, offset, limit)
 }

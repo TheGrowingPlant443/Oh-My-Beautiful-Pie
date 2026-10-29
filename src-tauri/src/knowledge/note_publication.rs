@@ -32,7 +32,8 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Weak};
 
-static NOTES: LazyLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static NOTES: LazyLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Marks a simulated process death: the replacement stops exactly where it is, with nothing cleaned up.
 const CRASH_MARKER: &str = "simulated crash";
@@ -54,13 +55,18 @@ pub(crate) enum HookAction {
 #[cfg(test)]
 pub(crate) type Hook = Box<dyn Fn(Stage, &Path, &str) -> HookAction + Send>;
 #[cfg(test)]
-pub(crate) static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+pub(crate) static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(any(windows, unix))]
 fn crash_requested(stage: u8, parent: &Path, name: &str) -> bool {
     #[cfg(test)]
     {
-        let stage = if stage == 0 { Stage::Locked } else { Stage::Reserved };
+        let stage = if stage == 0 {
+            Stage::Locked
+        } else {
+            Stage::Reserved
+        };
         if let Some(hook) = HOOKS.lock().get(&fsio::norm(parent)) {
             return matches!(hook(stage, parent, name), HookAction::Crash);
         }
@@ -73,7 +79,9 @@ fn note_lock(root: &Path, relative: &str) -> Arc<Mutex<()>> {
     let key = format!("{}\0{}", fsio::norm(root), relative.to_lowercase());
     let mut notes = NOTES.lock();
     notes.retain(|_, value| value.strong_count() > 0);
-    if let Some(lock) = notes.get(&key).and_then(Weak::upgrade) { return lock; }
+    if let Some(lock) = notes.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
     let lock = Arc::new(Mutex::new(()));
     notes.insert(key, Arc::downgrade(&lock));
     lock
@@ -82,27 +90,52 @@ fn note_lock(root: &Path, relative: &str) -> Arc<Mutex<()>> {
 /// Human-reviewed Markdown publication; `expected_hash == None` is create-only, `Some(hash)` a checked replacement.
 /// `journal_dir` is a private application folder (never inside a vault) that holds the crash journal and the
 /// original-bytes backup of a replacement.
-pub(crate) fn write_relative_markdown_journaled(root: &Path, relative: &str, text: &str, expected_hash: Option<&str>, journal_dir: &Path) -> Result<()> {
-    #[cfg(not(any(windows, unix)))] {
+pub(crate) fn write_relative_markdown_journaled(
+    root: &Path,
+    relative: &str,
+    text: &str,
+    expected_hash: Option<&str>,
+    journal_dir: &Path,
+) -> Result<()> {
+    #[cfg(not(any(windows, unix)))]
+    {
         let _ = (root, relative, text, expected_hash, journal_dir);
         return Err("Conflict-safe Markdown publication requires handle-based rename support that this platform lacks".into());
     }
-    #[cfg(any(windows, unix))] {
+    #[cfg(any(windows, unix))]
+    {
         let components = fsio::validate_relative(relative)?;
         let (name, parents) = components.split_last().ok_or("A note path is required")?;
-        if !fsio::is_markdown_name(name) { return Err("Only Markdown documents may be published".into()); }
+        if !fsio::is_markdown_name(name) {
+            return Err("Only Markdown documents may be published".into());
+        }
         let lock = note_lock(root, relative);
         let _note = lock.lock();
-        let parent = fsio::pin_descendants(root, parents, true, true)?;
-        for entry in fs::read_dir(parent.path()).map_err(|e| fsio::err("Cannot inspect note directory", e))? {
+        let parent = fsio::pin_descendants(
+            root, parents, /* create */ true, /* writable_leaf */ true,
+        )?;
+        let folded_name = name.to_lowercase();
+        for entry in fs::read_dir(parent.path())
+            .map_err(|e| fsio::err("Cannot inspect note directory", e))?
+        {
             let entry = entry.map_err(|e| fsio::err("Cannot inspect note directory", e))?;
             if let Some(existing) = entry.file_name().to_str() {
-                if existing != name && existing.to_lowercase() == name.to_lowercase() { return Err("A document differing only by letter case already exists".into()); }
+                if existing != name && existing.to_lowercase() == folded_name {
+                    return Err("A document differing only by letter case already exists".into());
+                }
             }
         }
         match expected_hash {
             None => create_only(&parent, name, text.as_bytes()),
-            Some(expected) => replace_checked(root, parents, &parent, name, text.as_bytes(), expected, journal_dir),
+            Some(expected) => replace_checked(
+                root,
+                parents,
+                &parent,
+                name,
+                text.as_bytes(),
+                expected,
+                journal_dir,
+            ),
         }
     }
 }
@@ -110,20 +143,38 @@ pub(crate) fn write_relative_markdown_journaled(root: &Path, relative: &str, tex
 #[cfg(any(windows, unix))]
 fn create_only(parent: &fsio::DirectoryPins, name: &str, text: &[u8]) -> Result<()> {
     let staged = super::rooted::stage(parent, text, &format!(".omp-{}.tmp", uuid::Uuid::new_v4()))?;
-    let published = super::rooted::rename_handle(&staged.file, parent, name, false);
-    if published.is_err() { let _ = super::rooted::delete_handle(&staged.file); }
+    let published =
+        super::rooted::rename_handle(&staged.file, parent, name, /* replace */ false);
+    if published.is_err() {
+        let _ = super::rooted::delete_handle(&staged.file);
+    }
     published
 }
 
 /// Immutable private copy of the original bytes, made from the locked handle BEFORE anything moves.
 #[cfg(any(windows, unix))]
-fn backup_original<R: std::io::Read + std::io::Seek>(locked: &mut R, journal_dir: &Path, backup_name: &str) -> Result<()> {
+fn backup_original<R: std::io::Read + std::io::Seek>(
+    locked: &mut R,
+    journal_dir: &Path,
+    backup_name: &str,
+) -> Result<()> {
     use std::io::{SeekFrom, Write};
-    fs::create_dir_all(journal_dir).map_err(|e| fsio::err("Cannot create the private publication journal", e))?;
-    let mut backup = fs::OpenOptions::new().write(true).create_new(true).open(journal_dir.join(backup_name)).map_err(|e| fsio::err("Cannot back up the original note", e))?;
-    std::io::copy(locked, &mut backup).map_err(|e| fsio::err("Cannot back up the original note", e))?;
-    backup.flush().and_then(|_| backup.sync_all()).map_err(|e| fsio::err("Cannot back up the original note", e))?;
-    locked.seek(SeekFrom::Start(0)).map_err(|e| fsio::err("Cannot rewind the locked note", e))?;
+    fs::create_dir_all(journal_dir)
+        .map_err(|e| fsio::err("Cannot create the private publication journal", e))?;
+    let mut backup = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(journal_dir.join(backup_name))
+        .map_err(|e| fsio::err("Cannot back up the original note", e))?;
+    std::io::copy(locked, &mut backup)
+        .map_err(|e| fsio::err("Cannot back up the original note", e))?;
+    backup
+        .flush()
+        .and_then(|_| backup.sync_all())
+        .map_err(|e| fsio::err("Cannot back up the original note", e))?;
+    locked
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| fsio::err("Cannot rewind the locked note", e))?;
     Ok(())
 }
 
@@ -131,8 +182,14 @@ fn backup_original<R: std::io::Read + std::io::Seek>(locked: &mut R, journal_dir
 /// overwrite it; put the original back only if the name is still free, otherwise keep the foreign note and the
 /// original's backup. Always an error.
 #[cfg(any(windows, unix))]
-fn undo_failed_publication(locked: &super::rooted::Handle, parent: &fsio::DirectoryPins, journal_dir: &Path, record: &mut PublicationJournal, publish_error: String) -> Result<()> {
-    match super::rooted::rename_handle(locked, parent, &record.name, false) {
+fn undo_failed_publication(
+    locked: &super::rooted::Handle,
+    parent: &fsio::DirectoryPins,
+    journal_dir: &Path,
+    record: &mut PublicationJournal,
+    publish_error: String,
+) -> Result<()> {
+    match super::rooted::rename_handle(locked, parent, &record.name, /* replace */ false) {
         Ok(()) => {
             let _ = publication_journal::finish(journal_dir, &record.id);
             let _ = fs::remove_file(journal_dir.join(&record.backup));
@@ -153,7 +210,15 @@ fn undo_failed_publication(locked: &super::rooted::Handle, parent: &fsio::Direct
 }
 
 #[cfg(any(windows, unix))]
-fn replace_checked(root: &Path, parents: &[String], parent: &fsio::DirectoryPins, name: &str, text: &[u8], expected: &str, journal_dir: &Path) -> Result<()> {
+fn replace_checked(
+    root: &Path,
+    parents: &[String],
+    parent: &fsio::DirectoryPins,
+    name: &str,
+    text: &[u8],
+    expected: &str,
+    journal_dir: &Path,
+) -> Result<()> {
     let id = uuid::Uuid::new_v4().to_string();
     // Recovery must never mistake this live writer for a crashed one: guard the id for the whole replacement.
     let _inflight = InFlight::begin(&id);
@@ -161,11 +226,17 @@ fn replace_checked(root: &Path, parents: &[String], parent: &fsio::DirectoryPins
     let outcome = (|| -> Result<()> {
         let mut locked = super::rooted::lock_destination(&parent.path().join(name))?;
         let base_hash = super::rooted::hash_handle(&mut locked)?;
-        if base_hash != expected { return Err("The note changed since it was read; review it before replacing".into()); }
-        if crash_requested(0, parent.path(), name) { return Err(CRASH_MARKER.into()); }
+        if base_hash != expected {
+            return Err("The note changed since it was read; review it before replacing".into());
+        }
+        if crash_requested(0, parent.path(), name) {
+            return Err(CRASH_MARKER.into());
+        }
         let backup_name = publication_journal::backup_name(&id);
         backup_original(&mut locked, journal_dir, &backup_name)?;
-        let discard_backup = || { let _ = fs::remove_file(journal_dir.join(&backup_name)); };
+        let discard_backup = || {
+            let _ = fs::remove_file(journal_dir.join(&backup_name));
+        };
         let reservation = publication_journal::reservation_name(&id);
         let mut record = PublicationJournal {
             version: publication_journal::JOURNAL_VERSION,
@@ -174,35 +245,44 @@ fn replace_checked(root: &Path, parents: &[String], parent: &fsio::DirectoryPins
             root_identity: parent_root_identity(root)?,
             parents: parents.to_vec(),
             name: name.to_string(),
-            reservation: reservation.clone(),
+            reservation,
             staged: staged.name.clone(),
-            base_hash: base_hash.clone(),
+            base_hash,
             new_hash: fsio::sha256_hex(text),
             state: publication_journal::STATE_PREPARED.to_string(),
             backup: backup_name.clone(),
             message: None,
         };
-        if let Err(e) = publication_journal::save(journal_dir, &record) { discard_backup(); return Err(e); }
+        if let Err(e) = publication_journal::save(journal_dir, &record) {
+            discard_backup();
+            return Err(e);
+        }
         // Step 1: move the exact locked original out of the way (create-only). Nothing is lost if this fails.
-        if let Err(e) = super::rooted::reserve_handle(&locked, parent, &reservation) {
+        if let Err(e) = super::rooted::reserve_handle(&locked, parent, &record.reservation) {
             let _ = publication_journal::finish(journal_dir, &id);
             discard_backup();
             return Err(format!("The note could not be reserved for replacement; nothing was overwritten or lost: {e}"));
         }
-        if crash_requested(1, parent.path(), name) { return Err(CRASH_MARKER.into()); }
+        if crash_requested(1, parent.path(), name) {
+            return Err(CRASH_MARKER.into());
+        }
         // Step 2: publish the staged note into the now-empty name (create-only).
-        match super::rooted::rename_handle(&staged.file, parent, name, false) {
+        match super::rooted::rename_handle(&staged.file, parent, name, /* replace */ false) {
             Ok(()) => {
                 let _ = super::rooted::delete_handle(&locked); // the superseded original (we still hold its handle)
                 let _ = publication_journal::finish(journal_dir, &id);
                 discard_backup();
                 Ok(())
             }
-            Err(publish_error) => undo_failed_publication(&locked, parent, journal_dir, &mut record, publish_error),
+            Err(publish_error) => {
+                undo_failed_publication(&locked, parent, journal_dir, &mut record, publish_error)
+            }
         }
     })();
     // A simulated process death leaves everything exactly as it was, like a real one would.
-    if outcome.as_ref().is_err_and(|e| e != CRASH_MARKER) { let _ = super::rooted::delete_handle(&staged.file); }
+    if outcome.as_ref().is_err_and(|e| e != CRASH_MARKER) {
+        let _ = super::rooted::delete_handle(&staged.file);
+    }
     outcome
 }
 
@@ -223,12 +303,20 @@ pub(crate) fn publications_need_recovery(journal_dir: &Path) -> Result<bool> {
 }
 
 /// Deletes only an unchanged, singly linked Markdown file; the OS lock is held through deletion by handle.
-pub(crate) fn remove_relative_checked(root: &Path, relative: &str, expected_hash: &str) -> Result<()> {
+pub(crate) fn remove_relative_checked(
+    root: &Path,
+    relative: &str,
+    expected_hash: &str,
+) -> Result<()> {
     let components = fsio::validate_relative(relative)?;
     let (name, parents) = components.split_last().ok_or("A note path is required")?;
-    if !fsio::is_markdown_name(name) { return Err("Only Markdown documents may be removed".into()); }
+    if !fsio::is_markdown_name(name) {
+        return Err("Only Markdown documents may be removed".into());
+    }
     let lock = note_lock(root, relative);
     let _note = lock.lock();
-    let parent = fsio::pin_descendants(root, parents, false, false)?;
+    let parent = fsio::pin_descendants(
+        root, parents, /* create */ false, /* writable_leaf */ false,
+    )?;
     super::rooted::remove_checked(&parent, name, expected_hash)
 }

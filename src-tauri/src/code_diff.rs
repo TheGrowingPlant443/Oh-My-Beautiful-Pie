@@ -4,16 +4,18 @@
 //! push, PR) happen only on an explicit user action. A snapshot pins the baseline commit and the exact changed-file
 //! list, so file reads, saves and actions can never name an arbitrary path.
 use parking_lot::Mutex;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsStr;
-use std::fs;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, Metadata};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
 
@@ -21,7 +23,7 @@ pub type Result<T, E = String> = std::result::Result<T, E>;
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 const CHANGED: &str = "diff_view_changed: Project changed; refresh Code diff";
 const CONFLICT: &str = "diff_conflict: File changed on disk; reload before saving";
-const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -88,7 +90,7 @@ pub struct CommitResult {
     pub commit: String,
     pub summary: String,
 }
-#[derive(Clone, Deserialize, Debug)]
+#[derive(Clone, Default, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishOptions {
     pub new_branch: Option<String>,
@@ -119,7 +121,7 @@ pub struct DiffService {
     /// Last pull request created per instance (the only URL `open_pull_request` will open).
     prs: Mutex<HashMap<String, String>>,
     /// GitHub CLI program ("gh"; replaceable in tests).
-    gh: std::ffi::OsString,
+    gh: OsString,
 }
 // File saves, index changes and history operations share the same in-process writer lock.
 pub(crate) static WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -136,13 +138,22 @@ fn file_key(group: Option<DiffGroup>, path: &str) -> String {
 // ---------------------------------------------------------------- Git
 
 const GIT_MISSING: &str = "Git is not installed or is not on PATH";
-const GH_MISSING: &str = "GitHub CLI (gh) is not installed or is not on PATH; install it and run \"gh auth login\"";
+const GH_MISSING: &str =
+    "GitHub CLI (gh) is not installed or is not on PATH; install it and run \"gh auth login\"";
 
 fn git_command(dir: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(dir)
-        .args(["--no-pager", "--no-optional-locks", "--literal-pathspecs", "-c", "core.quotepath=false", "-c", "core.fsmonitor=false"])
+        .args([
+            "--no-pager",
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.quotepath=false",
+            "-c",
+            "core.fsmonitor=false",
+        ])
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -161,7 +172,7 @@ pub(crate) fn no_console(cmd: &mut Command) {
     #[cfg(not(windows))]
     let _ = cmd;
 }
-pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<Output> {
     git_command(dir, args).output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             GIT_MISSING.to_string()
@@ -171,10 +182,25 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
     })
 }
 /// Runs `cmd` with optional stdin and a deadline; the child is killed when the deadline passes.
-pub(crate) fn run_timed(mut cmd: Command, stdin: Option<&[u8]>, limit: Duration, not_found: &str) -> Result<std::process::Output> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+pub(crate) fn run_timed(
+    mut cmd: Command,
+    stdin: Option<&[u8]>,
+    limit: Duration,
+    not_found: &str,
+) -> Result<Output> {
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
     let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound { not_found.to_string() } else { format!("Could not start the command: {e}") }
+        if e.kind() == std::io::ErrorKind::NotFound {
+            not_found.to_string()
+        } else {
+            format!("Could not start the command: {e}")
+        }
     })?;
     let mut out = child.stdout.take().ok_or("stdout unavailable")?;
     let mut err = child.stderr.take().ok_or("stderr unavailable")?;
@@ -204,9 +230,13 @@ pub(crate) fn run_timed(mut cmd: Command, stdin: Option<&[u8]>, limit: Duration,
             None => std::thread::sleep(Duration::from_millis(50)),
         }
     };
-    Ok(std::process::Output { status, stdout: out_thread.join().unwrap_or_default(), stderr: err_thread.join().unwrap_or_default() })
+    Ok(Output {
+        status,
+        stdout: out_thread.join().unwrap_or_default(),
+        stderr: err_thread.join().unwrap_or_default(),
+    })
 }
-pub(crate) fn failure_text(out: &std::process::Output) -> String {
+pub(crate) fn failure_text(out: &Output) -> String {
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
     match (err.is_empty(), stdout.is_empty()) {
@@ -217,9 +247,23 @@ pub(crate) fn failure_text(out: &std::process::Output) -> String {
     }
 }
 /// Git with a deadline and optional stdin; success returns stdout.
-pub(crate) fn git_timed(dir: &Path, args: &[&str], stdin: Option<&[u8]>, secs: u64) -> Result<Vec<u8>> {
-    let out = run_timed(git_command(dir, args), stdin, Duration::from_secs(secs), GIT_MISSING)?;
-    if out.status.success() { Ok(out.stdout) } else { Err(failure_text(&out)) }
+pub(crate) fn git_timed(
+    dir: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    secs: u64,
+) -> Result<Vec<u8>> {
+    let out = run_timed(
+        git_command(dir, args),
+        stdin,
+        Duration::from_secs(secs),
+        GIT_MISSING,
+    )?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(failure_text(&out))
+    }
 }
 /// Opens a credential-free https URL (or http with a literal loopback host when `allow_loopback_http`)
 /// with the platform handler (no shell).
@@ -227,7 +271,7 @@ pub(crate) fn open_url(url: &str, allow_loopback_http: bool) -> Result<()> {
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("Refusing to open a link with whitespace or control characters".into());
     }
-    let parsed = reqwest::Url::parse(url).map_err(|_| "Refusing to open an invalid link".to_string())?;
+    let parsed = Url::parse(url).map_err(|_| "Refusing to open an invalid link".to_string())?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("Refusing to open a link that contains credentials".into());
     }
@@ -259,7 +303,9 @@ pub(crate) fn open_url(url: &str, allow_loopback_http: bool) -> Result<()> {
         cmd
     };
     no_console(&mut cmd);
-    cmd.spawn().map(|_| ()).map_err(|e| format!("Could not open the link: {e}"))
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open the link: {e}"))
 }
 pub(crate) fn git_ok(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = git(dir, args)?;
@@ -270,7 +316,11 @@ pub(crate) fn git_ok(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     if message.contains("not a git repository") {
         return Err("This project is not inside a Git repository".into());
     }
-    Err(if message.is_empty() { format!("Git failed ({})", out.status) } else { message })
+    Err(if message.is_empty() {
+        format!("Git failed ({})", out.status)
+    } else {
+        message
+    })
 }
 /// `Ok(None)` when Git answers "no such object" (exit 1); real failures stay errors.
 pub(crate) fn git_optional(dir: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
@@ -282,7 +332,11 @@ pub(crate) fn git_optional(dir: &Path, args: &[&str]) -> Result<Option<Vec<u8>>>
         return Ok(None);
     }
     let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Err(if message.is_empty() { format!("Git failed ({})", out.status) } else { message })
+    Err(if message.is_empty() {
+        format!("Git failed ({})", out.status)
+    } else {
+        message
+    })
 }
 pub(crate) fn text(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).trim().to_string()
@@ -292,20 +346,40 @@ pub(crate) fn repository_root(project: &Path) -> Result<PathBuf> {
     if top.is_empty() {
         return Err("This project is not inside a Git repository".into());
     }
-    crate::setup::canonical(Path::new(&top)).map_err(|e| format!("Repository root is unreadable: {e}"))
+    crate::setup::canonical(Path::new(&top))
+        .map_err(|e| format!("Repository root is unreadable: {e}"))
 }
 pub(crate) fn resolve_commit(root: &Path, reference: &str) -> Result<Option<String>> {
     let spec = format!("{reference}^{{commit}}");
-    Ok(git_optional(root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &spec])?.map(text))
+    Ok(git_optional(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &spec,
+        ],
+    )?
+    .map(text))
 }
 pub(crate) fn valid_commit(root: &Path, hash: &str) -> Result<()> {
-    if !matches!(hash.len(), 40 | 64) || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) || resolve_commit(root, hash)?.is_none() {
+    if !matches!(hash.len(), 40 | 64)
+        || !hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || resolve_commit(root, hash)?.is_none()
+    {
         return Err(format!("Not a commit: {hash}"));
     }
     Ok(())
 }
 fn short_name(reference: &str) -> String {
-    reference.strip_prefix("refs/heads/").or_else(|| reference.strip_prefix("refs/remotes/")).unwrap_or(reference).to_string()
+    reference
+        .strip_prefix("refs/heads/")
+        .or_else(|| reference.strip_prefix("refs/remotes/"))
+        .unwrap_or(reference)
+        .to_string()
 }
 /// master first, then the repository's recorded default branch, then main. Only local refs are read.
 pub(crate) fn default_branch(root: &Path) -> Result<Option<(String, String)>> {
@@ -317,22 +391,44 @@ pub(crate) fn default_branch(root: &Path) -> Result<Option<(String, String)>> {
             return Ok(Some(hit));
         }
     }
-    let listed = text(git_ok(root, &["for-each-ref", "--format=%(refname)", "refs/remotes/"])?);
+    let listed = text(git_ok(
+        root,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
+    )?);
     let mut remotes: Vec<&str> = listed
         .lines()
         .filter_map(|line| line.strip_prefix("refs/remotes/")?.strip_suffix("/HEAD"))
         .collect();
     remotes.sort_by_key(|remote| (*remote != "origin", *remote));
     for remote in remotes {
-        let symbolic = git_optional(root, &["symbolic-ref", "--quiet", &format!("refs/remotes/{remote}/HEAD")])?.map(text);
-        let Some(target) = symbolic.and_then(|t| t.strip_prefix(&format!("refs/remotes/{remote}/")).map(str::to_string)) else { continue };
-        for candidate in [format!("refs/heads/{target}"), format!("refs/remotes/{remote}/{target}")] {
+        let symbolic = git_optional(
+            root,
+            &[
+                "symbolic-ref",
+                "--quiet",
+                &format!("refs/remotes/{remote}/HEAD"),
+            ],
+        )?
+        .map(text);
+        let Some(target) = symbolic.and_then(|t| {
+            t.strip_prefix(&format!("refs/remotes/{remote}/"))
+                .map(str::to_string)
+        }) else {
+            continue;
+        };
+        for candidate in [
+            format!("refs/heads/{target}"),
+            format!("refs/remotes/{remote}/{target}"),
+        ] {
             if let Some(hit) = found(candidate)? {
                 return Ok(Some(hit));
             }
         }
     }
-    if let Some(name) = git_optional(root, &["config", "--get", "init.defaultBranch"])?.map(text).filter(|n| !n.is_empty()) {
+    if let Some(name) = git_optional(root, &["config", "--get", "init.defaultBranch"])?
+        .map(text)
+        .filter(|n| !n.is_empty())
+    {
         if let Some(hit) = found(format!("refs/heads/{name}"))? {
             return Ok(Some(hit));
         }
@@ -345,7 +441,11 @@ pub(crate) fn default_branch(root: &Path) -> Result<Option<(String, String)>> {
     Ok(None)
 }
 fn split_nul(bytes: &[u8]) -> Vec<String> {
-    bytes.split(|b| *b == 0).filter(|part| !part.is_empty()).map(|part| String::from_utf8_lossy(part).into_owned()).collect()
+    bytes
+        .split(|b| *b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
 }
 /// `git diff --name-status -z` records: status, path (and a second path for renames/copies).
 fn parse_name_status(bytes: &[u8]) -> Vec<DiffFile> {
@@ -355,7 +455,9 @@ fn parse_name_status(bytes: &[u8]) -> Vec<DiffFile> {
     while let Some(status) = tokens.next() {
         let letter = status.chars().next().unwrap_or('M');
         let (old_path, path) = if matches!(letter, 'R' | 'C') {
-            let (Some(old), Some(new)) = (tokens.next(), tokens.next()) else { break };
+            let (Some(old), Some(new)) = (tokens.next(), tokens.next()) else {
+                break;
+            };
             (Some(old), new)
         } else {
             let Some(path) = tokens.next() else { break };
@@ -363,7 +465,15 @@ fn parse_name_status(bytes: &[u8]) -> Vec<DiffFile> {
         };
         let keep_unmerged = files.get(&path).is_some_and(|f| f.status == "U");
         if !keep_unmerged {
-            files.insert(path.clone(), DiffFile { path, old_path, status: letter.to_string(), group: None });
+            files.insert(
+                path.clone(),
+                DiffFile {
+                    path,
+                    old_path,
+                    status: letter.to_string(),
+                    group: None,
+                },
+            );
         }
     }
     files.into_values().collect()
@@ -372,7 +482,19 @@ fn changed_files(root: &Path, base: Option<&str>) -> Result<Vec<DiffFile>> {
     let mut files: BTreeMap<String, DiffFile> = BTreeMap::new();
     match base {
         Some(commit) => {
-            let out = git_ok(root, &["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "--find-renames", commit, "--"])?;
+            let out = git_ok(
+                root,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--name-status",
+                    "-z",
+                    "--find-renames",
+                    commit,
+                    "--",
+                ],
+            )?;
             for file in parse_name_status(&out) {
                 files.insert(file.path.clone(), file);
             }
@@ -381,15 +503,31 @@ fn changed_files(root: &Path, base: Option<&str>) -> Result<Vec<DiffFile>> {
             // No commit yet: everything tracked is new, as long as it still exists on disk.
             for path in split_nul(&git_ok(root, &["ls-files", "--cached", "-z"])?) {
                 if fs::symlink_metadata(root.join(&path)).is_ok() {
-                    files.insert(path.clone(), DiffFile { path, old_path: None, status: "A".into(), group: None });
+                    files.insert(
+                        path.clone(),
+                        DiffFile {
+                            path,
+                            old_path: None,
+                            status: "A".into(),
+                            group: None,
+                        },
+                    );
                 }
             }
         }
     }
-    for path in split_nul(&git_ok(root, &["ls-files", "--others", "--exclude-standard", "-z"])?) {
+    for path in split_nul(&git_ok(
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?) {
         // A trailing slash marks an untracked nested repository: not a file we can show.
         if !path.ends_with('/') {
-            files.entry(path.clone()).or_insert(DiffFile { path, old_path: None, status: "?".into(), group: None });
+            files.entry(path.clone()).or_insert(DiffFile {
+                path,
+                old_path: None,
+                status: "?".into(),
+                group: None,
+            });
         }
     }
     Ok(files.into_values().collect())
@@ -402,15 +540,24 @@ struct BaseBlob {
 }
 fn base_blob(root: &Path, commit: &str, path: &str) -> Result<Option<BaseBlob>> {
     let out = git_ok(root, &["ls-tree", "-z", commit, "--", path])?;
-    for entry in out.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+    let entries = out
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty());
+    for entry in entries {
         let entry = String::from_utf8_lossy(entry);
-        let Some((meta, name)) = entry.split_once('\t') else { continue };
+        let Some((meta, name)) = entry.split_once('\t') else {
+            continue;
+        };
         if name != path {
             continue;
         }
         let mut parts = meta.split(' ');
         if let (Some(mode), Some(kind), Some(oid)) = (parts.next(), parts.next(), parts.next()) {
-            return Ok(Some(BaseBlob { mode: mode.into(), kind: kind.into(), oid: oid.into() }));
+            return Ok(Some(BaseBlob {
+                mode: mode.into(),
+                kind: kind.into(),
+                oid: oid.into(),
+            }));
         }
     }
     Ok(None)
@@ -418,16 +565,25 @@ fn base_blob(root: &Path, commit: &str, path: &str) -> Result<Option<BaseBlob>> 
 /// The stage-0 index entry for `path`, in the same shape as a tree entry.
 fn index_blob(root: &Path, path: &str) -> Result<Option<BaseBlob>> {
     let out = git_ok(root, &["ls-files", "--stage", "-z", "--", path])?;
-    for entry in out.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+    let entries = out
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty());
+    for entry in entries {
         let entry = String::from_utf8_lossy(entry);
-        let Some((meta, name)) = entry.split_once('\t') else { continue };
+        let Some((meta, name)) = entry.split_once('\t') else {
+            continue;
+        };
         if name != path {
             continue;
         }
         let mut parts = meta.split(' ');
         if let (Some(mode), Some(oid), Some("0")) = (parts.next(), parts.next(), parts.next()) {
             let kind = if mode == "160000" { "commit" } else { "blob" };
-            return Ok(Some(BaseBlob { mode: mode.into(), kind: kind.into(), oid: oid.into() }));
+            return Ok(Some(BaseBlob {
+                mode: mode.into(),
+                kind: kind.into(),
+                oid: oid.into(),
+            }));
         }
     }
     Ok(None)
@@ -443,14 +599,18 @@ fn blob_side(root: &Path, blob: &BaseBlob) -> Result<(Option<String>, Option<&'s
     if blob.kind != "blob" {
         return Ok((None, Some("Not a regular file")));
     }
-    let size: u64 = text(git_ok(root, &["cat-file", "-s", &blob.oid])?).parse().map_err(|_| "Git returned an invalid object size".to_string())?;
+    let size: u64 = text(git_ok(root, &["cat-file", "-s", &blob.oid])?)
+        .parse()
+        .map_err(|_| "Git returned an invalid object size".to_string())?;
     if size > MAX_BYTES {
         return Ok((None, Some("Files larger than 2 MiB are shown read-only")));
     }
-    Ok(match decode(&git_ok(root, &["cat-file", "blob", &blob.oid])?, false) {
-        Ok(decoded) => (Some(decoded.text), None),
-        Err(why) => (None, Some(why)),
-    })
+    Ok(
+        match decode(&git_ok(root, &["cat-file", "blob", &blob.oid])?, false) {
+            Ok(decoded) => (Some(decoded.text), None),
+            Err(why) => (None, Some(why)),
+        },
+    )
 }
 /// `git status --porcelain=v2 -z` records mapped to Staged and Changes entries (each group sorted by path).
 fn parse_status_v2(bytes: &[u8]) -> Vec<DiffFile> {
@@ -472,35 +632,68 @@ fn parse_status_v2(bytes: &[u8]) -> Vec<DiffFile> {
     staged
 }
 /// Ordinary (`1`) and rename/copy (`2`) records: the first XY letter is the Staged entry, the second the Changes entry.
-fn push_tracked_status(record: &str, original: Option<String>, staged: &mut Vec<DiffFile>, changes: &mut Vec<DiffFile>) {
-    let fields: Vec<&str> = record.splitn(if record.starts_with('2') { 10 } else { 9 }, ' ').collect();
-    let xy: Vec<char> = fields.get(1).map(|f| f.chars().collect()).unwrap_or_default();
+fn push_tracked_status(
+    record: &str,
+    original: Option<String>,
+    staged: &mut Vec<DiffFile>,
+    changes: &mut Vec<DiffFile>,
+) {
+    let fields: Vec<&str> = record
+        .splitn(if record.starts_with('2') { 10 } else { 9 }, ' ')
+        .collect();
+    let xy: Vec<char> = fields
+        .get(1)
+        .map(|f| f.chars().collect())
+        .unwrap_or_default();
     if fields.len() < 9 || xy.len() != 2 {
         return;
     }
     let path = fields[fields.len() - 1].to_string();
     if xy[0] != '.' {
-        staged.push(DiffFile { path: path.clone(), old_path: original, status: xy[0].to_string(), group: Some(DiffGroup::Staged) });
+        staged.push(DiffFile {
+            path: path.clone(),
+            old_path: original,
+            status: xy[0].to_string(),
+            group: Some(DiffGroup::Staged),
+        });
     }
     if xy[1] != '.' {
-        changes.push(DiffFile { path, old_path: None, status: xy[1].to_string(), group: Some(DiffGroup::Changes) });
+        changes.push(DiffFile {
+            path,
+            old_path: None,
+            status: xy[1].to_string(),
+            group: Some(DiffGroup::Changes),
+        });
     }
 }
 fn push_unmerged_status(record: &str, changes: &mut Vec<DiffFile>) {
     let fields: Vec<&str> = record.splitn(11, ' ').collect();
     if fields.len() == 11 {
-        changes.push(DiffFile { path: fields[10].to_string(), old_path: None, status: "U".into(), group: Some(DiffGroup::Changes) });
+        changes.push(DiffFile {
+            path: fields[10].to_string(),
+            old_path: None,
+            status: "U".into(),
+            group: Some(DiffGroup::Changes),
+        });
     }
 }
 fn push_untracked_status(record: &str, changes: &mut Vec<DiffFile>) {
     let path = record[2..].to_string();
     // A trailing slash marks an untracked nested repository: not a file we can show.
     if !path.ends_with('/') {
-        changes.push(DiffFile { path, old_path: None, status: "?".into(), group: Some(DiffGroup::Changes) });
+        changes.push(DiffFile {
+            path,
+            old_path: None,
+            status: "?".into(),
+            group: Some(DiffGroup::Changes),
+        });
     }
 }
 fn status_files(root: &Path) -> Result<Vec<DiffFile>> {
-    Ok(parse_status_v2(&git_ok(root, &["status", "--porcelain=v2", "-z", "--untracked-files=all"])?))
+    Ok(parse_status_v2(&git_ok(
+        root,
+        &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+    )?))
 }
 
 // ------------------------------------------------------ paths & text
@@ -515,14 +708,23 @@ fn relative_parts(path: &str) -> Result<Vec<&str>> {
     let parts: Vec<&str> = path.split('/').collect();
     for part in &parts {
         let lower = part.to_ascii_lowercase();
-        let short_git = lower.strip_prefix("git~").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-        if part.is_empty() || *part == "." || *part == ".." || part.contains(':') || part.ends_with(['.', ' ']) || lower == ".git" || short_git {
+        let short_git = lower
+            .strip_prefix("git~")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if part.is_empty()
+            || *part == "."
+            || *part == ".."
+            || part.contains(':')
+            || part.ends_with(['.', ' '])
+            || lower == ".git"
+            || short_git
+        {
             return Err(unsafe_path());
         }
     }
     Ok(parts)
 }
-fn is_link(meta: &fs::Metadata) -> bool {
+fn is_link(meta: &Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -535,7 +737,7 @@ fn is_link(meta: &fs::Metadata) -> bool {
 }
 enum Working {
     Missing,
-    File(PathBuf, fs::Metadata),
+    File(PathBuf, Metadata),
     Blocked(&'static str),
 }
 /// Walks every existing component without following links, so a link or junction anywhere is refused.
@@ -545,14 +747,22 @@ fn inspect_working(root: &Path, path: &str) -> Result<Working> {
     for (index, part) in parts.iter().enumerate() {
         current.push(part);
         match fs::symlink_metadata(&current) {
-            Ok(meta) if is_link(&meta) => return Ok(Working::Blocked("Symbolic links and junctions are shown read-only")),
+            Ok(meta) if is_link(&meta) => {
+                return Ok(Working::Blocked(
+                    "Symbolic links and junctions are shown read-only",
+                ))
+            }
             Ok(meta) if index + 1 < parts.len() => {
                 if !meta.is_dir() {
                     return Ok(Working::Missing);
                 }
             }
             Ok(meta) => {
-                return Ok(if meta.is_file() { Working::File(current, meta) } else { Working::Blocked("Not a regular file") });
+                return Ok(if meta.is_file() {
+                    Working::File(current, meta)
+                } else {
+                    Working::Blocked("Not a regular file")
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Working::Missing),
             Err(e) => return Err(format!("{path}: {e}")),
@@ -576,7 +786,8 @@ fn decode(bytes: &[u8], strict_eol: bool) -> std::result::Result<Decoded, &'stat
     if body.contains(&0) {
         return Err("Binary files are shown read-only");
     }
-    let text = std::str::from_utf8(body).map_err(|_| "Files that are not valid UTF-8 are shown read-only")?;
+    let text = std::str::from_utf8(body)
+        .map_err(|_| "Files that are not valid UTF-8 are shown read-only")?;
     let (mut crlf, mut lf, mut lone_cr) = (0usize, 0usize, 0usize);
     let raw = body;
     for (i, byte) in raw.iter().enumerate() {
@@ -593,8 +804,16 @@ fn decode(bytes: &[u8], strict_eol: bool) -> std::result::Result<Decoded, &'stat
     if strict_eol && crlf > 0 && lf > 0 {
         return Err("Files with mixed line endings are shown read-only");
     }
-    let text = if crlf > 0 { text.replace("\r\n", "\n") } else { text.to_string() };
-    Ok(Decoded { text, crlf: crlf > 0 && lf == 0, bom })
+    let text = if crlf > 0 {
+        text.replace("\r\n", "\n")
+    } else {
+        text.to_string()
+    };
+    Ok(Decoded {
+        text,
+        crlf: crlf > 0 && lf == 0,
+        bom,
+    })
 }
 fn read_limited(path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -613,7 +832,11 @@ impl Default for DiffService {
 }
 
 pub(crate) fn current_branch(root: &Path) -> Result<Option<String>> {
-    Ok(git_optional(root, &["symbolic-ref", "--short", "-q", "HEAD"])?.map(text).filter(|b| !b.is_empty()))
+    Ok(
+        git_optional(root, &["symbolic-ref", "--short", "-q", "HEAD"])?
+            .map(text)
+            .filter(|b| !b.is_empty()),
+    )
 }
 
 /// What a helper agent is told about the comparison the Code diff page shows.
@@ -632,28 +855,69 @@ pub fn comparison(project: &Path, mode: DiffMode) -> Result<Comparison> {
     let head = resolve_commit(&root, "HEAD")?;
     let (base_commit, label) = match mode {
         DiffMode::Head => (head, "Since the last commit (HEAD)".to_string()),
-        DiffMode::Uncommitted => (head, "Uncommitted changes (staged and unstaged, against HEAD)".to_string()),
+        DiffMode::Uncommitted => (
+            head,
+            "Uncommitted changes (staged and unstaged, against HEAD)".to_string(),
+        ),
         DiffMode::Branch => {
-            let (name, commit) = default_branch(&root)?.ok_or("No master or default branch was found in this repository")?;
+            let (name, commit) = default_branch(&root)?
+                .ok_or("No master or default branch was found in this repository")?;
             (Some(commit), format!("Compared with {name}"))
         }
-        DiffMode::Commits => return Err("Use the commit comparison command for historical diffs".into()),
+        DiffMode::Commits => {
+            return Err("Use the commit comparison command for historical diffs".into())
+        }
     };
     let patch = match &base_commit {
-        Some(base) => git_timed(&root, &["diff", "--no-ext-diff", "--no-textconv", base, "--"], None, 60)?,
-        None => git_timed(&root, &["diff", "--no-ext-diff", "--no-textconv", "--cached", "--"], None, 60)?,
+        Some(base) => git_timed(
+            &root,
+            &["diff", "--no-ext-diff", "--no-textconv", base, "--"],
+            None,
+            60,
+        )?,
+        None => git_timed(
+            &root,
+            &["diff", "--no-ext-diff", "--no-textconv", "--cached", "--"],
+            None,
+            60,
+        )?,
     };
-    let untracked = git_timed(&root, &["ls-files", "--others", "--exclude-standard", "-z"], None, 30)?;
+    let untracked = git_timed(
+        &root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        None,
+        30,
+    )?;
     // Untracked files are not in the patch: their names, sizes and modification times stand in for their content.
     let mut seen = String::new();
-    for name in untracked.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+    let untracked_names = untracked
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty());
+    for name in untracked_names {
         let name = String::from_utf8_lossy(name);
-        let (len, modified) = fs::metadata(root.join(&*name)).map_or((0, 0), |m| (m.len(), m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis())));
+        let (len, modified) = fs::metadata(root.join(&*name)).map_or((0, 0), |m| {
+            (
+                m.len(),
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_millis()),
+            )
+        });
         seen.push_str(&format!("{name}:{len}:{modified}\n"));
     }
-    let fingerprint = crate::terminal::digest(&format!("{mode:?}|{}|{}|{seen}", base_commit.as_deref().unwrap_or("-"), String::from_utf8_lossy(&patch)));
+    let fingerprint = crate::terminal::digest(&format!(
+        "{mode:?}|{}|{}|{seen}",
+        base_commit.as_deref().unwrap_or("-"),
+        String::from_utf8_lossy(&patch)
+    ));
     let branch = current_branch(&root)?;
-    Ok(Comparison { base_commit, label, branch, fingerprint })
+    Ok(Comparison {
+        base_commit,
+        label,
+        branch,
+        fingerprint,
+    })
 }
 
 impl DiffService {
@@ -661,41 +925,73 @@ impl DiffService {
         Self::default()
     }
     /// `gh` is a parameter so tests can substitute a fake program.
-    pub fn with_gh(gh: std::ffi::OsString) -> Self {
-        Self { snapshots: Mutex::new(HashMap::new()), prs: Mutex::new(HashMap::new()), gh }
+    pub fn with_gh(gh: OsString) -> Self {
+        Self {
+            snapshots: Mutex::new(HashMap::new()),
+            prs: Mutex::new(HashMap::new()),
+            gh,
+        }
     }
     pub fn overview(&self, id: &str, project: &Path, mode: DiffMode) -> Result<DiffOverview> {
         let root = repository_root(project)?;
         let head = resolve_commit(&root, "HEAD")?;
         let branch = default_branch(&root)?;
-        let head_label = head.as_ref().map_or("No commits yet".to_string(), |c| format!("Last commit {}", &c[..c.len().min(7)]));
+        let head_label = head.as_ref().map_or("No commits yet".to_string(), |c| {
+            format!("Last commit {}", &c[..c.len().min(7)])
+        });
         let head_ref = head.as_ref().map(|_| "HEAD".to_string());
         // (base ref, base commit, label shown for the whole comparison, label of the original side)
         let (base_ref, base_commit, base_label, side_label) = match mode {
             DiffMode::Head => (head_ref, head.clone(), head_label.clone(), head_label),
-            DiffMode::Uncommitted => (head_ref, head.clone(), "Uncommitted changes".to_string(), head_label),
-            DiffMode::Commits => return Err("Use the commit comparison command for historical diffs".into()),
+            DiffMode::Uncommitted => (
+                head_ref,
+                head.clone(),
+                "Uncommitted changes".to_string(),
+                head_label,
+            ),
+            DiffMode::Commits => {
+                return Err("Use the commit comparison command for historical diffs".into())
+            }
             DiffMode::Branch => {
-                let (name, commit) = branch.clone().ok_or("No master or default branch was found in this repository")?;
+                let (name, commit) = branch
+                    .clone()
+                    .ok_or("No master or default branch was found in this repository")?;
                 let label = format!("Compared with {name}");
                 (Some(name), Some(commit), label.clone(), label)
             }
         };
-        let files = if mode == DiffMode::Uncommitted { status_files(&root)? } else { changed_files(&root, base_commit.as_deref())? };
-        let current_branch = git_optional(&root, &["symbolic-ref", "--short", "-q", "HEAD"])?.map(text).filter(|b| !b.is_empty());
+        let files = if mode == DiffMode::Uncommitted {
+            status_files(&root)?
+        } else {
+            changed_files(&root, base_commit.as_deref())?
+        };
+        let current_branch = git_optional(&root, &["symbolic-ref", "--short", "-q", "HEAD"])?
+            .map(text)
+            .filter(|b| !b.is_empty());
         let upstream = match &current_branch {
-            Some(name) => Some(text(git_ok(&root, &["for-each-ref", "--format=%(upstream:short)", &format!("refs/heads/{name}")])?)).filter(|u| !u.is_empty()),
+            Some(name) => Some(text(git_ok(
+                &root,
+                &[
+                    "for-each-ref",
+                    "--format=%(upstream:short)",
+                    &format!("refs/heads/{name}"),
+                ],
+            )?))
+            .filter(|u| !u.is_empty()),
             None => None,
         };
         let snapshot = Arc::new(Snapshot {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: Uuid::new_v4().to_string(),
             root: root.clone(),
             mode,
             base_commit: base_commit.clone(),
             base_label: side_label,
             target_commit: None,
             target_label: "Working tree".into(),
-            files: files.iter().map(|f| (file_key(f.group, &f.path), f.clone())).collect(),
+            files: files
+                .iter()
+                .map(|f| (file_key(f.group, &f.path), f.clone()))
+                .collect(),
         });
         let overview = DiffOverview {
             snapshot_id: snapshot.id.clone(),
@@ -712,7 +1008,13 @@ impl DiffService {
         self.snapshots.lock().insert(id.into(), snapshot);
         Ok(overview)
     }
-    pub fn commit_overview(&self, id: &str, project: &Path, base: Option<&str>, target: &str) -> Result<DiffOverview> {
+    pub fn commit_overview(
+        &self,
+        id: &str,
+        project: &Path,
+        base: Option<&str>,
+        target: &str,
+    ) -> Result<DiffOverview> {
         let root = repository_root(project)?;
         valid_commit(&root, target)?;
         let base = if let Some(base) = base {
@@ -723,48 +1025,108 @@ impl DiffService {
         };
         let left = match &base {
             Some(hash) => hash.clone(),
-            None => text(git_timed(&root, &["hash-object", "-t", "tree", "--stdin"], Some(b""), 10)?),
+            None => text(git_timed(
+                &root,
+                &["hash-object", "-t", "tree", "--stdin"],
+                Some(b""),
+                10,
+            )?),
         };
-        let files = parse_name_status(&git_ok(&root, &["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "--find-renames", &left, target, "--"])?);
+        let files = parse_name_status(&git_ok(
+            &root,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--name-status",
+                "-z",
+                "--find-renames",
+                &left,
+                target,
+                "--",
+            ],
+        )?);
         let base_label = match &base {
             Some(hash) => text(git_ok(&root, &["log", "-1", "--format=%h %s", hash])?),
             None => "Empty tree".into(),
         };
         let target_label = text(git_ok(&root, &["log", "-1", "--format=%h %s", target])?);
         let snapshot = Arc::new(Snapshot {
-            id: uuid::Uuid::new_v4().to_string(), root: root.clone(), mode: DiffMode::Commits,
-            base_commit: base.clone(), base_label: base_label.clone(),
-            target_commit: Some(target.into()), target_label,
-            files: files.iter().map(|f| (file_key(None, &f.path), f.clone())).collect(),
+            id: Uuid::new_v4().to_string(),
+            root: root.clone(),
+            mode: DiffMode::Commits,
+            base_commit: base.clone(),
+            base_label: base_label.clone(),
+            target_commit: Some(target.into()),
+            target_label,
+            files: files
+                .iter()
+                .map(|f| (file_key(None, &f.path), f.clone()))
+                .collect(),
         });
-        let current_branch = git_optional(&root, &["symbolic-ref", "--short", "-q", "HEAD"])?.map(text);
+        let current_branch =
+            git_optional(&root, &["symbolic-ref", "--short", "-q", "HEAD"])?.map(text);
         let upstream = match &current_branch {
-            Some(name) => Some(text(git_ok(&root, &["for-each-ref", "--format=%(upstream:short)", &format!("refs/heads/{name}")])?)).filter(|u| !u.is_empty()),
+            Some(name) => Some(text(git_ok(
+                &root,
+                &[
+                    "for-each-ref",
+                    "--format=%(upstream:short)",
+                    &format!("refs/heads/{name}"),
+                ],
+            )?))
+            .filter(|u| !u.is_empty()),
             None => None,
         };
         let overview = DiffOverview {
-            snapshot_id: snapshot.id.clone(), root: root.display().to_string(), mode: DiffMode::Commits,
-            base_ref: base.clone(), base_commit: base, base_label, branch_ref: None, current_branch, upstream, files,
+            snapshot_id: snapshot.id.clone(),
+            root: root.display().to_string(),
+            mode: DiffMode::Commits,
+            base_ref: base.clone(),
+            base_commit: base,
+            base_label,
+            branch_ref: None,
+            current_branch,
+            upstream,
+            files,
         };
         self.snapshots.lock().insert(id.into(), snapshot);
         Ok(overview)
     }
     fn snapshot(&self, id: &str, project: &Path, snapshot_id: &str) -> Result<Arc<Snapshot>> {
-        let snapshot = self.snapshots.lock().get(id).cloned().filter(|s| s.id == snapshot_id).ok_or(CHANGED)?;
+        let snapshot = self
+            .snapshots
+            .lock()
+            .get(id)
+            .cloned()
+            .filter(|s| s.id == snapshot_id)
+            .ok_or(CHANGED)?;
         if repository_root(project).map_err(|_| CHANGED.to_string())? != snapshot.root {
             return Err(CHANGED.into());
         }
         Ok(snapshot)
     }
     /// A snapshot usable for Git actions: only the Uncommitted view mutates anything.
-    fn action_snapshot(&self, id: &str, project: &Path, snapshot_id: &str) -> Result<Arc<Snapshot>> {
+    fn action_snapshot(
+        &self,
+        id: &str,
+        project: &Path,
+        snapshot_id: &str,
+    ) -> Result<Arc<Snapshot>> {
         let snapshot = self.snapshot(id, project, snapshot_id)?;
         if snapshot.mode != DiffMode::Uncommitted {
             return Err("Git actions are only available in Uncommitted changes".into());
         }
         Ok(snapshot)
     }
-    pub fn read_file(&self, id: &str, project: &Path, snapshot_id: &str, path: &str, group: Option<DiffGroup>) -> Result<DiffContent> {
+    pub fn read_file(
+        &self,
+        id: &str,
+        project: &Path,
+        snapshot_id: &str,
+        path: &str,
+        group: Option<DiffGroup>,
+    ) -> Result<DiffContent> {
         let snapshot = self.snapshot(id, project, snapshot_id)?;
         let file = entry(&snapshot, group, path)?;
         Ok(load(&snapshot, file)?.content)
@@ -809,7 +1171,15 @@ impl DiffService {
         write_guarded(&snapshot.root, path, &bytes, expected_hash)?;
         Ok(load(&snapshot, file)?.content)
     }
-    pub fn change_file(&self, id: &str, project: &Path, snapshot_id: &str, path: &str, group: Option<DiffGroup>, action: FileAction) -> Result<()> {
+    pub fn change_file(
+        &self,
+        id: &str,
+        project: &Path,
+        snapshot_id: &str,
+        path: &str,
+        group: Option<DiffGroup>,
+        action: FileAction,
+    ) -> Result<()> {
         let snapshot = self.action_snapshot(id, project, snapshot_id)?;
         let file = entry(&snapshot, group, path)?;
         let _serial = WRITE_LOCK.lock();
@@ -818,7 +1188,13 @@ impl DiffService {
         self.snapshots.lock().remove(id);
         result
     }
-    pub fn commit(&self, id: &str, project: &Path, snapshot_id: &str, message: &str) -> Result<CommitResult> {
+    pub fn commit(
+        &self,
+        id: &str,
+        project: &Path,
+        snapshot_id: &str,
+        message: &str,
+    ) -> Result<CommitResult> {
         let snapshot = self.action_snapshot(id, project, snapshot_id)?;
         let message = message.trim();
         if message.is_empty() {
@@ -836,14 +1212,28 @@ impl DiffService {
                 Some(1) => {}
                 _ => return Err(failure_text(&staged)),
             }
-            git_timed(root, &["commit", "--quiet", "-F", "-"], Some(format!("{message}\n").as_bytes()), 300)?;
+            git_timed(
+                root,
+                &["commit", "--quiet", "-F", "-"],
+                Some(format!("{message}\n").as_bytes()),
+                300,
+            )?;
             let commit = text(git_ok(root, &["rev-parse", "--short", "HEAD"])?);
-            Ok(CommitResult { commit, summary: message.lines().next().unwrap_or_default().to_string() })
+            Ok(CommitResult {
+                commit,
+                summary: message.lines().next().unwrap_or_default().to_string(),
+            })
         })();
         self.snapshots.lock().remove(id);
         result
     }
-    pub fn publish(&self, id: &str, project: &Path, snapshot_id: &str, options: &PublishOptions) -> Result<PublishResult> {
+    pub fn publish(
+        &self,
+        id: &str,
+        project: &Path,
+        snapshot_id: &str,
+        options: &PublishOptions,
+    ) -> Result<PublishResult> {
         let snapshot = self.action_snapshot(id, project, snapshot_id)?;
         let _serial = WRITE_LOCK.lock();
         let result = self.publish_steps(id, &snapshot.root, options);
@@ -851,11 +1241,24 @@ impl DiffService {
         self.snapshots.lock().remove(id);
         result
     }
-    fn publish_steps(&self, id: &str, root: &Path, options: &PublishOptions) -> Result<PublishResult> {
+    fn publish_steps(
+        &self,
+        id: &str,
+        root: &Path,
+        options: &PublishOptions,
+    ) -> Result<PublishResult> {
         let mut steps: Vec<String> = Vec::new();
         // Completed steps stay visible when a later one fails, so the user knows what already happened.
-        let fail = |steps: &[String], message: String| if steps.is_empty() { message } else { format!("{}. Then: {message}", steps.join("; ")) };
-        let current = git_optional(root, &["symbolic-ref", "--short", "-q", "HEAD"])?.map(text).filter(|b| !b.is_empty());
+        let fail = |steps: &[String], message: String| {
+            if steps.is_empty() {
+                message
+            } else {
+                format!("{}. Then: {message}", steps.join("; "))
+            }
+        };
+        let current = git_optional(root, &["symbolic-ref", "--short", "-q", "HEAD"])?
+            .map(text)
+            .filter(|b| !b.is_empty());
         let (branch, is_new) = match options.new_branch.as_deref().map(str::trim) {
             Some("") => return Err("Enter a name for the new branch".into()),
             Some(name) => {
@@ -864,11 +1267,25 @@ impl DiffService {
                 steps.push(format!("Created branch {name}"));
                 (name.to_string(), true)
             }
-            None => (current.ok_or("HEAD is detached; enter a new branch name to publish")?, false),
+            None => (
+                current.ok_or("HEAD is detached; enter a new branch name to publish")?,
+                false,
+            ),
         };
         let remote = publish_remote(root, &branch, is_new).map_err(|e| fail(&steps, e))?;
         let has_upstream = !is_new
-            && !text(git_ok(root, &["for-each-ref", "--format=%(upstream:short)", &format!("refs/heads/{branch}")]).map_err(|e| fail(&steps, e))?).is_empty();
+            && !text(
+                git_ok(
+                    root,
+                    &[
+                        "for-each-ref",
+                        "--format=%(upstream:short)",
+                        &format!("refs/heads/{branch}"),
+                    ],
+                )
+                .map_err(|e| fail(&steps, e))?,
+            )
+            .is_empty();
         let push: Vec<&str> = if has_upstream {
             vec!["-c", "push.default=upstream", "push"]
         } else {
@@ -883,38 +1300,71 @@ impl DiffService {
             steps.push(format!("Created pull request {url}"));
             pr_url = Some(url);
         }
-        Ok(PublishResult { branch, remote, pr_url, steps })
+        Ok(PublishResult {
+            branch,
+            remote,
+            pr_url,
+            steps,
+        })
     }
     pub fn open_pull_request(&self, id: &str) -> Result<()> {
-        let url = self.prs.lock().get(id).cloned().ok_or("No pull request was created in this session")?;
+        let url = self
+            .prs
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or("No pull request was created in this session")?;
         open_url(&url, false)
     }
 }
 
 fn entry<'a>(snapshot: &'a Snapshot, group: Option<DiffGroup>, path: &str) -> Result<&'a DiffFile> {
-    snapshot.files.get(&file_key(group, path)).ok_or_else(|| "That file is not part of this comparison".to_string())
+    snapshot
+        .files
+        .get(&file_key(group, path))
+        .ok_or_else(|| "That file is not part of this comparison".to_string())
 }
 pub(crate) fn validate_new_branch(root: &Path, name: &str) -> Result<()> {
     let valid = !name.starts_with('-')
         && !name.chars().any(char::is_whitespace)
-        && git(root, &["check-ref-format", "--branch", name])?.status.success();
+        && git(root, &["check-ref-format", "--branch", name])?
+            .status
+            .success();
     if !valid {
         return Err(format!("Invalid branch name {name}"));
     }
-    if git_optional(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}")])?.is_some() {
+    if git_optional(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{name}"),
+        ],
+    )?
+    .is_some()
+    {
         return Err(format!("Branch {name} already exists"));
     }
     Ok(())
 }
 fn publish_remote(root: &Path, branch: &str, is_new: bool) -> Result<String> {
     if !is_new {
-        let configured = git_optional(root, &["config", "--get", &format!("branch.{branch}.remote")])?.map(text);
+        let configured = git_optional(
+            root,
+            &["config", "--get", &format!("branch.{branch}.remote")],
+        )?
+        .map(text);
         if let Some(remote) = configured.filter(|r| !r.is_empty() && r != ".") {
             return Ok(remote);
         }
     }
     let listed = text(git_ok(root, &["remote"])?);
-    let remotes: Vec<&str> = listed.lines().map(str::trim).filter(|r| !r.is_empty()).collect();
+    let remotes: Vec<&str> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .collect();
     match remotes.as_slice() {
         [] => Err("No Git remote is configured".into()),
         list if list.contains(&"origin") => Ok("origin".into()),
@@ -955,7 +1405,11 @@ fn apply_file_action(snapshot: &Snapshot, file: &DiffFile, action: FileAction) -
             git_timed(root, &["add", "--", &file.path], None, 60)?;
         }
         (FileAction::Unstage, Some(DiffGroup::Staged)) => {
-            let mut args: Vec<&str> = if snapshot.base_commit.is_some() { vec!["restore", "--staged", "--"] } else { vec!["rm", "--cached", "-f", "-q", "--"] };
+            let mut args: Vec<&str> = if snapshot.base_commit.is_some() {
+                vec!["restore", "--staged", "--"]
+            } else {
+                vec!["rm", "--cached", "-f", "-q", "--"]
+            };
             args.push(&file.path);
             if let Some(old) = &file.old_path {
                 args.push(old);
@@ -967,7 +1421,8 @@ fn apply_file_action(snapshot: &Snapshot, file: &DiffFile, action: FileAction) -
                 git_timed(root, &["restore", "--worktree", "--", &file.path], None, 60)?;
             }
             "?" => match inspect_working(root, &file.path)? {
-                Working::File(path, _) => fs::remove_file(&path).map_err(|e| format!("Could not delete {}: {e}", file.path))?,
+                Working::File(path, _) => fs::remove_file(&path)
+                    .map_err(|e| format!("Could not delete {}: {e}", file.path))?,
                 Working::Missing => {}
                 Working::Blocked(why) => return Err(why.into()),
             },
@@ -1016,7 +1471,12 @@ fn original_from_commit(snapshot: &Snapshot, file: &DiffFile, in_changes: bool) 
         (false, _) => snapshot.base_commit.is_some(),
     }
 }
-fn original_side(snapshot: &Snapshot, file: &DiffFile, in_changes: bool, reason: &mut Option<String>) -> Result<Option<String>> {
+fn original_side(
+    snapshot: &Snapshot,
+    file: &DiffFile,
+    in_changes: bool,
+    reason: &mut Option<String>,
+) -> Result<Option<String>> {
     let root = &snapshot.root;
     if original_from_commit(snapshot, file, in_changes) {
         let commit = snapshot.base_commit.as_deref().unwrap_or_default();
@@ -1024,7 +1484,9 @@ fn original_side(snapshot: &Snapshot, file: &DiffFile, in_changes: bool, reason:
         relative_parts(base_path)?;
         return match base_blob(root, commit, base_path)? {
             None if in_changes => Ok(Some(String::new())),
-            None => Err(format!("{base_path} is not in the baseline; refresh Code diff")),
+            None => Err(format!(
+                "{base_path} is not in the baseline; refresh Code diff"
+            )),
             Some(blob) => side_text(root, &blob, reason),
         };
     }
@@ -1043,32 +1505,52 @@ struct Modified {
     bom: bool,
 }
 impl Modified {
-    fn of(text: Option<String>) -> Self {
-        Self { text, working_hash: None, crlf: false, bom: false }
+    fn new(text: Option<String>) -> Self {
+        Self {
+            text,
+            working_hash: None,
+            crlf: false,
+            bom: false,
+        }
     }
 }
-fn commit_modified(snapshot: &Snapshot, file: &DiffFile, reason: &mut Option<String>) -> Result<Option<String>> {
+fn commit_modified(
+    snapshot: &Snapshot,
+    file: &DiffFile,
+    reason: &mut Option<String>,
+) -> Result<Option<String>> {
     if file.status == "D" {
         return Ok(Some(String::new()));
     }
-    let target = snapshot.target_commit.as_deref().ok_or("Missing target commit")?;
-    let blob = base_blob(&snapshot.root, target, &file.path)?.ok_or_else(|| format!("{} is not in the commit; refresh", file.path))?;
+    let target = snapshot
+        .target_commit
+        .as_deref()
+        .ok_or("Missing target commit")?;
+    let blob = base_blob(&snapshot.root, target, &file.path)?
+        .ok_or_else(|| format!("{} is not in the commit; refresh", file.path))?;
     side_text(&snapshot.root, &blob, reason)
 }
-fn staged_modified(root: &Path, file: &DiffFile, reason: &mut Option<String>) -> Result<Option<String>> {
+fn staged_modified(
+    root: &Path,
+    file: &DiffFile,
+    reason: &mut Option<String>,
+) -> Result<Option<String>> {
     if file.status == "D" {
         return Ok(Some(String::new()));
     }
     match index_blob(root, &file.path)? {
-        None => Err(format!("{} is not in the index; refresh Code diff", file.path)),
+        None => Err(format!(
+            "{} is not in the index; refresh Code diff",
+            file.path
+        )),
         Some(blob) => side_text(root, &blob, reason),
     }
 }
 fn oversized_working(reason: &mut Option<String>) -> Modified {
     note_reason(reason, "Files larger than 2 MiB are shown read-only");
-    Modified::of(None)
+    Modified::new(None)
 }
-fn working_file(path: &Path, meta: &fs::Metadata, reason: &mut Option<String>) -> Result<Modified> {
+fn working_file(path: &Path, meta: &Metadata, reason: &mut Option<String>) -> Result<Modified> {
     if meta.len() > MAX_BYTES {
         return Ok(oversized_working(reason));
     }
@@ -1078,29 +1560,42 @@ fn working_file(path: &Path, meta: &fs::Metadata, reason: &mut Option<String>) -
     }
     let working_hash = Some(hash(&bytes));
     Ok(match decode(&bytes, true) {
-        Ok(decoded) => Modified { text: Some(decoded.text), working_hash, crlf: decoded.crlf, bom: decoded.bom },
+        Ok(decoded) => Modified {
+            text: Some(decoded.text),
+            working_hash,
+            crlf: decoded.crlf,
+            bom: decoded.bom,
+        },
         Err(why) => {
             note_reason(reason, why);
-            Modified { working_hash, ..Modified::of(None) }
+            Modified {
+                working_hash,
+                ..Modified::new(None)
+            }
         }
     })
 }
 fn working_modified(root: &Path, path: &str, reason: &mut Option<String>) -> Result<Modified> {
     match inspect_working(root, path)? {
-        Working::Missing => Ok(Modified::of(Some(String::new()))),
+        Working::Missing => Ok(Modified::new(Some(String::new()))),
         Working::Blocked(why) => {
             note_reason(reason, why);
-            Ok(Modified::of(None))
+            Ok(Modified::new(None))
         }
         Working::File(file, meta) => working_file(&file, &meta, reason),
     }
 }
-fn modified_side(snapshot: &Snapshot, file: &DiffFile, staged: bool, reason: &mut Option<String>) -> Result<Modified> {
+fn modified_side(
+    snapshot: &Snapshot,
+    file: &DiffFile,
+    staged: bool,
+    reason: &mut Option<String>,
+) -> Result<Modified> {
     if snapshot.mode == DiffMode::Commits {
-        return commit_modified(snapshot, file, reason).map(Modified::of);
+        return commit_modified(snapshot, file, reason).map(Modified::new);
     }
     if staged {
-        return staged_modified(&snapshot.root, file, reason).map(Modified::of);
+        return staged_modified(&snapshot.root, file, reason).map(Modified::new);
     }
     working_modified(&snapshot.root, &file.path, reason)
 }
@@ -1112,7 +1607,8 @@ fn load(snapshot: &Snapshot, file: &DiffFile) -> Result<Loaded> {
     }
     let commits = snapshot.mode == DiffMode::Commits;
     let staged = snapshot.mode == DiffMode::Uncommitted && file.group == Some(DiffGroup::Staged);
-    let in_changes = snapshot.mode == DiffMode::Uncommitted && file.group == Some(DiffGroup::Changes);
+    let in_changes =
+        snapshot.mode == DiffMode::Uncommitted && file.group == Some(DiffGroup::Changes);
     let (original_label, modified_label) = side_labels(snapshot, in_changes, staged);
     let original = original_side(snapshot, file, in_changes, &mut reason)?;
     let modified = modified_side(snapshot, file, staged, &mut reason)?;
@@ -1146,12 +1642,15 @@ fn write_guarded(root: &Path, path: &str, bytes: &[u8], expected: Option<&str>) 
     let permissions = match inspect_working(root, path)? {
         Working::File(_, meta) => {
             if meta.permissions().readonly() {
-                return Err("The file is read-only on disk; clear its read-only attribute first".into());
+                return Err(
+                    "The file is read-only on disk; clear its read-only attribute first".into(),
+                );
             }
             Some(meta.permissions())
         }
         Working::Missing => {
-            fs::create_dir_all(parent).map_err(|e| format!("Could not create {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Could not create {}: {e}", parent.display()))?;
             // Directories created above (or raced in) must still be plain directories inside the repository.
             if !matches!(inspect_working(root, path)?, Working::Missing) {
                 return Err(CONFLICT.into());
@@ -1160,11 +1659,21 @@ fn write_guarded(root: &Path, path: &str, bytes: &[u8], expected: Option<&str>) 
         }
         Working::Blocked(why) => return Err(why.into()),
     };
-    let name = target.file_name().ok_or_else(unsafe_path)?.to_string_lossy().into_owned();
+    let name = target
+        .file_name()
+        .ok_or_else(unsafe_path)?
+        .to_string_lossy()
+        .into_owned();
     let temp = parent.join(format!(".{name}.omp-diff-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp).map_err(|e| format!("Could not write {}: {e}", temp.display()))?;
-        file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|e| format!("Could not write {}: {e}", temp.display()))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|e| format!("Could not write {}: {e}", temp.display()))?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| format!("Could not write {}: {e}", temp.display()))?;
         drop(file);
         if let Some(permissions) = permissions {
             fs::set_permissions(&temp, permissions).map_err(|e| e.to_string())?;
@@ -1207,11 +1716,24 @@ mod tests {
             let out = Command::new("git")
                 .arg("-C")
                 .arg(&self.0)
-                .args(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.autocrlf=false",
+                ])
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             String::from_utf8_lossy(&out.stdout).into_owned()
         }
         fn write(&self, path: &str, bytes: &[u8]) {
@@ -1233,7 +1755,11 @@ mod tests {
         }
     }
     fn statuses(overview: &DiffOverview) -> Vec<(String, String)> {
-        overview.files.iter().map(|f| (f.path.clone(), f.status.clone())).collect()
+        overview
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.status.clone()))
+            .collect()
     }
     fn paths(overview: &DiffOverview) -> Vec<&str> {
         overview.files.iter().map(|f| f.path.as_str()).collect()
@@ -1245,7 +1771,10 @@ mod tests {
         repo.write("kept.txt", b"one\n");
         repo.write("changed.txt", b"a\n");
         repo.write("gone.txt", b"bye\n");
-        repo.write("moved name.txt", b"same content here\nline two\nline three\n");
+        repo.write(
+            "moved name.txt",
+            b"same content here\nline two\nline three\n",
+        );
         repo.commit("base");
         repo.write("changed.txt", b"a\nb\n");
         repo.git(&["add", "changed.txt"]);
@@ -1263,18 +1792,53 @@ mod tests {
         assert_eq!(overview.branch_ref.as_deref(), Some("master"));
         assert_eq!(
             statuses(&overview),
-            [("changed.txt", "M"), ("gone.txt", "D"), ("kept.txt", "M"), ("moved é.txt", "R"), ("sub dir/new ünï.txt", "?")]
-                .map(|(p, s)| (p.to_string(), s.to_string()))
+            [
+                ("changed.txt", "M"),
+                ("gone.txt", "D"),
+                ("kept.txt", "M"),
+                ("moved é.txt", "R"),
+                ("sub dir/new ünï.txt", "?")
+            ]
+            .map(|(p, s)| (p.to_string(), s.to_string()))
         );
         let renamed = overview.files.iter().find(|f| f.status == "R").unwrap();
         assert_eq!(renamed.old_path.as_deref(), Some("moved name.txt"));
-        let content = service.read_file("a", &repo.0, &overview.snapshot_id, "moved é.txt", None).unwrap();
-        assert_eq!(content.original, content.modified, "renames compare the old baseline path with the new file");
-        let deleted = service.read_file("a", &repo.0, &overview.snapshot_id, "gone.txt", None).unwrap();
-        assert_eq!((deleted.original.as_deref(), deleted.modified.as_deref(), deleted.working_hash), (Some("bye\n"), Some(""), None));
-        let added = service.read_file("a", &repo.0, &overview.snapshot_id, "sub dir/new ünï.txt", None).unwrap();
-        assert_eq!((added.original.as_deref(), added.modified.as_deref()), (Some(""), Some("fresh\n")));
-        assert_eq!(repo.git(&["ls-files", "--stage"]), index_before, "inspecting a diff must not touch the index");
+        let content = service
+            .read_file("a", &repo.0, &overview.snapshot_id, "moved é.txt", None)
+            .unwrap();
+        assert_eq!(
+            content.original, content.modified,
+            "renames compare the old baseline path with the new file"
+        );
+        let deleted = service
+            .read_file("a", &repo.0, &overview.snapshot_id, "gone.txt", None)
+            .unwrap();
+        assert_eq!(
+            (
+                deleted.original.as_deref(),
+                deleted.modified.as_deref(),
+                deleted.working_hash
+            ),
+            (Some("bye\n"), Some(""), None)
+        );
+        let added = service
+            .read_file(
+                "a",
+                &repo.0,
+                &overview.snapshot_id,
+                "sub dir/new ünï.txt",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            (added.original.as_deref(), added.modified.as_deref()),
+            (Some(""), Some("fresh\n"))
+        );
+        assert_eq!(
+            repo.git(&["ls-files", "--stage"]),
+            index_before,
+            "inspecting a diff must not touch the index"
+        );
     }
 
     #[test]
@@ -1294,11 +1858,25 @@ mod tests {
         let branch = service.overview("a", &repo.0, DiffMode::Branch).unwrap();
         assert_eq!(branch.base_ref.as_deref(), Some("master"));
         assert_eq!(branch.base_label, "Compared with master");
-        assert_eq!(paths(&branch), ["feature.txt", "shared.txt"], "committed branch changes appear with working edits");
-        let shared = service.read_file("a", &repo.0, &branch.snapshot_id, "shared.txt", None).unwrap();
+        assert_eq!(
+            paths(&branch),
+            ["feature.txt", "shared.txt"],
+            "committed branch changes appear with working edits"
+        );
+        let shared = service
+            .read_file("a", &repo.0, &branch.snapshot_id, "shared.txt", None)
+            .unwrap();
         assert_eq!(shared.original.as_deref(), Some("base\n"));
-        assert_eq!(shared.modified.as_deref(), Some("base\nfeature commit\nworking edit\n"));
-        assert!(service.read_file("a", &repo.0, &head.snapshot_id, "shared.txt", None).is_err(), "a new overview invalidates the older snapshot");
+        assert_eq!(
+            shared.modified.as_deref(),
+            Some("base\nfeature commit\nworking edit\n")
+        );
+        assert!(
+            service
+                .read_file("a", &repo.0, &head.snapshot_id, "shared.txt", None)
+                .is_err(),
+            "a new overview invalidates the older snapshot"
+        );
     }
 
     #[test]
@@ -1310,27 +1888,69 @@ mod tests {
         let service = DiffService::new();
         let overview = service.overview("a", &repo.0, DiffMode::Head).unwrap();
         let first = comparison(&repo.0, DiffMode::Uncommitted).unwrap();
-        assert_eq!(first.label, "Uncommitted changes (staged and unstaged, against HEAD)");
-        assert_eq!((first.base_commit.as_deref(), first.branch.as_deref()), (overview.base_commit.as_deref(), Some("master")));
-        assert!(service.read_file("a", &repo.0, &overview.snapshot_id, "a.txt", None).is_ok(), "asking for a comparison keeps the page's snapshot valid");
-        assert_eq!(comparison(&repo.0, DiffMode::Uncommitted).unwrap().fingerprint, first.fingerprint);
-        assert_ne!(comparison(&repo.0, DiffMode::Head).unwrap().fingerprint, first.fingerprint, "the mode is part of it");
+        assert_eq!(
+            first.label,
+            "Uncommitted changes (staged and unstaged, against HEAD)"
+        );
+        assert_eq!(
+            (first.base_commit.as_deref(), first.branch.as_deref()),
+            (overview.base_commit.as_deref(), Some("master"))
+        );
+        assert!(
+            service
+                .read_file("a", &repo.0, &overview.snapshot_id, "a.txt", None)
+                .is_ok(),
+            "asking for a comparison keeps the page's snapshot valid"
+        );
+        assert_eq!(
+            comparison(&repo.0, DiffMode::Uncommitted)
+                .unwrap()
+                .fingerprint,
+            first.fingerprint
+        );
+        assert_ne!(
+            comparison(&repo.0, DiffMode::Head).unwrap().fingerprint,
+            first.fingerprint,
+            "the mode is part of it"
+        );
         repo.write("a.txt", b"one\ntwo\n");
-        let edited = comparison(&repo.0, DiffMode::Uncommitted).unwrap().fingerprint;
+        let edited = comparison(&repo.0, DiffMode::Uncommitted)
+            .unwrap()
+            .fingerprint;
         assert_ne!(edited, first.fingerprint);
         repo.write("new.txt", b"x\n");
-        let untracked = comparison(&repo.0, DiffMode::Uncommitted).unwrap().fingerprint;
+        let untracked = comparison(&repo.0, DiffMode::Uncommitted)
+            .unwrap()
+            .fingerprint;
         assert_ne!(untracked, edited);
         repo.write("new.txt", b"changed content\n");
-        assert_ne!(comparison(&repo.0, DiffMode::Uncommitted).unwrap().fingerprint, untracked, "editing an untracked file counts");
-        assert_eq!(comparison(&repo.0, DiffMode::Branch).unwrap().label, "Compared with master");
-        assert_eq!(comparison(&repo.0, DiffMode::Commits).err().as_deref(), Some("Use the commit comparison command for historical diffs"));
+        assert_ne!(
+            comparison(&repo.0, DiffMode::Uncommitted)
+                .unwrap()
+                .fingerprint,
+            untracked,
+            "editing an untracked file counts"
+        );
+        assert_eq!(
+            comparison(&repo.0, DiffMode::Branch).unwrap().label,
+            "Compared with master"
+        );
+        assert_eq!(
+            comparison(&repo.0, DiffMode::Commits).err().as_deref(),
+            Some("Use the commit comparison command for historical diffs")
+        );
 
         let trunk = Repo::new("trunk");
         trunk.write("a.txt", b"1\n");
-        assert_eq!(comparison(&trunk.0, DiffMode::Head).unwrap().base_commit, None, "no commits yet");
+        assert_eq!(
+            comparison(&trunk.0, DiffMode::Head).unwrap().base_commit,
+            None,
+            "no commits yet"
+        );
         trunk.commit("base");
-        assert!(comparison(&trunk.0, DiffMode::Branch).unwrap_err().contains("No master or default branch"));
+        assert!(comparison(&trunk.0, DiffMode::Branch)
+            .unwrap_err()
+            .contains("No master or default branch"));
         assert!(comparison(&trunk.0, DiffMode::Head).is_ok());
     }
 
@@ -1342,27 +1962,64 @@ mod tests {
         repo.write("a.txt", b"2\n");
         let service = DiffService::new();
         let overview = service.overview("a", &repo.0, DiffMode::Branch).unwrap();
-        assert_eq!((overview.base_ref.as_deref(), overview.base_label.as_str()), (Some("main"), "Compared with main"));
+        assert_eq!(
+            (overview.base_ref.as_deref(), overview.base_label.as_str()),
+            (Some("main"), "Compared with main")
+        );
         repo.git(&["branch", "master"]);
-        assert_eq!(service.overview("a", &repo.0, DiffMode::Head).unwrap().branch_ref.as_deref(), Some("master"));
+        assert_eq!(
+            service
+                .overview("a", &repo.0, DiffMode::Head)
+                .unwrap()
+                .branch_ref
+                .as_deref(),
+            Some("master")
+        );
 
         let trunk = Repo::new("trunk");
         trunk.write("a.txt", b"1\n");
         trunk.commit("base");
-        assert!(service.overview("t", &trunk.0, DiffMode::Branch).unwrap_err().contains("No master or default branch"));
-        assert_eq!(service.overview("t", &trunk.0, DiffMode::Head).unwrap().branch_ref, None, "head mode stays usable");
+        assert!(service
+            .overview("t", &trunk.0, DiffMode::Branch)
+            .unwrap_err()
+            .contains("No master or default branch"));
+        assert_eq!(
+            service
+                .overview("t", &trunk.0, DiffMode::Head)
+                .unwrap()
+                .branch_ref,
+            None,
+            "head mode stays usable"
+        );
         trunk.git(&["config", "init.defaultBranch", "trunk"]);
-        assert_eq!(service.overview("t", &trunk.0, DiffMode::Branch).unwrap().base_ref.as_deref(), Some("trunk"));
+        assert_eq!(
+            service
+                .overview("t", &trunk.0, DiffMode::Branch)
+                .unwrap()
+                .base_ref
+                .as_deref(),
+            Some("trunk")
+        );
 
         let clone_parent = Repo::new("develop");
         clone_parent.write("a.txt", b"1\n");
         clone_parent.commit("base");
-        let clone = std::env::temp_dir().join(format!("omp-code-diff-clone-{}", uuid::Uuid::new_v4()));
-        let out = Command::new("git").args(["clone", "--quiet"]).arg(&clone_parent.0).arg(&clone).output().unwrap();
+        let clone =
+            std::env::temp_dir().join(format!("omp-code-diff-clone-{}", uuid::Uuid::new_v4()));
+        let out = Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(&clone_parent.0)
+            .arg(&clone)
+            .output()
+            .unwrap();
         assert!(out.status.success());
         let clone = crate::setup::canonical(&clone).unwrap();
         let overview = service.overview("c", &clone, DiffMode::Branch).unwrap();
-        assert_eq!(overview.base_ref.as_deref(), Some("develop"), "a clone's remote HEAD names its default branch");
+        assert_eq!(
+            overview.base_ref.as_deref(),
+            Some("develop"),
+            "a clone's remote HEAD names its default branch"
+        );
         fs::remove_dir_all(clone).unwrap();
     }
 
@@ -1376,19 +2033,33 @@ mod tests {
         let overview = service.overview("a", &repo.0, DiffMode::Head).unwrap();
         assert_eq!(overview.base_commit, None);
         assert_eq!(overview.base_label, "No commits yet");
-        assert_eq!(statuses(&overview), [("loose.txt", "?"), ("staged.txt", "A")].map(|(p, s)| (p.to_string(), s.to_string())));
-        let content = service.read_file("a", &repo.0, &overview.snapshot_id, "staged.txt", None).unwrap();
-        assert_eq!((content.original.as_deref(), content.modified.as_deref()), (Some(""), Some("s\n")));
+        assert_eq!(
+            statuses(&overview),
+            [("loose.txt", "?"), ("staged.txt", "A")].map(|(p, s)| (p.to_string(), s.to_string()))
+        );
+        let content = service
+            .read_file("a", &repo.0, &overview.snapshot_id, "staged.txt", None)
+            .unwrap();
+        assert_eq!(
+            (content.original.as_deref(), content.modified.as_deref()),
+            (Some(""), Some("s\n"))
+        );
         assert!(service.overview("a", &repo.0, DiffMode::Branch).is_err());
     }
 
     #[test]
     fn non_repositories_and_stale_views_are_explained() {
-        let plain = std::env::temp_dir().join(format!("omp-code-diff-plain-{}", uuid::Uuid::new_v4()));
+        let plain =
+            std::env::temp_dir().join(format!("omp-code-diff-plain-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&plain).unwrap();
         let service = DiffService::new();
-        assert_eq!(service.overview("a", &plain, DiffMode::Head).unwrap_err(), "This project is not inside a Git repository");
-        assert!(service.overview("a", &plain.join("missing"), DiffMode::Head).is_err());
+        assert_eq!(
+            service.overview("a", &plain, DiffMode::Head).unwrap_err(),
+            "This project is not inside a Git repository"
+        );
+        assert!(service
+            .overview("a", &plain.join("missing"), DiffMode::Head)
+            .is_err());
         fs::remove_dir_all(plain).unwrap();
 
         let one = Repo::new("master");
@@ -1399,18 +2070,54 @@ mod tests {
         two.write("a.txt", b"1\n");
         two.commit("base");
         let snapshot = service.overview("a", &one.0, DiffMode::Head).unwrap();
-        assert_eq!(service.read_file("a", &two.0, &snapshot.snapshot_id, "a.txt", None).unwrap_err(), CHANGED);
-        assert_eq!(service.read_file("a", &one.0, "stale", "a.txt", None).unwrap_err(), CHANGED);
-        assert_eq!(service.read_file("other", &one.0, &snapshot.snapshot_id, "a.txt", None).unwrap_err(), CHANGED);
-        assert!(service.read_file("a", &one.0, &snapshot.snapshot_id, "never-listed.txt", None).is_err());
+        assert_eq!(
+            service
+                .read_file("a", &two.0, &snapshot.snapshot_id, "a.txt", None)
+                .unwrap_err(),
+            CHANGED
+        );
+        assert_eq!(
+            service
+                .read_file("a", &one.0, "stale", "a.txt", None)
+                .unwrap_err(),
+            CHANGED
+        );
+        assert_eq!(
+            service
+                .read_file("other", &one.0, &snapshot.snapshot_id, "a.txt", None)
+                .unwrap_err(),
+            CHANGED
+        );
+        assert!(service
+            .read_file("a", &one.0, &snapshot.snapshot_id, "never-listed.txt", None)
+            .is_err());
     }
 
     #[test]
     fn unsafe_paths_never_reach_the_filesystem() {
-        for path in ["", "/abs", "C:/abs", "a/../b", "../b", "a//b", "./a", ".git/config", "a/.GIT/config", "GIT~1/config", "a:stream", "a\\b", "dir /x", "x.", "a/\0"] {
+        for path in [
+            "",
+            "/abs",
+            "C:/abs",
+            "a/../b",
+            "../b",
+            "a//b",
+            "./a",
+            ".git/config",
+            "a/.GIT/config",
+            "GIT~1/config",
+            "a:stream",
+            "a\\b",
+            "dir /x",
+            "x.",
+            "a/\0",
+        ] {
             assert!(relative_parts(path).is_err(), "{path:?} must be rejected");
         }
-        assert_eq!(relative_parts("src/lib/ä b.rs").unwrap(), ["src", "lib", "ä b.rs"]);
+        assert_eq!(
+            relative_parts("src/lib/ä b.rs").unwrap(),
+            ["src", "lib", "ä b.rs"]
+        );
         assert!(relative_parts(".github/workflows/ci.yml").is_ok());
     }
 
@@ -1435,7 +2142,15 @@ mod tests {
         let reasons: Vec<(String, Option<String>)> = overview
             .files
             .iter()
-            .map(|f| (f.path.clone(), service.read_file("a", &repo.0, &overview.snapshot_id, &f.path, None).unwrap().read_only_reason))
+            .map(|f| {
+                (
+                    f.path.clone(),
+                    service
+                        .read_file("a", &repo.0, &overview.snapshot_id, &f.path, None)
+                        .unwrap()
+                        .read_only_reason,
+                )
+            })
             .collect();
         let reason = |name: &str| reasons.iter().find(|(p, _)| p == name).unwrap().1.clone();
         assert!(reason("binary.bin").unwrap().contains("Binary"));
@@ -1444,9 +2159,23 @@ mod tests {
         assert!(reason("lone.txt").unwrap().contains("lone carriage"));
         assert!(reason("big.txt").unwrap().contains("2 MiB"));
         assert_eq!(reason("ok.txt"), None);
-        let blocked = service.save_file("a", &repo.0, &overview.snapshot_id, "mixed.txt", None, Some("x"), "replaced\n").unwrap_err();
+        let blocked = service
+            .save_file(
+                "a",
+                &repo.0,
+                &overview.snapshot_id,
+                "mixed.txt",
+                None,
+                Some("x"),
+                "replaced\n",
+            )
+            .unwrap_err();
         assert!(blocked.contains("mixed line endings"));
-        assert_eq!(repo.read("mixed.txt"), b"a\r\nb\nc\nd\n", "read-only files are never rewritten");
+        assert_eq!(
+            repo.read("mixed.txt"),
+            b"a\r\nb\nc\nd\n",
+            "read-only files are never rewritten"
+        );
     }
 
     #[test]
@@ -1461,18 +2190,58 @@ mod tests {
         let service = DiffService::new();
         let overview = service.overview("a", &repo.0, DiffMode::Head).unwrap();
 
-        let crlf = service.read_file("a", &repo.0, &overview.snapshot_id, "crlf.txt", None).unwrap();
-        assert_eq!((crlf.eol.as_str(), crlf.bom, crlf.modified.as_deref()), ("crlf", true, Some("one\ntwo\nthree\n")));
-        let saved = service.save_file("a", &repo.0, &overview.snapshot_id, "crlf.txt", None, crlf.working_hash.as_deref(), "one\ntwo\nthree\nfour\n").unwrap();
-        assert_eq!(repo.read("crlf.txt"), b"\xef\xbb\xbfone\r\ntwo\r\nthree\r\nfour\r\n");
-        assert_eq!(saved.working_hash.as_deref(), Some(hash(&repo.read("crlf.txt")).as_str()));
+        let crlf = service
+            .read_file("a", &repo.0, &overview.snapshot_id, "crlf.txt", None)
+            .unwrap();
+        assert_eq!(
+            (crlf.eol.as_str(), crlf.bom, crlf.modified.as_deref()),
+            ("crlf", true, Some("one\ntwo\nthree\n"))
+        );
+        let saved = service
+            .save_file(
+                "a",
+                &repo.0,
+                &overview.snapshot_id,
+                "crlf.txt",
+                None,
+                crlf.working_hash.as_deref(),
+                "one\ntwo\nthree\nfour\n",
+            )
+            .unwrap();
+        assert_eq!(
+            repo.read("crlf.txt"),
+            b"\xef\xbb\xbfone\r\ntwo\r\nthree\r\nfour\r\n"
+        );
+        assert_eq!(
+            saved.working_hash.as_deref(),
+            Some(hash(&repo.read("crlf.txt")).as_str())
+        );
 
-        let lf = service.read_file("a", &repo.0, &overview.snapshot_id, "lf.txt", None).unwrap();
-        service.save_file("a", &repo.0, &overview.snapshot_id, "lf.txt", None, lf.working_hash.as_deref(), "one\ntwo\nthree\nno final newline").unwrap();
+        let lf = service
+            .read_file("a", &repo.0, &overview.snapshot_id, "lf.txt", None)
+            .unwrap();
+        service
+            .save_file(
+                "a",
+                &repo.0,
+                &overview.snapshot_id,
+                "lf.txt",
+                None,
+                lf.working_hash.as_deref(),
+                "one\ntwo\nthree\nno final newline",
+            )
+            .unwrap();
         assert_eq!(repo.read("lf.txt"), b"one\ntwo\nthree\nno final newline");
         assert_eq!(repo.git(&["ls-files", "--stage"]), index_before);
-        assert!(repo.git(&["diff", "--stat"]).contains("crlf.txt"), "the saved change is visible to Git");
-        let leftovers = fs::read_dir(&repo.0).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).count();
+        assert!(
+            repo.git(&["diff", "--stat"]).contains("crlf.txt"),
+            "the saved change is visible to Git"
+        );
+        let leftovers = fs::read_dir(&repo.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
         assert_eq!(leftovers, 0);
     }
 
@@ -1484,15 +2253,56 @@ mod tests {
         repo.write("a.txt", b"mine\n");
         let service = DiffService::new();
         let overview = service.overview("a", &repo.0, DiffMode::Head).unwrap();
-        let loaded = service.read_file("a", &repo.0, &overview.snapshot_id, "a.txt", None).unwrap();
+        let loaded = service
+            .read_file("a", &repo.0, &overview.snapshot_id, "a.txt", None)
+            .unwrap();
         repo.write("a.txt", b"agent wrote this\n");
-        let error = service.save_file("a", &repo.0, &overview.snapshot_id, "a.txt", None, loaded.working_hash.as_deref(), "typed text\n").unwrap_err();
+        let error = service
+            .save_file(
+                "a",
+                &repo.0,
+                &overview.snapshot_id,
+                "a.txt",
+                None,
+                loaded.working_hash.as_deref(),
+                "typed text\n",
+            )
+            .unwrap_err();
         assert_eq!(error, CONFLICT);
-        assert_eq!(repo.read("a.txt"), b"agent wrote this\n", "no bytes are lost to a conflicting save");
-        let fresh = service.read_file("a", &repo.0, &overview.snapshot_id, "a.txt", None).unwrap();
-        service.save_file("a", &repo.0, &overview.snapshot_id, "a.txt", None, fresh.working_hash.as_deref(), "typed text\n").unwrap();
+        assert_eq!(
+            repo.read("a.txt"),
+            b"agent wrote this\n",
+            "no bytes are lost to a conflicting save"
+        );
+        let fresh = service
+            .read_file("a", &repo.0, &overview.snapshot_id, "a.txt", None)
+            .unwrap();
+        service
+            .save_file(
+                "a",
+                &repo.0,
+                &overview.snapshot_id,
+                "a.txt",
+                None,
+                fresh.working_hash.as_deref(),
+                "typed text\n",
+            )
+            .unwrap();
         assert_eq!(repo.read("a.txt"), b"typed text\n");
-        assert_eq!(service.save_file("a", &repo.0, &overview.snapshot_id, "a.txt", None, None, "x\n").unwrap_err(), CONFLICT);
+        assert_eq!(
+            service
+                .save_file(
+                    "a",
+                    &repo.0,
+                    &overview.snapshot_id,
+                    "a.txt",
+                    None,
+                    None,
+                    "x\n"
+                )
+                .unwrap_err(),
+            CONFLICT
+        );
     }
 
     #[test]
@@ -1504,9 +2314,30 @@ mod tests {
         fs::remove_dir_all(repo.0.join("deep")).unwrap();
         let service = DiffService::new();
         let overview = service.overview("a", &repo.0, DiffMode::Head).unwrap();
-        let deleted = service.read_file("a", &repo.0, &overview.snapshot_id, "deep/dir/file.txt", None).unwrap();
-        assert_eq!((deleted.working_hash.as_deref(), deleted.original.as_deref()), (None, Some("old\n")));
-        service.save_file("a", &repo.0, &overview.snapshot_id, "deep/dir/file.txt", None, None, "restored\n").unwrap();
+        let deleted = service
+            .read_file(
+                "a",
+                &repo.0,
+                &overview.snapshot_id,
+                "deep/dir/file.txt",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            (deleted.working_hash.as_deref(), deleted.original.as_deref()),
+            (None, Some("old\n"))
+        );
+        service
+            .save_file(
+                "a",
+                &repo.0,
+                &overview.snapshot_id,
+                "deep/dir/file.txt",
+                None,
+                None,
+                "restored\n",
+            )
+            .unwrap();
         assert_eq!(repo.read("deep/dir/file.txt"), b"restored\n");
     }
 
@@ -1515,22 +2346,42 @@ mod tests {
         let repo = Repo::new("master");
         repo.write("real/file.txt", b"1\n");
         repo.commit("base");
-        let outside = std::env::temp_dir().join(format!("omp-code-diff-outside-{}", uuid::Uuid::new_v4()));
+        let outside =
+            std::env::temp_dir().join(format!("omp-code-diff-outside-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("file.txt"), b"outside\n").unwrap();
         fs::remove_dir_all(repo.0.join("real")).unwrap();
         let link = repo.0.join("real");
         #[cfg(windows)]
-        let linked = Command::new("cmd.exe").args(["/C", "mklink", "/J"]).arg(&link).arg(&outside).output().unwrap().status.success();
+        let linked = Command::new("cmd.exe")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .unwrap()
+            .status
+            .success();
         #[cfg(unix)]
         let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
         if linked {
             let service = DiffService::new();
             let overview = service.overview("a", &repo.0, DiffMode::Head).unwrap();
             if let Some(file) = overview.files.iter().find(|f| f.path == "real/file.txt") {
-                let content = service.read_file("a", &repo.0, &overview.snapshot_id, &file.path, None).unwrap();
+                let content = service
+                    .read_file("a", &repo.0, &overview.snapshot_id, &file.path, None)
+                    .unwrap();
                 assert!(content.read_only_reason.is_some());
-                assert!(service.save_file("a", &repo.0, &overview.snapshot_id, &file.path, None, content.working_hash.as_deref(), "pwn\n").is_err());
+                assert!(service
+                    .save_file(
+                        "a",
+                        &repo.0,
+                        &overview.snapshot_id,
+                        &file.path,
+                        None,
+                        content.working_hash.as_deref(),
+                        "pwn\n"
+                    )
+                    .is_err());
             }
             assert_eq!(fs::read(outside.join("file.txt")).unwrap(), b"outside\n");
             #[cfg(windows)]
@@ -1546,10 +2397,19 @@ mod tests {
     #[test]
     fn name_status_parser_handles_renames_copies_and_unmerged_entries() {
         let parsed = parse_name_status(b"M\0a b.txt\0R087\0old.txt\0new.txt\0C100\0src.txt\0copy.txt\0U\0conflict.txt\0M\0conflict.txt\0D\0gone.txt\0");
-        let rows: Vec<(&str, &str, Option<&str>)> = parsed.iter().map(|f| (f.path.as_str(), f.status.as_str(), f.old_path.as_deref())).collect();
+        let rows: Vec<(&str, &str, Option<&str>)> = parsed
+            .iter()
+            .map(|f| (f.path.as_str(), f.status.as_str(), f.old_path.as_deref()))
+            .collect();
         assert_eq!(
             rows,
-            [("a b.txt", "M", None), ("conflict.txt", "U", None), ("copy.txt", "C", Some("src.txt")), ("gone.txt", "D", None), ("new.txt", "R", Some("old.txt"))]
+            [
+                ("a b.txt", "M", None),
+                ("conflict.txt", "U", None),
+                ("copy.txt", "C", Some("src.txt")),
+                ("gone.txt", "D", None),
+                ("new.txt", "R", Some("old.txt"))
+            ]
         );
     }
 
@@ -1565,7 +2425,11 @@ mod tests {
         lines(repo.git(&["diff", "--name-only"]))
     }
     fn rows(overview: &DiffOverview) -> Vec<(Option<DiffGroup>, String, String)> {
-        overview.files.iter().map(|f| (f.group, f.path.clone(), f.status.clone())).collect()
+        overview
+            .files
+            .iter()
+            .map(|f| (f.group, f.path.clone(), f.status.clone()))
+            .collect()
     }
     fn row(group: DiffGroup, path: &str, status: &str) -> (Option<DiffGroup>, String, String) {
         (Some(group), path.into(), status.into())
@@ -1590,7 +2454,10 @@ mod tests {
         repo
     }
     fn fresh(service: &DiffService, repo: &Repo) -> String {
-        service.overview("a", &repo.0, DiffMode::Uncommitted).unwrap().snapshot_id
+        service
+            .overview("a", &repo.0, DiffMode::Uncommitted)
+            .unwrap()
+            .snapshot_id
     }
 
     #[test]
@@ -1602,12 +2469,27 @@ mod tests {
             ? untracked file.txt\0? nested/\0! ignored.log\0\
             1 .D N... 100644 100644 000000 ggg ggg gone.txt\0";
         let parsed = parse_status_v2(bytes);
-        let got: Vec<(Option<DiffGroup>, &str, &str, Option<&str>)> = parsed.iter().map(|f| (f.group, f.path.as_str(), f.status.as_str(), f.old_path.as_deref())).collect();
+        let got: Vec<(Option<DiffGroup>, &str, &str, Option<&str>)> = parsed
+            .iter()
+            .map(|f| {
+                (
+                    f.group,
+                    f.path.as_str(),
+                    f.status.as_str(),
+                    f.old_path.as_deref(),
+                )
+            })
+            .collect();
         assert_eq!(
             got,
             [
                 (Some(DiffGroup::Staged), "dir/a b.txt", "M", None),
-                (Some(DiffGroup::Staged), "moved é.txt", "R", Some("moved name.txt")),
+                (
+                    Some(DiffGroup::Staged),
+                    "moved é.txt",
+                    "R",
+                    Some("moved name.txt")
+                ),
                 (Some(DiffGroup::Staged), "new.txt", "A", None),
                 (Some(DiffGroup::Changes), "conflict.txt", "U", None),
                 (Some(DiffGroup::Changes), "dir/a b.txt", "M", None),
@@ -1621,9 +2503,14 @@ mod tests {
     fn uncommitted_view_shows_vscode_style_sides_for_each_group() {
         let repo = dirty_repo();
         let service = DiffService::new();
-        let ov = service.overview("a", &repo.0, DiffMode::Uncommitted).unwrap();
+        let ov = service
+            .overview("a", &repo.0, DiffMode::Uncommitted)
+            .unwrap();
         assert_eq!(ov.base_label, "Uncommitted changes");
-        assert_eq!((ov.current_branch.as_deref(), ov.upstream.as_deref()), (Some("master"), None));
+        assert_eq!(
+            (ov.current_branch.as_deref(), ov.upstream.as_deref()),
+            (Some("master"), None)
+        );
         assert_eq!(
             rows(&ov),
             [
@@ -1636,25 +2523,63 @@ mod tests {
                 row(DiffGroup::Changes, "u.txt", "?"),
             ]
         );
-        let read = |group, path: &str| service.read_file("a", &repo.0, &ov.snapshot_id, path, Some(group)).unwrap();
+        let read = |group, path: &str| {
+            service
+                .read_file("a", &repo.0, &ov.snapshot_id, path, Some(group))
+                .unwrap()
+        };
         let side = |c: &DiffContent| (c.original.clone().unwrap(), c.modified.clone().unwrap());
         let staged_a = read(DiffGroup::Staged, "a.txt");
-        assert_eq!(side(&staged_a), ("a1\n".to_string(), "a2\n".to_string()), "staged = HEAD vs index");
+        assert_eq!(
+            side(&staged_a),
+            ("a1\n".to_string(), "a2\n".to_string()),
+            "staged = HEAD vs index"
+        );
         assert_eq!(staged_a.read_only_reason.as_deref(), Some(STAGED_READ_ONLY));
         assert_eq!(staged_a.working_hash, None);
-        assert!(staged_a.original_label.starts_with("Last commit ") && staged_a.modified_label == "Staged (index)");
+        assert!(
+            staged_a.original_label.starts_with("Last commit ")
+                && staged_a.modified_label == "Staged (index)"
+        );
         let changes_a = read(DiffGroup::Changes, "a.txt");
-        assert_eq!(side(&changes_a), ("a2\n".to_string(), "a3\n".to_string()), "changes = index vs working tree");
+        assert_eq!(
+            side(&changes_a),
+            ("a2\n".to_string(), "a3\n".to_string()),
+            "changes = index vs working tree"
+        );
         assert_eq!(changes_a.read_only_reason, None);
         assert!(changes_a.working_hash.is_some());
-        assert_eq!((changes_a.original_label.as_str(), changes_a.modified_label.as_str()), ("Staged (index)", "Working tree"));
-        assert_eq!(side(&read(DiffGroup::Staged, "added.txt")), (String::new(), "added\n".to_string()));
+        assert_eq!(
+            (
+                changes_a.original_label.as_str(),
+                changes_a.modified_label.as_str()
+            ),
+            ("Staged (index)", "Working tree")
+        );
+        assert_eq!(
+            side(&read(DiffGroup::Staged, "added.txt")),
+            (String::new(), "added\n".to_string())
+        );
         let renamed = side(&read(DiffGroup::Staged, "new.txt"));
         assert_eq!(renamed.0, "same content here\nline two\nline three\n");
-        assert_eq!(renamed.0, renamed.1, "a staged rename compares the old HEAD path with the index");
-        assert_eq!(side(&read(DiffGroup::Changes, "gone.txt")), ("bye\n".to_string(), String::new()));
-        assert_eq!(side(&read(DiffGroup::Changes, "u.txt")), (String::new(), "untracked\n".to_string()));
-        assert!(service.read_file("a", &repo.0, &ov.snapshot_id, "a.txt", None).is_err(), "entries are keyed by group");
+        assert_eq!(
+            renamed.0, renamed.1,
+            "a staged rename compares the old HEAD path with the index"
+        );
+        assert_eq!(
+            side(&read(DiffGroup::Changes, "gone.txt")),
+            ("bye\n".to_string(), String::new())
+        );
+        assert_eq!(
+            side(&read(DiffGroup::Changes, "u.txt")),
+            (String::new(), "untracked\n".to_string())
+        );
+        assert!(
+            service
+                .read_file("a", &repo.0, &ov.snapshot_id, "a.txt", None)
+                .is_err(),
+            "entries are keyed by group"
+        );
         let head = service.overview("a", &repo.0, DiffMode::Head).unwrap();
         assert!(head.files.iter().all(|f| f.group.is_none()));
     }
@@ -1668,11 +2593,32 @@ mod tests {
             service.change_file("a", &repo.0, &id, path, Some(group), action)
         };
         act("b.txt", DiffGroup::Changes, FileAction::Stage).unwrap();
-        assert!(staged(&repo).contains(&"b.txt".to_string()) && !unstaged(&repo).contains(&"b.txt".to_string()));
+        assert!(
+            staged(&repo).contains(&"b.txt".to_string())
+                && !unstaged(&repo).contains(&"b.txt".to_string())
+        );
         let stale = fresh(&service, &repo);
-        service.change_file("a", &repo.0, &stale, "b.txt", Some(DiffGroup::Staged), FileAction::Unstage).unwrap();
-        assert!(!staged(&repo).contains(&"b.txt".to_string()) && unstaged(&repo).contains(&"b.txt".to_string()));
-        assert_eq!(service.read_file("a", &repo.0, &stale, "b.txt", Some(DiffGroup::Changes)).unwrap_err(), CHANGED, "an action drops the snapshot");
+        service
+            .change_file(
+                "a",
+                &repo.0,
+                &stale,
+                "b.txt",
+                Some(DiffGroup::Staged),
+                FileAction::Unstage,
+            )
+            .unwrap();
+        assert!(
+            !staged(&repo).contains(&"b.txt".to_string())
+                && unstaged(&repo).contains(&"b.txt".to_string())
+        );
+        assert_eq!(
+            service
+                .read_file("a", &repo.0, &stale, "b.txt", Some(DiffGroup::Changes))
+                .unwrap_err(),
+            CHANGED,
+            "an action drops the snapshot"
+        );
 
         // Revert discards only the unstaged edit: the staged version survives.
         act("a.txt", DiffGroup::Changes, FileAction::Revert).unwrap();
@@ -1683,21 +2629,59 @@ mod tests {
         act("gone.txt", DiffGroup::Changes, FileAction::Revert).unwrap();
         assert_eq!(repo.read("gone.txt"), b"bye\n");
         act("u.txt", DiffGroup::Changes, FileAction::Revert).unwrap();
-        assert!(!repo.0.join("u.txt").exists(), "reverting an untracked file deletes it");
+        assert!(
+            !repo.0.join("u.txt").exists(),
+            "reverting an untracked file deletes it"
+        );
 
         // A staged rename is unstaged through both of its paths.
         act("new.txt", DiffGroup::Staged, FileAction::Unstage).unwrap();
-        assert!(!staged(&repo).iter().any(|p| p == "new.txt" || p == "old.txt"));
-        assert!(lines(repo.git(&["ls-files", "--others", "--exclude-standard"])).contains(&"new.txt".to_string()));
+        assert!(!staged(&repo)
+            .iter()
+            .any(|p| p == "new.txt" || p == "old.txt"));
+        assert!(
+            lines(repo.git(&["ls-files", "--others", "--exclude-standard"]))
+                .contains(&"new.txt".to_string())
+        );
         assert!(unstaged(&repo).contains(&"old.txt".to_string()));
 
         // Wrong group, unknown path and non-Uncommitted snapshots are rejected.
-        assert_eq!(act("a.txt", DiffGroup::Staged, FileAction::Stage).unwrap_err(), "That action does not apply to this entry");
-        assert_eq!(act("added.txt", DiffGroup::Staged, FileAction::Revert).unwrap_err(), "That action does not apply to this entry");
+        assert_eq!(
+            act("a.txt", DiffGroup::Staged, FileAction::Stage).unwrap_err(),
+            "That action does not apply to this entry"
+        );
+        assert_eq!(
+            act("added.txt", DiffGroup::Staged, FileAction::Revert).unwrap_err(),
+            "That action does not apply to this entry"
+        );
         let id = fresh(&service, &repo);
-        assert_eq!(service.change_file("a", &repo.0, &id, "nope.txt", Some(DiffGroup::Changes), FileAction::Stage).unwrap_err(), "That file is not part of this comparison");
+        assert_eq!(
+            service
+                .change_file(
+                    "a",
+                    &repo.0,
+                    &id,
+                    "nope.txt",
+                    Some(DiffGroup::Changes),
+                    FileAction::Stage
+                )
+                .unwrap_err(),
+            "That file is not part of this comparison"
+        );
         let head = service.overview("a", &repo.0, DiffMode::Head).unwrap();
-        assert_eq!(service.change_file("a", &repo.0, &head.snapshot_id, "b.txt", None, FileAction::Stage).unwrap_err(), "Git actions are only available in Uncommitted changes");
+        assert_eq!(
+            service
+                .change_file(
+                    "a",
+                    &repo.0,
+                    &head.snapshot_id,
+                    "b.txt",
+                    None,
+                    FileAction::Stage
+                )
+                .unwrap_err(),
+            "Git actions are only available in Uncommitted changes"
+        );
     }
 
     #[test]
@@ -1707,14 +2691,47 @@ mod tests {
         repo.git(&["add", "f.txt"]);
         let service = DiffService::new();
         let id = fresh(&service, &repo);
-        service.change_file("a", &repo.0, &id, "f.txt", Some(DiffGroup::Staged), FileAction::Unstage).unwrap();
-        assert_eq!(repo.git(&["ls-files", "--cached"]).trim(), "", "with no commit, unstaging removes the index entry");
+        service
+            .change_file(
+                "a",
+                &repo.0,
+                &id,
+                "f.txt",
+                Some(DiffGroup::Staged),
+                FileAction::Unstage,
+            )
+            .unwrap();
+        assert_eq!(
+            repo.git(&["ls-files", "--cached"]).trim(),
+            "",
+            "with no commit, unstaging removes the index entry"
+        );
         assert_eq!(repo.read("f.txt"), b"first\n");
 
-        let snapshot = Snapshot { id: "s".into(), root: repo.0.clone(), mode: DiffMode::Uncommitted, base_commit: None, base_label: "x".into(), target_commit: None, target_label: "Working tree".into(), files: HashMap::new() };
-        for (status, message) in [("U", "Resolve merge conflicts with Git first"), ("A", "Intent-to-add files can only be unstaged with Git")] {
-            let file = DiffFile { path: "f.txt".into(), old_path: None, status: status.into(), group: Some(DiffGroup::Changes) };
-            assert_eq!(apply_file_action(&snapshot, &file, FileAction::Revert).unwrap_err(), message);
+        let snapshot = Snapshot {
+            id: "s".into(),
+            root: repo.0.clone(),
+            mode: DiffMode::Uncommitted,
+            base_commit: None,
+            base_label: "x".into(),
+            target_commit: None,
+            target_label: "Working tree".into(),
+            files: HashMap::new(),
+        };
+        for (status, message) in [
+            ("U", "Resolve merge conflicts with Git first"),
+            ("A", "Intent-to-add files can only be unstaged with Git"),
+        ] {
+            let file = DiffFile {
+                path: "f.txt".into(),
+                old_path: None,
+                status: status.into(),
+                group: Some(DiffGroup::Changes),
+            };
+            assert_eq!(
+                apply_file_action(&snapshot, &file, FileAction::Revert).unwrap_err(),
+                message
+            );
         }
         assert_eq!(repo.read("f.txt"), b"first\n");
     }
@@ -1724,19 +2741,42 @@ mod tests {
         let repo = dirty_repo();
         let service = DiffService::new();
         let id = fresh(&service, &repo);
-        assert_eq!(service.commit("a", &repo.0, &id, "   ").unwrap_err(), "Enter a commit message");
+        assert_eq!(
+            service.commit("a", &repo.0, &id, "   ").unwrap_err(),
+            "Enter a commit message"
+        );
         let id = fresh(&service, &repo);
-        let result = service.commit("a", &repo.0, &id, "  Subject line\n\nBody text\n  ").unwrap();
+        let result = service
+            .commit("a", &repo.0, &id, "  Subject line\n\nBody text\n  ")
+            .unwrap();
         assert_eq!(result.summary, "Subject line");
-        assert_eq!(result.commit, repo.git(&["rev-parse", "--short", "HEAD"]).trim());
-        assert_eq!(repo.git(&["log", "-1", "--format=%B"]).trim(), "Subject line\n\nBody text");
+        assert_eq!(
+            result.commit,
+            repo.git(&["rev-parse", "--short", "HEAD"]).trim()
+        );
+        assert_eq!(
+            repo.git(&["log", "-1", "--format=%B"]).trim(),
+            "Subject line\n\nBody text"
+        );
         assert!(staged(&repo).is_empty());
-        assert!(unstaged(&repo).contains(&"b.txt".to_string()) && unstaged(&repo).contains(&"a.txt".to_string()), "unstaged edits stay uncommitted");
+        assert!(
+            unstaged(&repo).contains(&"b.txt".to_string())
+                && unstaged(&repo).contains(&"a.txt".to_string()),
+            "unstaged edits stay uncommitted"
+        );
         assert_eq!(repo.read("a.txt"), b"a3\n");
         let id = fresh(&service, &repo);
-        assert_eq!(service.commit("a", &repo.0, &id, "again").unwrap_err(), "Nothing is staged to commit");
+        assert_eq!(
+            service.commit("a", &repo.0, &id, "again").unwrap_err(),
+            "Nothing is staged to commit"
+        );
         let head = service.overview("a", &repo.0, DiffMode::Head).unwrap();
-        assert_eq!(service.commit("a", &repo.0, &head.snapshot_id, "x").unwrap_err(), "Git actions are only available in Uncommitted changes");
+        assert_eq!(
+            service
+                .commit("a", &repo.0, &head.snapshot_id, "x")
+                .unwrap_err(),
+            "Git actions are only available in Uncommitted changes"
+        );
     }
 
     #[test]
@@ -1764,8 +2804,13 @@ mod tests {
     }
 
     fn bare_remote() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("omp-code-diff-remote-{}", uuid::Uuid::new_v4()));
-        let out = Command::new("git").args(["init", "--bare", "--quiet", "--initial-branch=master"]).arg(&dir).output().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("omp-code-diff-remote-{}", uuid::Uuid::new_v4()));
+        let out = Command::new("git")
+            .args(["init", "--bare", "--quiet", "--initial-branch=master"])
+            .arg(&dir)
+            .output()
+            .unwrap();
         assert!(out.status.success());
         dir
     }
@@ -1777,12 +2822,30 @@ mod tests {
         repo
     }
     fn remote_branches(remote: &Path) -> String {
-        let out = Command::new("git").arg("-C").arg(remote).args(["branch", "--list"]).output().unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(remote)
+            .args(["branch", "--list"])
+            .output()
+            .unwrap();
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
-    fn publish(service: &DiffService, repo: &Repo, new_branch: Option<&str>, create_pr: bool) -> Result<PublishResult> {
+    fn publish(
+        service: &DiffService,
+        repo: &Repo,
+        new_branch: Option<&str>,
+        create_pr: bool,
+    ) -> Result<PublishResult> {
         let id = fresh(service, repo);
-        service.publish("a", &repo.0, &id, &PublishOptions { new_branch: new_branch.map(str::to_string), create_pr })
+        service.publish(
+            "a",
+            &repo.0,
+            &id,
+            &PublishOptions {
+                new_branch: new_branch.map(str::to_string),
+                create_pr,
+            },
+        )
     }
 
     #[test]
@@ -1791,19 +2854,46 @@ mod tests {
         let repo = committed_repo_with_remote(&remote);
         let service = DiffService::new();
         let first = publish(&service, &repo, Some("feature-x"), false).unwrap();
-        assert_eq!((first.branch.as_str(), first.remote.as_str(), first.pr_url.as_deref()), ("feature-x", "origin", None));
-        assert_eq!(first.steps, ["Created branch feature-x", "Pushed feature-x to origin"]);
+        assert_eq!(
+            (
+                first.branch.as_str(),
+                first.remote.as_str(),
+                first.pr_url.as_deref()
+            ),
+            ("feature-x", "origin", None)
+        );
+        assert_eq!(
+            first.steps,
+            ["Created branch feature-x", "Pushed feature-x to origin"]
+        );
         assert!(remote_branches(&remote).contains("feature-x"));
-        assert_eq!(repo.git(&["rev-parse", "--abbrev-ref", "feature-x@{u}"]).trim(), "origin/feature-x");
-        let ov = service.overview("a", &repo.0, DiffMode::Uncommitted).unwrap();
-        assert_eq!((ov.current_branch.as_deref(), ov.upstream.as_deref()), (Some("feature-x"), Some("origin/feature-x")));
+        assert_eq!(
+            repo.git(&["rev-parse", "--abbrev-ref", "feature-x@{u}"])
+                .trim(),
+            "origin/feature-x"
+        );
+        let ov = service
+            .overview("a", &repo.0, DiffMode::Uncommitted)
+            .unwrap();
+        assert_eq!(
+            (ov.current_branch.as_deref(), ov.upstream.as_deref()),
+            (Some("feature-x"), Some("origin/feature-x"))
+        );
 
         repo.write("f.txt", b"two\n");
         repo.commit("second");
         let second = publish(&service, &repo, None, false).unwrap();
         assert_eq!(second.steps, ["Pushed feature-x to origin"]);
-        let remote_tip = Command::new("git").arg("-C").arg(&remote).args(["rev-parse", "feature-x"]).output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&remote_tip.stdout).trim(), repo.git(&["rev-parse", "HEAD"]).trim());
+        let remote_tip = Command::new("git")
+            .arg("-C")
+            .arg(&remote)
+            .args(["rev-parse", "feature-x"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&remote_tip.stdout).trim(),
+            repo.git(&["rev-parse", "HEAD"]).trim()
+        );
         fs::remove_dir_all(remote).unwrap();
     }
 
@@ -1814,12 +2904,25 @@ mod tests {
         let service = DiffService::new();
         for bad in ["bad name", "-x", "a..b", "x\ty", "master"] {
             let error = publish(&service, &repo, Some(bad), false).unwrap_err();
-            assert!(error.contains("Invalid branch name") || error.contains("already exists"), "{bad}: {error}");
+            assert!(
+                error.contains("Invalid branch name") || error.contains("already exists"),
+                "{bad}: {error}"
+            );
         }
-        assert_eq!(publish(&service, &repo, Some("  "), false).unwrap_err(), "Enter a name for the new branch");
-        assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "master", "a rejected name must not switch branches");
+        assert_eq!(
+            publish(&service, &repo, Some("  "), false).unwrap_err(),
+            "Enter a name for the new branch"
+        );
+        assert_eq!(
+            repo.git(&["branch", "--show-current"]).trim(),
+            "master",
+            "a rejected name must not switch branches"
+        );
         repo.git(&["checkout", "--detach"]);
-        assert_eq!(publish(&service, &repo, None, false).unwrap_err(), "HEAD is detached; enter a new branch name to publish");
+        assert_eq!(
+            publish(&service, &repo, None, false).unwrap_err(),
+            "HEAD is detached; enter a new branch name to publish"
+        );
         repo.git(&["checkout", "master"]);
         fs::remove_dir_all(remote).unwrap();
 
@@ -1827,12 +2930,15 @@ mod tests {
         lonely.write("f.txt", b"one\n");
         lonely.commit("base");
         let error = publish(&service, &lonely, Some("solo"), false).unwrap_err();
-        assert_eq!(error, "Created branch solo. Then: No Git remote is configured", "completed steps are reported with the failure");
+        assert_eq!(
+            error, "Created branch solo. Then: No Git remote is configured",
+            "completed steps are reported with the failure"
+        );
         assert_eq!(lonely.git(&["branch", "--show-current"]).trim(), "solo");
     }
 
     /// A fake `gh` that records its arguments and prints a pull request URL (or fails).
-    fn fake_gh(dir: &Path, succeed: bool) -> (std::ffi::OsString, PathBuf) {
+    fn fake_gh(dir: &Path, succeed: bool) -> (OsString, PathBuf) {
         let args = dir.join("gh-args.txt");
         #[cfg(windows)]
         let (script, body) = (
@@ -1849,7 +2955,8 @@ mod tests {
             if succeed {
                 format!("#!/bin/sh\necho \"$@\" > \"{}\"\necho Creating pull request >&2\necho https://example.invalid/pull/7\n", args.display())
             } else {
-                "#!/bin/sh\necho a pull request for this branch already exists >&2\nexit 1\n".to_string()
+                "#!/bin/sh\necho a pull request for this branch already exists >&2\nexit 1\n"
+                    .to_string()
             },
         );
         fs::write(&script, body).unwrap();
@@ -1871,10 +2978,26 @@ mod tests {
         let (gh, args) = fake_gh(&tools, true);
         let service = DiffService::with_gh(gh);
         let result = publish(&service, &repo, Some("feature-pr"), true).unwrap();
-        assert_eq!(result.pr_url.as_deref(), Some("https://example.invalid/pull/7"));
-        assert_eq!(result.steps, ["Created branch feature-pr", "Pushed feature-pr to origin", "Created pull request https://example.invalid/pull/7"]);
-        assert!(fs::read_to_string(&args).unwrap().trim().ends_with("pr create --fill --head feature-pr"));
-        assert!(remote_branches(&remote).contains("feature-pr"), "the branch is pushed before the PR is created");
+        assert_eq!(
+            result.pr_url.as_deref(),
+            Some("https://example.invalid/pull/7")
+        );
+        assert_eq!(
+            result.steps,
+            [
+                "Created branch feature-pr",
+                "Pushed feature-pr to origin",
+                "Created pull request https://example.invalid/pull/7"
+            ]
+        );
+        assert!(fs::read_to_string(&args)
+            .unwrap()
+            .trim()
+            .ends_with("pr create --fill --head feature-pr"));
+        assert!(
+            remote_branches(&remote).contains("feature-pr"),
+            "the branch is pushed before the PR is created"
+        );
 
         let failing_dir = tools.join("failing");
         fs::create_dir_all(&failing_dir).unwrap();
@@ -1883,12 +3006,18 @@ mod tests {
         repo.write("f.txt", b"two\n");
         repo.commit("second");
         let error = publish(&service, &repo, None, true).unwrap_err();
-        assert_eq!(error, "Pushed feature-pr to origin. Then: a pull request for this branch already exists");
+        assert_eq!(
+            error,
+            "Pushed feature-pr to origin. Then: a pull request for this branch already exists"
+        );
 
         let service = DiffService::with_gh("definitely-not-a-program-omp".into());
         let error = publish(&service, &repo, None, true).unwrap_err();
         assert!(error.ends_with(GH_MISSING), "{error}");
-        assert_eq!(service.open_pull_request("a").unwrap_err(), "No pull request was created in this session");
+        assert_eq!(
+            service.open_pull_request("a").unwrap_err(),
+            "No pull request was created in this session"
+        );
         fs::remove_dir_all(remote).unwrap();
         fs::remove_dir_all(tools).unwrap();
     }
@@ -1908,9 +3037,21 @@ mod tests {
             cmd
         };
         let started = Instant::now();
-        assert_eq!(run_timed(cmd, None, Duration::from_secs(1), "missing").unwrap_err(), "Timed out after 1 s");
+        assert_eq!(
+            run_timed(cmd, None, Duration::from_secs(1), "missing").unwrap_err(),
+            "Timed out after 1 s"
+        );
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert_eq!(run_timed(Command::new("definitely-not-a-program-omp"), None, Duration::from_secs(1), "missing").unwrap_err(), "missing");
+        assert_eq!(
+            run_timed(
+                Command::new("definitely-not-a-program-omp"),
+                None,
+                Duration::from_secs(1),
+                "missing"
+            )
+            .unwrap_err(),
+            "missing"
+        );
     }
 
     #[test]
@@ -1929,28 +3070,90 @@ mod tests {
         let second = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
         repo.write("edit.txt", b"unrelated disk edit\n");
         let service = DiffService::new();
-        let overview = service.commit_overview("a", &repo.0, None, &second).unwrap();
+        let overview = service
+            .commit_overview("a", &repo.0, None, &second)
+            .unwrap();
         assert_eq!(overview.base_commit.as_deref(), Some(first.as_str()));
-        assert_eq!(statuses(&overview), [("add.txt", "A"), ("delete.txt", "D"), ("edit.txt", "M"), ("renamed.txt", "R")].map(|(p,s)| (p.into(),s.into())));
-        for (path, original, modified) in [("edit.txt", "before\n", "after\n"), ("add.txt", "", "new\n"), ("delete.txt", "gone\n", ""), ("renamed.txt", "stable renamed content\nmore lines here\n", "stable renamed content\nmore lines here\n")] {
-            let content = service.read_file("a", &repo.0, &overview.snapshot_id, path, None).unwrap();
-            assert_eq!((content.original.as_deref(), content.modified.as_deref()), (Some(original), Some(modified)));
-            assert_eq!(content.read_only_reason.as_deref(), Some("Commit diffs are read-only"));
-            assert!(content.original_label.ends_with(" initial") && content.modified_label.ends_with(" changes"));
+        assert_eq!(
+            statuses(&overview),
+            [
+                ("add.txt", "A"),
+                ("delete.txt", "D"),
+                ("edit.txt", "M"),
+                ("renamed.txt", "R")
+            ]
+            .map(|(p, s)| (p.into(), s.into()))
+        );
+        for (path, original, modified) in [
+            ("edit.txt", "before\n", "after\n"),
+            ("add.txt", "", "new\n"),
+            ("delete.txt", "gone\n", ""),
+            (
+                "renamed.txt",
+                "stable renamed content\nmore lines here\n",
+                "stable renamed content\nmore lines here\n",
+            ),
+        ] {
+            let content = service
+                .read_file("a", &repo.0, &overview.snapshot_id, path, None)
+                .unwrap();
+            assert_eq!(
+                (content.original.as_deref(), content.modified.as_deref()),
+                (Some(original), Some(modified))
+            );
+            assert_eq!(
+                content.read_only_reason.as_deref(),
+                Some("Commit diffs are read-only")
+            );
+            assert!(
+                content.original_label.ends_with(" initial")
+                    && content.modified_label.ends_with(" changes")
+            );
             assert!(content.working_hash.is_none());
         }
-        assert_eq!(service.save_file("a", &repo.0, &overview.snapshot_id, "edit.txt", None, None, "bad").unwrap_err(), "Commit diffs are read-only");
+        assert_eq!(
+            service
+                .save_file(
+                    "a",
+                    &repo.0,
+                    &overview.snapshot_id,
+                    "edit.txt",
+                    None,
+                    None,
+                    "bad"
+                )
+                .unwrap_err(),
+            "Commit diffs are read-only"
+        );
         assert_eq!(repo.read("edit.txt"), b"unrelated disk edit\n");
         let root = service.commit_overview("a", &repo.0, None, &first).unwrap();
         assert_eq!(root.base_label, "Empty tree");
         assert!(root.files.iter().all(|f| f.status == "A"));
-        let content = service.read_file("a", &repo.0, &root.snapshot_id, "edit.txt", None).unwrap();
-        assert_eq!((content.original.as_deref(), content.modified.as_deref()), (Some(""), Some("before\n")));
-        repo.write("edit.txt", b"third\n");repo.commit("third");
+        let content = service
+            .read_file("a", &repo.0, &root.snapshot_id, "edit.txt", None)
+            .unwrap();
+        assert_eq!(
+            (content.original.as_deref(), content.modified.as_deref()),
+            (Some(""), Some("before\n"))
+        );
+        repo.write("edit.txt", b"third\n");
+        repo.commit("third");
         let third = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
-        let pair = service.commit_overview("a", &repo.0, Some(&first), &third).unwrap();
-        let content = service.read_file("a", &repo.0, &pair.snapshot_id, "edit.txt", None).unwrap();
-        assert_eq!((content.original.as_deref(), content.modified.as_deref()), (Some("before\n"), Some("third\n")));
-        for bad in ["HEAD", "--all", "not-a-hash"] { assert!(service.commit_overview("a", &repo.0, None, bad).unwrap_err().starts_with("Not a commit:")); }
+        let pair = service
+            .commit_overview("a", &repo.0, Some(&first), &third)
+            .unwrap();
+        let content = service
+            .read_file("a", &repo.0, &pair.snapshot_id, "edit.txt", None)
+            .unwrap();
+        assert_eq!(
+            (content.original.as_deref(), content.modified.as_deref()),
+            (Some("before\n"), Some("third\n"))
+        );
+        for bad in ["HEAD", "--all", "not-a-hash"] {
+            assert!(service
+                .commit_overview("a", &repo.0, None, bad)
+                .unwrap_err()
+                .starts_with("Not a commit:"));
+        }
     }
 }

@@ -83,6 +83,25 @@ function appendOutput(exec, chunk) {
   exec.dirty = true;
 }
 
+function interactiveContext(ctx, exec) {
+  const ui = ctx?.ui;
+  if (!ui || typeof ui.custom !== 'function') return ctx;
+  const custom = function(factory, ...rest) {
+    const wrapped = (...args) => {
+      const component = factory(...args);
+      if (component && typeof component.appendOutput === 'function') {
+        const original = component.appendOutput;
+        exec.interactive = true;
+        component.appendOutput = function(chunk) { appendOutput(exec, chunk); return original.call(this, chunk); };
+        exec.restoreOverlay = () => { delete component.appendOutput; exec.restoreOverlay = undefined; };
+      }
+      return component;
+    };
+    return ui.custom(wrapped, ...rest);
+  };
+  return Object.create(ctx, { ui: { value: Object.create(ui, { custom: { value: custom } }) } });
+}
+
 const sameService = (daemon, service) => !!daemon && daemon.id === service.id && daemon.startedAt === service.startedAt && daemon.owner === service.owner;
 
 function serviceOutcome(killRequested, daemon) {
@@ -404,25 +423,6 @@ export function installTerminalCommands(pi, options) {
     };
     Object.defineProperty(manager, 'register', { configurable: true, writable: true, enumerable: descriptor?.enumerable ?? false, value: wrapper });
     patchedManagers.set(manager, { descriptor, wrapper });
-  }
-
-  function interactiveContext(ctx, exec) {
-    const ui = ctx?.ui;
-    if (!ui || typeof ui.custom !== 'function') return ctx;
-    const custom = function(factory, ...rest) {
-      const wrapped = (...args) => {
-        const component = factory(...args);
-        if (component && typeof component.appendOutput === 'function') {
-          const original = component.appendOutput;
-          exec.interactive = true;
-          component.appendOutput = function(chunk) { appendOutput(exec, chunk); return original.call(this, chunk); };
-          exec.restoreOverlay = () => { delete component.appendOutput; exec.restoreOverlay = undefined; };
-        }
-        return component;
-      };
-      return ui.custom(wrapped, ...rest);
-    };
-    return Object.create(ctx, { ui: { value: Object.create(ui, { custom: { value: custom } }) } });
   }
 
   async function adoptService(exec, result) {

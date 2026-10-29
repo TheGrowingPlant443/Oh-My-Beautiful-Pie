@@ -6,14 +6,16 @@
     url = "github:nix-community/fenix";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  inputs.crane.url = "github:ipetkov/crane";
 
-  outputs = { self, nixpkgs, fenix }:
+  outputs = { self, nixpkgs, fenix, crane }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
       perSystem = pkgs:
         let
           inherit (pkgs) lib stdenv;
+          craneLib = crane.mkLib pkgs;
           sdk = import ./nix/omp-sdk { inherit pkgs; };
           sdkCommand = pkgs.writeShellScript "omp-manager-cli" ''
             unset PI_COMPILED
@@ -25,27 +27,52 @@
             inherit (pkgs.tree-sitter-grammars.tree-sitter-php) version src;
             pyproject = true;
             build-system = with pkgs.python3Packages; [ setuptools wheel ];
+            postPatch = ''
+              substituteInPlace pyproject.toml --replace-fail 'license = "LICENSE"' 'license = "MIT"'
+            '';
             nativeCheckInputs = with pkgs.python3Packages; [ tree-sitter pytestCheckHook ];
             pytestFlags = [ "bindings/python/tests" ];
             pythonImportsCheck = [ "tree_sitter_php" ];
           };
           # Tree-sitter grammars used by the System overview parser worker (bridge/source-index).
-          # Missing grammars are reported by the app as unavailable; they never break the build.
           sourceIndexPythonWith = extra: pkgs.python3.withPackages (ps:
-            let grammarPackages = ps.tree-sitter-grammars // ps // { tree-sitter-php = phpGrammar; }; in
+            let
+              # The visitors require these upstream schemas, not Nixpkgs' alternative grammars.
+              jvmGrammar = language: version: src:
+                ps.tree-sitter-grammars."tree-sitter-${language}".override {
+                  grammarDrv = pkgs.tree-sitter-grammars."tree-sitter-${language}".overrideAttrs {
+                    inherit version src;
+                  };
+                };
+              grammarPackages = ps.tree-sitter-grammars // ps // {
+                tree-sitter-php = phpGrammar;
+                tree-sitter-groovy = jvmGrammar "groovy" "0.1.2" (pkgs.fetchFromGitHub {
+                  owner = "amaanq";
+                  repo = "tree-sitter-groovy";
+                  rev = "70efb0b9b50f95bcbd89dcfd42b275e0304e10cf";
+                  hash = "sha256-usgT3dOq5Tg1wet4jCcS47Dn+2psl7dPRjcimjZClBk=";
+                });
+                tree-sitter-kotlin = jvmGrammar "kotlin" "1.1.0" (pkgs.fetchFromGitHub {
+                  owner = "tree-sitter-grammars";
+                  repo = "tree-sitter-kotlin";
+                  rev = "77dd60ea0a9003ce062c9728a513ffe1aaff8c82";
+                  hash = "sha256-6jjK5rA/lEdsYDboU7wGfzEiRdZo44SrLlcgWci0xa4=";
+                });
+              };
+            in
             [ ps.tree-sitter ] ++ extra ps ++
-            map (name: grammarPackages.${name}) (lib.filter (name: builtins.hasAttr name grammarPackages) [
+            map (name: grammarPackages.${name}) [
               "tree-sitter-python" "tree-sitter-javascript" "tree-sitter-typescript" "tree-sitter-go"
               "tree-sitter-rust" "tree-sitter-java" "tree-sitter-groovy" "tree-sitter-c" "tree-sitter-cpp"
               "tree-sitter-ruby" "tree-sitter-c-sharp" "tree-sitter-kotlin" "tree-sitter-scala"
               "tree-sitter-php" "tree-sitter-lua" "tree-sitter-swift" "tree-sitter-bash" "tree-sitter-powershell"
               "tree-sitter-zig" "tree-sitter-elixir" "tree-sitter-objc" "tree-sitter-julia"
               "tree-sitter-fortran" "tree-sitter-verilog"
-            ]));
+            ]);
           sourceIndexPython = sourceIndexPythonWith (_: []);
           coveragePython = sourceIndexPythonWith (ps: [ ps.coverage ]);
           testNodeModules = pkgs.importNpmLock.buildNodeModules {
-            npmRoot = ./.;
+            npmRoot = frontendSource;
             nodejs = pkgs.nodejs_24;
             derivationArgs = {
               npmFlags = [ "--ignore-scripts" ];
@@ -74,7 +101,7 @@
           ];
           # Keep the complete bridge/resource trees: Rust embeds these at compile time.
           # A checkout can contain very large build outputs and nested worktrees.
-          source = lib.cleanSourceWith {
+          sourceFor = roots: lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
               let
@@ -86,18 +113,21 @@
               && !(builtins.any (part: builtins.elem part [
                 "target" "node_modules" "dist" ".worktrees" "worktrees" "result" "__pycache__"
               ]) parts)
-              && (toString path == toString ./. || builtins.elem root [
-                "src" "src-tauri" "bridge" "resources" "package.json" "package-lock.json"
-                "index.html" "vite.config.ts" "svelte.config.js" "tsconfig.json"
-              ]);
+              && (toString path == toString ./. || builtins.elem root roots);
           };
+          frontendRoots = [
+            "src" "package.json" "package-lock.json" "index.html"
+            "vite.config.ts" "svelte.config.js" "tsconfig.json"
+          ];
+          frontendSource = sourceFor frontendRoots;
+          source = sourceFor ([ "src-tauri" "bridge" "resources" ] ++ frontendRoots);
           frontend = pkgs.buildNpmPackage {
             pname = "omp-manager-frontend";
             version = "0.1.0";
-            src = source;
+            src = frontendSource;
             nodejs = pkgs.nodejs_24;
             # Every download is integrity-pinned by the checked-in npm lockfile.
-            npmDeps = pkgs.importNpmLock { npmRoot = ./.; };
+            npmDeps = pkgs.importNpmLock { npmRoot = frontendSource; };
             npmConfigHook = pkgs.importNpmLock.npmConfigHook;
             npmRebuildFlags = [ "--ignore-scripts" ];
             npmFlags = [ "--ignore-scripts" ];
@@ -118,26 +148,32 @@
             terminal = false;
             categories = [ "Development" ];
           };
-          package = pkgs.rustPlatform.buildRustPackage {
+          rustArgs = {
             pname = "omp-manager";
             version = "0.1.0";
             src = source;
-            cargoLock.lockFile = ./src-tauri/Cargo.lock;
-            cargoRoot = "src-tauri";
-            buildAndTestSubdir = "src-tauri";
-            # The Cargo dependency feature embeds dist without needing the Tauri CLI.
-            buildFeatures = [ "tauri/custom-protocol" ];
+            postUnpack = ''sourceRoot="$sourceRoot/src-tauri"'';
+            cargoLock = pkgs.writeText "Cargo.lock" (builtins.readFile ./src-tauri/Cargo.lock);
+            # Both cache and application must enable the same embedded-asset feature.
+            cargoExtraArgs = "--locked --features tauri/custom-protocol";
             nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake pkgs.makeWrapper ]
               ++ lib.optionals stdenv.hostPlatform.isLinux [ pkgs.wrapGAppsHook3 ];
             buildInputs = lib.optionals stdenv.hostPlatform.isLinux linuxLibs
               # Darwin frameworks come from the SDK supplied by the Nix stdenv.
               ++ lib.optionals stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
-            preBuild = ''
-              cp -r ${frontend} dist
-            '';
             # Desktop/keyring/container smoke tests require an actual user session.
             doCheck = false;
             dontWrapGApps = true;
+          };
+          cargoArtifacts = craneLib.buildDepsOnly (rustArgs // {
+            # Crane's dummy source puts an explicit lock at its root; this crate is nested.
+            extraDummyScript = "mv $out/Cargo.lock $out/src-tauri/Cargo.lock";
+          });
+          package = craneLib.buildPackage (rustArgs // {
+            inherit cargoArtifacts;
+            preBuild = ''
+              cp -r ${frontend} ../dist
+            '';
             postInstall = lib.optionalString stdenv.hostPlatform.isLinux ''
               mkdir -p "$out/share/applications"
               cp ${desktopItem}/share/applications/*.desktop "$out/share/applications/"
@@ -176,7 +212,7 @@
               mainProgram = "omp-manager";
               platforms = systems;
             };
-          };
+          });
         in
         {
           inherit package frontend sdk;
@@ -196,7 +232,7 @@
             OMP_COVERAGE_CARGO = "${coverageRust}/bin/cargo";
             OMP_COVERAGE_CARGO_VENDOR = "${coverageCargoVendor}";
           } // lib.optionalAttrs stdenv.hostPlatform.isLinux {
-            LD_LIBRARY_PATH = lib.makeLibraryPath linuxLibs;
+            LD_LIBRARY_PATH = lib.makeLibraryPath (linuxLibs ++ [ pkgs.dbus.lib ]);
             GIO_MODULE_DIR = "${pkgs.glib-networking}/lib/gio/modules";
             XDG_DATA_DIRS = lib.concatStringsSep ":" [
               "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}"

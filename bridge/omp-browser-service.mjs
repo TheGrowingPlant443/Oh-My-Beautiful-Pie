@@ -773,18 +773,16 @@ if (import.meta.main) {
   const service=new BrowserService(root,sdkDir,state=>{log('state',state.instanceId,state.state,`pid=${state.pid}`,state.error??'');output({type:'state',data:state});},{native,log,helperSession});
   await service.start(); output({type:'ready',helperSession});
   let chunks=[];let bytes=0;
-  const respond=async frame=>{
+  const respond=frame=>{
     const started=Date.now();
-    let response;
-    try {
-      const data=await service.dispatch(frame.action,frame.payload,frame.id);
+    // Keep stdin free for native replies and concurrent supervisor actions.
+    return service.dispatch(frame.action,frame.payload,frame.id).then(data=>{
       log(frame.action,'ok',`${Date.now()-started}ms`);
-      response={type:'response',id:frame.id,ok:true,data};
-    } catch(error) {
+      return {type:'response',id:frame.id,ok:true,data};
+    }).catch(error=>{
       log(frame.action,'failed',`${Date.now()-started}ms`,String(error.message??error));
-      response={type:'response',id:frame.id,ok:false,error:String(error.message??error)};
-    }
-    output(response);
+      return {type:'response',id:frame.id,ok:false,error:String(error.message??error)};
+    }).then(output);
   };
   try {
     for await (const chunk of process.stdin) {

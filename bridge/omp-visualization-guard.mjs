@@ -57,6 +57,19 @@ function submittedBy(guard, event) {
   return event.toolName === submitterFor(guard.kind) && event?.input?.requestId === guard.requestId;
 }
 
+function noteInitiator(guard, initiator) {
+  // Native steering can enter inside an existing loop without before_agent_start.
+  // Its fresh user-message timestamp distinguishes it from retained pre-compaction history.
+  if (initiator?.role !== 'user' || !Number.isFinite(initiator.timestamp)) return;
+  if (guard.inputTimestamp !== undefined && initiator.timestamp > guard.inputTimestamp && !messageText(initiator).includes(guard.nonce)) guard.uncertainTurn = true;
+  guard.inputTimestamp = Math.max(guard.inputTimestamp ?? 0, initiator.timestamp);
+}
+
+function assertPendingInactive(guard, messages) {
+  if (guard.uncertain) throw new Error('analysis_authorization_missing: Pending stage authorization is uncertain.');
+  if (messages.some(message => messageText(message).includes(guard.nonce))) throw new Error('analysis_authorization_missing: Stage activation did not run.');
+}
+
 /** Native provenance, not the text of a compacted summary, owns authorization. */
 export function createVisualizationGuard({ nonce = () => randomBytes(16).toString('hex') } = {}) {
   const guards = new Map();
@@ -85,17 +98,6 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
     guards.delete(guard.nonce);
     if (guard.mode === 'srs') host?.onYield?.(publicStage(guard), reason);
     else retireMonitor(guard, reason);
-  }
-  function noteInitiator(guard, initiator) {
-    // Native steering can enter inside an existing loop without before_agent_start.
-    // Its fresh user-message timestamp distinguishes it from retained pre-compaction history.
-    if (initiator?.role !== 'user' || !Number.isFinite(initiator.timestamp)) return;
-    if (guard.inputTimestamp !== undefined && initiator.timestamp > guard.inputTimestamp && !messageText(initiator).includes(guard.nonce)) guard.uncertainTurn = true;
-    guard.inputTimestamp = Math.max(guard.inputTimestamp ?? 0, initiator.timestamp);
-  }
-  function assertPendingInactive(guard, messages) {
-    if (guard.uncertain) throw new Error('analysis_authorization_missing: Pending stage authorization is uncertain.');
-    if (messages.some(message => messageText(message).includes(guard.nonce))) throw new Error('analysis_authorization_missing: Stage activation did not run.');
   }
   // False when an unrelated human turn ended this guard; throws when the continuation cannot be attributed.
   function settleUncertainTurn(guard, initiator) {
@@ -255,7 +257,12 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
     compact(_event, ctx) { for (const guard of live(ctx)) guard.continuationExpected = true; },
     agentEnd(event, ctx) {
       if (!main(ctx) || !guards.size) return;
-      if (event?.willContinue === true) { for (const guard of live(ctx)) guard.continuationExpected = true; return; }
+      if (event?.willContinue === true) {
+        for (const guard of live(ctx)) {
+          guard.continuationExpected = true;
+        }
+        return;
+      }
       const mineVersion = ++version;
       const settle = () => {
         if (mineVersion !== version || !guards.size) return;
