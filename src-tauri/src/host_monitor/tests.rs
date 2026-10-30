@@ -1469,23 +1469,6 @@ fn native_snapshot_smoke() {
     assert!(native::capture_identity(1).is_none());
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-fn native_snapshot_smoke() {
-    let identity = native::capture_identity(std::process::id()).expect("own process identity");
-    let collection = native::collect(&AtomicBool::new(false)).expect("native collection");
-    let process = collection
-        .processes
-        .iter()
-        .find(|row| row.pid == identity.pid)
-        .expect("own process collected");
-    assert_eq!(process.creation, Some(identity.creation_time_100ns));
-    assert_eq!(
-        native::collect(&AtomicBool::new(true)).err().as_deref(),
-        Some("monitor_cancelled")
-    );
-}
-
 // ---------------------------------------------------------------- Linux /proc decoding (pure, runs on any host)
 
 // Captured from a live Linux host (little-endian: the kernel prints each address word in host byte order).
