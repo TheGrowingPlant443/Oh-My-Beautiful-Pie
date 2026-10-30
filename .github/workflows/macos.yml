@@ -1,4 +1,4 @@
-name: macOS app
+name: Native apps
 
 on:
   workflow_dispatch:
@@ -8,6 +8,7 @@ permissions:
 
 jobs:
   build:
+    name: macOS arm64
     runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: '15.0'
@@ -31,6 +32,14 @@ jobs:
             --config 'source.vendored-sources.directory="cargo-vendor-dir"' \
             build --manifest-path src-tauri/Cargo.toml --release --locked --offline \
             --features tauri/custom-protocol
+      - name: Test native identity regression
+        run: |
+          TMPDIR="$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.gettempdir()))')"
+          export TMPDIR
+          cargo --config 'source.crates-io.replace-with="vendored-sources"' \
+            --config 'source.vendored-sources.directory="cargo-vendor-dir"' \
+            test --manifest-path src-tauri/Cargo.toml --locked --offline \
+            --features tauri/custom-protocol host_monitor::host_monitor_service::tests::native_snapshot_smoke -- --exact
       - name: Test native backend
         run: |
           TMPDIR="$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.gettempdir()))')"
@@ -82,4 +91,50 @@ jobs:
         with:
           name: OMP-Manager-macos-arm64
           path: artifacts/*.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2025
+    steps:
+      # Runner-owned scratch avoids short-name aliases in the user-profile temp path.
+      - name: Use runner-owned temporary directory
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Build frontend
+        run: npm ci --ignore-scripts && npm run check && npm run build
+      - name: Build native app
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --locked --features tauri/custom-protocol
+      - name: Test Markdown path regressions
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol agent_markdown::tests::
+      - name: Test frozen rule metadata
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol code_quality::alternate::tests::
+      - name: Test configuration path regressions
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol config::tests::
+      - name: Test instance path regressions
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol instance::tests::
+      - name: Test native backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol
+      - name: Package app
+        run: |
+          New-Item -ItemType Directory -Path artifacts | Out-Null
+          Compress-Archive -LiteralPath src-tauri/target/release/omp-manager.exe -DestinationPath artifacts/OMP-Manager-windows-x64.zip
+          Get-FileHash artifacts/OMP-Manager-windows-x64.zip -Algorithm SHA256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: OMP-Manager-windows-x64
+          path: artifacts/OMP-Manager-windows-x64.zip
           if-no-files-found: error

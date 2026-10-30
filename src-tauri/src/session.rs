@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -53,6 +54,7 @@ pub struct SessionState {
     pub phases: Vec<Phase>,
 }
 
+#[must_use]
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -60,6 +62,7 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[must_use]
 pub fn agent_dir(home: &Path, profile: &str) -> PathBuf {
     let root = home.join(
         std::env::var_os("PI_CONFIG_DIR")
@@ -82,6 +85,7 @@ pub fn agent_dir(home: &Path, profile: &str) -> PathBuf {
     }
 }
 
+#[must_use]
 pub fn same_path(a: &Path, b: &Path) -> bool {
     let normalize = |p: &Path| {
         let p = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
@@ -125,6 +129,7 @@ pub fn header(path: &Path) -> Option<(Value, Option<String>)> {
     None
 }
 
+#[must_use]
 pub fn list(home: &Path, project: &Path, profile: &str) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
     let root = agent_dir(home, profile).join("sessions");
@@ -169,7 +174,7 @@ pub fn list(home: &Path, project: &Path, profile: &str) -> Vec<SessionInfo> {
             });
         }
     }
-    sessions.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    sessions.sort_by_key(|session| Reverse(session.modified_ms));
     sessions
 }
 
@@ -191,28 +196,38 @@ pub fn local_path(session: &Path, uri: &str) -> Option<PathBuf> {
 
 /// The session's todo list as markdown: one `#` heading per phase, one checkbox line per task
 /// (`[x]` completed, `[~]` in progress, `[ ]` otherwise).
+#[must_use]
 pub fn todo_markdown(phases: &[Phase]) -> String {
-    phases
-        .iter()
-        .map(|phase| {
-            let title = if phase.name.trim().is_empty() { "Plan" } else { phase.name.trim() };
-            let tasks = phase
-                .tasks
-                .iter()
-                .map(|task| {
-                    let mark = match task.status.as_str() {
-                        "completed" => "x",
-                        "in_progress" => "~",
-                        _ => " ",
-                    };
-                    format!("- [{mark}] {}", task.content)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("# {title}\n{tasks}\n")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut text = String::new();
+    for (index, phase) in phases.iter().enumerate() {
+        if index > 0 {
+            text.push('\n');
+        }
+        let title = if phase.name.trim().is_empty() {
+            "Plan"
+        } else {
+            phase.name.trim()
+        };
+        text.push_str("# ");
+        text.push_str(title);
+        text.push('\n');
+        for task in &phase.tasks {
+            let mark = match task.status.as_str() {
+                "completed" => "x",
+                "in_progress" => "~",
+                _ => " ",
+            };
+            text.push_str("- [");
+            text.push_str(mark);
+            text.push_str("] ");
+            text.push_str(&task.content);
+            text.push('\n');
+        }
+        if phase.tasks.is_empty() {
+            text.push('\n');
+        }
+    }
+    text
 }
 
 /// The most recently saved native plan file among a project's sessions (newest 10 sessions that have
@@ -246,6 +261,16 @@ pub struct TailReader {
     resolved_local: HashMap<String, PathBuf>,
 }
 
+/// A `write` tool call targeting a `local://` URI, as (call id, URI).
+fn local_write_call(block: &Value) -> Option<(&str, &str)> {
+    if block["type"] != "toolCall" || block["name"] != "write" {
+        return None;
+    }
+    let uri = block["arguments"]["path"].as_str()?;
+    uri.starts_with("local://")
+        .then_some((block["id"].as_str()?, uri))
+}
+
 impl TailReader {
     fn fold(&mut self, value: Value) {
         if value["type"] == "mode_change" {
@@ -259,50 +284,58 @@ impl TailReader {
             self.todos(&value["data"]["phases"]);
         }
         if value["type"] == "message" && value["message"]["role"] == "assistant" {
-            for block in value["message"]["content"].as_array().into_iter().flatten() {
-                if block["type"] == "toolCall" && block["name"] == "write" {
-                    if let (Some(id), Some(uri)) =
-                        (block["id"].as_str(), block["arguments"]["path"].as_str())
-                    {
-                        if uri.starts_with("local://") {
-                            self.local_writes.insert(id.into(), uri.into());
-                        }
-                    }
-                }
+            self.record_local_writes(&value["message"]);
+        }
+        if value["type"] == "message" && value["message"]["role"] == "toolResult" {
+            self.fold_tool_result(&value["message"]);
+        }
+    }
+
+    fn record_local_writes(&mut self, message: &Value) {
+        let blocks = message["content"].as_array().into_iter().flatten();
+        for block in blocks {
+            if let Some((id, uri)) = local_write_call(block) {
+                self.local_writes.insert(id.into(), uri.into());
             }
         }
-        if value["type"] != "message" || value["message"]["role"] != "toolResult" {
-            return;
-        }
-        let message = &value["message"];
+    }
+
+    fn fold_tool_result(&mut self, message: &Value) {
         match message["toolName"].as_str() {
-            Some("write") => {
-                if let Some(id) = message["toolCallId"].as_str() {
-                    if let Some(uri) = self.local_writes.remove(id) {
-                        if message["isError"] != true {
-                            if let Some(path) = message["details"]["resolvedPath"].as_str() {
-                                let path = PathBuf::from(path);
-                                if path.is_absolute() {
-                                    self.resolved_local.insert(uri, path);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            Some("write") => self.resolve_local_write(message),
             Some("todo") => self.todos(&message["details"]["phases"]),
             Some("task") => {
-                for item in message["details"]["progress"]
+                let progress = message["details"]["progress"]
                     .as_array()
                     .into_iter()
-                    .flatten()
-                {
+                    .flatten();
+                for item in progress {
                     if let Some(id) = item["id"].as_str() {
                         self.progress.insert(id.into(), item.clone());
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn resolve_local_write(&mut self, message: &Value) {
+        let Some(id) = message["toolCallId"].as_str() else {
+            return;
+        };
+        let Some(uri) = self.local_writes.remove(id) else {
+            return;
+        };
+        if message["isError"] == true {
+            return;
+        }
+        if let Some(path) = message["details"]["resolvedPath"]
+            .as_str()
+            .map(PathBuf::from)
+        {
+            if path.is_absolute() {
+                self.resolved_local.insert(uri, path);
+            }
         }
     }
 
@@ -316,7 +349,8 @@ impl TailReader {
         self.state.phases.clear();
         for phase in phases {
             let mut tasks = Vec::new();
-            for task in phase["tasks"].as_array().into_iter().flatten() {
+            let phase_tasks = phase["tasks"].as_array().into_iter().flatten();
+            for task in phase_tasks {
                 self.state.todo_total += 1;
                 if task["status"] == "completed" {
                     self.state.todo_done += 1;
@@ -329,7 +363,10 @@ impl TailReader {
                     status: task["status"].as_str().unwrap_or("pending").into(),
                 });
             }
-            self.state.phases.push(Phase { name: phase["name"].as_str().unwrap_or_default().into(), tasks });
+            self.state.phases.push(Phase {
+                name: phase["name"].as_str().unwrap_or_default().into(),
+                tasks,
+            });
         }
     }
 
@@ -338,42 +375,12 @@ impl TailReader {
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         let len = metadata.len();
         let created = metadata.created().ok();
-        let mut replaced = len < self.offset || (self.created.is_some() && created != self.created);
-        if !replaced && self.offset > 0 {
-            file.seek(SeekFrom::Start(self.offset - self.checkpoint.len() as u64))
-                .map_err(|e| e.to_string())?;
-            let mut previous = vec![0; self.checkpoint.len()];
-            file.read_exact(&mut previous).map_err(|e| e.to_string())?;
-            replaced = previous != self.checkpoint;
-        }
-        if replaced {
+        if self.is_replaced(&mut file, len, created)? {
             *self = Self::default();
         }
         self.created = created;
         if len > self.offset {
-            file.seek(SeekFrom::Start(self.offset))
-                .map_err(|e| e.to_string())?;
-            file.read_to_end(&mut self.pending)
-                .map_err(|e| e.to_string())?;
-            self.offset = file.stream_position().map_err(|e| e.to_string())?;
-            let complete = self
-                .pending
-                .iter()
-                .rposition(|b| *b == b'\n')
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let bytes: Vec<u8> = self.pending.drain(..complete).collect();
-            for line in bytes.split(|b| *b == b'\n') {
-                if let Ok(value) = serde_json::from_slice(line) {
-                    self.fold(value);
-                }
-            }
-            let size = self.offset.min(64) as usize;
-            file.seek(SeekFrom::Start(self.offset - size as u64))
-                .map_err(|e| e.to_string())?;
-            self.checkpoint = vec![0; size];
-            file.read_exact(&mut self.checkpoint)
-                .map_err(|e| e.to_string())?;
+            self.read_appended(&mut file)?;
         }
         self.state.title = header(path).and_then(|(_, title)| title);
         self.state.plan_path = self
@@ -384,48 +391,131 @@ impl TailReader {
                     .map(|fallback| self.resolved_local.get(uri).cloned().unwrap_or(fallback))
             })
             .filter(|p| p.is_file());
-        self.state.subagents.clear();
-        for entry in fs::read_dir(path.with_extension(""))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let child = entry.path();
-            if child.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some((value, _)) = header(&child) else {
-                continue;
-            };
-            let Some(parent) = value["parentSession"].as_str() else {
-                continue;
-            };
-            if !same_path(Path::new(parent), path) {
-                continue;
-            }
-            let name = child
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            let progress = self.progress.get(&name);
-            self.state.subagents.push(Subagent {
-                id: name.clone(),
-                name,
-                path: child,
-                task: progress
-                    .and_then(|p| p["task"].as_str())
-                    .map(|s| s.lines().next().unwrap_or("").into()),
-                status: progress
-                    .and_then(|p| p["status"].as_str())
-                    .unwrap_or("unknown")
-                    .into(),
-                agent: progress.and_then(|p| p["agent"].as_str()).map(String::from),
-            });
-        }
-        self.state.subagents.sort_by(|a, b| a.name.cmp(&b.name));
+        self.refresh_subagents(path);
         Ok(())
     }
+
+    fn is_replaced(
+        &self,
+        file: &mut File,
+        len: u64,
+        created: Option<SystemTime>,
+    ) -> Result<bool, String> {
+        if len < self.offset || (self.created.is_some() && created != self.created) {
+            return Ok(true);
+        }
+        if self.offset == 0 {
+            return Ok(false);
+        }
+        file.seek(SeekFrom::Start(self.offset - self.checkpoint.len() as u64))
+            .map_err(|e| e.to_string())?;
+        let mut previous = vec![0; self.checkpoint.len()];
+        file.read_exact(&mut previous).map_err(|e| e.to_string())?;
+        Ok(previous != self.checkpoint)
+    }
+
+    fn read_appended(&mut self, file: &mut File) -> Result<(), String> {
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(|e| e.to_string())?;
+        file.read_to_end(&mut self.pending)
+            .map_err(|e| e.to_string())?;
+        self.offset = file.stream_position().map_err(|e| e.to_string())?;
+        let complete = self
+            .pending
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let bytes: Vec<u8> = self.pending.drain(..complete).collect();
+        for line in bytes.split(|b| *b == b'\n') {
+            if let Ok(value) = serde_json::from_slice(line) {
+                self.fold(value);
+            }
+        }
+        let size = self.offset.min(64) as usize;
+        file.seek(SeekFrom::Start(self.offset - size as u64))
+            .map_err(|e| e.to_string())?;
+        self.checkpoint = vec![0; size];
+        file.read_exact(&mut self.checkpoint)
+            .map_err(|e| e.to_string())
+    }
+
+    fn refresh_subagents(&mut self, path: &Path) {
+        self.state.subagents.clear();
+        let entries = fs::read_dir(path.with_extension(""))
+            .into_iter()
+            .flatten()
+            .flatten();
+        for entry in entries {
+            if let Some(subagent) = self.subagent(entry.path(), path) {
+                self.state.subagents.push(subagent);
+            }
+        }
+        self.state.subagents.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    fn subagent(&self, child: PathBuf, session: &Path) -> Option<Subagent> {
+        if child.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            return None;
+        }
+        let (value, _) = header(&child)?;
+        let parent = value["parentSession"].as_str()?;
+        if !same_path(Path::new(parent), session) {
+            return None;
+        }
+        let name = child
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let progress = self.progress.get(&name);
+        Some(Subagent {
+            id: name.clone(),
+            name,
+            path: child,
+            task: progress
+                .and_then(|p| p["task"].as_str())
+                .map(|s| s.lines().next().unwrap_or("").into()),
+            status: progress
+                .and_then(|p| p["status"].as_str())
+                .unwrap_or("unknown")
+                .into(),
+            agent: progress.and_then(|p| p["agent"].as_str()).map(String::from),
+        })
+    }
+}
+
+pub fn render_transcript_file(
+    path: &Path,
+    input: &crate::instance::CreateInput,
+) -> Result<String, String> {
+    let program = crate::toolchain::omp_program();
+    let mut command = std::process::Command::new(program);
+    command
+        .arg("render")
+        .arg(path)
+        .args(["-w", "120", "--plain"]);
+    command
+        .current_dir(&input.project_path)
+        .env("OMP_PROFILE", &input.profile);
+    let overlays: Vec<PathBuf> = std::env::var_os("PI_CONFIG_FILES")
+        .map(|s| std::env::split_paths(&s).collect())
+        .unwrap_or_default();
+    command.env(
+        "PI_CONFIG_FILES",
+        std::env::join_paths(overlays.iter().chain(input.configs.iter()))
+            .map_err(|e| e.to_string())?,
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command.output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]
@@ -542,12 +632,30 @@ mod tests {
         let todo = serde_json::json!({"type":"message","message":{"role":"toolResult","toolName":"todo","details":{"phases":[
             {"name":"Build","tasks":[{"content":"one","status":"completed"},{"content":"two","status":"in_progress"}]},
             {"name":"","tasks":[{"content":"three","status":"pending"},{"content":"four","status":"abandoned"}]}]}}});
-        fs::write(&journal, format!("{}\n{todo}\n", serde_json::json!({"type":"session","id":"s","cwd":dir}))).unwrap();
+        fs::write(
+            &journal,
+            format!(
+                "{}\n{todo}\n",
+                serde_json::json!({"type":"session","id":"s","cwd":dir})
+            ),
+        )
+        .unwrap();
         let mut reader = TailReader::default();
         reader.update(&journal).unwrap();
         assert_eq!((reader.state.todo_done, reader.state.todo_total), (1, 4));
-        assert_eq!(todo_markdown(&reader.state.phases), "# Build\n- [x] one\n- [~] two\n\n# Plan\n- [ ] three\n- [ ] four\n");
+        assert_eq!(
+            todo_markdown(&reader.state.phases),
+            "# Build\n- [x] one\n- [~] two\n\n# Plan\n- [ ] three\n- [ ] four\n"
+        );
         assert_eq!(todo_markdown(&[]), "");
+        assert_eq!(
+            todo_markdown(&[Phase {
+                name: "  ".into(),
+                tasks: Vec::new()
+            }]),
+            "# Plan\n\n",
+            "An empty phase keeps the saved Markdown layout"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -556,15 +664,26 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let session = |name: &str, plan: Option<(&str, &str)>| {
             let path = dir.join(format!("{name}.jsonl"));
-            let mut text = format!("{}\n", serde_json::json!({"type":"session","id":name,"cwd":dir}));
+            let mut text = format!(
+                "{}\n",
+                serde_json::json!({"type":"session","id":name,"cwd":dir})
+            );
             if let Some((uri, body)) = plan {
-                text += &format!("{}\n", serde_json::json!({"type":"mode_change","mode":"plan","data":{"planFilePath":uri}}));
+                text += &format!(
+                    "{}\n",
+                    serde_json::json!({"type":"mode_change","mode":"plan","data":{"planFilePath":uri}})
+                );
                 let file = local_path(&path, uri).unwrap();
                 fs::create_dir_all(file.parent().unwrap()).unwrap();
                 fs::write(file, body).unwrap();
             }
             fs::write(&path, text).unwrap();
-            SessionInfo { id: name.into(), path, title: name.into(), modified_ms: 0 }
+            SessionInfo {
+                id: name.into(),
+                path,
+                title: name.into(),
+                modified_ms: 0,
+            }
         };
         let old = session("old", Some(("local://old.md", "old")));
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -572,42 +691,14 @@ mod tests {
         let bare = session("bare", None);
         let picked = last_saved_plan(&[bare.clone(), old.clone(), new.clone()]).unwrap();
         assert_eq!(fs::read_to_string(picked).unwrap(), "new");
-        assert_eq!(last_saved_plan(&[bare.clone(), old]).map(|p| fs::read_to_string(p).unwrap()).as_deref(), Some("old"));
+        assert_eq!(
+            last_saved_plan(&[bare.clone(), old])
+                .map(|p| fs::read_to_string(p).unwrap())
+                .as_deref(),
+            Some("old")
+        );
         assert_eq!(last_saved_plan(&[bare]), None);
         assert_eq!(last_saved_plan(&[]), None);
         fs::remove_dir_all(dir).unwrap();
     }
-}
-
-pub fn render_transcript_file(
-    path: &Path,
-    input: &crate::instance::CreateInput,
-) -> Result<String, String> {
-    let program = crate::toolchain::omp_program();
-    let mut command = std::process::Command::new(program);
-    command
-        .arg("render")
-        .arg(path)
-        .args(["-w", "120", "--plain"]);
-    command
-        .current_dir(&input.project_path)
-        .env("OMP_PROFILE", &input.profile);
-    let overlays: Vec<PathBuf> = std::env::var_os("PI_CONFIG_FILES")
-        .map(|s| std::env::split_paths(&s).collect())
-        .unwrap_or_default();
-    command.env(
-        "PI_CONFIG_FILES",
-        std::env::join_paths(overlays.iter().chain(input.configs.iter()))
-            .map_err(|e| e.to_string())?,
-    );
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    let output = command.output().map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }

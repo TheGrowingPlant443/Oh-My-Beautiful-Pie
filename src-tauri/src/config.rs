@@ -41,7 +41,11 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 const SDK_PACKAGE: &str = "node_modules/@oh-my-pi/pi-coding-agent";
 
 /// Where the installed OMP SDK (`@oh-my-pi/pi-coding-agent`) may be, most specific first. `OMP_SDK_DIR` is exclusive.
-fn sdk_candidates(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>, omp: Option<&Path>) -> Vec<PathBuf> {
+fn sdk_candidates(
+    home: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    omp: Option<&Path>,
+) -> Vec<PathBuf> {
     if let Some(path) = env("OMP_SDK_DIR") {
         return vec![PathBuf::from(path)];
     }
@@ -59,8 +63,12 @@ fn sdk_candidates(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
             candidates.push(data.join("omp-manager/sdk").join(SDK_PACKAGE));
         }
         // A package-manager install: `omp` is (a link into) `<prefix>/node_modules/@oh-my-pi/pi-coding-agent/...`.
-        if let Some(real) = omp.filter(|path| path.is_absolute()).and_then(|path| fs::canonicalize(path).ok()) {
-            for ancestor in real.ancestors().skip(1).filter(|a| a.parent().is_some()) {
+        if let Some(real) = omp
+            .filter(|path| path.is_absolute())
+            .and_then(|path| fs::canonicalize(path).ok())
+        {
+            let ancestors = real.ancestors().skip(1).filter(|a| a.parent().is_some());
+            for ancestor in ancestors {
                 if ancestor.ends_with("@oh-my-pi/pi-coding-agent") {
                     candidates.push(ancestor.to_path_buf());
                 }
@@ -76,7 +84,10 @@ fn sdk_candidates(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 #[cfg(unix)]
 fn app_data_dirs(home: &Path, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
     let mut dirs = vec![];
-    if let Some(data) = env("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()) {
+    if let Some(data) = env("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
         dirs.push(data);
     }
     dirs.push(home.join(".local/share"));
@@ -105,7 +116,11 @@ pub(crate) fn sdk_dir(home: &Path) -> Result<PathBuf> {
             ));
         }
     }
-    let hint = if cfg!(unix) { " On Linux/macOS build the matching SDK with Nix as described in the README section \"Linux and macOS\", then set OMP_SDK_DIR to its @oh-my-pi/pi-coding-agent directory." } else { "" };
+    let hint = if cfg!(unix) {
+        " On Linux/macOS build the matching SDK with Nix as described in the README section \"Linux and macOS\", then set OMP_SDK_DIR to its @oh-my-pi/pi-coding-agent directory."
+    } else {
+        ""
+    };
     Err(format!("Portable config requires Bun and the installed OMP SDK. Set BUN_BIN / OMP_SDK_DIR if they are not discoverable.{hint}"))
 }
 
@@ -135,7 +150,7 @@ pub fn native_request(root: &Path, home: &Path, mut request: Value) -> Result<Va
     let mut child = command(bun)
         .arg(root.join("omp-config.mjs"))
         .current_dir(cwd)
-        .env("PI_COMPILED", "false")
+        .env_remove("PI_COMPILED")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -155,7 +170,7 @@ pub fn native_request(root: &Path, home: &Path, mut request: Value) -> Result<Va
         return Err(format!("Write native config request: {error}"));
     }
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
-    let response: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+    let mut response: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
         "OMP config helper returned invalid output. Check Bun and OMP SDK compatibility."
             .to_string()
     })?;
@@ -165,7 +180,7 @@ pub fn native_request(root: &Path, home: &Path, mut request: Value) -> Result<Va
             .unwrap_or("OMP config helper failed")
             .into());
     }
-    Ok(response["data"].clone())
+    Ok(response["data"].take())
 }
 
 pub fn preview(root: &Path, home: &Path, request: Value) -> Result<ConfigPreview> {
@@ -200,6 +215,7 @@ pub struct GlobalConfigStore {
     state: Mutex<DefaultConfigState>,
 }
 impl GlobalConfigStore {
+    #[must_use]
     pub fn load(root: PathBuf) -> Self {
         let loaded = match fs::read(root.join("global-config.json")) {
             Ok(bytes) => serde_json::from_slice::<Pointer>(&bytes)
@@ -244,6 +260,7 @@ impl GlobalConfigStore {
         }
         Ok(())
     }
+    #[must_use]
     pub fn info(&self) -> GlobalConfigInfo {
         match self.state.lock() {
             Ok(state) => {
@@ -319,11 +336,13 @@ impl GlobalConfigStore {
         Ok(())
     }
     fn normalize(path: &Path) -> Result<PathBuf> {
-        let path = fs::canonicalize(path).map_err(|e| format!("Global config is unavailable: {e}"))?;
+        let path =
+            fs::canonicalize(path).map_err(|e| format!("Global config is unavailable: {e}"))?;
         Ok(PathBuf::from(
             path.to_string_lossy().trim_start_matches("\\\\?\\"),
         ))
     }
+    #[must_use]
     pub fn list(&self) -> Vec<SavedConfig> {
         let Ok(entries) = fs::read_dir(self.root.join("global-configs")) else {
             return Vec::new();
@@ -341,7 +360,11 @@ impl GlobalConfigStore {
                 Some(SavedConfig { path, modified_ms })
             })
             .collect();
-        found.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms).then_with(|| a.path.cmp(&b.path)));
+        found.sort_by(|a, b| {
+            b.modified_ms
+                .cmp(&a.modified_ms)
+                .then_with(|| a.path.cmp(&b.path))
+        });
         found
     }
     pub fn activate(&self, path: &Path) -> Result<PathBuf> {
@@ -415,7 +438,9 @@ mod tests {
         assert_eq!(store.current_path().unwrap(), Some(a.clone()));
         assert_eq!(count(), before);
         assert_eq!(
-            GlobalConfigStore::load(root.clone()).current_path().unwrap(),
+            GlobalConfigStore::load(root.clone())
+                .current_path()
+                .unwrap(),
             Some(a.clone())
         );
         let outside = root.join("outside.yml");
@@ -426,11 +451,18 @@ mod tests {
     }
     #[test]
     fn explicit_sdk_dir_is_exclusive_and_defaults_cover_bun_global() {
-        let env = |name: &str| (name == "OMP_SDK_DIR").then(|| std::ffi::OsString::from("/explicit/sdk"));
-        assert_eq!(sdk_candidates(Path::new("/home/u"), &env, None), vec![PathBuf::from("/explicit/sdk")]);
+        let env =
+            |name: &str| (name == "OMP_SDK_DIR").then(|| std::ffi::OsString::from("/explicit/sdk"));
+        assert_eq!(
+            sdk_candidates(Path::new("/home/u"), &env, None),
+            vec![PathBuf::from("/explicit/sdk")]
+        );
         let none = |_: &str| None;
         let defaults = sdk_candidates(Path::new("/home/u"), &none, None);
-        assert_eq!(defaults[0], PathBuf::from("/home/u/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent"));
+        assert_eq!(
+            defaults[0],
+            PathBuf::from("/home/u/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent")
+        );
     }
     #[cfg(unix)]
     #[test]
@@ -438,11 +470,18 @@ mod tests {
         let env = |name: &str| (name == "XDG_DATA_HOME").then(|| std::ffi::OsString::from("/xdg"));
         let home = Path::new("/home/u");
         let candidates = sdk_candidates(home, &env, None);
-        assert!(candidates.contains(&PathBuf::from("/xdg/omp-manager/sdk/node_modules/@oh-my-pi/pi-coding-agent")));
-        assert!(candidates.contains(&PathBuf::from("/home/u/.local/share/omp-manager/sdk/node_modules/@oh-my-pi/pi-coding-agent")));
+        assert!(candidates.contains(&PathBuf::from(
+            "/xdg/omp-manager/sdk/node_modules/@oh-my-pi/pi-coding-agent"
+        )));
+        assert!(candidates.contains(&PathBuf::from(
+            "/home/u/.local/share/omp-manager/sdk/node_modules/@oh-my-pi/pi-coding-agent"
+        )));
         // A relative XDG_DATA_HOME is ignored per the XDG specification.
-        let relative = |name: &str| (name == "XDG_DATA_HOME").then(|| std::ffi::OsString::from("relative"));
-        assert!(sdk_candidates(home, &relative, None).iter().all(|c| c.is_absolute()));
+        let relative =
+            |name: &str| (name == "XDG_DATA_HOME").then(|| std::ffi::OsString::from("relative"));
+        assert!(sdk_candidates(home, &relative, None)
+            .iter()
+            .all(|c| c.is_absolute()));
 
         let prefix = std::env::temp_dir().join(format!("omp-sdk-prefix-{}", uuid::Uuid::new_v4()));
         let package = prefix.join("lib/node_modules/@oh-my-pi/pi-coding-agent");
@@ -451,8 +490,12 @@ mod tests {
         fs::write(package.join("src/cli.ts"), "").unwrap();
         std::os::unix::fs::symlink(package.join("src/cli.ts"), prefix.join("bin/omp")).unwrap();
         let canonical = fs::canonicalize(&package).unwrap();
-        assert!(sdk_candidates(home, &|_| None, Some(&prefix.join("bin/omp"))).contains(&canonical));
-        assert!(sdk_candidates(home, &|_| None, Some(Path::new("omp"))).iter().all(|c| c.is_absolute()));
+        assert!(
+            sdk_candidates(home, &|_| None, Some(&prefix.join("bin/omp"))).contains(&canonical)
+        );
+        assert!(sdk_candidates(home, &|_| None, Some(Path::new("omp")))
+            .iter()
+            .all(|c| c.is_absolute()));
         fs::remove_dir_all(prefix).unwrap();
     }
 }

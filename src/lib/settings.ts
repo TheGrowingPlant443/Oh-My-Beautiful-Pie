@@ -3,8 +3,9 @@ import type { Instance } from "./api";
 export type StartupTarget = "manager" | "architect" | "project" | "latest" | "dashboard";
 export type ProjectLanguage = "maven" | "npm" | "pypi" | "cargo";
 export type ProjectRole = "backend" | "frontend";
-const LANGUAGES: readonly ProjectLanguage[] = ["maven", "npm", "pypi", "cargo"];
-const ROLES: readonly ProjectRole[] = ["backend", "frontend"];
+const LANGUAGES: ReadonlySet<ProjectLanguage> = new Set(["maven", "npm", "pypi", "cargo"]);
+const ROLES: ReadonlySet<ProjectRole> = new Set(["backend", "frontend"]);
+const STARTUP_TARGETS: ReadonlySet<unknown> = new Set(["architect", "project", "latest", "dashboard"]);
 export interface AppSettings {
   version: 1;
   startupTarget: StartupTarget;
@@ -29,6 +30,10 @@ export interface AppSettings {
   filterRoles: ProjectRole[];
 }
 
+const flag = (value: Record<string, unknown>, key: keyof AppSettings, fallback: boolean): boolean => (typeof value[key] === "boolean" ? (value[key] as boolean) : fallback);
+const projectId = (value: unknown): string | null => typeof value === "string" && value.trim() ? value : null;
+const choices = <T>(value: unknown, allowed: ReadonlySet<T>): T[] => Array.isArray(value) ? [...new Set(value.filter((item): item is T => allowed.has(item)))] : [];
+
 export function parseAppSettings(raw: string | null, legacyShowManager: string | null): AppSettings {
   const defaults: AppSettings = {
     version: 1, startupTarget: "manager", startupProjectId: null, latestProjectId: null,
@@ -44,23 +49,23 @@ export function parseAppSettings(raw: string | null, legacyShowManager: string |
   if (value.version !== 1) return defaults;
   return {
     version: 1,
-    startupProjectId: typeof value.startupProjectId === "string" && value.startupProjectId.trim() ? value.startupProjectId : null,
-    latestProjectId: typeof value.latestProjectId === "string" && value.latestProjectId.trim() ? value.latestProjectId : null,
-    startupTarget: value.startupTarget === "architect" || value.startupTarget === "project" || value.startupTarget === "latest" || value.startupTarget === "dashboard" ? value.startupTarget : "manager",
-    showPreviousProjects: typeof value.showPreviousProjects === "boolean" ? value.showPreviousProjects : defaults.showPreviousProjects,
-    showManagerTile: typeof value.showManagerTile === "boolean" ? value.showManagerTile : defaults.showManagerTile,
+    startupProjectId: projectId(value.startupProjectId),
+    latestProjectId: projectId(value.latestProjectId),
+    startupTarget: STARTUP_TARGETS.has(value.startupTarget) ? value.startupTarget as StartupTarget : "manager",
+    showPreviousProjects: flag(value, "showPreviousProjects", defaults.showPreviousProjects),
+    showManagerTile: flag(value, "showManagerTile", defaults.showManagerTile),
     previewSize: value.previewSize === 420 || value.previewSize === 1000 ? value.previewSize : 640,
-    autoStart: typeof value.autoStart === "boolean" ? value.autoStart : defaults.autoStart,
-    browserHeadless: typeof value.browserHeadless === "boolean" ? value.browserHeadless : defaults.browserHeadless,
-    browserEmbedded: typeof value.browserEmbedded === "boolean" ? value.browserEmbedded : defaults.browserEmbedded,
-    terminalAutoOpen: typeof value.terminalAutoOpen === "boolean" ? value.terminalAutoOpen : defaults.terminalAutoOpen,
-    terminalCreateUser: typeof value.terminalCreateUser === "boolean" ? value.terminalCreateUser : defaults.terminalCreateUser,
-    alwaysNewSession: typeof value.alwaysNewSession === "boolean" ? value.alwaysNewSession : defaults.alwaysNewSession,
-    packageLookupGate: typeof value.packageLookupGate === "boolean" ? value.packageLookupGate : defaults.packageLookupGate,
-    manifestFilter: typeof value.manifestFilter === "boolean" ? value.manifestFilter : defaults.manifestFilter,
-    filterLanguages: Array.isArray(value.filterLanguages) ? [...new Set(value.filterLanguages.filter((item): item is ProjectLanguage => LANGUAGES.includes(item)))] : [],
-    aiFilter: typeof value.aiFilter === "boolean" ? value.aiFilter : defaults.aiFilter,
-    filterRoles: Array.isArray(value.filterRoles) ? [...new Set(value.filterRoles.filter((item): item is ProjectRole => ROLES.includes(item)))] : [],
+    autoStart: flag(value, "autoStart", defaults.autoStart),
+    browserHeadless: flag(value, "browserHeadless", defaults.browserHeadless),
+    browserEmbedded: flag(value, "browserEmbedded", defaults.browserEmbedded),
+    terminalAutoOpen: flag(value, "terminalAutoOpen", defaults.terminalAutoOpen),
+    terminalCreateUser: flag(value, "terminalCreateUser", defaults.terminalCreateUser),
+    alwaysNewSession: flag(value, "alwaysNewSession", defaults.alwaysNewSession),
+    packageLookupGate: flag(value, "packageLookupGate", defaults.packageLookupGate),
+    manifestFilter: flag(value, "manifestFilter", defaults.manifestFilter),
+    filterLanguages: choices(value.filterLanguages, LANGUAGES),
+    aiFilter: flag(value, "aiFilter", defaults.aiFilter),
+    filterRoles: choices(value.filterRoles, ROLES),
   };
 }
 

@@ -65,7 +65,55 @@ export function sanitizeConfig(input, definitions) {
       if (value !== null && (typeof value !== 'string' || !value.trim())) throw new Error(`modelRoles.${role} requires a model selection or null`);
     }
   }
-  return { settings: output, omitted: [...omitted].sort() };
+  return { settings: output, omitted: [...omitted].sort((a, b) => (a < b ? -1 : Number(a > b))) };
+}
+
+const loadSdk = (sdk, file) => import(pathToFileURL(path.join(sdk, file)).href);
+
+// The first restorable saved model role that resolves; explicit thinking history overrides the model's default.
+async function savedSessionModel(sdk, models, resolveSessionModelSelector, sessionPath) {
+  const { SessionManager } = await loadSdk(sdk, 'src/session/session-manager.ts');
+  const { getRestorableSessionModels } = await loadSdk(sdk, 'src/session/session-context.ts');
+  const session = await SessionManager.open(sessionPath, undefined, undefined, { suppressBreadcrumb: true, throwIfMissing: true });
+  let resolved;
+  try {
+    const context = session.buildSessionContext();
+    for (const selector of getRestorableSessionModels(context.models, session.getLastModelChangeRole())) {
+      const saved = resolveSessionModelSelector(models, selector);
+      if (!saved) continue;
+      const hasThinkingEntry = session.getBranch().some(entry => entry.type === 'thinking_level_change');
+      resolved = { ...saved, thinkingLevel: hasThinkingEntry ? context.configuredThinkingLevel ?? context.thinkingLevel : saved.thinkingLevel };
+      break;
+    }
+  } finally { await session.close(); }
+  return resolved;
+}
+
+async function localSetup(request, sdk, dirs, Settings) {
+  const settings = await Settings.loadReadOnly({ cwd: request.cwd, agentDir: dirs.getAgentDir(), configFiles: request.configFiles ?? [] });
+  const { discoverAuthStorage } = await loadSdk(sdk, 'src/sdk.ts');
+  const { ModelRegistry } = await loadSdk(sdk, 'src/config/model-registry.ts');
+  const { resolveCliModel, resolveSessionModelSelector } = await loadSdk(sdk, 'src/config/model-resolver.ts');
+  const auth = await discoverAuthStorage(dirs.getAgentDir(), { settings, cwd: request.cwd });
+  try {
+    // Static/cached metadata only: admission never probes a model or performs inference.
+    const models = new ModelRegistry(auth, path.join(dirs.getAgentDir(), 'models.yml'), { settings, fetch: () => Promise.reject(new Error('Local setup admission does not discover models online')) });
+    await models.hydrateCredentialScopedModelCaches();
+    let resolved;
+    if (request.model) resolved = resolveCliModel({ cliModel: request.model, modelRegistry: models, settings });
+    else if (request.sessionPath) resolved = await savedSessionModel(sdk, models, resolveSessionModelSelector, request.sessionPath);
+    resolved ??= resolveCliModel({ cliModel: '@default', modelRegistry: models, settings });
+    if (!isLocalModel(resolved.model)) return { local: false };
+    return { local: true, selector: `${resolved.model.provider}/${resolved.model.id}`, thinkingLevel: resolved.thinkingLevel ?? null };
+  } finally { auth.close(); }
+}
+
+function exportedSettings(settings, definitions) {
+  const input = Object.create(null);
+  for (const def of definitions) {
+    if (settings.isConfigured(def)) put(input, def.segments, def.get(settings));
+  }
+  return input;
 }
 
 export async function runConfig(request) {
@@ -74,51 +122,15 @@ export async function runConfig(request) {
   const dirs = await import(pathToFileURL(dirsPath).href);
   dirs.setProfile(request.profile || 'default');
   if (request.action === 'paths') return { globalOmpFolder: dirs.getBaseConfigRoot(), globalAgentFolder: dirs.getAgentDir() };
-  const { Settings } = await import(pathToFileURL(path.join(sdk, 'src/config/settings.ts')).href);
-  if (request.action === 'local_setup') {
-    const settings = await Settings.loadReadOnly({ cwd: request.cwd, agentDir: dirs.getAgentDir(), configFiles: request.configFiles ?? [] });
-    const { discoverAuthStorage } = await import(pathToFileURL(path.join(sdk, 'src/sdk.ts')).href);
-    const { ModelRegistry } = await import(pathToFileURL(path.join(sdk, 'src/config/model-registry.ts')).href);
-    const { resolveCliModel, resolveSessionModelSelector } = await import(pathToFileURL(path.join(sdk, 'src/config/model-resolver.ts')).href);
-    const auth = await discoverAuthStorage(dirs.getAgentDir(), { settings, cwd: request.cwd });
-    try {
-      // Static/cached metadata only: admission never probes a model or performs inference.
-      const models = new ModelRegistry(auth, path.join(dirs.getAgentDir(), 'models.yml'), { settings, fetch: () => Promise.reject(new Error('Local setup admission does not discover models online')) });
-      await models.hydrateCredentialScopedModelCaches();
-      let resolved;
-      if (request.model) resolved = resolveCliModel({ cliModel: request.model, modelRegistry: models, settings });
-      else if (request.sessionPath) {
-        const { SessionManager } = await import(pathToFileURL(path.join(sdk, 'src/session/session-manager.ts')).href);
-        const { getRestorableSessionModels } = await import(pathToFileURL(path.join(sdk, 'src/session/session-context.ts')).href);
-        const session = await SessionManager.open(request.sessionPath, undefined, undefined, { suppressBreadcrumb: true, throwIfMissing: true });
-        try {
-          const context = session.buildSessionContext();
-          for (const selector of getRestorableSessionModels(context.models, session.getLastModelChangeRole())) {
-            const saved = resolveSessionModelSelector(models, selector);
-            if (saved) {
-              const hasThinkingEntry = session.getBranch().some(entry => entry.type === 'thinking_level_change');
-              const thinkingLevel = hasThinkingEntry ? context.configuredThinkingLevel ?? context.thinkingLevel : saved.thinkingLevel;
-              resolved = { ...saved, thinkingLevel };
-              break;
-            }
-          }
-        } finally { await session.close(); }
-      }
-      resolved ??= resolveCliModel({ cliModel: '@default', modelRegistry: models, settings });
-      if (!isLocalModel(resolved.model)) return { local: false };
-      return { local: true, selector: `${resolved.model.provider}/${resolved.model.id}`, thinkingLevel: resolved.thinkingLevel ?? null };
-    } finally { auth.close(); }
-  }
-  const registry = await import(pathToFileURL(path.join(sdk, 'src/config/registry.ts')).href);
+  const { Settings } = await loadSdk(sdk, 'src/config/settings.ts');
+  if (request.action === 'local_setup') return localSetup(request, sdk, dirs, Settings);
+  const registry = await loadSdk(sdk, 'src/config/registry.ts');
   const definitions = registry.all();
   if (!definitions.length) throw new Error('OMP compatibility: native setting registry is empty');
   let input;
   if (request.action === 'export') {
     const settings = await Settings.loadReadOnly({ cwd: request.cwd, agentDir: dirs.getAgentDir(), configFiles: request.configFiles ?? [] });
-    input = Object.create(null);
-    for (const def of definitions) {
-      if (settings.isConfigured(def)) put(input, def.segments, def.get(settings));
-    }
+    input = exportedSettings(settings, definitions);
   } else if (request.action === 'import') {
     const text = request.yaml ?? await Bun.file(request.path).text();
     input = Bun.YAML.parse(text);

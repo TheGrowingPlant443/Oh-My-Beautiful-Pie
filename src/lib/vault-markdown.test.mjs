@@ -137,6 +137,13 @@ test("embed sections: by heading up to the next same-or-higher heading, by block
   assert.equal(extractFragment(text, "^nope"), null);
 });
 
+test("embed sections accept closed and tab-separated ATX headings and block ids after a fenced block", () => {
+  const text = "  ##\tPart X ##  \nx\n####### not a heading\n## Next\n\n```\ncode\n\nstill code ^fenced\n```\ntail ^tail\n";
+  assert.equal(extractFragment(text, "Part X"), "  ##\tPart X ##  \nx\n####### not a heading");
+  assert.equal(extractFragment(text, "^tail"), "```\ncode\n\nstill code ^fenced\n```\ntail");
+  assert.equal(extractFragment(text, "^fenced"), null);
+});
+
 test("a cancelled render stops without output", async () => {
   let calls = 0;
   const html = await renderSegment(md, "[[A]]", newEnv("a.md"), { resolve: async () => { calls++; return [{ raw: "A", status: "resolved", path: "A.md", candidates: [] }]; }, loadEmbed: async () => ({ html: "", notice: null }), cancelled: () => true });

@@ -1,8 +1,8 @@
 //! Versioned on-disk state under `<app-config>/code-quality/`. Nonsecret only.
 //! Corrupt or unknown-version files are reported, never silently reset (ownership records must survive).
-use super::secrets::{path_identity, sha256_hex};
-use super::types::*;
-use crate::dependency_security::{atomic_json, bounded_json};
+use super::secrets;
+use super::types::{QualityConfig, QualityProject, QualityRuntime, QualityScan, Result};
+use crate::dependency_security;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -23,7 +23,13 @@ pub struct ConfigFile {
 
 impl Default for ConfigFile {
     fn default() -> Self {
-        ConfigFile { version: 1, config: QualityConfig::default(), revision: 0, activated: false, start_at_launch: false }
+        ConfigFile {
+            version: 1,
+            config: QualityConfig::default(),
+            revision: 0,
+            activated: false,
+            start_at_launch: false,
+        }
     }
 }
 
@@ -78,8 +84,12 @@ pub struct ResourceFile {
 }
 
 impl ResourceFile {
+    #[must_use]
     pub fn new() -> Self {
-        ResourceFile { version: 1, ..Default::default() }
+        ResourceFile {
+            version: 1,
+            ..Default::default()
+        }
     }
     pub fn runtime_mut(&mut self, runtime: &QualityRuntime) -> Option<&mut RuntimeRecord> {
         self.runtimes.iter_mut().find(|r| &r.runtime == runtime)
@@ -123,45 +133,62 @@ pub struct Paths {
 }
 
 impl Paths {
+    #[must_use]
     pub fn new(root: PathBuf) -> Self {
         Paths { root }
     }
+    #[must_use]
     pub fn config(&self) -> PathBuf {
         self.root.join("config.json")
     }
+    #[must_use]
     pub fn installation(&self) -> PathBuf {
         self.root.join("installation.json")
     }
+    #[must_use]
     pub fn resources(&self) -> PathBuf {
         self.root.join("resources.json")
     }
+    #[must_use]
     pub fn consents(&self) -> PathBuf {
         self.root.join("consents.json")
     }
+    #[must_use]
     pub fn project(&self, folder: &str) -> PathBuf {
-        self.root.join("projects").join(format!("{}.json", folder_hash(folder)))
+        self.root
+            .join("projects")
+            .join(format!("{}.json", folder_hash(folder)))
     }
+    #[must_use]
     pub fn jobs(&self) -> PathBuf {
         self.root.join("jobs")
     }
+    #[must_use]
     pub fn job(&self, id: &str) -> PathBuf {
         self.root.join("jobs").join(id)
     }
+    #[must_use]
     pub fn result(&self, id: &str) -> PathBuf {
         self.job(id).join("result.json")
     }
 }
 
+#[must_use]
 pub fn folder_hash(folder: &str) -> String {
-    sha256_hex(&path_identity(folder))[..32].to_string()
+    secrets::sha256_hex(&secrets::path_identity(folder))[..32].to_string()
 }
 
+#[must_use]
 pub fn valid_job_id(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok()
 }
 
-fn read_versioned<T: for<'de> Deserialize<'de>>(path: &Path, max: u64, what: &str) -> Result<Option<T>> {
-    bounded_json::<T>(path, max).map_err(|e| {
+fn read_versioned<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    max: u64,
+    what: &str,
+) -> Result<Option<T>> {
+    dependency_security::bounded_json::<T>(path, max).map_err(|e| {
         format!(
             "The code quality {what} file {} is unreadable ({e}). Fix or remove it manually; the app will not reset it because it records container ownership.",
             path.display()
@@ -179,7 +206,7 @@ pub fn load_config(paths: &Paths) -> Result<ConfigFile> {
 
 pub fn save_config(paths: &Paths, file: &ConfigFile) -> Result<()> {
     std::fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
-    atomic_json(&paths.config(), file, MAX_STATE_BYTES)
+    dependency_security::atomic_json(&paths.config(), file, MAX_STATE_BYTES)
 }
 
 pub fn load_resources(paths: &Paths) -> Result<ResourceFile> {
@@ -192,12 +219,14 @@ pub fn load_resources(paths: &Paths) -> Result<ResourceFile> {
 
 pub fn save_resources(paths: &Paths, file: &ResourceFile) -> Result<()> {
     std::fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
-    atomic_json(&paths.resources(), file, MAX_STATE_BYTES)
+    dependency_security::atomic_json(&paths.resources(), file, MAX_STATE_BYTES)
 }
 
 /// Read-only installation identity lookup. A waiting process must never create this file.
 pub fn read_installation(paths: &Paths) -> Result<Option<String>> {
-    if let Some(file) = read_versioned::<InstallationFile>(&paths.installation(), MAX_STATE_BYTES, "installation")? {
+    if let Some(file) =
+        read_versioned::<InstallationFile>(&paths.installation(), MAX_STATE_BYTES, "installation")?
+    {
         if file.version == 1 && uuid::Uuid::parse_str(&file.id).is_ok() {
             return Ok(Some(file.id));
         }
@@ -212,13 +241,23 @@ pub fn load_installation(paths: &Paths) -> Result<String> {
         return Ok(id);
     }
     std::fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
-    let id = uuid::Uuid::new_v4().to_string();
-    atomic_json(&paths.installation(), &InstallationFile { version: 1, id: id.clone() }, MAX_STATE_BYTES)?;
-    Ok(id)
+    let file = InstallationFile {
+        version: 1,
+        id: uuid::Uuid::new_v4().to_string(),
+    };
+    dependency_security::atomic_json(&paths.installation(), &file, MAX_STATE_BYTES)?;
+    Ok(file.id)
 }
 
 pub fn load_project(paths: &Paths, folder: &str) -> Result<ProjectFile> {
-    Ok(read_versioned::<ProjectFile>(&paths.project(folder), MAX_STATE_BYTES, "project")?.unwrap_or(ProjectFile { version: 1, project: None, recent: Vec::new() }))
+    Ok(
+        read_versioned::<ProjectFile>(&paths.project(folder), MAX_STATE_BYTES, "project")?
+            .unwrap_or(ProjectFile {
+                version: 1,
+                project: None,
+                recent: Vec::new(),
+            }),
+    )
 }
 
 pub fn list_project_folders(paths: &Paths) -> Result<Vec<String>> {
@@ -230,14 +269,24 @@ pub fn list_project_folders(paths: &Paths) -> Result<Vec<String>> {
     let mut files = Vec::new();
     for entry in entries {
         let path = entry.map_err(|error| error.to_string())?.path();
-        if path.extension().and_then(|value| value.to_str()) == Some("json") { files.push(path); }
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            files.push(path);
+        }
     }
     files.sort();
     let mut folders = Vec::new();
     for path in files {
         if let Some(file) = read_versioned::<ProjectFile>(&path, MAX_STATE_BYTES, "project")? {
-            if file.version != 1 { return Err(format!("The code quality project file {} has an unsupported version {}", path.display(), file.version)); }
-            if let Some(project) = file.project { folders.push(project.folder); }
+            if file.version != 1 {
+                return Err(format!(
+                    "The code quality project file {} has an unsupported version {}",
+                    path.display(),
+                    file.version
+                ));
+            }
+            if let Some(project) = file.project {
+                folders.push(project.folder);
+            }
         }
     }
     folders.sort();
@@ -247,18 +296,26 @@ pub fn list_project_folders(paths: &Paths) -> Result<Vec<String>> {
 
 pub fn save_project(paths: &Paths, folder: &str, file: &ProjectFile) -> Result<()> {
     std::fs::create_dir_all(paths.root.join("projects")).map_err(|e| e.to_string())?;
-    atomic_json(&paths.project(folder), file, MAX_STATE_BYTES)
+    dependency_security::atomic_json(&paths.project(folder), file, MAX_STATE_BYTES)
 }
 
 pub fn load_consents(paths: &Paths) -> Result<ConsentFile> {
-    Ok(read_versioned::<ConsentFile>(&paths.consents(), MAX_STATE_BYTES, "consent")?.unwrap_or(ConsentFile { version: 1, approved: Vec::new() }))
+    Ok(
+        read_versioned::<ConsentFile>(&paths.consents(), MAX_STATE_BYTES, "consent")?.unwrap_or(
+            ConsentFile {
+                version: 1,
+                approved: Vec::new(),
+            },
+        ),
+    )
 }
 
 pub fn save_consents(paths: &Paths, file: &ConsentFile) -> Result<()> {
     std::fs::create_dir_all(&paths.root).map_err(|e| e.to_string())?;
-    atomic_json(&paths.consents(), file, MAX_STATE_BYTES)
+    dependency_security::atomic_json(&paths.consents(), file, MAX_STATE_BYTES)
 }
 
+#[must_use]
 pub fn consent_key(folder: &str, recipe_hash: &str) -> String {
     format!("{}:{}", folder_hash(folder), recipe_hash)
 }
@@ -267,7 +324,7 @@ pub fn load_scan(paths: &Paths, id: &str) -> Result<Option<QualityScan>> {
     if !valid_job_id(id) {
         return Err("Invalid scan id".into());
     }
-    bounded_json::<QualityScan>(&paths.result(id), MAX_RESULT_BYTES)
+    dependency_security::bounded_json::<QualityScan>(&paths.result(id), MAX_RESULT_BYTES)
 }
 
 pub fn save_scan(paths: &Paths, scan: &QualityScan) -> Result<()> {
@@ -275,12 +332,16 @@ pub fn save_scan(paths: &Paths, scan: &QualityScan) -> Result<()> {
         return Err("Invalid scan id".into());
     }
     std::fs::create_dir_all(paths.job(&scan.id)).map_err(|e| e.to_string())?;
-    atomic_json(&paths.result(&scan.id), scan, MAX_RESULT_BYTES)
+    dependency_security::atomic_json(&paths.result(&scan.id), scan, MAX_RESULT_BYTES)
 }
 
 pub fn save_request(paths: &Paths, request: &JobRequest) -> Result<()> {
     std::fs::create_dir_all(paths.job(&request.id)).map_err(|e| e.to_string())?;
-    atomic_json(&paths.job(&request.id).join("request.json"), request, MAX_STATE_BYTES)
+    dependency_security::atomic_json(
+        &paths.job(&request.id).join("request.json"),
+        request,
+        MAX_STATE_BYTES,
+    )
 }
 
 #[cfg(test)]
@@ -305,9 +366,13 @@ mod tests {
         assert!(list_project_folders(&paths).unwrap().is_empty());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         std::fs::write(&path, br#"{"version":2,"project":null,"recent":[]}"#).unwrap();
-        assert!(list_project_folders(&paths).unwrap_err().contains("unsupported version"));
+        assert!(list_project_folders(&paths)
+            .unwrap_err()
+            .contains("unsupported version"));
         std::fs::write(&path, b"invalid").unwrap();
-        assert!(list_project_folders(&paths).unwrap_err().contains("unreadable"));
+        assert!(list_project_folders(&paths)
+            .unwrap_err()
+            .contains("unreadable"));
         assert_eq!(std::fs::read(&path).unwrap(), b"invalid");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -316,9 +381,11 @@ mod tests {
     fn missing_config_is_default_and_roundtrips() {
         let (paths, dir) = temp_paths();
         assert_eq!(load_config(&paths).unwrap(), ConfigFile::default());
-        let mut file = ConfigFile::default();
-        file.revision = 4;
-        file.activated = true;
+        let file = ConfigFile {
+            revision: 4,
+            activated: true,
+            ..Default::default()
+        };
         save_config(&paths, &file).unwrap();
         assert_eq!(load_config(&paths).unwrap(), file);
         std::fs::remove_dir_all(dir).unwrap();
@@ -332,7 +399,9 @@ mod tests {
         assert!(error.contains("ownership"), "{error}");
         assert_eq!(std::fs::read(paths.resources()).unwrap(), b"{ not json");
         std::fs::write(paths.config(), br#"{"version":2,"config":{"version":2,"mode":"alternate","runtime":{"kind":"dockerDesktop"},"communityPort":9000,"enterpriseUrl":""},"revision":0,"activated":false}"#).unwrap();
-        assert!(load_config(&paths).unwrap_err().contains("unsupported version"));
+        assert!(load_config(&paths)
+            .unwrap_err()
+            .contains("unsupported version"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -351,7 +420,10 @@ mod tests {
     fn job_ids_must_be_uuids() {
         let (paths, dir) = temp_paths();
         assert!(load_scan(&paths, "..\\..\\x").is_err());
-        assert_eq!(load_scan(&paths, &uuid::Uuid::new_v4().to_string()).unwrap(), None);
+        assert_eq!(
+            load_scan(&paths, &uuid::Uuid::new_v4().to_string()).unwrap(),
+            None
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -360,7 +432,11 @@ mod tests {
     fn unix_folders_differing_only_in_case_keep_separate_settings_and_consents() {
         let (paths, dir) = temp_paths();
         let (upper, lower) = ("/repo/A", "/repo/a");
-        let saved = |name: &str| ProjectFile { version: 1, project: None, recent: vec![name.into()] };
+        let saved = |name: &str| ProjectFile {
+            version: 1,
+            project: None,
+            recent: vec![name.into()],
+        };
         save_project(&paths, upper, &saved("upper")).unwrap();
         assert!(load_project(&paths, lower).unwrap().recent.is_empty());
         save_project(&paths, lower, &saved("lower")).unwrap();
@@ -374,7 +450,16 @@ mod tests {
     #[test]
     fn windows_folder_case_keeps_one_project_file() {
         let (paths, dir) = temp_paths();
-        save_project(&paths, "C:/Repo", &ProjectFile { version: 1, project: None, recent: vec!["saved".into()] }).unwrap();
+        save_project(
+            &paths,
+            "C:/Repo",
+            &ProjectFile {
+                version: 1,
+                project: None,
+                recent: vec!["saved".into()],
+            },
+        )
+        .unwrap();
         assert_eq!(load_project(&paths, "c:/repo").unwrap().recent, ["saved"]);
         std::fs::remove_dir_all(dir).unwrap();
     }

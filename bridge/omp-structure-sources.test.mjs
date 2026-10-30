@@ -430,7 +430,7 @@ test('Architect registration owns the capture listener and the human-only contro
 test('installed SDK local:// resolver backs a real session paste file and the capture reads its body', {
   skip: process.env.OMP_SDK_DIR ? false : 'Set OMP_SDK_DIR for the isolated installed-SDK local paste proof', timeout: 90000,
 }, async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'omp-structure-sdk-'));
+  const root = await mkdtemp(path.join(os.homedir(), '.omp-structure-sdk-'));
   try {
     await mkdir(path.join(root, 'agent'), { recursive: true });
     const { version } = JSON.parse(await readFile(path.join(process.env.OMP_SDK_DIR, 'package.json'), 'utf8'));
@@ -440,7 +440,7 @@ test('installed SDK local:// resolver backs a real session paste file and the ca
     const config = path.relative(os.homedir(), path.join(root, 'config'));
     assert.equal(config.split(path.sep).includes('..'), false, 'scratch config must remain under the real home');
     const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', [fileURLToPath(new URL('./fixtures/structure-sources-sdk.mjs', import.meta.url))], {
-      env: { ...process.env, STRUCTURE_SOURCES_TEST_ROOT: root, OMP_MANAGER_SDK_DIR: process.env.OMP_SDK_DIR, PI_CODING_AGENT_DIR: path.join(root, 'agent'), PI_CONFIG_DIR: config, PI_NATIVES_DIR: nativeRoot, OMP_PROFILE: 'default', PI_COMPILED: 'false' },
+      env: { ...process.env, STRUCTURE_SOURCES_TEST_ROOT: root, OMP_MANAGER_SDK_DIR: process.env.OMP_SDK_DIR, PI_CODING_AGENT_DIR: path.join(root, 'agent'), PI_CONFIG_DIR: config, PI_NATIVES_DIR: nativeRoot, OMP_PROFILE: 'default', PI_COMPILED: '' },
       timeout: 80000, maxBuffer: 1024 * 1024,
     });
     assert.match(stdout, /Structure source local paste capture verified/);

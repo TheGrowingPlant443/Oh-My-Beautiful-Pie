@@ -27,6 +27,7 @@ PROFILES = {
 }
 
 RAW_CAP = 4096
+ANONYMOUS = "<anonymous>"
 LOADERS = {"require": False, "dofile": True, "loadfile": True}
 DYNAMIC_FUNCS = {"load", "loadstring", "getfenv", "setfenv", "loadfile_dynamic"}
 CONDITIONAL = {
@@ -79,7 +80,11 @@ class _Walker:
     def bind_name(self, name, name_node, stmt, *, is_local, sym=None, site=None):
         """Record the binding or rebinding of identifier ``name`` by statement ``stmt``."""
         ctx = self.ctx
-        kind = "import" if site is not None else ("function" if sym is not None else "variable")
+        kind = "variable"
+        if site is not None:
+            kind = "import"
+        elif sym is not None:
+            kind = "function"
         if is_local:
             start = stmt.start_byte if (sym is not None and sym["kind"] == "function" and stmt.type == "function_declaration") else stmt.end_byte
             self.declare(name, kind, start, self.block_end(stmt), sym=sym, site=site, mutable=False, node=name_node)
@@ -97,7 +102,7 @@ class _Walker:
         ctx.declare(name, gkind, 0, len(ctx.source), symbol_id=sym["id"] if sym else None,
                     site_id=site["id"] if site else None, mutable=True, position=name_node.start_byte, owner=self.module_id)
 
-    def declare_params(self, node, sym):
+    def declare_params(self, node):
         params = node.child_by_field_name("parameters")
         if params is None:
             return
@@ -147,96 +152,59 @@ class _Walker:
         args = node.child_by_field_name("arguments")
         argv = self.arg_nodes(args)
         cond = self.cond > 0
-        if fn is not None and fn.type == "identifier":
-            fname = ctx.text(fn)
-            if fname in LOADERS:
-                self.import_site(node, fname, argv[0] if argv else None, conditional=cond, bind=self.require_bind.pop(node.id, None))
-                return
-            if fname in ("pcall", "xpcall") and argv and argv[0].type == "identifier" and ctx.text(argv[0]) == "require":
-                self.import_site(node, "require", argv[1] if len(argv) > 1 else None, conditional=True)
+        if self.loader_call(node, fn, argv, cond):
+            return
         end = args.start_byte if args is not None else node.end_byte
         raw = ctx.source[node.start_byte:end].decode("utf-8", "replace").rstrip()
-        binding: dict = {"name": None, "receiver": None, "receiverKind": None}
-        dynamic = False
-        t = fn.type if fn is not None else None
-        if t == "identifier":
-            binding.update(kind="identifier", name=ctx.text(fn))
-            dynamic = binding["name"] in DYNAMIC_FUNCS
-        elif t == "dot_index_expression":
-            table = fn.child_by_field_name("table")
-            field = fn.child_by_field_name("field")
-            rtext = ctx.text(table)
-            rk = "self" if rtext == "self" else ("identifier" if table.type == "identifier" else "expression")
-            binding.update(kind="member", name=ctx.text(field), receiver=_cap(rtext, binding), receiverKind=rk)
-        elif t == "method_index_expression":
-            table = fn.child_by_field_name("table")
-            method = fn.child_by_field_name("method")
-            rtext = ctx.text(table)
-            rk = "self" if rtext == "self" else ("identifier" if table.type == "identifier" else "expression")
-            binding.update(kind="member", name=ctx.text(method), receiver=_cap(rtext, binding), receiverKind=rk, method=True)
-        else:
-            binding.update(kind="dynamic", dynamic=True)
-            dynamic = True
+        binding, dynamic = self.call_binding(fn)
         if dynamic:
             binding["dynamic"] = True
         ctx.add_site("calls", _cap(raw, binding), node, conditional=cond, dynamic=dynamic, binding=binding)
+
+    def loader_call(self, node, fn, argv, conditional):
+        if fn is None or fn.type != "identifier":
+            return False
+        fname = self.ctx.text(fn)
+        if fname in LOADERS:
+            self.import_site(node, fname, argv[0] if argv else None, conditional=conditional,
+                             bind=self.require_bind.pop(node.id, None))
+            return True
+        if fname in ("pcall", "xpcall") and argv and argv[0].type == "identifier" and self.ctx.text(argv[0]) == "require":
+            self.import_site(node, "require", argv[1] if len(argv) > 1 else None, conditional=True)
+        return False
+
+    def call_binding(self, fn):
+        binding = {"name": None, "receiver": None, "receiverKind": None}
+        t = fn.type if fn is not None else None
+        if t == "identifier":
+            binding.update(kind="identifier", name=self.ctx.text(fn))
+            return binding, binding["name"] in DYNAMIC_FUNCS
+        if t in ("dot_index_expression", "method_index_expression"):
+            table = fn.child_by_field_name("table")
+            field_name = "method" if t == "method_index_expression" else "field"
+            field = fn.child_by_field_name(field_name)
+            rtext = self.ctx.text(table)
+            rk = "identifier" if table.type == "identifier" else "expression"
+            if rtext == "self":
+                rk = "self"
+            binding.update(kind="member", name=self.ctx.text(field), receiver=_cap(rtext, binding), receiverKind=rk)
+            if t == "method_index_expression":
+                binding["method"] = True
+            return binding, False
+        binding.update(kind="dynamic", dynamic=True)
+        return binding, True
 
     # -- declarations ---------------------------------------------------------
     def function_symbol(self, node):
         """Create the symbol for a function_declaration / function_definition and bind its name."""
         ctx = self.ctx
-        t = node.type
-        outer_owner = ctx.owner
-        kind, name, qualified = "lambda", "<anonymous>", None
         bindings: dict = {}
-        bind = None  # (name, name_node, stmt, is_local)
-        if t == "function_declaration":
-            name_node = node.child_by_field_name("name")
-            is_local = any((not c.is_named) and c.type == "local" for c in node.children)
-            nt = name_node.type
-            text = ctx.text(name_node)
-            if nt == "identifier":
-                kind, name = "function", text
-                bind = (text, name_node, node, is_local)
-                bindings["local"] = is_local
-            elif nt == "dot_index_expression":
-                kind, name = "function", ctx.text(name_node.child_by_field_name("field"))
-                qualified = text
-                bindings.update(assignedTo=text, receiver=ctx.text(name_node.child_by_field_name("table")), static=True)
-            elif nt == "method_index_expression":
-                kind, name = "method", ctx.text(name_node.child_by_field_name("method"))
-                qualified = text
-                bindings.update(assignedTo=text, receiver=ctx.text(name_node.child_by_field_name("table")), static=False, method=True)
-            else:
-                kind, name = "function", text
-                bindings["assignedTo"] = text
-        else:  # function_definition: derive the name from the binding position
-            parent = node.parent
-            if parent is not None and parent.type == "expression_list" and parent.parent is not None and parent.parent.type == "assignment_statement":
-                stmt = parent.parent
-                vars_ = stmt.named_children[0] if stmt.named_children else None
-                vlist = [c for c in vars_.named_children if c.type != "attribute"] if vars_ is not None and vars_.type == "variable_list" else []
-                idx = [c for c in parent.named_children].index(node) if node in parent.named_children else -1
-                if 0 <= idx < len(vlist):
-                    target = vlist[idx]
-                    full = ctx.text(target)
-                    if target.type == "identifier":
-                        kind, name = "function", full
-                        outer = stmt.parent
-                        is_local = outer is not None and outer.type == "variable_declaration"
-                        bind = (full, target, outer if is_local else stmt, is_local)
-                        bindings["assignedTo"] = full
-                    elif target.type == "dot_index_expression":
-                        kind, name = "function", ctx.text(target.child_by_field_name("field"))
-                        qualified = full
-                        bindings.update(assignedTo=full, receiver=ctx.text(target.child_by_field_name("table")), static=True)
-            elif parent is not None and parent.type == "field":
-                n = parent.child_by_field_name("name")
-                if n is not None and n.type == "identifier":
-                    kind, name = "function", ctx.text(n)
-                    bindings.update(assignedTo=name, tableField=True)
+        if node.type == "function_declaration":
+            kind, name, qualified, bind = self.declared_function(node, bindings)
+        else:
+            kind, name, qualified, bind = self.defined_function(node, bindings)
         bindings["body"] = True
-        if bind is not None and not bind[3] and t == "function_declaration":
+        if bind is not None and not bind[3] and node.type == "function_declaration":
             bindings["global"] = True
         sym = ctx.add_symbol(kind, name, node, bindings=bindings, qualified=qualified)
         if bind is not None:
@@ -246,16 +214,63 @@ class _Walker:
         ctx.push_scope(sym["id"], name, kind)
         self.pushed[node.id] = self.cond
         self.cond = 0
-        if t == "function_declaration":
+        if node.type == "function_declaration":
             name_node = node.child_by_field_name("name")
             if name_node.type == "method_index_expression":
                 self.declare("self", "parameter", node.start_byte, node.end_byte, node=name_node, mutable=False)
-        self.declare_params(node, sym)
+        self.declare_params(node)
         return sym
+
+    def declared_function(self, node, bindings):
+        name_node = node.child_by_field_name("name")
+        is_local = any((not c.is_named) and c.type == "local" for c in node.children)
+        nt = name_node.type
+        text = self.ctx.text(name_node)
+        if nt == "identifier":
+            bindings["local"] = is_local
+            return "function", text, None, (text, name_node, node, is_local)
+        if nt == "dot_index_expression":
+            bindings.update(assignedTo=text, receiver=self.ctx.text(name_node.child_by_field_name("table")), static=True)
+            return "function", self.ctx.text(name_node.child_by_field_name("field")), text, None
+        if nt == "method_index_expression":
+            bindings.update(assignedTo=text, receiver=self.ctx.text(name_node.child_by_field_name("table")), static=False, method=True)
+            return "method", self.ctx.text(name_node.child_by_field_name("method")), text, None
+        bindings["assignedTo"] = text
+        return "function", text, None, None
+
+    def defined_function(self, node, bindings):
+        parent = node.parent
+        if parent is not None and parent.type == "expression_list" and parent.parent is not None and parent.parent.type == "assignment_statement":
+            return self.assigned_function(node, parent, bindings)
+        if parent is not None and parent.type == "field":
+            name_node = parent.child_by_field_name("name")
+            if name_node is not None and name_node.type == "identifier":
+                name = self.ctx.text(name_node)
+                bindings.update(assignedTo=name, tableField=True)
+                return "function", name, None, None
+        return "lambda", ANONYMOUS, None, None
+
+    def assigned_function(self, node, parent, bindings):
+        stmt = parent.parent
+        vars_ = stmt.named_children[0] if stmt.named_children else None
+        vlist = [c for c in vars_.named_children if c.type != "attribute"] if vars_ is not None and vars_.type == "variable_list" else []
+        idx = list(parent.named_children).index(node) if node in parent.named_children else -1
+        if not 0 <= idx < len(vlist):
+            return "lambda", ANONYMOUS, None, None
+        target = vlist[idx]
+        full = self.ctx.text(target)
+        if target.type == "identifier":
+            outer = stmt.parent
+            is_local = outer is not None and outer.type == "variable_declaration"
+            bindings["assignedTo"] = full
+            return "function", full, None, (full, target, outer if is_local else stmt, is_local)
+        if target.type == "dot_index_expression":
+            bindings.update(assignedTo=full, receiver=self.ctx.text(target.child_by_field_name("table")), static=True)
+            return "function", self.ctx.text(target.child_by_field_name("field")), full, None
+        return "lambda", ANONYMOUS, None, None
 
     def assignment(self, node):
         """Declarations introduced by `local a, b = ...` / `a = ...` (functions/requires are bound at their value)."""
-        ctx = self.ctx
         parent = node.parent
         is_local = parent is not None and parent.type == "variable_declaration"
         stmt = parent if is_local else node
@@ -267,53 +282,52 @@ class _Walker:
         targets = [c for c in vars_.named_children if c.type != "attribute"]
         for i, target in enumerate(targets):
             value = vals[i] if i < len(vals) else None
-            if target.type != "identifier":
-                continue
-            name = ctx.text(target)
-            if value is not None and value.type == "function_definition":
-                continue  # bound when the closure symbol is created
-            if value is not None and value.type == "function_call":
-                fn = value.child_by_field_name("name")
-                if fn is not None and fn.type == "identifier" and ctx.text(fn) in LOADERS:
-                    self.require_bind[value.id] = {"name": name, "node": target, "stmt": stmt, "local": is_local}
-                    continue
-            self.bind_name(name, target, stmt, is_local=is_local)
+            self.assignment_target(target, value, stmt, is_local)
+
+    def assignment_target(self, target, value, stmt, is_local):
+        if target.type != "identifier":
+            return
+        name = self.ctx.text(target)
+        if value is not None and value.type == "function_definition":
+            return  # bound when the closure symbol is created
+        if value is not None and value.type == "function_call":
+            fn = value.child_by_field_name("name")
+            if fn is not None and fn.type == "identifier" and self.ctx.text(fn) in LOADERS:
+                self.require_bind[value.id] = {"name": name, "node": target, "stmt": stmt, "local": is_local}
+                return
+        self.bind_name(name, target, stmt, is_local=is_local)
 
     # -- traversal ------------------------------------------------------------
     def enter(self, node):
         if not node.is_named:
-            return True  # keyword/punctuation tokens share names with node types (e.g. `function`)
-        ctx = self.ctx
+            return  # keyword/punctuation tokens share names with node types (e.g. `function`)
         t = node.type
         if t in CONDITIONAL:
             self.cond += 1
             self.cond_nodes.add(node.id)
         if t in ("function_declaration", "function_definition"):
             self.function_symbol(node)
-            return True
-        if t == "assignment_statement":
+        elif t == "assignment_statement":
             self.assignment(node)
-            return True
-        if t == "for_numeric_clause":
-            n = node.child_by_field_name("name")
-            body = node.parent.child_by_field_name("body") if node.parent is not None else None
-            rng = (body.start_byte, body.end_byte) if body is not None else (node.end_byte, node.end_byte)
-            if n is not None:
-                self.declare(ctx.text(n), "variable", rng[0], rng[1], node=n, mutable=False)
-            return True
-        if t == "for_generic_clause":
-            body = node.parent.child_by_field_name("body") if node.parent is not None else None
-            rng = (body.start_byte, body.end_byte) if body is not None else (node.end_byte, node.end_byte)
-            for vl in node.named_children:
-                if vl.type == "variable_list":
-                    for n in vl.named_children:
-                        if n.type == "identifier":
-                            self.declare(ctx.text(n), "variable", rng[0], rng[1], node=n, mutable=False)
-            return True
-        if t == "function_call":
+        elif t in ("for_numeric_clause", "for_generic_clause"):
+            self.for_variables(node)
+        elif t == "function_call":
             self.call_site(node)
-            return True
-        return True
+
+    def for_variables(self, node):
+        body = node.parent.child_by_field_name("body") if node.parent is not None else None
+        rng = (body.start_byte, body.end_byte) if body is not None else (node.end_byte, node.end_byte)
+        if node.type == "for_numeric_clause":
+            name = node.child_by_field_name("name")
+            if name is not None:
+                self.declare(self.ctx.text(name), "variable", rng[0], rng[1], node=name, mutable=False)
+            return
+        for vl in node.named_children:
+            if vl.type != "variable_list":
+                continue
+            for name in vl.named_children:
+                if name.type == "identifier":
+                    self.declare(self.ctx.text(name), "variable", rng[0], rng[1], node=name, mutable=False)
 
     def leave(self, node):
         if node.id in self.cond_nodes:
@@ -324,7 +338,7 @@ class _Walker:
             self.cond = self.pushed.pop(node.id)
 
 
-def extract(language: str, source: bytes, ctx: "common.Context") -> dict:
+def extract(_language: str, _source: bytes, ctx: "common.Context") -> dict:
     tree = ctx.parse()
     root = tree.root_node
     module = ctx.module_symbol(root)

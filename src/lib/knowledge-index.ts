@@ -51,31 +51,44 @@ export class IndexHost {
           this.jobs.delete(jobId);
           this.post({ type: "cancelled", version: INDEX_PROTOCOL_VERSION, jobId });
           return;
-        case "chunk": {
-          const job = this.jobs.get(jobId);
-          if (!job) return;
-          if (job.kind === "vault" && message.section === "notes") job.builder.addNotes(message.items);
-          else if (job.kind === "vault" && message.section === "links") job.builder.addLinks(message.items);
-          else if (job.kind === "graphify" && message.section === "graphifyNodes") job.builder.addNodes(message.items);
-          else if (job.kind === "graphify" && message.section === "graphifyLinks") job.builder.addLinks(message.items);
-          else if (job.kind === "graphify" && message.section === "graphifyCommunities") job.builder.addCommunities(message.items);
-          else if (job.kind === "graphify" && message.section === "graphifyHyperedges") job.builder.addHyperedges(message.items);
-          else throw new Error(`Section ${message.section} does not belong to a ${job.kind} job`);
+        case "chunk":
+          this.addChunk(this.jobs.get(jobId), message);
           return;
-        }
-        case "finish": {
-          const job = this.jobs.get(jobId);
-          if (!job) return;
-          this.jobs.delete(jobId);
-          if (job.kind === "vault") this.post({ type: "done", version: INDEX_PROTOCOL_VERSION, jobId, result: { kind: "vault", model: job.builder.build(), stats: job.builder.stats } });
-          else this.post({ type: "done", version: INDEX_PROTOCOL_VERSION, jobId, result: { kind: "graphify", ...job.builder.build() } });
+        case "finish":
+          this.finish(jobId);
           return;
-        }
       }
     } catch (error) {
       this.jobs.delete(jobId);
       this.post({ type: "error", version: INDEX_PROTOCOL_VERSION, jobId, message: error instanceof Error ? error.message : String(error) });
     }
+  }
+
+  private addChunk(job: Builder | undefined, chunk: IndexChunk): void {
+    if (!job) return;
+    if (job.kind === "vault") {
+      if (chunk.section === "notes") job.builder.addNotes(chunk.items);
+      else if (chunk.section === "links") job.builder.addLinks(chunk.items);
+      else throw new Error(`Section ${chunk.section} does not belong to a ${job.kind} job`);
+      return;
+    }
+    switch (chunk.section) {
+      case "graphifyNodes": job.builder.addNodes(chunk.items); return;
+      case "graphifyLinks": job.builder.addLinks(chunk.items); return;
+      case "graphifyCommunities": job.builder.addCommunities(chunk.items); return;
+      case "graphifyHyperedges": job.builder.addHyperedges(chunk.items); return;
+      default: throw new Error(`Section ${chunk.section} does not belong to a ${job.kind} job`);
+    }
+  }
+
+  private finish(jobId: number): void {
+    const job = this.jobs.get(jobId);
+    if (!job) return;
+    this.jobs.delete(jobId);
+    const result: IndexResult = job.kind === "vault"
+      ? { kind: "vault", model: job.builder.build(), stats: job.builder.stats }
+      : { kind: "graphify", ...job.builder.build() };
+    this.post({ type: "done", version: INDEX_PROTOCOL_VERSION, jobId, result });
   }
 }
 

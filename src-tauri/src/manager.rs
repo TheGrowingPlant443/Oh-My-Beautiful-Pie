@@ -9,8 +9,8 @@ use std::time::Duration;
 use crate::instance::{
     ControlLease, CreateInput, Definition, Instance, InstanceKind, Origin, Registry,
 };
-use crate::session;
 use crate::plan;
+use crate::session;
 use crate::terminal::TerminalService;
 use serde_json::{json, Value};
 use tauri::Emitter;
@@ -258,176 +258,440 @@ impl ManagerHub {
             .set(registry)
             .map_err(|_| "manager registry already bound".into())
     }
-    pub fn install_browser_supervisor(&self, browser: Arc<crate::browser::BrowserSupervisor>) -> Result<()> {
-        self.browser.set(browser).map_err(|_| "browser supervisor already installed".into())
+    pub fn install_browser_supervisor(
+        &self,
+        browser: Arc<crate::browser::BrowserSupervisor>,
+    ) -> Result<()> {
+        self.browser
+            .set(browser)
+            .map_err(|_| "browser supervisor already installed".into())
     }
     pub fn install_terminal_service(&self, terminals: Arc<TerminalService>) -> Result<()> {
-        self.terminals.set(terminals).map_err(|_| "terminal service already installed".into())
+        self.terminals
+            .set(terminals)
+            .map_err(|_| "terminal service already installed".into())
     }
-    pub fn install_workspace_service(&self, service: Weak<crate::workspace::WorkspaceService>) -> Result<()> {
-        self.workspace.set(service).map_err(|_| "workspace service already installed".into())
+    pub fn install_workspace_service(
+        &self,
+        service: Weak<crate::workspace::WorkspaceService>,
+    ) -> Result<()> {
+        self.workspace
+            .set(service)
+            .map_err(|_| "workspace service already installed".into())
     }
-    pub fn install_code_quality_service(&self, service: Weak<crate::code_quality::CodeQualityService>) -> Result<()> {
-        self.code_quality.set(service).map_err(|_| "code quality service already installed".into())
+    pub fn install_code_quality_service(
+        &self,
+        service: Weak<crate::code_quality::CodeQualityService>,
+    ) -> Result<()> {
+        self.code_quality
+            .set(service)
+            .map_err(|_| "code quality service already installed".into())
     }
     pub fn install_srs_service(&self, service: Weak<crate::srs::SrsService>) -> Result<()> {
-        self.srs.set(service).map_err(|_| "SRS service already installed".into())
+        self.srs
+            .set(service)
+            .map_err(|_| "SRS service already installed".into())
     }
-    pub fn install_host_monitor_service(&self, service: Weak<crate::host_monitor::HostMonitorService>) -> Result<()> {
-        self.host_monitor.set(service).map_err(|_| "host monitor service already installed".into())
+    pub fn install_host_monitor_service(
+        &self,
+        service: Weak<crate::host_monitor::HostMonitorService>,
+    ) -> Result<()> {
+        self.host_monitor
+            .set(service)
+            .map_err(|_| "host monitor service already installed".into())
     }
     /// Separate from SRS: a session replacement, disconnect, process exit or hub shutdown retires exactly the frozen-snapshot
     /// explanations bound to that Architect launch, never a UI idle guess.
     fn monitor_lifecycle(&self, id: &str, generation: u64, kind: &str) {
-        if let Some(service) = self.host_monitor.get().and_then(Weak::upgrade) { service.on_architect_lifecycle(id, generation, kind); }
+        if let Some(service) = self.host_monitor.get().and_then(Weak::upgrade) {
+            service.on_architect_lifecycle(id, generation, kind);
+        }
     }
     fn srs_lifecycle(&self, id: &str, generation: u64, kind: &str, payload: Value) {
-        let Some(service) = self.srs.get().and_then(Weak::upgrade) else { return };
+        let Some(service) = self.srs.get().and_then(Weak::upgrade) else {
+            return;
+        };
         let producer = (|| -> Result<DependencyProducer> {
-            let lease = self.registry()?.lease(id, Origin::Human, false)?;
+            let lease = self
+                .registry()?
+                .lease(id, Origin::Human, /* mutation */ false)?;
             let state = self.state.lock().map_err(|e| e.to_string())?;
             let client = state.clients.get(id).ok_or("bridge_not_ready")?;
-            if client.role != InstanceKind::Architect || client.generation != generation { return Err("stale_generation".into()); }
-            Ok(DependencyProducer { instance_id: id.into(), generation, launch_id: launch_hash(&client.token), session_id: lease.session_id.ok_or("session_not_ready")? })
+            if client.role != InstanceKind::Architect || client.generation != generation {
+                return Err("stale_generation".into());
+            }
+            Ok(DependencyProducer {
+                instance_id: id.into(),
+                generation,
+                launch_id: launch_hash(&client.token),
+                session_id: lease.session_id.ok_or("session_not_ready")?,
+            })
         })();
-        if let Ok(producer) = producer { service.on_architect_lifecycle(&producer, crate::srs::SrsLifecycle { kind: kind.into(), payload }); }
+        if let Ok(producer) = producer {
+            service.on_architect_lifecycle(
+                &producer,
+                crate::srs::SrsLifecycle {
+                    kind: kind.into(),
+                    payload,
+                },
+            );
+        }
     }
     /// Only persisted, human-started SRS jobs can authorize these captured-native controls.
-    pub(crate) fn srs_control(&self, producer: &DependencyProducer, action: &str, payload: Value) -> Result<Value> {
-        if !["srs_stage_prompt", "srs_stage_status", "srs_pause"].contains(&action) { return Err("invalid_srs_control".into()); }
-        let service = self.srs.get().and_then(Weak::upgrade).ok_or("SRS service unavailable")?;
+    pub(crate) fn srs_control(
+        &self,
+        producer: &DependencyProducer,
+        action: &str,
+        payload: Value,
+    ) -> Result<Value> {
+        if !["srs_stage_prompt", "srs_stage_status", "srs_pause"].contains(&action) {
+            return Err("invalid_srs_control".into());
+        }
+        let service = self
+            .srs
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or("SRS service unavailable")?;
         service.authorize_control(producer, action, &payload)?;
         let registry = self.registry()?;
-        let lease = registry.lease(&producer.instance_id, Origin::Human, true)?;
-        if self.dependency_producer(&producer.instance_id, producer.generation)? != *producer { return Err("stale_generation".into()); }
-        self.control(&producer.instance_id, &lease, action, payload, Origin::Human)
+        let lease = registry.lease(
+            &producer.instance_id,
+            Origin::Human,
+            /* mutation */ true,
+        )?;
+        if self.dependency_producer(&producer.instance_id, producer.generation)? != *producer {
+            return Err("stale_generation".into());
+        }
+        self.control(
+            &producer.instance_id,
+            &lease,
+            action,
+            payload,
+            Origin::Human,
+        )
     }
-    pub(crate) fn respond_srs_ask(&self, producer: &DependencyProducer, invocation: &str, response: Value) -> Result<Value> {
-        let decision = self.state.lock().map_err(|e| e.to_string())?.decisions.values()
-            .find(|d| d.worker == producer.instance_id && d.generation == producer.generation && d.base_id == invocation).cloned().ok_or("decision_already_resolved")?;
-        let target = HumanDecisionTarget { instance_id: decision.worker, request_id: decision.public_id, generation: decision.generation, session_id: decision.session_id, ownership_epoch: decision.epoch, workspace_epoch: decision.workspace_epoch };
+    pub(crate) fn respond_srs_ask(
+        &self,
+        producer: &DependencyProducer,
+        invocation: &str,
+        response: Value,
+    ) -> Result<Value> {
+        let decision = self
+            .state
+            .lock()
+            .map_err(|e| e.to_string())?
+            .decisions
+            .values()
+            .find(|d| {
+                d.worker == producer.instance_id
+                    && d.generation == producer.generation
+                    && d.base_id == invocation
+            })
+            .cloned()
+            .ok_or("decision_already_resolved")?;
+        let target = HumanDecisionTarget {
+            instance_id: decision.worker,
+            request_id: decision.public_id,
+            generation: decision.generation,
+            session_id: decision.session_id,
+            ownership_epoch: decision.epoch,
+            workspace_epoch: decision.workspace_epoch,
+        };
         self.respond_human_decision(&target, response)
     }
     pub fn bind_app(&self, app: tauri::AppHandle) -> Result<()> {
-        self.app.set(app).map_err(|_| "manager app already bound".into())
+        self.app
+            .set(app)
+            .map_err(|_| "manager app already bound".into())
     }
     /// Conservatively holds every connected running app-managed OMP session at its native quiescent boundary for one
     /// Apply transaction. No Registry/hub state lock is held across the polling sleep; any failure releases earlier holds.
-    pub(crate) fn hold_markdown_sessions(self: &Arc<Self>, registry: &Arc<Registry>, transaction_id: &str) -> Result<Box<dyn Send>> {
-        let mut guard = MarkdownHold { hub: self.clone(), transaction_id: transaction_id.into(), held: Vec::new() };
+    pub(crate) fn hold_markdown_sessions(
+        self: &Arc<Self>,
+        registry: &Registry,
+        transaction_id: &str,
+    ) -> Result<Box<dyn Send>> {
+        let mut guard = MarkdownHold {
+            hub: self.clone(),
+            transaction_id: transaction_id.into(),
+            held: Vec::new(),
+        };
         let deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
-        let targets: Vec<String> = registry.snapshot().into_iter().filter(|row| row.status == "running" || row.status == "starting").map(|row| row.id).collect();
+        let targets: Vec<String> = registry
+            .snapshot()
+            .into_iter()
+            .filter(|row| row.status == "running" || row.status == "starting")
+            .map(|row| row.id)
+            .collect();
         for id in targets {
-            loop {
-                if self.closing.load(Ordering::Relaxed) { return Err("manager bridge closed".into()); }
-                match self.connection(&id, true) {
-                    Ok(_) => {}
-                    // Not connected, so no native session can read instructions through this bridge.
-                    Err(_) => break,
-                }
-                let lease = match registry.lease(&id, Origin::Human, true) { Ok(lease) => lease, Err(_) => break };
-                match self.control(&id, &lease, "setup_markdown_hold", json!({"transactionId": transaction_id}), Origin::Human) {
-                    Ok(_) => { guard.held.push((id.clone(), lease)); break; }
-                    Err(error) if error.contains("native_session_busy") => {
-                        if std::time::Instant::now() >= deadline {
-                            return Err("native_session_busy: an app-managed OMP session did not reach a quiet boundary in ten minutes; nothing was applied".into());
-                        }
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
-                    // A session that stopped between listing and holding is no longer a reader.
-                    Err(error) if error == "bridge_not_ready" || error == "stale_generation" => break,
-                    Err(error) => return Err(error),
-                }
+            if let Some(lease) =
+                self.hold_markdown_session(registry, &id, transaction_id, deadline)?
+            {
+                guard.held.push((id, lease));
             }
         }
         Ok(Box::new(guard))
     }
+    /// Holds one session; `None` when it is not connected (or stopped meanwhile), so it cannot read instructions through this bridge.
+    fn hold_markdown_session(
+        &self,
+        registry: &Registry,
+        id: &str,
+        transaction_id: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Option<ControlLease>> {
+        loop {
+            if self.closing.load(Ordering::Relaxed) {
+                return Err("manager bridge closed".into());
+            }
+            if self.connection(id, true).is_err() {
+                return Ok(None);
+            }
+            let Ok(lease) = registry.lease(id, Origin::Human, /* mutation */ true) else {
+                return Ok(None);
+            };
+            match self.control(
+                id,
+                &lease,
+                "setup_markdown_hold",
+                json!({"transactionId": transaction_id}),
+                Origin::Human,
+            ) {
+                Ok(_) => return Ok(Some(lease)),
+                Err(error) if error.contains("native_session_busy") => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("native_session_busy: an app-managed OMP session did not reach a quiet boundary in ten minutes; nothing was applied".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                // A session that stopped between listing and holding is no longer a reader.
+                Err(error) if error == "bridge_not_ready" || error == "stale_generation" => {
+                    return Ok(None)
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
     fn decision_repository(&self, registry: &Registry, id: &str) -> Result<DecisionRepository> {
         let own = registry.workspace_metadata(id)?.definition;
         let folder = if let Some(helper) = &own.helper {
-            registry.workspace_metadata(&helper.target).map(|target| target.definition.input.project_path).unwrap_or_else(|_| helper.repo.clone())
+            registry
+                .workspace_metadata(&helper.target)
+                .map(|target| target.definition.input.project_path)
+                .unwrap_or_else(|_| helper.repo.clone())
         } else if let Some(target) = &own.plan_target {
-            registry.workspace_metadata(target)?.definition.input.project_path
-        } else { own.input.project_path.clone() };
-        let computed = own.kind != InstanceKind::Instance && self.workspace.get().and_then(Weak::upgrade)
-            .map(|service| service.computed_folders()).transpose()?.unwrap_or_default().iter()
-            .any(|known| crate::instance::same_folder(known, &folder)) &&
-            !registry.ordinary_project_folders().iter().any(|known| crate::instance::same_folder(known, &folder));
+            registry
+                .workspace_metadata(target)?
+                .definition
+                .input
+                .project_path
+        } else {
+            own.input.project_path.clone()
+        };
+        let computed = own.kind != InstanceKind::Instance
+            && self
+                .workspace
+                .get()
+                .and_then(Weak::upgrade)
+                .map(|service| service.computed_folders())
+                .transpose()?
+                .unwrap_or_default()
+                .iter()
+                .any(|known| crate::instance::same_folder(known, &folder))
+            && !registry
+                .ordinary_project_folders()
+                .iter()
+                .any(|known| crate::instance::same_folder(known, &folder));
         let real = registry.is_real_project_folder(&folder) && !computed;
         let label = if own.kind != InstanceKind::Instance && !real {
             let neutral = registry.coordinator_neutral_folder(own.kind)?;
-            if crate::instance::same_folder(&neutral, &folder) { "Temporary workspace".into() } else { "Shared workspace".into() }
+            if crate::instance::same_folder(&neutral, &folder) {
+                "Temporary workspace".into()
+            } else {
+                "Shared workspace".into()
+            }
         } else {
-            std::path::Path::new(&folder).file_name().and_then(|part| part.to_str()).unwrap_or(&folder).to_owned()
+            std::path::Path::new(&folder)
+                .file_name()
+                .and_then(|part| part.to_str())
+                .unwrap_or(&folder)
+                .to_owned()
         };
-        Ok(DecisionRepository { folder: (!folder.is_empty()).then_some(folder), label, scope: if real { "repository" } else { "workspace" } })
+        Ok(DecisionRepository {
+            folder: (!folder.is_empty()).then_some(folder),
+            label,
+            scope: if real { "repository" } else { "workspace" },
+        })
     }
     /// One authority: every presentation snapshot is derived from the native pending records.
     /// Serializing publication fences event/list races without holding Registry or hub locks during emit.
     pub fn human_decisions(&self) -> Result<HumanDecisionSnapshot> {
         use sha2::{Digest, Sha256};
-        let _publication = self.decision_publication.lock().map_err(|e| e.to_string())?;
-        let decisions: Vec<_> = self.state.lock().map_err(|e| e.to_string())?.decisions.values().cloned().collect();
+        let _publication = self
+            .decision_publication
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let decisions: Vec<_> = self
+            .state
+            .lock()
+            .map_err(|e| e.to_string())?
+            .decisions
+            .values()
+            .cloned()
+            .collect();
         let registry = self.registry()?;
         let mut items = Vec::with_capacity(decisions.len());
         for decision in decisions {
-            let Ok(metadata) = registry.workspace_metadata(&decision.worker) else { continue };
+            let Ok(metadata) = registry.workspace_metadata(&decision.worker) else {
+                continue;
+            };
             let lease = &metadata.lease;
-            if lease.generation != decision.generation || lease.session_id != decision.session_id ||
-                lease.ownership_epoch != decision.epoch || lease.workspace_epoch != decision.workspace_epoch { continue; }
-            let method = decision.payload["method"].as_str().unwrap_or("custom").to_owned();
+            if lease.generation != decision.generation
+                || lease.session_id != decision.session_id
+                || lease.ownership_epoch != decision.epoch
+                || lease.workspace_epoch != decision.workspace_epoch
+            {
+                continue;
+            }
+            let method = decision.payload["method"]
+                .as_str()
+                .unwrap_or("custom")
+                .to_owned();
             let mut payload = decision.payload.clone();
             // Native base IDs and authority fields are private; the full public target is the only answer address.
             if let Some(object) = payload.as_object_mut() {
-                for key in ["requestId", "generation", "sessionId", "ownershipEpoch", "workspaceEpoch", "source"] { object.remove(key); }
+                for key in [
+                    "requestId",
+                    "generation",
+                    "sessionId",
+                    "ownershipEpoch",
+                    "workspaceEpoch",
+                    "source",
+                ] {
+                    object.remove(key);
+                }
             }
             items.push(HumanDecision {
-                target: HumanDecisionTarget { instance_id: decision.worker, request_id: decision.public_id,
-                    generation: decision.generation, session_id: decision.session_id, ownership_epoch: decision.epoch,
-                    workspace_epoch: decision.workspace_epoch },
+                target: HumanDecisionTarget {
+                    instance_id: decision.worker,
+                    request_id: decision.public_id,
+                    generation: decision.generation,
+                    session_id: decision.session_id,
+                    ownership_epoch: decision.epoch,
+                    workspace_epoch: decision.workspace_epoch,
+                },
                 created_at: decision.created_at,
                 instance_name: metadata.definition.input.name,
                 instance_kind: metadata.definition.kind,
-                agent_origin: decision.payload.get("agentOrigin").filter(|value| value.is_object()).cloned(),
+                agent_origin: decision
+                    .payload
+                    .get("agentOrigin")
+                    .filter(|value| value.is_object())
+                    .cloned(),
                 repository: decision.repository,
-                answerable: matches!(method.as_str(), "approve" | "confirm" | "select" | "input" | "editor" | "askDialog"),
+                answerable: matches!(
+                    method.as_str(),
+                    "approve" | "confirm" | "select" | "input" | "editor" | "askDialog"
+                ),
                 human_only: decision.payload["humanOnly"].as_bool().unwrap_or(false),
-                method, payload,
+                method,
+                payload,
             });
         }
-        items.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.target.instance_id.cmp(&b.target.instance_id)).then_with(|| a.target.request_id.cmp(&b.target.request_id)));
-        let fingerprint: [u8; 32] = Sha256::digest(serde_json::to_vec(&items).map_err(|e| e.to_string())?).into();
+        items.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.target.instance_id.cmp(&b.target.instance_id))
+                .then_with(|| a.target.request_id.cmp(&b.target.request_id))
+        });
+        let fingerprint: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(&items).map_err(|e| e.to_string())?).into();
         let (revision, changed) = {
             let mut state = self.state.lock().map_err(|e| e.to_string())?;
             let changed = state.decisions_fingerprint != Some(fingerprint);
-            if changed { state.decisions_fingerprint = Some(fingerprint); state.decisions_revision += 1; }
+            if changed {
+                state.decisions_fingerprint = Some(fingerprint);
+                state.decisions_revision += 1;
+            }
             (state.decisions_revision, changed)
         };
         let snapshot = HumanDecisionSnapshot { revision, items };
-        if changed { if let Some(app) = self.app.get() { let _ = app.emit("human_decisions", &snapshot); } }
+        if changed {
+            if let Some(app) = self.app.get() {
+                let _ = app.emit("human_decisions", &snapshot);
+            }
+        }
         Ok(snapshot)
     }
     fn publish_human_decisions(&self) {
-        if let Err(error) = self.human_decisions() { eprintln!("Human decisions: {error}"); }
+        if let Err(error) = self.human_decisions() {
+            eprintln!("Human decisions: {error}");
+        }
     }
-    pub fn respond_human_decision(&self, target: &HumanDecisionTarget, response: Value) -> Result<Value> {
-        self.respond_decision(&target.instance_id, &target.request_id, target.generation, Some(target), response, Origin::Human)
+    pub fn respond_human_decision(
+        &self,
+        target: &HumanDecisionTarget,
+        response: Value,
+    ) -> Result<Value> {
+        self.respond_decision(
+            &target.instance_id,
+            &target.request_id,
+            target.generation,
+            Some(target),
+            response,
+            Origin::Human,
+        )
     }
-    fn respond_decision(&self, id: &str, request: &str, generation: u64, target: Option<&HumanDecisionTarget>, response: Value, origin: Origin<'_>) -> Result<Value> {
+    fn respond_decision(
+        &self,
+        id: &str,
+        request: &str,
+        generation: u64,
+        target: Option<&HumanDecisionTarget>,
+        response: Value,
+        origin: Origin<'_>,
+    ) -> Result<Value> {
         let registry = self.registry()?;
-        let lease = registry.lease(id, origin, true)?;
-        let decision = self.state.lock().map_err(|e| e.to_string())?.decisions.get(request).cloned().ok_or("decision_already_resolved")?;
-        if generation != lease.generation || decision.worker != id || decision.generation != lease.generation ||
-            decision.epoch != lease.ownership_epoch || decision.session_id != lease.session_id || decision.workspace_epoch != lease.workspace_epoch ||
-            target.is_some_and(|target| target.session_id != lease.session_id || target.ownership_epoch != lease.ownership_epoch || target.workspace_epoch != lease.workspace_epoch) {
+        let lease = registry.lease(id, origin, /* mutation */ true)?;
+        let decision = self
+            .state
+            .lock()
+            .map_err(|e| e.to_string())?
+            .decisions
+            .get(request)
+            .cloned()
+            .ok_or("decision_already_resolved")?;
+        if generation != lease.generation
+            || decision.worker != id
+            || decision.generation != lease.generation
+            || decision.epoch != lease.ownership_epoch
+            || decision.session_id != lease.session_id
+            || decision.workspace_epoch != lease.workspace_epoch
+            || target.is_some_and(|target| {
+                target.session_id != lease.session_id
+                    || target.ownership_epoch != lease.ownership_epoch
+                    || target.workspace_epoch != lease.workspace_epoch
+            })
+        {
             return Err("stale_generation".into());
         }
-        if decision.payload["humanOnly"] == true && matches!(origin, Origin::Manager(_)) { return Err("human_only_decision".into()); }
-        if !matches!(decision.payload["method"].as_str(), Some("approve" | "confirm" | "select" | "input" | "editor" | "askDialog")) {
+        if decision.payload["humanOnly"] == true && matches!(origin, Origin::Manager(_)) {
+            return Err("human_only_decision".into());
+        }
+        if !matches!(
+            decision.payload["method"].as_str(),
+            Some("approve" | "confirm" | "select" | "input" | "editor" | "askDialog")
+        ) {
             return Err("native_terminal_decision".into());
         }
         // Do not retire optimistically: native validation and the single native settlement guard decide the winner.
-        self.control(id, &lease, "reply_ui", json!({"requestId":decision.base_id,"response":response}), origin)
+        self.control(
+            id,
+            &lease,
+            "reply_ui",
+            json!({"requestId":decision.base_id,"response":response}),
+            origin,
+        )
     }
 
     /// The repository a Code quality read may use, from the authenticated actor's own Registry definition: a helper reads
@@ -435,50 +699,129 @@ impl ManagerHub {
     /// Returns (project folder, instance whose folder it is, that instance's workspace epoch) so the caller can detect a move.
     fn quality_repository(registry: &Registry, actor: &Actor) -> Result<(String, String, u64)> {
         let own = registry.workspace_metadata(&actor.id)?;
-        let target = own.definition.helper.as_ref().map(|link| link.target.clone()).or_else(|| own.definition.plan_target.clone());
+        let target = own
+            .definition
+            .helper
+            .as_ref()
+            .map(|link| link.target.as_str())
+            .or(own.definition.plan_target.as_deref());
         let subject = match target {
-            Some(target) => registry.workspace_metadata(&target)?,
+            Some(target) => registry.workspace_metadata(target)?,
             None => own,
         };
-        Ok((subject.definition.input.project_path.clone(), subject.definition.id.clone(), subject.workspace_epoch))
+        Ok((
+            subject.definition.input.project_path,
+            subject.definition.id,
+            subject.workspace_epoch,
+        ))
     }
-    pub(crate) fn workspace_control(&self, id: &str, lease: &ControlLease, action: &str, payload: Value) -> Result<Value> {
+    pub(crate) fn workspace_control(
+        &self,
+        id: &str,
+        lease: &ControlLease,
+        action: &str,
+        payload: Value,
+    ) -> Result<Value> {
         self.control(id, lease, action, payload, Origin::Human)
     }
-    pub(crate) fn send_workspace_plan_prompt(&self, manager_id: &str, lease: &ControlLease, request_id: &str, message: &str) -> std::result::Result<(), UpdatePlanSendError> {
-        let service = self.workspace.get().and_then(Weak::upgrade).ok_or_else(|| UpdatePlanSendError::NotSent("Workspace service unavailable".into()))?;
-        if !service.allows_plan_prompt(manager_id, request_id) { return Err(UpdatePlanSendError::NotSent("Dependency workspace request is no longer active".into())); }
+    pub(crate) fn send_workspace_plan_prompt(
+        &self,
+        manager_id: &str,
+        lease: &ControlLease,
+        request_id: &str,
+        message: &str,
+    ) -> std::result::Result<(), UpdatePlanSendError> {
+        let service = self
+            .workspace
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| UpdatePlanSendError::NotSent("Workspace service unavailable".into()))?;
+        if !service.allows_plan_prompt(manager_id, request_id) {
+            return Err(UpdatePlanSendError::NotSent(
+                "Dependency workspace request is no longer active".into(),
+            ));
+        }
         let registry = self.registry().map_err(UpdatePlanSendError::NotSent)?;
-        if registry.workspace_metadata(manager_id).map_err(UpdatePlanSendError::NotSent)?.definition.kind != InstanceKind::Manager {
-            return Err(UpdatePlanSendError::NotSent("The target is not The Manager".into()));
+        if registry
+            .workspace_metadata(manager_id)
+            .map_err(UpdatePlanSendError::NotSent)?
+            .definition
+            .kind
+            != InstanceKind::Manager
+        {
+            return Err(UpdatePlanSendError::NotSent(
+                "The target is not The Manager".into(),
+            ));
         }
-        if registry.lease(manager_id, Origin::Human, true).map_err(UpdatePlanSendError::NotSent)? != *lease {
-            return Err(UpdatePlanSendError::NotSent("Manager lease changed before plan admission".into()));
+        if registry
+            .lease(manager_id, Origin::Human, /* mutation */ true)
+            .map_err(UpdatePlanSendError::NotSent)?
+            != *lease
+        {
+            return Err(UpdatePlanSendError::NotSent(
+                "Manager lease changed before plan admission".into(),
+            ));
         }
-        self.control(manager_id, lease, "workspace_plan_prompt", json!({"requestId":request_id,"message":message}), Origin::Human)
-            .map(|_| ()).map_err(|error| if ["bridge_not_ready","stale_generation"].contains(&error.as_str()) || error.starts_with("workspace_plan_not_admitted:") { UpdatePlanSendError::NotSent(error) } else { UpdatePlanSendError::Uncertain(error) })
+        self.control(
+            manager_id,
+            lease,
+            "workspace_plan_prompt",
+            json!({"requestId":request_id,"message":message}),
+            Origin::Human,
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            if ["bridge_not_ready", "stale_generation"].contains(&error.as_str())
+                || error.starts_with("workspace_plan_not_admitted:")
+            {
+                UpdatePlanSendError::NotSent(error)
+            } else {
+                UpdatePlanSendError::Uncertain(error)
+            }
+        })
     }
     /// Opens the SDK's own hub in this existing native session without submitting input.
     pub fn open_agent_hub(&self, id: &str, expected_generation: u64) -> Result<()> {
         let registry = self.registry()?;
-        let lease = registry.lease(id, Origin::Human, false)?;
+        let lease = registry.lease(id, Origin::Human, /* mutation */ false)?;
         if lease.generation != expected_generation {
             return Err("stale_generation".into());
         }
-        if !registry.snapshot().iter().any(|row| row.id == id && row.capabilities.agent_hub) {
-            return Err("native_agent_hub_unavailable: Reopen this session with a compatible OMP version.".into());
+        if !registry
+            .snapshot()
+            .iter()
+            .any(|row| row.id == id && row.capabilities.agent_hub)
+        {
+            return Err(
+                "native_agent_hub_unavailable: Reopen this session with a compatible OMP version."
+                    .into(),
+            );
         }
         self.control(id, &lease, "agent_hub", json!({}), Origin::Human)?;
         Ok(())
     }
 
     /// Human-only: kills one command, interrupts its agent like Esc and holds new scripts until a new prompt.
-    pub fn kill_terminal_command(&self, id: &str, generation: u64, session_id: &str, execution_id: &str) -> Result<()> {
-        let lease = self.registry()?.lease(id, Origin::Human, false)?;
+    pub fn kill_terminal_command(
+        &self,
+        id: &str,
+        generation: u64,
+        session_id: &str,
+        execution_id: &str,
+    ) -> Result<()> {
+        let lease = self
+            .registry()?
+            .lease(id, Origin::Human, /* mutation */ false)?;
         if lease.generation != generation || lease.session_id.as_deref() != Some(session_id) {
             return Err("stale_generation".into());
         }
-        self.control(id, &lease, "terminal_kill", json!({"executionId": execution_id}), Origin::Human)?;
+        self.control(
+            id,
+            &lease,
+            "terminal_kill",
+            json!({"executionId": execution_id}),
+            Origin::Human,
+        )?;
         Ok(())
     }
     fn registry(&self) -> Result<Arc<Registry>> {
@@ -584,7 +927,9 @@ impl ManagerHub {
             }
         }
         if let Some(browser) = self.browser.get() {
-            if let Err(error) = browser.revoke(id, generation) { eprintln!("revoke terminal browser: {error}"); }
+            if let Err(error) = browser.revoke(id, generation) {
+                eprintln!("revoke terminal browser: {error}");
+            }
         }
         if let Some(terminals) = self.terminals.get() {
             terminals.invalidate(id, generation);
@@ -592,7 +937,9 @@ impl ManagerHub {
         self.publish_human_decisions();
     }
     pub fn shutdown(&self) {
-        if let Some(service) = self.srs.get().and_then(Weak::upgrade) { service.shutdown(); }
+        if let Some(service) = self.srs.get().and_then(Weak::upgrade) {
+            service.shutdown();
+        }
         self.monitor_lifecycle("", 0, "shutdown");
         self.closing.store(true, Ordering::Relaxed);
         let streams = {
@@ -632,7 +979,12 @@ impl ManagerHub {
         if !valid {
             return Err("unauthorized".into());
         }
-        if self.registry()?.lease(id, Origin::Human, false)?.generation != generation {
+        if self
+            .registry()?
+            .lease(id, Origin::Human, /* mutation */ false)?
+            .generation
+            != generation
+        {
             return Err("stale_generation".into());
         }
         Ok(Actor {
@@ -643,39 +995,52 @@ impl ManagerHub {
         })
     }
     fn serve(self: Arc<Self>, stream: TcpStream) {
-        // Windows accepts inherit the listener's non-blocking flag.
-        if stream.set_nonblocking(false).is_err() {
+        let Some((mut reader, actor, stream)) = self.serve_handshake(stream) else {
+            return;
+        };
+        let writer = Arc::new(Mutex::new(stream));
+        if !self.attach_connection(&actor, &writer) {
             return;
         }
+        if send(&writer,&json!({"type":"response","id":"hello","ok":true,"data":{"role":actor.role,"instanceId":actor.id,"generation":actor.generation}})).is_err(){return}
+        while let Ok(Some(frame)) = read_frame(&mut reader) {
+            if !self.is_current_connection(&actor) {
+                break;
+            }
+            self.dispatch_frame(&actor, &writer, frame);
+        }
+        self.close_connection(&actor, &writer);
+    }
+    fn serve_handshake(
+        &self,
+        stream: TcpStream,
+    ) -> Option<(BufReader<TcpStream>, Actor, TcpStream)> {
+        // Windows accepts inherit the listener's non-blocking flag.
+        stream.set_nonblocking(false).ok()?;
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let reader_stream = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => return,
+        let mut reader = BufReader::new(stream.try_clone().ok()?);
+        let Ok(Some(hello)) = read_frame(&mut reader) else {
+            return None;
         };
-        let mut reader = BufReader::new(reader_stream);
-        let hello = match read_frame(&mut reader) {
-            Ok(Some(v)) => v,
-            _ => return,
-        };
-        let actor = match self.authenticate(&hello) {
-            Ok(a) => a,
-            Err(_) => return,
-        };
+        let actor = self.authenticate(&hello).ok()?;
         // The 10 s hello deadline must not outlive authentication: Windows keeps it on the cloned reader.
         let _ = reader.get_ref().set_read_timeout(None);
         let _ = stream.set_read_timeout(None);
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-        let writer = Arc::new(Mutex::new(stream));
+        Some((reader, actor, stream))
+    }
+    /// Registers `writer` as the actor's live connection and closes any previous one; false when the client is gone or stale.
+    fn attach_connection(&self, actor: &Actor, writer: &Connection) -> bool {
         let previous = {
             let Ok(mut state) = self.state.lock() else {
-                return;
+                return false;
             };
             let Some(client) = state.clients.get_mut(&actor.id) else {
-                return;
+                return false;
             };
             if client.generation != actor.generation {
-                return;
+                return false;
             }
             client.connection_id = actor.connection_id.clone();
             client.ready = false;
@@ -686,59 +1051,61 @@ impl ManagerHub {
                 let _ = s.shutdown(Shutdown::Both);
             }
         }
-        if send(&writer,&json!({"type":"response","id":"hello","ok":true,"data":{"role":actor.role,"instanceId":actor.id,"generation":actor.generation}})).is_err(){return}
-        while let Ok(Some(frame)) = read_frame(&mut reader) {
-            let current = self.state.lock().ok().is_some_and(|s| {
-                s.clients.get(&actor.id).is_some_and(|c| {
-                    c.generation == actor.generation && c.connection_id == actor.connection_id
-                })
-            });
-            if !current {
-                break;
+        true
+    }
+    fn is_current_connection(&self, actor: &Actor) -> bool {
+        self.state.lock().ok().is_some_and(|s| {
+            s.clients.get(&actor.id).is_some_and(|c| {
+                c.generation == actor.generation && c.connection_id == actor.connection_id
+            })
+        })
+    }
+    fn dispatch_frame(self: &Arc<Self>, actor: &Actor, writer: &Connection, frame: Value) {
+        match frame["type"].as_str() {
+            Some("request") => {
+                let hub = self.clone();
+                let actor = actor.clone();
+                let output = writer.clone();
+                std::thread::spawn(move || hub.answer_request(&actor, &output, &frame));
             }
-            match frame["type"].as_str() {
-                Some("request") => {
-                    let hub = self.clone();
-                    let actor = actor.clone();
-                    let output = writer.clone();
-                    std::thread::spawn(move || {
-                        let id = frame["id"].clone();
-                        let result = hub.execute(&actor, &frame);
-                        let response = match result {
-                            Ok(data) => json!({"type":"response","id":id,"ok":true,"data":data}),
-                            Err(error) => {
-                                json!({"type":"response","id":id,"ok":false,"error":error})
-                            }
-                        };
-                        if let Err(error) = send(&output, &response) {
-                            let _ = send(
-                                &output,
-                                &json!({"type":"response","id":id,"ok":false,"error":error}),
-                            );
-                        }
-                    });
+            Some("event") => {
+                if let Err(e) = self.event(actor, &frame) {
+                    eprintln!("manager event: {e}");
                 }
-                Some("event") => {
-                    if let Err(e) = self.event(&actor, &frame) {
-                        eprintln!("manager event: {e}");
-                    }
-                }
-                Some("response") => self.control_response(&actor, &frame),
-                Some("ack") if actor.role == InstanceKind::Manager => {
-                    if let Ok(mut state) = self.state.lock() {
-                        if let Some(queue) = state.queues.get_mut(&actor.id) {
-                            queue.retain(|n| n["eventId"] != frame["eventId"]);
-                        }
-                    }
-                }
-                _ => {
-                    let _ = send(
-                        &writer,
-                        &json!({"type":"response","id":frame["id"],"ok":false,"error":"invalid_action"}),
-                    );
-                }
+            }
+            Some("response") => self.control_response(actor, &frame),
+            Some("ack") if actor.role == InstanceKind::Manager => {
+                self.acknowledge_event(actor, &frame)
+            }
+            _ => {
+                let _ = send(
+                    writer,
+                    &json!({"type":"response","id":frame["id"],"ok":false,"error":"invalid_action"}),
+                );
             }
         }
+    }
+    fn answer_request(&self, actor: &Actor, output: &Connection, frame: &Value) {
+        let id = frame["id"].clone();
+        let response = match self.execute(actor, frame) {
+            Ok(data) => json!({"type":"response","id":id,"ok":true,"data":data}),
+            Err(error) => json!({"type":"response","id":id,"ok":false,"error":error}),
+        };
+        if let Err(error) = send(output, &response) {
+            let _ = send(
+                output,
+                &json!({"type":"response","id":id,"ok":false,"error":error}),
+            );
+        }
+    }
+    fn acknowledge_event(&self, actor: &Actor, frame: &Value) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(queue) = state.queues.get_mut(&actor.id) {
+                queue.retain(|n| n["eventId"] != frame["eventId"]);
+            }
+        }
+    }
+    fn close_connection(&self, actor: &Actor, writer: &Connection) {
         // A bridge must never keep writing into a connection nobody reads; closing makes it fail fast and reconnect.
         if let Ok(s) = writer.lock() {
             let _ = s.shutdown(Shutdown::Both);
@@ -746,35 +1113,7 @@ impl ManagerHub {
         if let Some(workspace) = self.workspace.get().and_then(Weak::upgrade) {
             workspace.disconnected(&actor.id, actor.generation, &actor.connection_id);
         }
-        let current = {
-            let Ok(mut state) = self.state.lock() else {
-                return;
-            };
-            let current = state.clients.get(&actor.id).is_some_and(|c| {
-                c.connection_id == actor.connection_id && c.generation == actor.generation
-            });
-            if current {
-                if let Some(client) = state.clients.get_mut(&actor.id) {
-                    client.stream = None;
-                    client.ready = false;
-                }
-                let pending: Vec<String> = state
-                    .inflight
-                    .iter()
-                    .filter(|(_, p)| p.target == actor.id && p.generation == actor.generation)
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for key in pending {
-                    if let Some(p) = state.inflight.remove(&key) {
-                        let _ = p
-                            .sender
-                            .send(Err("bridge disconnected; outcome may be unknown".into()));
-                    }
-                }
-            }
-            current
-        };
-        if current {
+        if self.release_client(actor) {
             self.srs_lifecycle(&actor.id, actor.generation, "disconnect", Value::Null);
             self.monitor_lifecycle(&actor.id, actor.generation, "disconnect");
             if let Ok(registry) = self.registry() {
@@ -782,6 +1121,36 @@ impl ManagerHub {
             }
             self.clear_decisions(&actor.id);
         }
+    }
+    /// Drops the actor's stream and fails its in-flight controls when this is still its current connection.
+    fn release_client(&self, actor: &Actor) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let current = state.clients.get(&actor.id).is_some_and(|c| {
+            c.connection_id == actor.connection_id && c.generation == actor.generation
+        });
+        if !current {
+            return false;
+        }
+        if let Some(client) = state.clients.get_mut(&actor.id) {
+            client.stream = None;
+            client.ready = false;
+        }
+        let pending: Vec<String> = state
+            .inflight
+            .iter()
+            .filter(|(_, p)| p.target == actor.id && p.generation == actor.generation)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in pending {
+            if let Some(p) = state.inflight.remove(&key) {
+                let _ = p
+                    .sender
+                    .send(Err("bridge disconnected; outcome may be unknown".into()));
+            }
+        }
+        true
     }
     fn connection(&self, id: &str, ready: bool) -> Result<Connection> {
         let state = self.state.lock().map_err(|e| e.to_string())?;
@@ -875,7 +1244,7 @@ impl ManagerHub {
         let Ok(registry) = self.registry() else {
             return;
         };
-        let Ok(lease) = registry.lease(id, Origin::Human, false) else {
+        let Ok(lease) = registry.lease(id, Origin::Human, /* mutation */ false) else {
             return;
         };
         if lease.generation != generation {
@@ -977,16 +1346,32 @@ impl ManagerHub {
         }
         if let Some(owner) = &lease.manager_id {
             let context = self.registry().and_then(|registry| {
-                Ok((registry.managed_repository_roots(owner)?, registry.workspace_metadata(owner)?.definition.input.project_path))
+                Ok((
+                    registry.managed_repository_roots(owner)?,
+                    registry
+                        .workspace_metadata(owner)?
+                        .definition
+                        .input
+                        .project_path,
+                ))
             });
             let (repositories, folder) = match context {
                 Ok(context) => (Some(context.0), Some(context.1)),
-                Err(error) => { eprintln!("Manager repository notification: {error}"); (None, None) }
+                Err(error) => {
+                    eprintln!("Manager repository notification: {error}");
+                    (None, None)
+                }
             };
-            self.notify(owner,id,lease.generation,"ownership_gained",json!({
-                "pendingDecisions":decisions.iter().map(Decision::view).collect::<Vec<_>>(),
-                "repositoryFolders":repositories,"managerWorkingDirectory":folder
-            }));
+            self.notify(
+                owner,
+                id,
+                lease.generation,
+                "ownership_gained",
+                json!({
+                    "pendingDecisions":decisions.iter().map(Decision::view).collect::<Vec<_>>(),
+                    "repositoryFolders":repositories,"managerWorkingDirectory":folder
+                }),
+            );
             for decision in decisions {
                 self.notify(
                     owner,
@@ -1004,82 +1389,22 @@ impl ManagerHub {
         let payload = &frame["payload"];
         let registry = self.registry()?;
         if actor.role == InstanceKind::Architect {
-            let lifecycle = if kind == "session_changed" {
-                let old = registry.lease(&actor.id, Origin::Human, false)?.session_id;
-                if payload["sessionId"].as_str() == old.as_deref() { "ready" } else { "session_changed" }
-            } else { kind };
-            self.srs_lifecycle(&actor.id, actor.generation, lifecycle, payload.clone());
-            self.monitor_lifecycle(&actor.id, actor.generation, lifecycle);
+            self.architect_event_lifecycle(&registry, actor, kind, payload)?;
         }
-        if registry.lease(&actor.id, Origin::Human, false)?.generation != actor.generation {
+        if registry
+            .lease(&actor.id, Origin::Human, /* mutation */ false)?
+            .generation
+            != actor.generation
+        {
             return Err("stale_generation".into());
         }
         match kind {
-            "ready" | "session_changed" => {
-                registry.apply_identity(&actor.id, actor.generation, payload)?;
-                if let Some(terminals) = self.terminals.get() {
-                    if let Err(error) = terminals.apply_snapshot(&actor.id, actor.generation, payload) {
-                        eprintln!("terminal snapshot: {error}");
-                    }
-                }
-                if let Ok(mut state) = self.state.lock() {
-                    if let Some(c) = state.clients.get_mut(&actor.id) {
-                        c.ready = payload["supported"] != false;
-                    }
-                }
-                self.ready_changed.notify_all();
-                self.clear_decisions(&actor.id);
-                let lease = registry.lease(&actor.id, Origin::Human, false)?;
-                if let Ok(stream) = self.connection(&actor.id, false) {
-                    send(
-                        &stream,
-                        &json!({"type":"control","id":uuid::Uuid::new_v4().to_string(),"action":"ownership","payload":lease}),
-                    )?;
-                }
-                if actor.role == InstanceKind::Manager {
-                    self.replay(&actor.id);
-                }
-                for pending in payload["pendingDecisions"].as_array().into_iter().flatten() {
-                    self.register_decision(actor, pending)?;
-                }
-            }
+            "ready" | "session_changed" => self.event_ready(&registry, actor, payload)?,
             "needs_decision" => self.register_decision(actor, payload)?,
-            "decision_resolved" => {
-                let base = text(payload, "requestId")?;
-                let resolved = {
-                    let mut state = self.state.lock().map_err(|e| e.to_string())?;
-                    let key = state
-                        .decisions
-                        .iter()
-                        .find(|(_, d)| {
-                            d.worker == actor.id
-                                && d.base_id == base
-                                && d.generation == actor.generation
-                        })
-                        .map(|(k, _)| k.clone());
-                    key.and_then(|k| state.decisions.remove(&k))
-                };
-                if let Some(decision) = resolved {
-                    registry.resolve_human_decision(&actor.id, &decision.public_id);
-                    self.retire_notification(&decision.public_id);
-                    self.owner_notification(
-                        &actor.id,
-                        actor.generation,
-                        kind,
-                        json!({"requestId":decision.public_id,"source":payload["source"]}),
-                    );
-                }
-                self.update_decision_count(&actor.id);
-                self.publish_human_decisions();
-            }
+            "decision_resolved" => self.event_decision_resolved(&registry, actor, kind, payload)?,
             "agent_started" => {}
             "terminal_command" | "terminal_output" | "terminal_hold" => {
-                let terminals = self.terminals.get().ok_or("terminal service unavailable")?;
-                match kind {
-                    "terminal_command" => terminals.apply_command(&actor.id, actor.generation, payload)?,
-                    "terminal_output" => terminals.apply_output(&actor.id, actor.generation, payload)?,
-                    _ => terminals.apply_hold(&actor.id, actor.generation, payload)?,
-                }
+                self.event_terminal(actor, kind, payload)?
             }
             "completed" | "turn_error" | "turn_aborted" => {
                 if actor.role == InstanceKind::Instance {
@@ -1090,13 +1415,112 @@ impl ManagerHub {
         }
         Ok(())
     }
+    fn architect_event_lifecycle(
+        &self,
+        registry: &Registry,
+        actor: &Actor,
+        kind: &str,
+        payload: &Value,
+    ) -> Result<()> {
+        let lifecycle = if kind == "session_changed" {
+            let old = registry
+                .lease(&actor.id, Origin::Human, /* mutation */ false)?
+                .session_id;
+            if payload["sessionId"].as_str() == old.as_deref() {
+                "ready"
+            } else {
+                "session_changed"
+            }
+        } else {
+            kind
+        };
+        self.srs_lifecycle(&actor.id, actor.generation, lifecycle, payload.clone());
+        self.monitor_lifecycle(&actor.id, actor.generation, lifecycle);
+        Ok(())
+    }
+    fn event_ready(&self, registry: &Registry, actor: &Actor, payload: &Value) -> Result<()> {
+        registry.apply_identity(&actor.id, actor.generation, payload)?;
+        if let Some(terminals) = self.terminals.get() {
+            if let Err(error) = terminals.apply_snapshot(&actor.id, actor.generation, payload) {
+                eprintln!("terminal snapshot: {error}");
+            }
+        }
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(c) = state.clients.get_mut(&actor.id) {
+                c.ready = payload["supported"] != false;
+            }
+        }
+        self.ready_changed.notify_all();
+        self.clear_decisions(&actor.id);
+        let lease = registry.lease(&actor.id, Origin::Human, /* mutation */ false)?;
+        if let Ok(stream) = self.connection(&actor.id, false) {
+            send(
+                &stream,
+                &json!({"type":"control","id":uuid::Uuid::new_v4().to_string(),"action":"ownership","payload":lease}),
+            )?;
+        }
+        if actor.role == InstanceKind::Manager {
+            self.replay(&actor.id);
+        }
+        for pending in payload["pendingDecisions"].as_array().into_iter().flatten() {
+            self.register_decision(actor, pending)?;
+        }
+        Ok(())
+    }
+    fn event_decision_resolved(
+        &self,
+        registry: &Registry,
+        actor: &Actor,
+        kind: &str,
+        payload: &Value,
+    ) -> Result<()> {
+        let base = text(payload, "requestId")?;
+        let resolved = {
+            let mut state = self.state.lock().map_err(|e| e.to_string())?;
+            let key = state
+                .decisions
+                .iter()
+                .find(|(_, d)| {
+                    d.worker == actor.id && d.base_id == base && d.generation == actor.generation
+                })
+                .map(|(k, _)| k.clone());
+            key.and_then(|k| state.decisions.remove(&k))
+        };
+        if let Some(decision) = resolved {
+            registry.resolve_human_decision(&actor.id, &decision.public_id);
+            self.retire_notification(&decision.public_id);
+            self.owner_notification(
+                &actor.id,
+                actor.generation,
+                kind,
+                json!({"requestId":decision.public_id,"source":payload["source"]}),
+            );
+        }
+        self.update_decision_count(&actor.id);
+        self.publish_human_decisions();
+        Ok(())
+    }
+    fn event_terminal(&self, actor: &Actor, kind: &str, payload: &Value) -> Result<()> {
+        let terminals = self.terminals.get().ok_or("terminal service unavailable")?;
+        match kind {
+            "terminal_command" => terminals.apply_command(&actor.id, actor.generation, payload)?,
+            "terminal_output" => terminals.apply_output(&actor.id, actor.generation, payload)?,
+            _ => terminals.apply_hold(&actor.id, actor.generation, payload)?,
+        }
+        Ok(())
+    }
     fn register_decision(&self, actor: &Actor, payload: &Value) -> Result<()> {
         let registry = self.registry()?;
-        let lease = registry.lease(&actor.id, Origin::Human, false)?;
+        let lease = registry.lease(&actor.id, Origin::Human, /* mutation */ false)?;
         let base = text(payload, "requestId")?;
-        if actor.generation != lease.generation ||
-            payload.get("sessionId").is_some_and(|session| session.as_str() != lease.session_id.as_deref()) ||
-            payload.get("workspaceEpoch").is_some_and(|epoch| epoch.as_u64() != Some(lease.workspace_epoch)) {
+        if actor.generation != lease.generation
+            || payload
+                .get("sessionId")
+                .is_some_and(|session| session.as_str() != lease.session_id.as_deref())
+            || payload
+                .get("workspaceEpoch")
+                .is_some_and(|epoch| epoch.as_u64() != Some(lease.workspace_epoch))
+        {
             return Err("stale_generation".into());
         }
         let mut repository = self.decision_repository(&registry, &actor.id)?;
@@ -1104,8 +1528,16 @@ impl ManagerHub {
             if let Some(service) = self.srs.get().and_then(Weak::upgrade) {
                 let producer = self.dependency_producer(&actor.id, actor.generation)?;
                 if let Some(folder) = service.native_question_repository(&producer, base)? {
-                    let label = std::path::Path::new(&folder).file_name().and_then(|name| name.to_str()).unwrap_or(&folder).to_owned();
-                    repository = DecisionRepository { folder: Some(folder), label, scope: "repository" };
+                    let label = std::path::Path::new(&folder)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&folder)
+                        .to_owned();
+                    repository = DecisionRepository {
+                        folder: Some(folder),
+                        label,
+                        scope: "repository",
+                    };
                 }
             }
         }
@@ -1124,7 +1556,9 @@ impl ManagerHub {
                 session_id: lease.session_id,
                 epoch: lease.ownership_epoch,
                 workspace_epoch: lease.workspace_epoch,
-                created_at: payload["createdAt"].as_u64().unwrap_or_else(crate::dependency_security::now_ms),
+                created_at: payload["createdAt"]
+                    .as_u64()
+                    .unwrap_or_else(crate::dependency_security::now_ms),
                 repository,
                 payload: payload.clone(),
             };
@@ -1200,8 +1634,8 @@ impl ManagerHub {
                     "process_exited",
                     json!({"exitCode":row.exit_code}),
                 );
-                if let Some(workspace)=self.workspace.get().and_then(Weak::upgrade) {
-                    workspace.process_exited(&row.id,row.generation);
+                if let Some(workspace) = self.workspace.get().and_then(Weak::upgrade) {
+                    workspace.process_exited(&row.id, row.generation);
                 }
                 self.invalidate(&row.id, row.generation);
             }
@@ -1210,14 +1644,29 @@ impl ManagerHub {
     }
     pub(crate) fn wait_ready(&self, id: &str) -> Result<()> {
         let state = self.state.lock().map_err(|e| e.to_string())?;
-        let (state, _) = self.ready_changed.wait_timeout_while(state, Duration::from_secs(20), |state| {
-            !self.closing.load(Ordering::Relaxed) && !state.clients.get(id).is_some_and(|client| client.ready && client.stream.is_some())
-        }).map_err(|e| e.to_string())?;
-        if state.clients.get(id).is_some_and(|client| client.ready && client.stream.is_some()) { Ok(()) } else { Err("bridge_not_ready".into()) }
+        let (state, _) = self
+            .ready_changed
+            .wait_timeout_while(state, Duration::from_secs(20), |state| {
+                !self.closing.load(Ordering::Relaxed)
+                    && !state
+                        .clients
+                        .get(id)
+                        .is_some_and(|client| client.ready && client.stream.is_some())
+            })
+            .map_err(|e| e.to_string())?;
+        if state
+            .clients
+            .get(id)
+            .is_some_and(|client| client.ready && client.stream.is_some())
+        {
+            Ok(())
+        } else {
+            Err("bridge_not_ready".into())
+        }
     }
     pub fn prompt_human(&self, id: &str, message: &str) -> Result<Value> {
         let registry = self.registry()?;
-        let lease = registry.lease(id, Origin::Human, true)?;
+        let lease = registry.lease(id, Origin::Human, /* mutation */ true)?;
         if registry.inspect(id, Origin::Human)?.kind == InstanceKind::Manager {
             return Err("Setup prompts require an ordinary human-controlled instance".into());
         }
@@ -1237,122 +1686,296 @@ impl ManagerHub {
         message: &str,
     ) -> Result<Value> {
         let registry = self.registry()?;
-        let lease = registry.lease(id, Origin::Human, true)?;
+        let lease = registry.lease(id, Origin::Human, /* mutation */ true)?;
         if lease.generation != generation {
             return Err("stale_generation".into());
         }
         if registry.inspect(id, Origin::Human)?.kind == InstanceKind::Manager {
             return Err("Setup prompts require an ordinary human-controlled instance".into());
         }
-        self.control(id, &lease, "prompt", json!({"message":message}), Origin::Human)
+        self.control(
+            id,
+            &lease,
+            "prompt",
+            json!({"message":message}),
+            Origin::Human,
+        )
     }
     /// Restart-safe producer identity for dependency jobs: the generation alone resets across app launches, so the
     /// request is also bound to a hash of this launch's private bridge token and the native main-session id.
     pub fn dependency_producer(&self, id: &str, generation: u64) -> Result<DependencyProducer> {
         let registry = self.registry()?;
-        let lease = registry.lease(id, Origin::Human, false)?;
+        let lease = registry.lease(id, Origin::Human, /* mutation */ false)?;
         if lease.generation != generation {
             return Err("stale_generation".into());
         }
         if registry.inspect(id, Origin::Human)?.kind != InstanceKind::Architect {
             return Err("The Architect is no longer available".into());
         }
-        let session_id = lease.session_id.ok_or("The Architect session is not ready yet")?;
+        let session_id = lease
+            .session_id
+            .ok_or("The Architect session is not ready yet")?;
         let state = self.state.lock().map_err(|e| e.to_string())?;
         let client = state.clients.get(id).ok_or("bridge_not_ready")?;
-        if client.generation != generation || !client.ready || client.role != InstanceKind::Architect {
+        if client.generation != generation
+            || !client.ready
+            || client.role != InstanceKind::Architect
+        {
             return Err("bridge_not_ready".into());
         }
-        Ok(DependencyProducer { instance_id: id.into(), generation, launch_id: launch_hash(&client.token), session_id })
+        Ok(DependencyProducer {
+            instance_id: id.into(),
+            generation,
+            launch_id: launch_hash(&client.token),
+            session_id,
+        })
     }
     /// False once the producer's process, launch or native session was stopped, replaced or switched.
+    #[must_use]
     pub fn dependency_producer_live(&self, producer: &DependencyProducer) -> bool {
-        let Ok(registry) = self.registry() else { return false; };
-        let Ok(lease) = registry.lease(&producer.instance_id, Origin::Human, false) else { return false; };
-        if lease.generation != producer.generation || lease.session_id.as_deref().is_some_and(|session| session != producer.session_id) {
+        let Ok(registry) = self.registry() else {
+            return false;
+        };
+        let Ok(lease) = registry.lease(
+            &producer.instance_id,
+            Origin::Human,
+            /* mutation */ false,
+        ) else {
+            return false;
+        };
+        if lease.generation != producer.generation
+            || lease
+                .session_id
+                .as_deref()
+                .is_some_and(|session| session != producer.session_id)
+        {
             return false;
         }
-        self.state.lock().ok().is_some_and(|state| state.clients.get(&producer.instance_id)
-            .is_some_and(|client| client.generation == producer.generation && launch_hash(&client.token) == producer.launch_id))
+        self.state.lock().ok().is_some_and(|state| {
+            state
+                .clients
+                .get(&producer.instance_id)
+                .is_some_and(|client| {
+                    client.generation == producer.generation
+                        && launch_hash(&client.token) == producer.launch_id
+                })
+        })
     }
     /// Display-only: the bridge reads the saved app-owned result by UUID/kind and prints it when Architect is idle.
     /// No path, text or model prompt is accepted.
-    pub fn show_dependency_result(&self, architect_id: &str, generation: u64, request_id: &str, kind: &str, replay: bool) -> Result<()> {
-        if !["security", "usage", "project", "updatePlan", "dependencyDiscovery", "requirements", "systemOverview", "helicopter", "structureCurrent", "structureProposed"].contains(&kind) || uuid::Uuid::parse_str(request_id).map(|id| id.to_string() != request_id).unwrap_or(true) {
+    pub fn show_dependency_result(
+        &self,
+        architect_id: &str,
+        generation: u64,
+        request_id: &str,
+        kind: &str,
+        replay: bool,
+    ) -> Result<()> {
+        if ![
+            "security",
+            "usage",
+            "project",
+            "updatePlan",
+            "dependencyDiscovery",
+            "requirements",
+            "systemOverview",
+            "helicopter",
+            "structureCurrent",
+            "structureProposed",
+        ]
+        .contains(&kind)
+            || uuid::Uuid::parse_str(request_id)
+                .map(|id| id.to_string() != request_id)
+                .unwrap_or(true)
+        {
             return Err("Invalid dependency result request".into());
         }
         let registry = self.registry()?;
-        let lease = registry.lease(architect_id, Origin::Human, true)?;
+        let lease = registry.lease(architect_id, Origin::Human, /* mutation */ true)?;
         if lease.generation != generation {
             return Err("stale_generation".into());
         }
         if registry.inspect(architect_id, Origin::Human)?.kind != InstanceKind::Architect {
             return Err("The Architect is no longer available".into());
         }
-        self.control(architect_id, &lease, "dependency_result", json!({"requestId": request_id, "kind": kind, "replay": replay}), Origin::Human)
-            .map(|_| ())
+        self.control(
+            architect_id,
+            &lease,
+            "dependency_result",
+            json!({"requestId": request_id, "kind": kind, "replay": replay}),
+            Origin::Human,
+        )
+        .map(|_| ())
     }
     /// Deliver an app-created, analysis-only visualization prompt through the human-only `project_visualization_prompt`
     /// control. The bridge, not this prompt, guards the turn; one lease binds the generation check and the frame.
-    pub(crate) fn prompt_visualization(&self, id: &str, generation: u64, request_id: &str, kind: &str, message: &str) -> Result<Value> {
+    pub(crate) fn prompt_visualization(
+        &self,
+        id: &str,
+        generation: u64,
+        request_id: &str,
+        kind: &str,
+        message: &str,
+    ) -> Result<Value> {
         let registry = self.registry()?;
-        let lease = registry.lease(id, Origin::Human, true)?;
+        let lease = registry.lease(id, Origin::Human, /* mutation */ true)?;
         if lease.generation != generation {
             return Err("stale_generation".into());
         }
-        if self.srs.get().and_then(Weak::upgrade).is_some_and(|s| s.has_active_generation(id)) {
-            return Err("srs_active: Pause SRS and continue before generating another overview analysis.".into());
+        if self
+            .srs
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|s| s.has_active_generation(id))
+        {
+            return Err(
+                "srs_active: Pause SRS and continue before generating another overview analysis."
+                    .into(),
+            );
         }
         if registry.inspect(id, Origin::Human)?.kind != InstanceKind::Architect {
             return Err("The Architect is no longer available".into());
         }
-        self.control(id, &lease, "project_visualization_prompt", json!({"requestId": request_id, "kind": kind, "message": message}), Origin::Human)
+        self.control(
+            id,
+            &lease,
+            "project_visualization_prompt",
+            json!({"requestId": request_id, "kind": kind, "message": message}),
+            Origin::Human,
+        )
     }
     /// Deliver the app-created frozen-snapshot explanation prompt through the human-only `monitor_explanation_prompt` control.
     /// One lease binds the generation check and the frame. An SRS job on this Architect is reported structurally, never paused here.
-    pub(crate) fn prompt_monitor_explanation(&self, producer: &DependencyProducer, request_id: &str, snapshot_id: &str, snapshot_hash: &str, message: &str) -> std::result::Result<(), MonitorPromptError> {
+    pub(crate) fn prompt_monitor_explanation(
+        &self,
+        producer: &DependencyProducer,
+        request_id: &str,
+        snapshot_id: &str,
+        snapshot_hash: &str,
+        message: &str,
+    ) -> std::result::Result<(), MonitorPromptError> {
         use MonitorPromptError::{NotSent, SrsActive, Uncertain};
-        let unsent = |code: &str, message: String| NotSent { code: code.into(), message };
-        let registry = self.registry().map_err(|e| unsent("registry_unavailable", e))?;
-        let lease = registry.lease(&producer.instance_id, Origin::Human, true).map_err(|e| unsent(e.split(':').next().filter(|c| !c.contains(' ')).unwrap_or("architect_unavailable"), e.clone()))?;
-        if lease.generation != producer.generation { return Err(unsent("stale_generation", "The Architect was replaced; nothing was sent.".into())); }
-        if self.dependency_producer(&producer.instance_id, producer.generation).map_err(|e| unsent("architect_unavailable", e))? != *producer {
-            return Err(unsent("stale_generation", "The Architect session was replaced; nothing was sent.".into()));
+        let unsent = |code: &str, message: String| NotSent {
+            code: code.into(),
+            message,
+        };
+        let registry = self
+            .registry()
+            .map_err(|e| unsent("registry_unavailable", e))?;
+        let lease = registry
+            .lease(
+                &producer.instance_id,
+                Origin::Human,
+                /* mutation */ true,
+            )
+            .map_err(|e| {
+                unsent(
+                    e.split(':')
+                        .next()
+                        .filter(|c| !c.contains(' '))
+                        .unwrap_or("architect_unavailable"),
+                    e.clone(),
+                )
+            })?;
+        if lease.generation != producer.generation {
+            return Err(unsent(
+                "stale_generation",
+                "The Architect was replaced; nothing was sent.".into(),
+            ));
         }
-        if registry.inspect(&producer.instance_id, Origin::Human).map_err(|e| unsent("architect_unavailable", e))?.kind != InstanceKind::Architect {
-            return Err(unsent("architect_unavailable", "The Architect is no longer available".into()));
+        if self
+            .dependency_producer(&producer.instance_id, producer.generation)
+            .map_err(|e| unsent("architect_unavailable", e))?
+            != *producer
+        {
+            return Err(unsent(
+                "stale_generation",
+                "The Architect session was replaced; nothing was sent.".into(),
+            ));
         }
-        if let Some((job_id, attempt_id)) = self.srs_active_job(&producer.instance_id) { return Err(SrsActive { job_id, attempt_id }); }
+        if registry
+            .inspect(&producer.instance_id, Origin::Human)
+            .map_err(|e| unsent("architect_unavailable", e))?
+            .kind
+            != InstanceKind::Architect
+        {
+            return Err(unsent(
+                "architect_unavailable",
+                "The Architect is no longer available".into(),
+            ));
+        }
+        if let Some((job_id, attempt_id)) = self.srs_active_job(&producer.instance_id) {
+            return Err(SrsActive { job_id, attempt_id });
+        }
         let outcome = self.control(&producer.instance_id, &lease, "monitor_explanation_prompt",
             json!({"requestId": request_id, "snapshotId": snapshot_id, "snapshotHash": snapshot_hash, "message": message}), Origin::Human);
         match outcome {
-            Ok(receipt) if receipt["requestId"] == request_id && receipt["snapshotId"] == snapshot_id && receipt["admitted"] == true => Ok(()),
+            Ok(receipt)
+                if receipt["requestId"] == request_id
+                    && receipt["snapshotId"] == snapshot_id
+                    && receipt["admitted"] == true =>
+            {
+                Ok(())
+            }
             // An explicit refusal is provably unsent even when a malformed request could not echo its ids.
             Ok(receipt) if receipt["admitted"] == false => Err(NotSent {
-                code: receipt["error"]["code"].as_str().unwrap_or("not_admitted").into(),
-                message: receipt["error"]["message"].as_str().unwrap_or("The Architect did not admit the explanation prompt.").into(),
+                code: receipt["error"]["code"]
+                    .as_str()
+                    .unwrap_or("not_admitted")
+                    .into(),
+                message: receipt["error"]["message"]
+                    .as_str()
+                    .unwrap_or("The Architect did not admit the explanation prompt.")
+                    .into(),
             }),
-            Ok(_) => Err(Uncertain("The Architect answered with an unrecognised receipt".into())),
-            Err(error) if ["bridge_not_ready", "stale_generation", "not_controlled"].contains(&error.as_str()) => Err(unsent(&error, error.clone())),
+            Ok(_) => Err(Uncertain(
+                "The Architect answered with an unrecognised receipt".into(),
+            )),
+            Err(error)
+                if ["bridge_not_ready", "stale_generation", "not_controlled"]
+                    .contains(&error.as_str()) =>
+            {
+                Err(unsent(&error, error.clone()))
+            }
             Err(error) => Err(Uncertain(error)),
         }
     }
     /// Read-only: the persisted SRS job/attempt that currently owns this Architect generation.
     pub(crate) fn srs_active_job(&self, instance_id: &str) -> Option<(String, String)> {
-        self.srs.get().and_then(Weak::upgrade).and_then(|service| service.active_job_for(instance_id))
+        self.srs
+            .get()
+            .and_then(Weak::upgrade)
+            .and_then(|service| service.active_job_for(instance_id))
     }
     /// Human "Pause SRS and continue": the job's own pause API; the native guard releases at its genuine quiescent boundary.
     pub(crate) fn pause_srs_job(&self, job_id: &str) -> Result<()> {
-        self.srs.get().and_then(Weak::upgrade).ok_or("SRS service unavailable")?.pause_srs(job_id).map(|_| ())
+        self.srs
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or("SRS service unavailable")?
+            .pause_srs(job_id)
+            .map(|_| ())
     }
     /// Human-only read of the Architect's captured structure-source Markdown (`structure_sources`,
     /// `structure_source_read`, `structure_source_select_last`). Never accepts a path.
-    pub(crate) fn architect_control(&self, id: &str, generation: u64, action: &str, payload: Value) -> Result<Value> {
-        if !["structure_sources", "structure_source_read", "structure_source_select_last"].contains(&action) {
+    pub(crate) fn architect_control(
+        &self,
+        id: &str,
+        generation: u64,
+        action: &str,
+        payload: Value,
+    ) -> Result<Value> {
+        if ![
+            "structure_sources",
+            "structure_source_read",
+            "structure_source_select_last",
+        ]
+        .contains(&action)
+        {
             return Err("Unsupported Architect control".into());
         }
         let registry = self.registry()?;
-        let lease = registry.lease(id, Origin::Human, false)?;
+        let lease = registry.lease(id, Origin::Human, /* mutation */ false)?;
         if lease.generation != generation {
             return Err("stale_generation".into());
         }
@@ -1363,10 +1986,22 @@ impl ManagerHub {
     }
     /// App-originated control of a plan agent's target: `Origin::Human`, so any session (including The Manager)
     /// can be interrupted and prompted. The target is derived from the registry, never from the payload.
-    fn plan_control(&self, registry: &Registry, target: &str, control: &str, payload: Value) -> Result<Value> {
-        let lease = registry.lease(target, Origin::Human, true)?;
+    fn plan_control(
+        &self,
+        registry: &Registry,
+        target: &str,
+        control: &str,
+        payload: Value,
+    ) -> Result<Value> {
+        let lease = registry.lease(target, Origin::Human, /* mutation */ true)?;
         self.control(target, &lease, control, payload, Origin::Human)
-            .map_err(|e| if e == "bridge_not_ready" { plan::NOT_RUNNING.into() } else { e })
+            .map_err(|e| {
+                if e == "bridge_not_ready" {
+                    plan::NOT_RUNNING.into()
+                } else {
+                    e
+                }
+            })
     }
     pub fn restore_plan_backup(&self, target: &str, backup_id: &str) -> Result<()> {
         let registry = self.registry()?;
@@ -1380,141 +2015,223 @@ impl ManagerHub {
         registry.revise_plan(target, &backup.text)?;
         Ok(())
     }
-    fn plan_action(&self, registry: &Arc<Registry>, target: &str, action: &str, p: &Value) -> Result<Value> {
+    fn plan_payload<'a>(action: &str, p: &'a Value) -> Result<&'a serde_json::Map<String, Value>> {
         let allowed: &[&str] = match action {
-            "plan_status" | "plan_read_plan" | "plan_screen" | "plan_interrupt" | "plan_handoff_info" => &[],
+            "plan_status" | "plan_read_plan" | "plan_screen" | "plan_interrupt"
+            | "plan_handoff_info" => &[],
             "plan_transcript" => &["tail"],
             "plan_write_plan" => &["text"],
             "plan_handoff" => &["summary", "revision", "startIfStopped"],
             _ => return Err("invalid_action".into()),
         };
-        let object = p.as_object().ok_or_else(|| "invalid_plan_payload: payload must be a JSON object".to_string())?;
+        let object = p
+            .as_object()
+            .ok_or_else(|| "invalid_plan_payload: payload must be a JSON object".to_string())?;
         if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-            return Err(format!("invalid_plan_payload: {action} does not accept '{key}' (allowed: {})", if allowed.is_empty() { "none".into() } else { allowed.join(", ") }));
+            return Err(format!(
+                "invalid_plan_payload: {action} does not accept '{key}' (allowed: {})",
+                if allowed.is_empty() {
+                    "none".into()
+                } else {
+                    allowed.join(", ")
+                }
+            ));
         }
+        Ok(object)
+    }
+    fn plan_action(
+        &self,
+        registry: &Registry,
+        target: &str,
+        action: &str,
+        p: &Value,
+    ) -> Result<Value> {
+        let object = Self::plan_payload(action, p)?;
         match action {
-            "plan_status" => {
-                let row = registry.inspect(target, Origin::Human)?;
-                Ok(json!({
-                    "name": row.name, "kind": row.kind, "projectPath": row.project_path, "status": row.status,
-                    "activity": row.activity, "task": row.task, "todoDone": row.todo_done, "todoTotal": row.todo_total,
-                    "planPath": row.plan_path, "planKind": row.plan_kind,
-                    "subagents": row.subagents.iter().map(|s| json!({"name": s.name, "agent": s.agent, "status": s.status, "task": s.task})).collect::<Vec<_>>(),
-                }))
-            }
-            "plan_read_plan" => Ok(json!({"kind": registry.inspect(target, Origin::Human)?.plan_kind, "path": registry.plan_file(target)?, "text": registry.plan(target, Origin::Human)?})),
-            "plan_transcript" => {
-                let tail = object.get("tail").map(|v| v.as_u64().ok_or("invalid_plan_payload")).transpose()?.unwrap_or(20_000).clamp(1_000, 60_000) as usize;
-                let (path, input) = registry.main_transcript(target, Origin::Human)?;
-                Ok(json!({"text": plan::tail(&session::render_transcript_file(&path, &input)?, tail)}))
-            }
+            "plan_status" => Self::plan_status(registry, target),
+            "plan_read_plan" => Ok(
+                json!({"kind": registry.inspect(target, Origin::Human)?.plan_kind, "path": registry.plan_file(target)?, "text": registry.plan(target, Origin::Human)?}),
+            ),
+            "plan_transcript" => Self::plan_transcript(registry, target, object),
             "plan_screen" => {
-                let screen = registry.screen(target, Origin::Human).map_err(|e| if e == "instance not started" { plan::NOT_RUNNING.to_string() } else { e })?;
+                let screen = registry.screen(target, Origin::Human).map_err(|e| {
+                    if e == "instance not started" {
+                        plan::NOT_RUNNING.to_string()
+                    } else {
+                        e
+                    }
+                })?;
                 Ok(json!({"text": plan::tail(screen["text"].as_str().unwrap_or(""), 8_000)}))
             }
             "plan_interrupt" => {
                 self.plan_control(registry, target, "abort", json!({}))?;
                 Ok(json!({"interrupted": true}))
             }
-            "plan_write_plan" => {
-                let text = object.get("text").and_then(Value::as_str)
-                    .filter(|t| !t.trim().is_empty() && t.chars().count() <= 262_144)
-                    .ok_or("plan text must be 1..262144 characters")?;
-                // The session must stop working before its plan changes; a stopped session has nothing to interrupt.
-                let interrupted = match self.plan_control(registry, target, "abort", json!({})) {
-                    Ok(_) => true,
-                    Err(e) if e == plan::NOT_RUNNING => false,
-                    Err(e) => return Err(e),
-                };
-                let backup = registry.revise_plan(target, text)?;
-                Ok(json!({"path": registry.plan_file(target)?, "bytes": text.len(), "interrupted": interrupted, "backup": backup}))
-            }
+            "plan_write_plan" => self.plan_write_plan(registry, target, object),
             "plan_handoff_info" => {
-                let revision = registry.plan_revision(target)?
+                let revision = registry
+                    .plan_revision(target)?
                     .ok_or("There is no plan to hand off; call write_plan first")?;
                 let row = registry.inspect(target, Origin::Human)?;
                 Ok(json!({"name": row.name, "revision": revision.id,
                     "needsStart": self.connection(target, true).is_err() && !matches!(row.status.as_str(), "running" | "starting")}))
             }
-            "plan_handoff" => {
-                let summary = object.get("summary").and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty() && s.chars().count() <= 4_000)
-                    .ok_or("summary must be 1..4000 characters")?;
-                let revision = registry.plan_revision(target)?
-                    .ok_or("There is no plan to hand off; call write_plan first")?;
-                if p["revision"].as_str() != Some(revision.id.as_str()) {
-                    return Err("The plan changed; confirm the new revision before handoff".into());
-                }
-                let start = p.get("startIfStopped").map(|v| v.as_bool().ok_or("startIfStopped must be boolean")).transpose()?.unwrap_or(false);
-                if self.connection(target, true).is_err() {
-                    let row = registry.inspect(target, Origin::Human)?;
-                    if !matches!(row.status.as_str(), "running" | "starting") {
-                        if !start { return Err(plan::NOT_RUNNING.into()); }
-                        registry.start(target, Origin::Human)?;
-                    }
-                    self.wait_ready(target)?;
-                }
-                // Starting/resuming may load a different native identity. Never send an unconfirmed revision.
-                let current = registry.plan_revision(target)?.ok_or("The session changed; review the plan before handoff")?;
-                if current.id != revision.id { return Err("The plan changed; confirm the new revision before handoff".into()); }
-                let message = plan::handoff_message(&revision.path, &revision.text, summary);
-                self.plan_control(registry, target, "prompt", json!({"message": message}))?;
-                registry.mark_plan_handoff(target, &revision.id)?;
-                Ok(json!({"accepted": true}))
-            }
+            "plan_handoff" => self.plan_handoff(registry, target, object, p),
             _ => Err("invalid_action".into()),
         }
     }
+    fn plan_status(registry: &Registry, target: &str) -> Result<Value> {
+        let row = registry.inspect(target, Origin::Human)?;
+        Ok(json!({
+            "name": row.name, "kind": row.kind, "projectPath": row.project_path, "status": row.status,
+            "activity": row.activity, "task": row.task, "todoDone": row.todo_done, "todoTotal": row.todo_total,
+            "planPath": row.plan_path, "planKind": row.plan_kind,
+            "subagents": row.subagents.iter().map(|s| json!({"name": s.name, "agent": s.agent, "status": s.status, "task": s.task})).collect::<Vec<_>>(),
+        }))
+    }
+    fn plan_transcript(
+        registry: &Registry,
+        target: &str,
+        object: &serde_json::Map<String, Value>,
+    ) -> Result<Value> {
+        let tail = object
+            .get("tail")
+            .map(|v| v.as_u64().ok_or("invalid_plan_payload"))
+            .transpose()?
+            .unwrap_or(20_000)
+            .clamp(1_000, 60_000) as usize;
+        let (path, input) = registry.main_transcript(target, Origin::Human)?;
+        Ok(json!({"text": plan::tail(&session::render_transcript_file(&path, &input)?, tail)}))
+    }
+    fn plan_write_plan(
+        &self,
+        registry: &Registry,
+        target: &str,
+        object: &serde_json::Map<String, Value>,
+    ) -> Result<Value> {
+        let text = object
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|t| !t.trim().is_empty() && t.chars().count() <= 262_144)
+            .ok_or("plan text must be 1..262144 characters")?;
+        // The session must stop working before its plan changes; a stopped session has nothing to interrupt.
+        let interrupted = match self.plan_control(registry, target, "abort", json!({})) {
+            Ok(_) => true,
+            Err(e) if e == plan::NOT_RUNNING => false,
+            Err(e) => return Err(e),
+        };
+        let backup = registry.revise_plan(target, text)?;
+        Ok(
+            json!({"path": registry.plan_file(target)?, "bytes": text.len(), "interrupted": interrupted, "backup": backup}),
+        )
+    }
+    fn plan_handoff(
+        &self,
+        registry: &Registry,
+        target: &str,
+        object: &serde_json::Map<String, Value>,
+        p: &Value,
+    ) -> Result<Value> {
+        let summary = object
+            .get("summary")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty() && s.chars().count() <= 4_000)
+            .ok_or("summary must be 1..4000 characters")?;
+        let revision = registry
+            .plan_revision(target)?
+            .ok_or("There is no plan to hand off; call write_plan first")?;
+        if p["revision"].as_str() != Some(revision.id.as_str()) {
+            return Err("The plan changed; confirm the new revision before handoff".into());
+        }
+        let start = p
+            .get("startIfStopped")
+            .map(|v| v.as_bool().ok_or("startIfStopped must be boolean"))
+            .transpose()?
+            .unwrap_or(false);
+        self.plan_handoff_ready(registry, target, start)?;
+        // Starting/resuming may load a different native identity. Never send an unconfirmed revision.
+        let current = registry
+            .plan_revision(target)?
+            .ok_or("The session changed; review the plan before handoff")?;
+        if current.id != revision.id {
+            return Err("The plan changed; confirm the new revision before handoff".into());
+        }
+        let message = plan::handoff_message(&revision.path, &revision.text, summary);
+        self.plan_control(registry, target, "prompt", json!({"message": message}))?;
+        registry.mark_plan_handoff(target, &revision.id)?;
+        Ok(json!({"accepted": true}))
+    }
+    fn plan_handoff_ready(&self, registry: &Registry, target: &str, start: bool) -> Result<()> {
+        if self.connection(target, true).is_ok() {
+            return Ok(());
+        }
+        let row = registry.inspect(target, Origin::Human)?;
+        if !matches!(row.status.as_str(), "running" | "starting") {
+            if !start {
+                return Err(plan::NOT_RUNNING.into());
+            }
+            registry.start(target, Origin::Human)?;
+        }
+        self.wait_ready(target)
+    }
     fn execute(&self, actor: &Actor, frame: &Value) -> Result<Value> {
-        let current = self.state.lock().map_err(|e| e.to_string())?.clients.get(&actor.id).is_some_and(|client| client.generation == actor.generation && client.connection_id == actor.connection_id);
-        if !current { return Err("stale_generation".into()); }
+        let current = self
+            .state
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clients
+            .get(&actor.id)
+            .is_some_and(|client| {
+                client.generation == actor.generation && client.connection_id == actor.connection_id
+            });
+        if !current {
+            return Err("stale_generation".into());
+        }
         let registry = self.registry()?;
-        if registry.lease(&actor.id, Origin::Human, false)?.generation != actor.generation {
+        if registry
+            .lease(&actor.id, Origin::Human, /* mutation */ false)?
+            .generation
+            != actor.generation
+        {
             return Err("stale_generation".into());
         }
         let action = text(frame, "action")?;
         let p = &frame["payload"];
-        if matches!(action, "srs_tool" | "srs_ask_map" | "srs_ask_receipt" | "srs_ask_retired" | "srs_stage_admitted" | "srs_stage_validate" | "srs_stage_yielded") {
-            if actor.role != InstanceKind::Architect { return Err("unauthorized".into()); }
-            let producer = self.dependency_producer(&actor.id, actor.generation)?;
-            let service = self.srs.get().and_then(Weak::upgrade).ok_or("SRS service unavailable")?;
-            return service.handle_bridge(&producer, action, p.clone());
+        if matches!(
+            action,
+            "srs_tool"
+                | "srs_ask_map"
+                | "srs_ask_receipt"
+                | "srs_ask_retired"
+                | "srs_stage_admitted"
+                | "srs_stage_validate"
+                | "srs_stage_yielded"
+        ) {
+            return self.execute_srs(actor, action, p);
         }
-        if matches!(action, "monitor_snapshot_read" | "monitor_explanation_validate" | "monitor_explanation_retired") {
-            // Authenticated Architect only, before the Manager boundary; the producer derives from the actor, never the payload.
-            if actor.role != InstanceKind::Architect { return Err("unauthorized".into()); }
-            let producer = self.dependency_producer(&actor.id, actor.generation)?;
-            let service = self.host_monitor.get().and_then(Weak::upgrade).ok_or("host monitor service unavailable")?;
-            return service.handle_bridge(&producer, action, p.clone());
+        if matches!(
+            action,
+            "monitor_snapshot_read"
+                | "monitor_explanation_validate"
+                | "monitor_explanation_retired"
+        ) {
+            return self.execute_monitor(actor, action, p);
         }
-        if matches!(action, "workspace_begin" | "workspace_ready" | "workspace_complete" | "workspace_failed" | "workspace_reconcile") {
-            if !registry.workspace_metadata(&actor.id).is_ok_and(|m| crate::instance::may_change_directory(&m.definition)) { return Err("unauthorized".into()); }
-            let service = self.workspace.get().and_then(Weak::upgrade).ok_or("workspace service unavailable")?;
-            return match action {
-                "workspace_begin" => service.begin(&actor.id, actor.generation, &actor.connection_id, text(p,"requestId")?),
-                "workspace_ready" => service.ready(&actor.id, actor.generation, &actor.connection_id, p),
-                "workspace_reconcile" => service.reconcile(&actor.id, actor.generation, p),
-                _ => service.complete(&actor.id, actor.generation, &actor.connection_id, p, action == "workspace_failed"),
-            };
+        if matches!(
+            action,
+            "workspace_begin"
+                | "workspace_ready"
+                | "workspace_complete"
+                | "workspace_failed"
+                | "workspace_reconcile"
+        ) {
+            return self.execute_workspace(actor, &registry, action, p);
         }
-        if matches!(action, "browser_prepare" | "browser_close_tab" | "browser_close_all" | "browser_tabs") {
-            let fields: &[&str] = match action {
-                "browser_close_all" | "browser_tabs" => &[],
-                "browser_prepare" => &["name", "target"],
-                _ => &["name"],
-            };
-            let object = p.as_object().ok_or("invalid_browser_payload")?;
-            if object.keys().any(|key| !fields.contains(&key.as_str())) { return Err("invalid_browser_payload".into()); }
-            let browser = self.browser.get().ok_or("browser supervisor unavailable")?;
-            return match action {
-                "browser_prepare" => {
-                    let target = p.get("target").map(|v| v.as_str().ok_or("invalid_browser_payload")).transpose()?;
-                    browser.prepare_tab(&actor.id, actor.generation, text(p, "name")?, target)
-                }
-                "browser_tabs" => browser.list_tabs(&actor.id, actor.generation),
-                "browser_close_tab" => browser.close_tab(&actor.id, actor.generation, Some(text(p, "name")?)).map(|_| Value::Null),
-                _ => browser.close_tab(&actor.id, actor.generation, None).map(|_| Value::Null),
-            };
+        if matches!(
+            action,
+            "browser_prepare" | "browser_close_tab" | "browser_close_all" | "browser_tabs"
+        ) {
+            return self.execute_browser(actor, action, p);
         }
         if action.starts_with("plan_") {
             if let Some(target) = registry.plan_target(&actor.id) {
@@ -1522,70 +2239,195 @@ impl ManagerHub {
             }
         }
         if action == "code_quality" {
-            // Read-only saved results for the caller's own repository, for every role; the repository comes from the
-            // authenticated actor's Registry definition, never from the payload.
-            let service = self.code_quality.get().and_then(Weak::upgrade).ok_or("code quality service unavailable")?;
-            let request: crate::code_quality::types::AgentReportRequest = serde_json::from_value(p.clone()).map_err(|e| format!("invalid_code_quality_payload: {e}"))?;
-            let (folder, subject, epoch) = Self::quality_repository(&registry, actor)?;
-            let result = service.agent_report(&folder, &request)?;
-            let after = registry.workspace_metadata(&subject)?;
-            if after.workspace_epoch != epoch || after.definition.input.project_path != folder {
-                return Err("workspace_changed: the working directory changed while reading; retry".into());
-            }
-            return Ok(result);
+            return self.execute_code_quality(actor, &registry, p);
         }
-        if actor.role != InstanceKind::Manager { return Err("unauthorized".into()); }
-        let origin = Origin::Manager(&actor.id);
-        if action == "list" {
-            let rows = registry
-                .snapshot()
-                .into_iter()
-                .filter(|r| {
-                    r.kind == InstanceKind::Instance
-                        && r.manager_id.as_deref() == Some(actor.id.as_str())
-                })
-                .collect::<Vec<_>>();
-            let state = self.state.lock().map_err(|e| e.to_string())?;
-            return Ok(
-                json!({"instances":rows,"pendingDecisions":state.decisions.values().filter(|d|rows.iter().any(|r|r.id==d.worker)).map(Decision::view).collect::<Vec<_>>()}),
+        if actor.role != InstanceKind::Manager {
+            return Err("unauthorized".into());
+        }
+        self.execute_manager(actor, &registry, action, p)
+    }
+    fn execute_srs(&self, actor: &Actor, action: &str, p: &Value) -> Result<Value> {
+        if actor.role != InstanceKind::Architect {
+            return Err("unauthorized".into());
+        }
+        let producer = self.dependency_producer(&actor.id, actor.generation)?;
+        let service = self
+            .srs
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or("SRS service unavailable")?;
+        service.handle_bridge(&producer, action, p.clone())
+    }
+    fn execute_monitor(&self, actor: &Actor, action: &str, p: &Value) -> Result<Value> {
+        // Authenticated Architect only, before the Manager boundary; the producer derives from the actor, never the payload.
+        if actor.role != InstanceKind::Architect {
+            return Err("unauthorized".into());
+        }
+        let producer = self.dependency_producer(&actor.id, actor.generation)?;
+        let service = self
+            .host_monitor
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or("host monitor service unavailable")?;
+        service.handle_bridge(&producer, action, p.clone())
+    }
+    fn execute_workspace(
+        &self,
+        actor: &Actor,
+        registry: &Registry,
+        action: &str,
+        p: &Value,
+    ) -> Result<Value> {
+        if !registry
+            .workspace_metadata(&actor.id)
+            .is_ok_and(|m| crate::instance::may_change_directory(&m.definition))
+        {
+            return Err("unauthorized".into());
+        }
+        let service = self
+            .workspace
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or("workspace service unavailable")?;
+        match action {
+            "workspace_begin" => service.begin(
+                &actor.id,
+                actor.generation,
+                &actor.connection_id,
+                text(p, "requestId")?,
+            ),
+            "workspace_ready" => {
+                service.ready(&actor.id, actor.generation, &actor.connection_id, p)
+            }
+            "workspace_reconcile" => service.reconcile(&actor.id, actor.generation, p),
+            _ => service.complete(
+                &actor.id,
+                actor.generation,
+                &actor.connection_id,
+                p,
+                action == "workspace_failed",
+            ),
+        }
+    }
+    fn execute_browser(&self, actor: &Actor, action: &str, p: &Value) -> Result<Value> {
+        let fields: &[&str] = match action {
+            "browser_close_all" | "browser_tabs" => &[],
+            "browser_prepare" => &["name", "target"],
+            _ => &["name"],
+        };
+        let object = p.as_object().ok_or("invalid_browser_payload")?;
+        if object.keys().any(|key| !fields.contains(&key.as_str())) {
+            return Err("invalid_browser_payload".into());
+        }
+        let browser = self.browser.get().ok_or("browser supervisor unavailable")?;
+        match action {
+            "browser_prepare" => {
+                let target = p
+                    .get("target")
+                    .map(|v| v.as_str().ok_or("invalid_browser_payload"))
+                    .transpose()?;
+                browser.prepare_tab(&actor.id, actor.generation, text(p, "name")?, target)
+            }
+            "browser_tabs" => browser.list_tabs(&actor.id, actor.generation),
+            "browser_close_tab" => browser
+                .close_tab(&actor.id, actor.generation, Some(text(p, "name")?))
+                .map(|_| Value::Null),
+            _ => browser
+                .close_tab(&actor.id, actor.generation, None)
+                .map(|_| Value::Null),
+        }
+    }
+    /// Read-only saved results for the caller's own repository, for every role; the repository comes from the
+    /// authenticated actor's Registry definition, never from the payload.
+    fn execute_code_quality(&self, actor: &Actor, registry: &Registry, p: &Value) -> Result<Value> {
+        let service = self
+            .code_quality
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or("code quality service unavailable")?;
+        let request: crate::code_quality::types::AgentReportRequest =
+            serde_json::from_value(p.clone())
+                .map_err(|e| format!("invalid_code_quality_payload: {e}"))?;
+        let (folder, subject, epoch) = Self::quality_repository(registry, actor)?;
+        let result = service.agent_report(&folder, &request)?;
+        let after = registry.workspace_metadata(&subject)?;
+        if after.workspace_epoch != epoch || after.definition.input.project_path != folder {
+            return Err(
+                "workspace_changed: the working directory changed while reading; retry".into(),
             );
         }
-        if action == "create" {
-            let start = p["start"].as_bool().unwrap_or(true);
-            let prompt = p["prompt"].as_str();
-            if !start && prompt.is_some() {
-                return Err("prompt_requires_start".into());
+        Ok(result)
+    }
+    fn execute_manager(
+        &self,
+        actor: &Actor,
+        registry: &Registry,
+        action: &str,
+        p: &Value,
+    ) -> Result<Value> {
+        match action {
+            "list" => self.manager_list(actor, registry),
+            "create" => self.manager_create(actor, registry, p),
+            _ => self.manager_instance_action(actor, registry, action, p),
+        }
+    }
+    fn manager_list(&self, actor: &Actor, registry: &Registry) -> Result<Value> {
+        let rows = registry
+            .snapshot()
+            .into_iter()
+            .filter(|r| {
+                r.kind == InstanceKind::Instance
+                    && r.manager_id.as_deref() == Some(actor.id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let state = self.state.lock().map_err(|e| e.to_string())?;
+        Ok(
+            json!({"instances":rows,"pendingDecisions":state.decisions.values().filter(|d|rows.iter().any(|r|r.id==d.worker)).map(Decision::view).collect::<Vec<_>>()}),
+        )
+    }
+    fn manager_create(&self, actor: &Actor, registry: &Registry, p: &Value) -> Result<Value> {
+        let origin = Origin::Manager(&actor.id);
+        let start = p["start"].as_bool().unwrap_or(true);
+        let prompt = p["prompt"].as_str();
+        if !start && prompt.is_some() {
+            return Err("prompt_requires_start".into());
+        }
+        let mut input: CreateInput =
+            serde_json::from_value(p["config"].clone()).map_err(|e| e.to_string())?;
+        input.agent_file = None;
+        let row = registry.create_owned(&actor.id, input)?;
+        if start {
+            if let Err(error) = registry.start(&row.id, origin) {
+                return Ok(
+                    json!({"instance":registry.inspect(&row.id,origin)?,"error":error,"promptSent":false}),
+                );
             }
-            let mut input: CreateInput =
-                serde_json::from_value(p["config"].clone()).map_err(|e| e.to_string())?;
-            input.agent_file = None;
-            let row = registry.create_owned(&actor.id, input)?;
-            if start {
-                if let Err(error) = registry.start(&row.id, origin) {
+            if prompt.is_some() {
+                if let Err(error) = self.wait_ready(&row.id) {
                     return Ok(
                         json!({"instance":registry.inspect(&row.id,origin)?,"error":error,"promptSent":false}),
                     );
                 }
-                if prompt.is_some() {
-                    if let Err(error) = self.wait_ready(&row.id) {
-                        return Ok(
-                            json!({"instance":registry.inspect(&row.id,origin)?,"error":error,"promptSent":false}),
-                        );
-                    }
-                    let lease = registry.lease(&row.id, origin, true)?;
-                    self.control(
-                        &row.id,
-                        &lease,
-                        "prompt",
-                        json!({"message":prompt,"delivery":"follow_up"}),
-                        origin,
-                    )?;
-                }
+                let lease = registry.lease(&row.id, origin, /* mutation */ true)?;
+                self.control(
+                    &row.id,
+                    &lease,
+                    "prompt",
+                    json!({"message":prompt,"delivery":"follow_up"}),
+                    origin,
+                )?;
             }
-            return Ok(
-                json!({"instance":registry.inspect(&row.id,origin)?,"promptSent":prompt.is_some()}),
-            );
         }
+        Ok(json!({"instance":registry.inspect(&row.id,origin)?,"promptSent":prompt.is_some()}))
+    }
+    fn manager_instance_action(
+        &self,
+        actor: &Actor,
+        registry: &Registry,
+        action: &str,
+        p: &Value,
+    ) -> Result<Value> {
+        let origin = Origin::Manager(&actor.id);
         let id = text(p, "instanceId")?;
         match action {
             "start" => {
@@ -1628,7 +2470,7 @@ impl ManagerHub {
                 Ok(json!({"accepted":true}))
             }
             "send" | "interrupt" => {
-                let lease = registry.lease(id, origin, true)?;
+                let lease = registry.lease(id, origin, /* mutation */ true)?;
                 self.control(
                     id,
                     &lease,
@@ -1637,63 +2479,113 @@ impl ManagerHub {
                     origin,
                 )
             }
-            "subscribe" => {
-                registry.lease(id, origin, false)?;
-                let enabled = p["enabled"].as_bool().ok_or("enabled is required")?;
-                let decisions = {
-                    let mut state = self.state.lock().map_err(|e| e.to_string())?;
-                    let was_enabled = state
-                        .subscriptions
-                        .insert(id.into(), enabled)
-                        .unwrap_or(true);
-                    if !enabled {
-                        for queue in state.queues.values_mut() {
-                            queue.retain(|n| n["instanceId"] != id);
-                        }
-                    }
-                    state
-                        .decisions
-                        .values()
-                        .filter(|d| enabled && !was_enabled && d.worker == id)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                };
-                if enabled {
-                    self.replay(&actor.id);
-                }
-                for decision in decisions {
-                    self.owner_notification(
-                        id,
-                        decision.generation,
-                        "needs_decision",
-                        decision.view(),
-                    );
-                }
-                Ok(json!({"subscribed":enabled}))
-            }
-            "request_human" => {
-                registry.lease(id, origin, false)?;
-                let decision_id = p["requestId"].as_str().map(String::from);
-                if let Some(request) = &decision_id {
-                    let state = self.state.lock().map_err(|e| e.to_string())?;
-                    if !state.decisions.get(request).is_some_and(|d| d.worker == id) {
-                        return Err("decision_already_resolved".into());
-                    }
-                }
-                registry.request_human(id, &actor.id, text(p, "reason")?.into(), decision_id)?;
-                self.owner_notification(
-                    id,
-                    registry.lease(id, origin, false)?.generation,
-                    "human_requested",
-                    p.clone(),
-                );
-                Ok(json!({"humanRequested":true}))
-            }
-            "respond" => {
-                self.respond_decision(id, text(p, "requestId")?, p["generation"].as_u64().ok_or("generation is required")?, None, p["response"].clone(), origin)
-            }
+            "subscribe" => self.manager_subscribe(actor, registry, id, p),
+            "request_human" => self.manager_request_human(actor, registry, id, p),
+            "respond" => self.respond_decision(
+                id,
+                text(p, "requestId")?,
+                p["generation"].as_u64().ok_or("generation is required")?,
+                None,
+                p["response"].clone(),
+                origin,
+            ),
             _ => Err("invalid_action".into()),
         }
+    }
+    fn manager_subscribe(
+        &self,
+        actor: &Actor,
+        registry: &Registry,
+        id: &str,
+        p: &Value,
+    ) -> Result<Value> {
+        registry.lease(id, Origin::Manager(&actor.id), /* mutation */ false)?;
+        let enabled = p["enabled"].as_bool().ok_or("enabled is required")?;
+        let decisions = {
+            let mut state = self.state.lock().map_err(|e| e.to_string())?;
+            let was_enabled = state
+                .subscriptions
+                .insert(id.into(), enabled)
+                .unwrap_or(true);
+            if !enabled {
+                for queue in state.queues.values_mut() {
+                    queue.retain(|n| n["instanceId"] != id);
+                }
+            }
+            state
+                .decisions
+                .values()
+                .filter(|d| enabled && !was_enabled && d.worker == id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if enabled {
+            self.replay(&actor.id);
+        }
+        for decision in decisions {
+            self.owner_notification(id, decision.generation, "needs_decision", decision.view());
+        }
+        Ok(json!({"subscribed":enabled}))
+    }
+    fn manager_request_human(
+        &self,
+        actor: &Actor,
+        registry: &Registry,
+        id: &str,
+        p: &Value,
+    ) -> Result<Value> {
+        let origin = Origin::Manager(&actor.id);
+        registry.lease(id, origin, /* mutation */ false)?;
+        let decision_id = p["requestId"].as_str().map(String::from);
+        if let Some(request) = &decision_id {
+            let state = self.state.lock().map_err(|e| e.to_string())?;
+            if !state.decisions.get(request).is_some_and(|d| d.worker == id) {
+                return Err("decision_already_resolved".into());
+            }
+        }
+        registry.request_human(id, &actor.id, text(p, "reason")?.into(), decision_id)?;
+        self.owner_notification(
+            id,
+            registry.lease(id, origin, /* mutation */ false)?.generation,
+            "human_requested",
+            p.clone(),
+        );
+        Ok(json!({"humanRequested":true}))
+    }
+}
+
+struct MarkdownHold {
+    hub: Arc<ManagerHub>,
+    transaction_id: String,
+    held: Vec<(String, ControlLease)>,
+}
+impl Drop for MarkdownHold {
+    fn drop(&mut self) {
+        for (id, lease) in self.held.drain(..) {
+            let _ = self.hub.control(
+                &id,
+                &lease,
+                "setup_markdown_release",
+                json!({"transactionId": self.transaction_id}),
+                Origin::Human,
+            );
+        }
+    }
+}
+
+/// Adapter installed once into the Markdown service; fails closed when the hub is unavailable.
+pub struct HubMarkdownBoundary(pub Weak<Registry>);
+impl crate::agent_markdown::MarkdownBoundary for HubMarkdownBoundary {
+    fn hold(
+        &self,
+        transaction_id: &str,
+        _target: &crate::agent_markdown::KnowledgeAssetTarget,
+    ) -> Result<Box<dyn Send>> {
+        let registry = self.0.upgrade().ok_or("registry unavailable")?;
+        let hub = registry
+            .manager_hub()
+            .ok_or("manager bridge not initialized")?;
+        hub.hold_markdown_sessions(&registry, transaction_id)
     }
 }
 
@@ -1705,50 +2597,132 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("omp-human-inbox-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(folder.join("repo-a")).unwrap();
         std::fs::create_dir_all(folder.join("repo-b")).unwrap();
-        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
-        let input = |name: &str, repo: &str| CreateInput { name: name.into(), project_path: folder.join(repo).to_string_lossy().into(), ..Default::default() };
+        let registry =
+            Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let input = |name: &str, repo: &str| CreateInput {
+            name: name.into(),
+            project_path: folder.join(repo).to_string_lossy().into(),
+            ..Default::default()
+        };
         let manager = registry.create_manager(input("Manager", "repo-a")).unwrap();
-        let architect = registry.create_architect(input("Architect", "repo-b")).unwrap();
-        let worker = registry.create_owned(&manager.id, input("Worker", "repo-a")).unwrap();
-        let helper = registry.create_helper(&worker.id, crate::instance::HelperPurpose::Diff, worker.project_path.clone()).unwrap();
+        let architect = registry
+            .create_architect(input("Architect", "repo-b"))
+            .unwrap();
+        let worker = registry
+            .create_owned(&manager.id, input("Worker", "repo-a"))
+            .unwrap();
+        let helper = registry
+            .create_helper(
+                &worker.id,
+                crate::instance::HelperPurpose::Diff,
+                worker.project_path.clone(),
+            )
+            .unwrap();
         let plan = registry.create_planner(&worker.id).unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
         for row in [&manager, &architect, &worker, &helper, &plan] {
-            registry.apply_identity(&row.id, 0, &json!({"sessionId":row.id,"supported":true,"workspaceEpoch":0})).unwrap();
+            registry
+                .apply_identity(
+                    &row.id,
+                    0,
+                    &json!({"sessionId":row.id,"supported":true,"workspaceEpoch":0}),
+                )
+                .unwrap();
             hub.register_decision(&Actor { id: row.id.clone(), generation: 0, role: row.kind, connection_id: String::new() },
                 &json!({"requestId":"native-base","method":"confirm","sessionId":row.id,"workspaceEpoch":0,"createdAt":1,"title":"Confirm","message":"Proceed?","humanOnly":true})).unwrap();
         }
         let initial = hub.human_decisions().unwrap();
         assert_eq!(initial.items.len(), 5);
         assert_eq!(hub.human_decisions().unwrap().revision, initial.revision);
-        let decision = initial.items.iter().find(|item| item.target.instance_id == worker.id).unwrap();
-        assert_eq!(decision.repository.folder.as_deref(), Some(worker.project_path.as_str()));
+        let decision = initial
+            .items
+            .iter()
+            .find(|item| item.target.instance_id == worker.id)
+            .unwrap();
+        assert_eq!(
+            decision.repository.folder.as_deref(),
+            Some(worker.project_path.as_str())
+        );
         assert!(decision.payload.get("requestId").is_none());
         assert!(decision.answerable && decision.human_only);
         for id in [&helper.id, &plan.id] {
-            assert_eq!(initial.items.iter().find(|item| &item.target.instance_id == id).unwrap().repository.folder, decision.repository.folder);
+            assert_eq!(
+                initial
+                    .items
+                    .iter()
+                    .find(|item| &item.target.instance_id == id)
+                    .unwrap()
+                    .repository
+                    .folder,
+                decision.repository.folder
+            );
         }
         let target = decision.target.clone();
         for changed in [
-            HumanDecisionTarget { instance_id: architect.id.clone(), ..target.clone() },
-            HumanDecisionTarget { generation: 1, ..target.clone() },
-            HumanDecisionTarget { session_id: Some("another".into()), ..target.clone() },
-            HumanDecisionTarget { ownership_epoch: target.ownership_epoch + 1, ..target.clone() },
-            HumanDecisionTarget { workspace_epoch: 1, ..target.clone() },
+            HumanDecisionTarget {
+                instance_id: architect.id.clone(),
+                ..target.clone()
+            },
+            HumanDecisionTarget {
+                generation: 1,
+                ..target.clone()
+            },
+            HumanDecisionTarget {
+                session_id: Some("another".into()),
+                ..target.clone()
+            },
+            HumanDecisionTarget {
+                ownership_epoch: target.ownership_epoch + 1,
+                ..target.clone()
+            },
+            HumanDecisionTarget {
+                workspace_epoch: 1,
+                ..target.clone()
+            },
         ] {
-            assert_eq!(hub.respond_human_decision(&changed, json!(true)).unwrap_err(), "stale_generation");
+            assert_eq!(
+                hub.respond_human_decision(&changed, json!(true))
+                    .unwrap_err(),
+                "stale_generation"
+            );
         }
-        assert_eq!(hub.respond_decision(&worker.id, &target.request_id, 0, None, json!(true), Origin::Manager(&manager.id)).unwrap_err(), "human_only_decision");
+        assert_eq!(
+            hub.respond_decision(
+                &worker.id,
+                &target.request_id,
+                0,
+                None,
+                json!(true),
+                Origin::Manager(&manager.id)
+            )
+            .unwrap_err(),
+            "human_only_decision"
+        );
         // A human passes ownership gates without transferring the worker. No live bridge in this fixture.
-        assert_eq!(hub.respond_human_decision(&target, json!(false)).unwrap_err(), "bridge_not_ready");
-        assert_eq!(registry.lease(&worker.id, Origin::Human, false).unwrap().manager_id.as_deref(), Some(manager.id.as_str()));
+        assert_eq!(
+            hub.respond_human_decision(&target, json!(false))
+                .unwrap_err(),
+            "bridge_not_ready"
+        );
+        assert_eq!(
+            registry
+                .lease(&worker.id, Origin::Human, false)
+                .unwrap()
+                .manager_id
+                .as_deref(),
+            Some(manager.id.as_str())
+        );
         hub.event(&Actor { id: worker.id.clone(), generation: 0, role: worker.kind, connection_id: String::new() },
             &json!({"kind":"decision_resolved","payload":{"requestId":"native-base","source":"native"}})).unwrap();
         let resolved = hub.human_decisions().unwrap();
         assert_eq!(resolved.items.len(), 4);
         assert!(resolved.revision > initial.revision);
-        assert_eq!(hub.respond_human_decision(&target, json!(true)).unwrap_err(), "decision_already_resolved");
+        assert_eq!(
+            hub.respond_human_decision(&target, json!(true))
+                .unwrap_err(),
+            "decision_already_resolved"
+        );
         hub.clear_decisions(&architect.id);
         assert_eq!(hub.human_decisions().unwrap().items.len(), 3);
         hub.shutdown();
@@ -1775,7 +2749,8 @@ mod tests {
             .unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
-        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder))
+            .unwrap();
         let definition = Definition {
             id: manager.id.clone(),
             input: CreateInput::default(),
@@ -1798,7 +2773,13 @@ mod tests {
         let welcome = read_frame(&mut BufReader::new(socket)).unwrap().unwrap();
         assert_eq!(welcome["ok"], true);
         let actor = Actor {
-            connection_id: hub.state.lock().unwrap_or_else(|e| e.into_inner()).clients[&manager.id].connection_id.clone(),
+            connection_id: hub
+                .state
+                .lock()
+                .expect("manager hub mutex poisoned")
+                .clients[&manager.id]
+                .connection_id
+                .clone(),
             ..actor
         };
         let human = registry
@@ -1842,7 +2823,8 @@ mod tests {
         let worker = registry.create_owned(&manager.id, config).unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
-        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder))
+            .unwrap();
         registry.install_manager_hub(hub.clone()).unwrap();
         let manager_actor = Actor {
             id: manager.id.clone(),
@@ -1856,12 +2838,36 @@ mod tests {
             role: InstanceKind::Instance,
             connection_id: String::new(),
         };
-        hub.launch(&Definition { id:manager.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Manager, manager_id:None, plan_target:None, helper:None }, 0).unwrap();
-        hub.launch(&Definition { id:worker.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Instance, manager_id:Some(manager.id.clone()), plan_target:None, helper:None }, 0).unwrap();
+        hub.launch(
+            &Definition {
+                id: manager.id.clone(),
+                input: CreateInput::default(),
+                session_path: None,
+                kind: InstanceKind::Manager,
+                manager_id: None,
+                plan_target: None,
+                helper: None,
+            },
+            0,
+        )
+        .unwrap();
+        hub.launch(
+            &Definition {
+                id: worker.id.clone(),
+                input: CreateInput::default(),
+                session_path: None,
+                kind: InstanceKind::Instance,
+                manager_id: Some(manager.id.clone()),
+                plan_target: None,
+                helper: None,
+            },
+            0,
+        )
+        .unwrap();
         let event = json!({"kind":"needs_decision","payload":{"requestId":"native-1","method":"select","title":"Review operation","options":["Approve","Deny"]}});
         hub.event(&worker_actor, &event).unwrap();
         let first_id = {
-            let state = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = hub.state.lock().expect("manager hub mutex poisoned");
             state.decisions.values().next().unwrap().public_id.clone()
         };
         let subscribe = |enabled| json!({"action":"subscribe","payload":{"instanceId":worker.id,"enabled":enabled}});
@@ -1872,7 +2878,7 @@ mod tests {
         .unwrap();
         hub.execute(&manager_actor, &subscribe(true)).unwrap();
         {
-            let state = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = hub.state.lock().expect("manager hub mutex poisoned");
             let queue = state.queues.get(&manager.id).unwrap();
             assert_eq!(
                 queue
@@ -1884,12 +2890,12 @@ mod tests {
         }
         hub.execute(&manager_actor, &subscribe(false)).unwrap();
         {
-            let state = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = hub.state.lock().expect("manager hub mutex poisoned");
             assert!(state.queues.get(&manager.id).unwrap().is_empty());
         }
         hub.execute(&manager_actor, &subscribe(true)).unwrap();
         {
-            let state = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = hub.state.lock().expect("manager hub mutex poisoned");
             let queue = state.queues.get(&manager.id).unwrap();
             assert_eq!(queue.len(), 1);
             assert_eq!(queue[0]["payload"]["requestId"], first_id);
@@ -1908,7 +2914,7 @@ mod tests {
             Some("decision_already_resolved")
         );
         let current_id = {
-            let state = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = hub.state.lock().expect("manager hub mutex poisoned");
             state.decisions.values().next().unwrap().public_id.clone()
         };
         assert_ne!(first_id, current_id);
@@ -1957,7 +2963,8 @@ mod tests {
             .unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
-        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder))
+            .unwrap();
         registry.install_manager_hub(hub.clone()).unwrap();
         let actor = Actor {
             id: manager.id.clone(),
@@ -1965,83 +2972,272 @@ mod tests {
             role: InstanceKind::Manager,
             connection_id: String::new(),
         };
-        hub.launch(&Definition { id:manager.id.clone(), input:CreateInput::default(), session_path:None, kind:InstanceKind::Manager, manager_id:None, plan_target:None, helper:None }, 0).unwrap();
+        hub.launch(
+            &Definition {
+                id: manager.id.clone(),
+                input: CreateInput::default(),
+                session_path: None,
+                kind: InstanceKind::Manager,
+                manager_id: None,
+                plan_target: None,
+                helper: None,
+            },
+            0,
+        )
+        .unwrap();
         let create = json!({"action":"create","payload":{"start":false,"config":{"name":"W","projectPath":folder,"agentFile":persona}}});
         hub.execute(&actor, &create).unwrap();
         let rows = registry.snapshot();
-        let worker = rows.iter().find(|r| r.kind == InstanceKind::Instance).unwrap();
+        let worker = rows
+            .iter()
+            .find(|r| r.kind == InstanceKind::Instance)
+            .unwrap();
         assert_eq!(worker.agent_file, None);
         hub.shutdown();
         std::fs::remove_dir_all(folder).unwrap();
     }
     #[test]
     fn worker_browser_actions_are_authenticated_and_cannot_choose_a_peer_owner() {
-        let folder = std::env::temp_dir().join(format!("omp-browser-auth-{}", uuid::Uuid::new_v4()));
+        let folder =
+            std::env::temp_dir().join(format!("omp-browser-auth-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&folder).unwrap();
-        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
-        let worker = registry.create(CreateInput { project_path:folder.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let registry =
+            Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let worker = registry
+            .create(CreateInput {
+                project_path: folder.to_string_lossy().into(),
+                ..Default::default()
+            })
+            .unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
-        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder))
+            .unwrap();
         let browser = crate::browser::BrowserSupervisor::new(folder.clone(), folder.clone());
         hub.install_browser_supervisor(browser.clone()).unwrap();
-        let launch = hub.launch(&Definition {id:worker.id.clone(),input:CreateInput::default(),session_path:None,kind:InstanceKind::Instance,manager_id:None,plan_target:None,helper:None},0).unwrap();
-        browser.register(&worker.id,0,&launch.token).unwrap();
-        let actor = Actor {id:worker.id.clone(),generation:0,role:InstanceKind::Instance,connection_id:String::new()};
-        assert_eq!(hub.execute(&actor,&json!({"action":"browser_prepare","payload":{"name":"main","instanceId":"peer"}})).unwrap_err(),"invalid_browser_payload");
-        assert_eq!(hub.execute(&actor,&json!({"action":"browser_prepare","payload":{"name":"main","target":5}})).unwrap_err(),"invalid_browser_payload");
-        assert_eq!(hub.execute(&actor,&json!({"action":"list","payload":{}})).unwrap_err(),"unauthorized");
-        assert_eq!(hub.execute(&actor,&json!({"action":"browser_tabs","payload":{"instanceId":"peer"}})).unwrap_err(),"invalid_browser_payload");
-        assert_eq!(hub.execute(&actor,&json!({"action":"browser_tabs","payload":{}})).unwrap(),json!([]), "no helper means no tabs, and none is started");
-        let replaced = Actor {connection_id:"replaced".into(),..actor.clone()};
-        assert_eq!(hub.execute(&replaced,&json!({"action":"browser_close_all","payload":{}})).unwrap_err(),"stale_generation");
-        hub.invalidate(&worker.id,0);
+        let launch = hub
+            .launch(
+                &Definition {
+                    id: worker.id.clone(),
+                    input: CreateInput::default(),
+                    session_path: None,
+                    kind: InstanceKind::Instance,
+                    manager_id: None,
+                    plan_target: None,
+                    helper: None,
+                },
+                0,
+            )
+            .unwrap();
+        browser.register(&worker.id, 0, &launch.token).unwrap();
+        let actor = Actor {
+            id: worker.id.clone(),
+            generation: 0,
+            role: InstanceKind::Instance,
+            connection_id: String::new(),
+        };
+        assert_eq!(
+            hub.execute(
+                &actor,
+                &json!({"action":"browser_prepare","payload":{"name":"main","instanceId":"peer"}})
+            )
+            .unwrap_err(),
+            "invalid_browser_payload"
+        );
+        assert_eq!(
+            hub.execute(
+                &actor,
+                &json!({"action":"browser_prepare","payload":{"name":"main","target":5}})
+            )
+            .unwrap_err(),
+            "invalid_browser_payload"
+        );
+        assert_eq!(
+            hub.execute(&actor, &json!({"action":"list","payload":{}}))
+                .unwrap_err(),
+            "unauthorized"
+        );
+        assert_eq!(
+            hub.execute(
+                &actor,
+                &json!({"action":"browser_tabs","payload":{"instanceId":"peer"}})
+            )
+            .unwrap_err(),
+            "invalid_browser_payload"
+        );
+        assert_eq!(
+            hub.execute(&actor, &json!({"action":"browser_tabs","payload":{}}))
+                .unwrap(),
+            json!([]),
+            "no helper means no tabs, and none is started"
+        );
+        let replaced = Actor {
+            connection_id: "replaced".into(),
+            ..actor.clone()
+        };
+        assert_eq!(
+            hub.execute(
+                &replaced,
+                &json!({"action":"browser_close_all","payload":{}})
+            )
+            .unwrap_err(),
+            "stale_generation"
+        );
+        hub.invalidate(&worker.id, 0);
         assert!(browser.snapshot().is_empty());
-        assert_eq!(hub.execute(&actor,&json!({"action":"browser_prepare","payload":{"name":"main"}})).unwrap_err(),"stale_generation");
-        browser.shutdown();hub.shutdown();std::fs::remove_dir_all(folder).unwrap();
+        assert_eq!(
+            hub.execute(
+                &actor,
+                &json!({"action":"browser_prepare","payload":{"name":"main"}})
+            )
+            .unwrap_err(),
+            "stale_generation"
+        );
+        browser.shutdown();
+        hub.shutdown();
+        std::fs::remove_dir_all(folder).unwrap();
     }
     #[test]
     fn host_monitor_bridge_actions_are_architect_only_and_a_refused_prompt_is_known_unsent() {
         let folder = std::env::temp_dir().join(format!("omp-monitor-hub-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&folder).unwrap();
-        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
-        let worker = registry.create(CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let registry =
+            Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let worker = registry
+            .create(CreateInput {
+                project_path: folder.to_string_lossy().into(),
+                ..Default::default()
+            })
+            .unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
-        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
-        hub.launch(&Definition { id: worker.id.clone(), input: CreateInput::default(), session_path: None, kind: InstanceKind::Instance, manager_id: None, plan_target: None, helper: None }, 0).unwrap();
-        let payload = json!({"requestId": "11111111-1111-4111-8111-111111111111", "snapshotId": "snap-A"});
+        hub.install_terminal_service(TerminalService::new(&folder))
+            .unwrap();
+        hub.launch(
+            &Definition {
+                id: worker.id.clone(),
+                input: CreateInput::default(),
+                session_path: None,
+                kind: InstanceKind::Instance,
+                manager_id: None,
+                plan_target: None,
+                helper: None,
+            },
+            0,
+        )
+        .unwrap();
+        let payload =
+            json!({"requestId": "11111111-1111-4111-8111-111111111111", "snapshotId": "snap-A"});
         for role in [InstanceKind::Instance, InstanceKind::Manager] {
-            let actor = Actor { id: worker.id.clone(), generation: 0, role, connection_id: String::new() };
-            for action in ["monitor_snapshot_read", "monitor_explanation_validate", "monitor_explanation_retired"] {
-                assert_eq!(hub.execute(&actor, &json!({"action": action, "payload": payload})).unwrap_err(), "unauthorized", "{role:?} {action}");
+            let actor = Actor {
+                id: worker.id.clone(),
+                generation: 0,
+                role,
+                connection_id: String::new(),
+            };
+            for action in [
+                "monitor_snapshot_read",
+                "monitor_explanation_validate",
+                "monitor_explanation_retired",
+            ] {
+                assert_eq!(
+                    hub.execute(&actor, &json!({"action": action, "payload": payload}))
+                        .unwrap_err(),
+                    "unauthorized",
+                    "{role:?} {action}"
+                );
             }
         }
         // Not an Architect session: the prompt is refused before any control frame, so it is provably unsent.
-        let producer = DependencyProducer { instance_id: worker.id.clone(), generation: 0, launch_id: "launch".into(), session_id: "session".into() };
-        let refused = hub.prompt_monitor_explanation(&producer, "11111111-1111-4111-8111-111111111111", "snap-A", &"ab".repeat(32), "Explain.");
-        assert!(matches!(refused, Err(MonitorPromptError::NotSent { .. })), "{refused:?}");
-        let missing = DependencyProducer { instance_id: "missing".into(), ..producer };
-        assert!(matches!(hub.prompt_monitor_explanation(&missing, "11111111-1111-4111-8111-111111111111", "snap-A", &"ab".repeat(32), "Explain."), Err(MonitorPromptError::NotSent { .. })));
-        assert_eq!(hub.srs_active_job(&worker.id), None, "no SRS service means no blocking job");
+        let producer = DependencyProducer {
+            instance_id: worker.id.clone(),
+            generation: 0,
+            launch_id: "launch".into(),
+            session_id: "session".into(),
+        };
+        let refused = hub.prompt_monitor_explanation(
+            &producer,
+            "11111111-1111-4111-8111-111111111111",
+            "snap-A",
+            &"ab".repeat(32),
+            "Explain.",
+        );
+        assert!(
+            matches!(refused, Err(MonitorPromptError::NotSent { .. })),
+            "{refused:?}"
+        );
+        let missing = DependencyProducer {
+            instance_id: "missing".into(),
+            ..producer
+        };
+        assert!(matches!(
+            hub.prompt_monitor_explanation(
+                &missing,
+                "11111111-1111-4111-8111-111111111111",
+                "snap-A",
+                &"ab".repeat(32),
+                "Explain."
+            ),
+            Err(MonitorPromptError::NotSent { .. })
+        ));
+        assert_eq!(
+            hub.srs_active_job(&worker.id),
+            None,
+            "no SRS service means no blocking job"
+        );
         hub.shutdown();
         std::fs::remove_dir_all(folder).unwrap();
     }
     #[test]
     fn workspace_acknowledgements_accept_ordinary_agents_but_not_helpers_or_plan_sessions() {
-        let folder = std::env::temp_dir().join(format!("omp-workspace-ack-{}", uuid::Uuid::new_v4()));
+        let folder =
+            std::env::temp_dir().join(format!("omp-workspace-ack-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&folder).unwrap();
-        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
-        let worker = registry.create(CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() }).unwrap();
-        let helper = registry.create_helper(&worker.id, crate::instance::HelperPurpose::Diff, worker.project_path.clone()).unwrap();
+        let registry =
+            Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let worker = registry
+            .create(CreateInput {
+                project_path: folder.to_string_lossy().into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let helper = registry
+            .create_helper(
+                &worker.id,
+                crate::instance::HelperPurpose::Diff,
+                worker.project_path.clone(),
+            )
+            .unwrap();
         let planner = registry.create_planner(&worker.id).unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
-        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder))
+            .unwrap();
         let ask = |id: &str| {
-            hub.launch(&Definition { id: id.into(), input: CreateInput::default(), session_path: None, kind: InstanceKind::Instance, manager_id: None, plan_target: None, helper: None }, 0).unwrap();
-            let actor = Actor { id: id.into(), generation: 0, role: InstanceKind::Instance, connection_id: String::new() };
-            hub.execute(&actor, &json!({"action":"workspace_begin","payload":{"requestId":"request"}})).unwrap_err()
+            hub.launch(
+                &Definition {
+                    id: id.into(),
+                    input: CreateInput::default(),
+                    session_path: None,
+                    kind: InstanceKind::Instance,
+                    manager_id: None,
+                    plan_target: None,
+                    helper: None,
+                },
+                0,
+            )
+            .unwrap();
+            let actor = Actor {
+                id: id.into(),
+                generation: 0,
+                role: InstanceKind::Instance,
+                connection_id: String::new(),
+            };
+            hub.execute(
+                &actor,
+                &json!({"action":"workspace_begin","payload":{"requestId":"request"}}),
+            )
+            .unwrap_err()
         };
         assert_eq!(ask(&helper.id), "unauthorized");
         assert_eq!(ask(&planner.id), "unauthorized");
@@ -2054,35 +3250,84 @@ mod tests {
     fn native_agent_hub_requires_current_generation_and_a_compatible_live_host() {
         let folder = std::env::temp_dir().join(format!("omp-native-hub-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&folder).unwrap();
-        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
-        let worker = registry.create(CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let registry =
+            Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let worker = registry
+            .create(CreateInput {
+                project_path: folder.to_string_lossy().into(),
+                ..Default::default()
+            })
+            .unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
-        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
-        let launch = hub.launch(&Definition { id: worker.id.clone(), input: CreateInput::default(), session_path: None,
-            kind: InstanceKind::Instance, manager_id: None, plan_target: None, helper: None }, 0).unwrap();
-        assert_eq!(hub.open_agent_hub(&worker.id, 1).unwrap_err(), "stale_generation");
-        assert!(hub.open_agent_hub(&worker.id, 0).unwrap_err().starts_with("native_agent_hub_unavailable:"));
+        hub.install_terminal_service(TerminalService::new(&folder))
+            .unwrap();
+        let launch = hub
+            .launch(
+                &Definition {
+                    id: worker.id.clone(),
+                    input: CreateInput::default(),
+                    session_path: None,
+                    kind: InstanceKind::Instance,
+                    manager_id: None,
+                    plan_target: None,
+                    helper: None,
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            hub.open_agent_hub(&worker.id, 1).unwrap_err(),
+            "stale_generation"
+        );
+        assert!(hub
+            .open_agent_hub(&worker.id, 0)
+            .unwrap_err()
+            .starts_with("native_agent_hub_unavailable:"));
         let mut socket = TcpStream::connect(&hub.endpoint).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         socket.write_all(format!("{}\n", json!({"type":"hello","id":"hello","protocol":1,"instanceId":worker.id,"generation":0,"token":launch.token})).as_bytes()).unwrap();
         let mut reader = BufReader::new(socket.try_clone().unwrap());
         assert_eq!(read_frame(&mut reader).unwrap().unwrap()["ok"], true);
-        socket.write_all(format!("{}\n", json!({"type":"event","eventId":"ready","kind":"ready","payload":{
-            "sessionId":"native","supported":true,"capabilities":{"agentHub":true}}})).as_bytes()).unwrap();
+        socket
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"type":"event","eventId":"ready","kind":"ready","payload":{
+            "sessionId":"native","supported":true,"capabilities":{"agentHub":true}}})
+                )
+                .as_bytes(),
+            )
+            .unwrap();
         hub.wait_ready(&worker.id).unwrap();
-        assert_eq!(read_frame(&mut reader).unwrap().unwrap()["action"], "ownership");
+        assert_eq!(
+            read_frame(&mut reader).unwrap().unwrap()["action"],
+            "ownership"
+        );
         let answered = std::thread::spawn(move || {
             let frame = read_frame(&mut reader).unwrap().unwrap();
             assert_eq!(frame["action"], "agent_hub");
             assert_eq!(frame["payload"]["source"], "human");
             assert_eq!(frame["payload"]["sessionId"], "native");
-            socket.write_all(format!("{}\n", json!({"type":"response","id":frame["id"],"ok":true,"data":{"opened":true}})).as_bytes()).unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"type":"response","id":frame["id"],"ok":true,"data":{"opened":true}})
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
         });
         hub.open_agent_hub(&worker.id, 0).unwrap();
         answered.join().unwrap();
         registry.set_bridge_ready(&worker.id, 0, false);
-        assert!(hub.open_agent_hub(&worker.id, 0).unwrap_err().starts_with("native_agent_hub_unavailable:"));
+        assert!(hub
+            .open_agent_hub(&worker.id, 0)
+            .unwrap_err()
+            .starts_with("native_agent_hub_unavailable:"));
         hub.shutdown();
         std::fs::remove_dir_all(folder).unwrap();
     }
@@ -2091,21 +3336,51 @@ mod tests {
     fn an_authenticated_bridge_connection_stays_readable_after_the_hello_deadline() {
         let folder = std::env::temp_dir().join(format!("omp-bridge-idle-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&folder).unwrap();
-        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
-        let worker = registry.create(CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() }).unwrap();
+        let registry =
+            Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let worker = registry
+            .create(CreateInput {
+                project_path: folder.to_string_lossy().into(),
+                ..Default::default()
+            })
+            .unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
-        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
-        let launch = hub.launch(&Definition {id:worker.id.clone(),input:CreateInput::default(),session_path:None,kind:InstanceKind::Instance,manager_id:None,plan_target:None,helper:None},0).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder))
+            .unwrap();
+        let launch = hub
+            .launch(
+                &Definition {
+                    id: worker.id.clone(),
+                    input: CreateInput::default(),
+                    session_path: None,
+                    kind: InstanceKind::Instance,
+                    manager_id: None,
+                    plan_target: None,
+                    helper: None,
+                },
+                0,
+            )
+            .unwrap();
         let mut socket = TcpStream::connect(&hub.endpoint).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let hello = json!({"type":"hello","id":"hello","protocol":1,"instanceId":worker.id,"generation":0,"token":launch.token});
         socket.write_all(format!("{hello}\n").as_bytes()).unwrap();
         let mut reader = BufReader::new(socket.try_clone().unwrap());
         assert_eq!(read_frame(&mut reader).unwrap().unwrap()["ok"], true);
         // A quiet bridge (no events for longer than the 10 s hello deadline) must still get answers.
         std::thread::sleep(Duration::from_secs(11));
-        socket.write_all(format!("{}\n", json!({"type":"request","id":"after-idle","action":"list","payload":{}})).as_bytes()).unwrap();
+        socket
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"type":"request","id":"after-idle","action":"list","payload":{}})
+                )
+                .as_bytes(),
+            )
+            .unwrap();
         let response = read_frame(&mut reader).unwrap().unwrap();
         assert_eq!(response["id"], "after-idle");
         assert_eq!(response["error"], "unauthorized");
@@ -2116,25 +3391,53 @@ mod tests {
     fn planner_actions_are_confined_to_their_target() {
         let folder = std::env::temp_dir().join(format!("omp-planner-hub-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&folder).unwrap();
-        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
-        let config = CreateInput { project_path: folder.to_string_lossy().into(), ..Default::default() };
-        let target = registry.create(CreateInput { name: "Target".into(), ..config.clone() }).unwrap();
+        let registry =
+            Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let config = CreateInput {
+            project_path: folder.to_string_lossy().into(),
+            ..Default::default()
+        };
+        let target = registry
+            .create(CreateInput {
+                name: "Target".into(),
+                ..config.clone()
+            })
+            .unwrap();
         let other = registry.create(config.clone()).unwrap();
         let planner = registry.create_planner(&target.id).unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
-        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder))
+            .unwrap();
         registry.install_manager_hub(hub.clone()).unwrap();
-        let definition = |id: &str, plan_target: Option<String>| Definition { id: id.into(), input: CreateInput::default(), session_path: None, kind: InstanceKind::Instance, manager_id: None, plan_target, helper: None };
+        let definition = |id: &str, plan_target: Option<String>| Definition {
+            id: id.into(),
+            input: CreateInput::default(),
+            session_path: None,
+            kind: InstanceKind::Instance,
+            manager_id: None,
+            plan_target,
+            helper: None,
+        };
         let target_launch = hub.launch(&definition(&target.id, None), 0).unwrap();
-        hub.launch(&definition(&planner.id, Some(target.id.clone())), 0).unwrap();
+        hub.launch(&definition(&planner.id, Some(target.id.clone())), 0)
+            .unwrap();
         hub.launch(&definition(&other.id, None), 0).unwrap();
-        let actor = |id: &str| Actor { id: id.into(), generation: 0, role: InstanceKind::Instance, connection_id: String::new() };
-        let ask = |who: &str, action: &str, payload: Value| hub.execute(&actor(who), &json!({"action": action, "payload": payload}));
+        let actor = |id: &str| Actor {
+            id: id.into(),
+            generation: 0,
+            role: InstanceKind::Instance,
+            connection_id: String::new(),
+        };
+        let ask = |who: &str, action: &str, payload: Value| {
+            hub.execute(&actor(who), &json!({"action": action, "payload": payload}))
+        };
 
         // The target's bridge: records every control frame and accepts it.
         let mut socket = TcpStream::connect(&hub.endpoint).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         socket.write_all(format!("{}\n", json!({"type":"hello","id":"hello","protocol":1,"instanceId":target.id,"generation":0,"token":target_launch.token})).as_bytes()).unwrap();
         let mut reader = BufReader::new(socket.try_clone().unwrap());
         assert_eq!(read_frame(&mut reader).unwrap().unwrap()["ok"], true);
@@ -2146,171 +3449,402 @@ mod tests {
         std::thread::spawn(move || {
             while let Ok(Some(frame)) = read_frame(&mut reader) {
                 if frame["type"] == "control" {
-                    log.lock().unwrap().push((frame["action"].as_str().unwrap_or_default().into(), frame["payload"].clone()));
+                    log.lock().unwrap().push((
+                        frame["action"].as_str().unwrap_or_default().into(),
+                        frame["payload"].clone(),
+                    ));
                     let _ = replies.write_all(format!("{}\n", json!({"type":"response","id":frame["id"],"ok":true,"data":{"accepted":true}})).as_bytes());
                 }
             }
         });
         hub.wait_ready(&target.id).unwrap();
-        let controls = |name: &str| recorded.lock().unwrap().iter().filter(|(action, _)| action == name).map(|(_, payload)| payload.clone()).collect::<Vec<_>>();
+        let controls = |name: &str| {
+            recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(action, _)| action == name)
+                .map(|(_, payload)| payload.clone())
+                .collect::<Vec<_>>()
+        };
 
-        assert_eq!(ask(&planner.id, "plan_handoff", json!({"summary": "x"})).unwrap_err(), "There is no plan to hand off; call write_plan first");
-        let written = ask(&planner.id, "plan_write_plan", json!({"text": "# New\nbody"})).unwrap();
+        assert_eq!(
+            ask(&planner.id, "plan_handoff", json!({"summary": "x"})).unwrap_err(),
+            "There is no plan to hand off; call write_plan first"
+        );
+        let written = ask(
+            &planner.id,
+            "plan_write_plan",
+            json!({"text": "# New\nbody"}),
+        )
+        .unwrap();
         assert_eq!(written["interrupted"], true);
         let plan_file = registry.plan_file(&target.id).unwrap();
         assert_eq!(std::fs::read_to_string(&plan_file).unwrap(), "# New\nbody");
         assert_eq!(controls("abort").len(), 1);
         let info = ask(&planner.id, "plan_handoff_info", json!({})).unwrap();
         assert_eq!(info["needsStart"], false);
-        assert!(ask(&planner.id, "plan_handoff", json!({"summary":"s", "revision":"stale"})).unwrap_err().contains("confirm the new revision"));
+        assert!(ask(
+            &planner.id,
+            "plan_handoff",
+            json!({"summary":"s", "revision":"stale"})
+        )
+        .unwrap_err()
+        .contains("confirm the new revision"));
         assert_eq!(controls("prompt").len(), 0);
-        assert_eq!(registry.inspect(&target.id, Origin::Human).unwrap().last_plan_handoff, None);
-        assert_eq!(ask(&planner.id, "plan_handoff", json!({"summary": "dropped the migration", "revision":info["revision"]})).unwrap()["accepted"], true);
-        let handoff_marker = registry.inspect(&target.id, Origin::Human).unwrap().last_plan_handoff.unwrap();
+        assert_eq!(
+            registry
+                .inspect(&target.id, Origin::Human)
+                .unwrap()
+                .last_plan_handoff,
+            None
+        );
+        assert_eq!(
+            ask(
+                &planner.id,
+                "plan_handoff",
+                json!({"summary": "dropped the migration", "revision":info["revision"]})
+            )
+            .unwrap()["accepted"],
+            true
+        );
+        let handoff_marker = registry
+            .inspect(&target.id, Origin::Human)
+            .unwrap()
+            .last_plan_handoff
+            .unwrap();
         let prompts = controls("prompt");
         assert_eq!(prompts.len(), 1);
         let message = prompts[0]["message"].as_str().unwrap();
-        assert!(message.starts_with("CHANGE OF PLANS") && message.contains("dropped the migration") && message.contains("# New\nbody"));
+        assert!(
+            message.starts_with("CHANGE OF PLANS")
+                && message.contains("dropped the migration")
+                && message.contains("# New\nbody")
+        );
         assert_eq!(prompts[0]["source"], "human");
-        assert_eq!(ask(&planner.id, "plan_interrupt", json!({})).unwrap()["interrupted"], true);
+        assert_eq!(
+            ask(&planner.id, "plan_interrupt", json!({})).unwrap()["interrupted"],
+            true
+        );
         assert_eq!(controls("abort").len(), 2);
-        assert_eq!(ask(&planner.id, "plan_status", json!({})).unwrap()["name"], "Target");
+        assert_eq!(
+            ask(&planner.id, "plan_status", json!({})).unwrap()["name"],
+            "Target"
+        );
         // The saved revision is visible before the target updates its own todo list.
         let read = ask(&planner.id, "plan_read_plan", json!({})).unwrap();
         assert_eq!(read["text"], "# New\nbody");
         assert_eq!(read["path"], json!(plan_file));
 
         // Only the listed fields are accepted and a plan agent can never name another session.
-        assert!(ask(&planner.id, "plan_write_plan", json!({"text": "a", "instanceId": other.id})).unwrap_err().starts_with("invalid_plan_payload: plan_write_plan does not accept 'instanceId'"));
-        assert!(ask(&planner.id, "plan_status", json!({"instanceId": other.id})).unwrap_err().starts_with("invalid_plan_payload"));
-        assert_eq!(ask(&planner.id, "plan_write_plan", json!("{\"text\":\"x\"}")).unwrap_err(), "invalid_plan_payload: payload must be a JSON object");
-        assert_eq!(ask(&planner.id, "plan_write_plan", json!({"text": "  "})).unwrap_err(), "plan text must be 1..262144 characters");
-        assert_eq!(ask(&planner.id, "plan_handoff", json!({"summary": ""})).unwrap_err(), "summary must be 1..4000 characters");
-        assert_eq!(ask(&planner.id, "plan_nope", json!({})).unwrap_err(), "invalid_action");
-        assert_eq!(ask(&other.id, "plan_status", json!({})).unwrap_err(), "unauthorized");
+        assert!(ask(
+            &planner.id,
+            "plan_write_plan",
+            json!({"text": "a", "instanceId": other.id})
+        )
+        .unwrap_err()
+        .starts_with("invalid_plan_payload: plan_write_plan does not accept 'instanceId'"));
+        assert!(
+            ask(&planner.id, "plan_status", json!({"instanceId": other.id}))
+                .unwrap_err()
+                .starts_with("invalid_plan_payload")
+        );
+        assert_eq!(
+            ask(&planner.id, "plan_write_plan", json!("{\"text\":\"x\"}")).unwrap_err(),
+            "invalid_plan_payload: payload must be a JSON object"
+        );
+        assert_eq!(
+            ask(&planner.id, "plan_write_plan", json!({"text": "  "})).unwrap_err(),
+            "plan text must be 1..262144 characters"
+        );
+        assert_eq!(
+            ask(&planner.id, "plan_handoff", json!({"summary": ""})).unwrap_err(),
+            "summary must be 1..4000 characters"
+        );
+        assert_eq!(
+            ask(&planner.id, "plan_nope", json!({})).unwrap_err(),
+            "invalid_action"
+        );
+        assert_eq!(
+            ask(&other.id, "plan_status", json!({})).unwrap_err(),
+            "unauthorized"
+        );
         assert_eq!(std::fs::read_to_string(&plan_file).unwrap(), "# New\nbody");
-        let replacement = ask(&planner.id, "plan_write_plan", json!({"text":"# Another revision"})).unwrap();
-        hub.restore_plan_backup(&target.id, replacement["backup"].as_str().unwrap()).unwrap();
-        assert_eq!(registry.plan(&target.id, Origin::Human).unwrap().as_deref(), Some("# New\nbody"));
+        let replacement = ask(
+            &planner.id,
+            "plan_write_plan",
+            json!({"text":"# Another revision"}),
+        )
+        .unwrap();
+        hub.restore_plan_backup(&target.id, replacement["backup"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            registry.plan(&target.id, Origin::Human).unwrap().as_deref(),
+            Some("# New\nbody")
+        );
         assert_eq!(controls("prompt").len(), 1, "restoration must not hand off");
-        assert_eq!(registry.inspect(&target.id, Origin::Human).unwrap().last_plan_handoff.as_deref(), Some(handoff_marker.as_str()), "restoration must not navigate away");
-        assert!(plan::list_backups(&registry.plan_folder(&target.id)).unwrap().iter().any(|b| b.text == "# Another revision"));
+        assert_eq!(
+            registry
+                .inspect(&target.id, Origin::Human)
+                .unwrap()
+                .last_plan_handoff
+                .as_deref(),
+            Some(handoff_marker.as_str()),
+            "restoration must not navigate away"
+        );
+        assert!(plan::list_backups(&registry.plan_folder(&target.id))
+            .unwrap()
+            .iter()
+            .any(|b| b.text == "# Another revision"));
         let current_info = ask(&planner.id, "plan_handoff_info", json!({})).unwrap();
         let handoff = json!({"summary":"send again", "revision":current_info["revision"]});
         ask(&planner.id, "plan_handoff", handoff.clone()).unwrap();
-        let first = registry.inspect(&target.id, Origin::Human).unwrap().last_plan_handoff.unwrap();
+        let first = registry
+            .inspect(&target.id, Origin::Human)
+            .unwrap()
+            .last_plan_handoff
+            .unwrap();
         ask(&planner.id, "plan_handoff", handoff).unwrap();
-        assert_ne!(registry.inspect(&target.id, Origin::Human).unwrap().last_plan_handoff.as_deref(), Some(first.as_str()), "each successful handoff must trigger navigation, even for the same plan revision");
+        assert_ne!(
+            registry
+                .inspect(&target.id, Origin::Human)
+                .unwrap()
+                .last_plan_handoff
+                .as_deref(),
+            Some(first.as_str()),
+            "each successful handoff must trigger navigation, even for the same plan revision"
+        );
 
         // A target whose bridge is not connected cannot be interrupted, but its plan can still be written.
         let idle = registry.create(config).unwrap();
         let idle_planner = registry.create_planner(&idle.id).unwrap();
         hub.launch(&definition(&idle.id, None), 0).unwrap();
-        hub.launch(&definition(&idle_planner.id, Some(idle.id.clone())), 0).unwrap();
-        assert_eq!(ask(&idle_planner.id, "plan_interrupt", json!({})).unwrap_err(), plan::NOT_RUNNING);
-        let offline = ask(&idle_planner.id, "plan_write_plan", json!({"text": "# Offline"})).unwrap();
+        hub.launch(&definition(&idle_planner.id, Some(idle.id.clone())), 0)
+            .unwrap();
+        assert_eq!(
+            ask(&idle_planner.id, "plan_interrupt", json!({})).unwrap_err(),
+            plan::NOT_RUNNING
+        );
+        let offline = ask(
+            &idle_planner.id,
+            "plan_write_plan",
+            json!({"text": "# Offline"}),
+        )
+        .unwrap();
         assert_eq!(offline["interrupted"], false);
-        assert_eq!(std::fs::read_to_string(registry.plan_file(&idle.id).unwrap()).unwrap(), "# Offline");
+        assert_eq!(
+            std::fs::read_to_string(registry.plan_file(&idle.id).unwrap()).unwrap(),
+            "# Offline"
+        );
         let info = ask(&idle_planner.id, "plan_handoff_info", json!({})).unwrap();
         assert_eq!(info["needsStart"], true);
-        assert_eq!(ask(&idle_planner.id, "plan_handoff", json!({"summary": "s", "revision":info["revision"]})).unwrap_err(), plan::NOT_RUNNING);
-        assert_eq!(registry.inspect(&idle.id, Origin::Human).unwrap().last_plan_handoff, None);
+        assert_eq!(
+            ask(
+                &idle_planner.id,
+                "plan_handoff",
+                json!({"summary": "s", "revision":info["revision"]})
+            )
+            .unwrap_err(),
+            plan::NOT_RUNNING
+        );
+        assert_eq!(
+            registry
+                .inspect(&idle.id, Origin::Human)
+                .unwrap()
+                .last_plan_handoff,
+            None
+        );
         hub.shutdown();
         std::fs::remove_dir_all(folder).unwrap();
     }
     #[test]
     fn code_quality_reads_resolve_only_the_authenticated_agents_repository() {
-        use crate::code_quality::{store, types::*};
+        use crate::code_quality::store;
+        use crate::code_quality::types::{
+            QualityConfig, QualityProject, QualityScan, QualityScanStatus, Scanner,
+        };
         use crate::instance::HelperPurpose;
-        let folder = std::env::temp_dir().join(format!("omp-manager-quality-{}", uuid::Uuid::new_v4()));
+        let folder =
+            std::env::temp_dir().join(format!("omp-manager-quality-{}", uuid::Uuid::new_v4()));
         let (repo_a, repo_b) = (folder.join("repo-a"), folder.join("repo-b"));
         std::fs::create_dir_all(&repo_a).unwrap();
         std::fs::create_dir_all(&repo_b).unwrap();
         let plain = |path: &std::path::Path| {
-            let text = std::fs::canonicalize(path).unwrap().to_string_lossy().to_string();
-            text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text)
+            let text = std::fs::canonicalize(path)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            text.strip_prefix(r"\\?\")
+                .map(str::to_string)
+                .unwrap_or(text)
         };
-        let registry = Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
-        let input = |path: &std::path::Path| CreateInput { project_path: path.to_string_lossy().into(), ..Default::default() };
+        let registry =
+            Arc::new(Registry::load(folder.join("instances.json"), folder.clone()).unwrap());
+        let input = |path: &std::path::Path| CreateInput {
+            project_path: path.to_string_lossy().into(),
+            ..Default::default()
+        };
         let worker_a = registry.create(input(&repo_a)).unwrap();
         let worker_b = registry.create(input(&repo_b)).unwrap();
-        let helper = registry.create_helper(&worker_a.id, HelperPurpose::Git, plain(&repo_a)).unwrap();
+        let helper = registry
+            .create_helper(&worker_a.id, HelperPurpose::Git, plain(&repo_a))
+            .unwrap();
         let planner = registry.create_planner(&worker_b.id).unwrap();
         let hub = ManagerHub::bind(folder.join("bridge.mjs")).unwrap();
         hub.bind_registry(Arc::downgrade(&registry)).unwrap();
-        hub.install_terminal_service(TerminalService::new(&folder)).unwrap();
+        hub.install_terminal_service(TerminalService::new(&folder))
+            .unwrap();
         let service = crate::code_quality::CodeQualityService::passive_for_tests(folder.clone());
 
         let paths = store::Paths::new(folder.join("code-quality"));
         let save = |repo: &std::path::Path| {
             let (id, canonical) = (uuid::Uuid::new_v4().to_string(), plain(repo));
-            let project = QualityProject { folder: canonical.clone(), project_key: "omp-test".into(), scanner: Scanner::Cli, entry_file: None, image: None, build_args: vec![], prepare_npm_dependencies: false, exclusions: vec![] };
+            let project = QualityProject {
+                folder: canonical.clone(),
+                project_key: "omp-test".into(),
+                scanner: Scanner::Cli,
+                entry_file: None,
+                image: None,
+                build_args: vec![],
+                prepare_npm_dependencies: false,
+                exclusions: vec![],
+            };
             let scan = QualityScan {
-                id: id.clone(), folder: canonical.clone(), config: QualityConfig::default(), project, status: QualityScanStatus::Complete, phase: "Done".into(),
-                started_at: 1, finished_at: Some(2), snapshot_hash: String::new(), rules_hash: String::new(), tools: vec![], findings: vec![], warnings: vec![],
-                error: None, analysis_id: None, dashboard_url: None, quality_gate: None, log: vec![],
+                id: id.clone(),
+                folder: canonical.clone(),
+                config: QualityConfig::default(),
+                project,
+                status: QualityScanStatus::Complete,
+                phase: "Done".into(),
+                started_at: 1,
+                finished_at: Some(2),
+                snapshot_hash: String::new(),
+                rules_hash: String::new(),
+                tools: vec![],
+                findings: vec![],
+                warnings: vec![],
+                error: None,
+                analysis_id: None,
+                dashboard_url: None,
+                quality_gate: None,
+                log: vec![],
             };
             store::save_scan(&paths, &scan).unwrap();
-            store::save_project(&paths, &canonical, &store::ProjectFile { version: 1, project: None, recent: vec![id.clone()] }).unwrap();
+            store::save_project(
+                &paths,
+                &canonical,
+                &store::ProjectFile {
+                    version: 1,
+                    project: None,
+                    recent: vec![id.clone()],
+                },
+            )
+            .unwrap();
             id
         };
         let (scan_a, scan_b) = (save(&repo_a), save(&repo_b));
 
-        let actor = |id: &str| Actor { id: id.into(), generation: 0, role: InstanceKind::Instance, connection_id: String::new() };
-        let ask = |who: &str, payload: Value| hub.execute(&actor(who), &json!({"action": "code_quality", "payload": payload}));
+        let actor = |id: &str| Actor {
+            id: id.into(),
+            generation: 0,
+            role: InstanceKind::Instance,
+            connection_id: String::new(),
+        };
+        let ask = |who: &str, payload: Value| {
+            hub.execute(
+                &actor(who),
+                &json!({"action": "code_quality", "payload": payload}),
+            )
+        };
         for id in [&worker_a.id, &worker_b.id, &helper.id, &planner.id] {
-            hub.launch(&registry.workspace_metadata(id).unwrap().definition, 0).unwrap();
+            hub.launch(&registry.workspace_metadata(id).unwrap().definition, 0)
+                .unwrap();
         }
         // Before the service is installed nothing is answered.
-        assert_eq!(ask(&worker_a.id, json!({"section": "scans"})).unwrap_err(), "code quality service unavailable");
-        hub.install_code_quality_service(Arc::downgrade(&service)).unwrap();
+        assert_eq!(
+            ask(&worker_a.id, json!({"section": "scans"})).unwrap_err(),
+            "code quality service unavailable"
+        );
+        hub.install_code_quality_service(Arc::downgrade(&service))
+            .unwrap();
 
         let listed = |who: &str| -> Vec<String> {
-            ask(who, json!({"section": "scans"})).unwrap()["scans"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap().to_string()).collect()
+            ask(who, json!({"section": "scans"})).unwrap()["scans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["id"].as_str().unwrap().to_string())
+                .collect()
         };
-        assert_eq!(listed(&worker_a.id), [scan_a.clone()], "an ordinary agent reads its own working directory");
-        assert_eq!(listed(&worker_b.id), [scan_b.clone()]);
-        assert_eq!(listed(&helper.id), [scan_a.clone()], "a helper resolves its target's project, not its app-owned folder");
-        assert_eq!(listed(&planner.id), [scan_b.clone()], "a plan agent resolves its plan target's project");
-        assert_eq!(ask(&helper.id, json!({"section": "summary", "scanId": scan_a})).unwrap()["scan"]["id"], scan_a.as_str());
-        for (who, foreign) in [(&worker_a.id, &scan_b), (&worker_b.id, &scan_a), (&helper.id, &scan_b), (&planner.id, &scan_a)] {
-            for payload in [json!({"section": "summary", "scanId": foreign}), json!({"section": "findings", "scanId": foreign}),
-                json!({"section": "artifact", "scanId": foreign, "reportName": "t.json"})] {
-                assert_eq!(ask(who, payload).unwrap_err(), "That scan does not belong to this repository");
+        assert_eq!(
+            listed(&worker_a.id).as_slice(),
+            std::slice::from_ref(&scan_a),
+            "an ordinary agent reads its own working directory"
+        );
+        assert_eq!(
+            listed(&worker_b.id).as_slice(),
+            std::slice::from_ref(&scan_b)
+        );
+        assert_eq!(
+            listed(&helper.id).as_slice(),
+            std::slice::from_ref(&scan_a),
+            "a helper resolves its target's project, not its app-owned folder"
+        );
+        assert_eq!(
+            listed(&planner.id).as_slice(),
+            std::slice::from_ref(&scan_b),
+            "a plan agent resolves its plan target's project"
+        );
+        assert_eq!(
+            ask(&helper.id, json!({"section": "summary", "scanId": scan_a})).unwrap()["scan"]["id"],
+            scan_a.as_str()
+        );
+        for (who, foreign) in [
+            (&worker_a.id, &scan_b),
+            (&worker_b.id, &scan_a),
+            (&helper.id, &scan_b),
+            (&planner.id, &scan_a),
+        ] {
+            for payload in [
+                json!({"section": "summary", "scanId": foreign}),
+                json!({"section": "findings", "scanId": foreign}),
+                json!({"section": "artifact", "scanId": foreign, "reportName": "t.json"}),
+            ] {
+                assert_eq!(
+                    ask(who, payload).unwrap_err(),
+                    "That scan does not belong to this repository"
+                );
             }
         }
         // The payload can never name a repository, instance or path.
-        for payload in [json!({"section": "scans", "folder": plain(&repo_b)}), json!({"section": "scans", "instanceId": worker_b.id}),
-            json!({"section": "scans", "path": plain(&repo_b)}), json!({"section": "export"}), json!({})] {
-            assert!(ask(&worker_a.id, payload.clone()).unwrap_err().starts_with("invalid_code_quality_payload"), "{payload}");
+        for payload in [
+            json!({"section": "scans", "folder": plain(&repo_b)}),
+            json!({"section": "scans", "instanceId": worker_b.id}),
+            json!({"section": "scans", "path": plain(&repo_b)}),
+            json!({"section": "export"}),
+            json!({}),
+        ] {
+            assert!(
+                ask(&worker_a.id, payload.clone())
+                    .unwrap_err()
+                    .starts_with("invalid_code_quality_payload"),
+                "{payload}"
+            );
         }
-        let replaced = Actor { connection_id: "replaced".into(), ..actor(&worker_a.id) };
-        assert_eq!(hub.execute(&replaced, &json!({"action": "code_quality", "payload": {"section": "scans"}})).unwrap_err(), "stale_generation");
+        let replaced = Actor {
+            connection_id: "replaced".into(),
+            ..actor(&worker_a.id)
+        };
+        assert_eq!(
+            hub.execute(
+                &replaced,
+                &json!({"action": "code_quality", "payload": {"section": "scans"}})
+            )
+            .unwrap_err(),
+            "stale_generation"
+        );
         hub.shutdown();
         drop(service);
         std::fs::remove_dir_all(folder).unwrap();
-    }
-}
-
-struct MarkdownHold {
-    hub: Arc<ManagerHub>,
-    transaction_id: String,
-    held: Vec<(String, ControlLease)>,
-}
-impl Drop for MarkdownHold {
-    fn drop(&mut self) {
-        for (id, lease) in self.held.drain(..) {
-            let _ = self.hub.control(&id, &lease, "setup_markdown_release", json!({"transactionId": self.transaction_id}), Origin::Human);
-        }
-    }
-}
-
-/// Adapter installed once into the Markdown service; fails closed when the hub is unavailable.
-pub struct HubMarkdownBoundary(pub Weak<Registry>);
-impl crate::agent_markdown::MarkdownBoundary for HubMarkdownBoundary {
-    fn hold(&self, transaction_id: &str, _target: &crate::agent_markdown::KnowledgeAssetTarget) -> Result<Box<dyn Send>> {
-        let registry = self.0.upgrade().ok_or("registry unavailable")?;
-        let hub = registry.manager_hub().ok_or("manager bridge not initialized")?;
-        hub.hold_markdown_sessions(&registry, transaction_id)
     }
 }

@@ -5,7 +5,10 @@ import type {
 
 // Pure data for the repository-structure area. Nothing here renders HTML; every string is plain text.
 
-const compare = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
+const compare = (a: string, b: string): number => {
+  if (a < b) return -1;
+  return a > b ? 1 : 0;
+};
 
 /** Sibling directories that share a child shape are grouped from this many. */
 export const MIN_DIR_GROUP = 4;
@@ -73,10 +76,17 @@ export interface GeneralGroup {
 }
 export type GeneralNode = GeneralDir | GeneralFile | GeneralGroup;
 
-const ownName = (child: string, own: string): string => child === own ? "*" : child.startsWith(`${own}.`) ? `*${child.slice(own.length)}` : child;
+const ownName = (child: string, own: string): string => {
+  if (child === own) return "*";
+  return child.startsWith(`${own}.`) ? `*${child.slice(own.length)}` : child;
+};
+function shapePattern(items: readonly string[]): string {
+  if (items.length === 0) return "*/ (empty)";
+  return items.length === 1 ? `*/${items[0]}` : `*/{${items.join(", ")}}`;
+}
 function dirShape(dir: TreeDir): { key: string; pattern: string } {
   const items = [...dir.dirs.map(child => `${ownName(child.name, dir.name)}/`), ...dir.files.map(child => ownName(child.name, dir.name))].sort(compare);
-  return { key: JSON.stringify(items), pattern: items.length === 0 ? "*/ (empty)" : items.length === 1 ? `*/${items[0]}` : `*/{${items.join(", ")}}` };
+  return { key: JSON.stringify(items), pattern: shapePattern(items) };
 }
 const fileSuffix = (name: string): string | null => {
   const dot = name.indexOf(".", 1);
@@ -84,30 +94,36 @@ const fileSuffix = (name: string): string | null => {
 };
 const prefixOf = (path: string): string => path ? `${path}/` : "";
 
-function generalizeDir(dir: TreeDir): GeneralDir {
+function generalizeSubdirs(dir: TreeDir): GeneralNode[] {
   const dirNodes = new Map<TreeDir, GeneralDir>(dir.dirs.map(child => [child, generalizeDir(child)]));
-  const children: GeneralNode[] = [];
   const dirBuckets = new Map<string, { pattern: string; dirs: TreeDir[] }>();
   for (const child of dir.dirs) {
     const shape = dirShape(child);
     const bucket = dirBuckets.get(shape.key);
     if (bucket) bucket.dirs.push(child); else dirBuckets.set(shape.key, { pattern: shape.pattern, dirs: [child] });
   }
-  const singles: GeneralNode[] = [];
+  const singles: GeneralDir[] = [];
   const dirGroups: GeneralGroup[] = [];
   for (const [key, bucket] of dirBuckets) {
-    if (bucket.dirs.length < MIN_DIR_GROUP) { for (const child of bucket.dirs) singles.push(dirNodes.get(child)!); continue; }
     const nodes = bucket.dirs.map(child => dirNodes.get(child)!);
+    if (bucket.dirs.length < MIN_DIR_GROUP) {
+      singles.push(...nodes);
+      continue;
+    }
     dirGroups.push({
       kind: "group", id: `dir:${dir.path}:${key}`, label: `${prefixOf(dir.path)}*/ (${nodes.length} similar)`, pattern: bucket.pattern,
       memberKind: "dir", parentPath: dir.path, members: nodes.map(node => node.path), nodes,
       fileCount: nodes.reduce((sum, node) => sum + node.fileCount, 0), dirCount: nodes.length + nodes.reduce((sum, node) => sum + node.dirCount, 0),
     });
   }
-  singles.sort((a, b) => compare((a as GeneralDir).name, (b as GeneralDir).name));
+  singles.sort((a, b) => compare(a.name, b.name));
   dirGroups.sort((a, b) => compare(a.label, b.label) || compare(a.id, b.id));
-  children.push(...singles, ...dirGroups);
+  return [...singles, ...dirGroups];
+}
 
+const generalFile = (file: TreeFile): GeneralFile => ({ kind: "file", name: file.name, path: file.path, bytes: file.bytes, language: file.language });
+
+function generalizeFiles(dir: TreeDir): GeneralNode[] {
   const suffixBuckets = new Map<string, TreeFile[]>();
   const loose: TreeFile[] = [];
   for (const file of dir.files) {
@@ -118,17 +134,24 @@ function generalizeDir(dir: TreeDir): GeneralDir {
   }
   const fileGroups: GeneralGroup[] = [];
   for (const [suffix, bucket] of suffixBuckets) {
-    if (bucket.length < MIN_FILE_GROUP) { loose.push(...bucket); continue; }
+    if (bucket.length < MIN_FILE_GROUP) {
+      loose.push(...bucket);
+      continue;
+    }
     fileGroups.push({
       kind: "group", id: `file:${dir.path}:${suffix}`, label: `${prefixOf(dir.path)}*${suffix} (${bucket.length} similar)`, pattern: `*${suffix}`,
       memberKind: "file", parentPath: dir.path, members: bucket.map(file => file.path),
-      nodes: bucket.map(file => ({ kind: "file", name: file.name, path: file.path, bytes: file.bytes, language: file.language })),
+      nodes: bucket.map(generalFile),
       fileCount: bucket.length, dirCount: 0,
     });
   }
   loose.sort((a, b) => compare(a.name, b.name));
   fileGroups.sort((a, b) => compare(a.label, b.label) || compare(a.id, b.id));
-  children.push(...fileGroups, ...loose.map((file): GeneralFile => ({ kind: "file", name: file.name, path: file.path, bytes: file.bytes, language: file.language })));
+  return [...fileGroups, ...loose.map(generalFile)];
+}
+
+function generalizeDir(dir: TreeDir): GeneralDir {
+  const children = [...generalizeSubdirs(dir), ...generalizeFiles(dir)];
   return { kind: "dir", name: dir.name, path: dir.path, children, fileCount: dir.fileCount, dirCount: dir.dirCount };
 }
 
@@ -153,8 +176,10 @@ export function generalPaths(root: GeneralDir): TreePaths {
   const stack: GeneralNode[] = [root];
   for (let node = stack.pop(); node; node = stack.pop()) {
     if (node.kind === "file") out.files.push(node.path);
-    else if (node.kind === "dir") { if (node.path !== "") out.directories.push(node.path); stack.push(...node.children); }
-    else stack.push(...node.nodes);
+    else if (node.kind === "dir") {
+      if (node.path !== "") out.directories.push(node.path);
+      stack.push(...node.children);
+    } else stack.push(...node.nodes);
   }
   out.files.sort(compare);
   out.directories.sort(compare);
@@ -236,10 +261,8 @@ export interface ProposedNode {
 }
 export interface ProposedTree { roots: ProposedNode[]; issues: string[] }
 
-/** Builds the proposed tree from entry parent links without ever recursing on untrusted links. */
-export function proposedTree(payload: StructurePayload | null): ProposedTree {
-  const issues: string[] = [];
-  if (!payload) return { roots: [], issues };
+/** Entries by id with their parent links; a repeated id keeps the first entry and is reported. */
+function proposedNodes(payload: StructurePayload, issues: string[]): { nodes: Map<string, ProposedNode>; parentOf: Map<string, string | null> } {
   const nodes = new Map<string, ProposedNode>();
   const parentOf = new Map<string, string | null>();
   for (const entry of payload.entries) {
@@ -247,17 +270,31 @@ export function proposedTree(payload: StructurePayload | null): ProposedTree {
     nodes.set(entry.id, { id: entry.id, label: entry.label, path: entry.path, pattern: entry.pattern, members: [...entry.members], purpose: entry.purpose, evidenceIds: [...entry.evidenceIds], children: [], cycleBroken: false });
     parentOf.set(entry.id, entry.parentId);
   }
+  return { nodes, parentOf };
+}
+
+/** Builds the proposed tree from entry parent links without ever recursing on untrusted links. */
+export function proposedTree(payload: StructurePayload | null): ProposedTree {
+  const issues: string[] = [];
+  if (!payload) return { roots: [], issues };
+  const { nodes, parentOf } = proposedNodes(payload, issues);
   const roots: ProposedNode[] = [];
   for (const [id, node] of nodes) {
     const parentId = parentOf.get(id) ?? null;
-    const parent = parentId !== null && parentId !== id ? nodes.get(parentId) : undefined;
-    if (parent) parent.children.push(node);
-    else { roots.push(node); if (parentId !== null && parentId !== id) issues.push(`Entry ${id} names a missing parent ${parentId}`); }
+    const linked = parentId !== null && parentId !== id;
+    const parent = linked ? nodes.get(parentId) : undefined;
+    if (parent) { parent.children.push(node); continue; }
+    roots.push(node);
+    if (linked) issues.push(`Entry ${id} names a missing parent ${parentId}`);
   }
   const reached = new Set<string>();
   const reach = (start: ProposedNode): void => {
     const stack = [start];
-    for (let node = stack.pop(); node; node = stack.pop()) { if (reached.has(node.id)) continue; reached.add(node.id); stack.push(...node.children); }
+    for (let node = stack.pop(); node; node = stack.pop()) {
+      if (reached.has(node.id)) continue;
+      reached.add(node.id);
+      stack.push(...node.children);
+    }
   };
   for (const root of roots) reach(root);
   // Anything still unreached sits in or below a parent cycle: cut it open at the first such entry, repeatedly.
@@ -340,7 +377,7 @@ export function canApprove(revision: ProjectInsightStatus | null, context: Appro
 
 export const indexChanged = (revision: Pick<ProjectInsightStatus, "snapshotId">, snapshotId: string | null): boolean => !!revision.snapshotId && revision.snapshotId !== snapshotId;
 export const differentDocument = (revision: Pick<ProjectInsightStatus, "sourceId" | "sourceHash">, source: ApprovalSource | null): boolean =>
-  !!revision.sourceId && (!source || revision.sourceId !== source.sourceId || (!!revision.sourceHash && revision.sourceHash !== source.sha256));
+  !!revision.sourceId && (revision.sourceId !== source?.sourceId || (!!revision.sourceHash && revision.sourceHash !== source.sha256));
 
 export interface ApprovalNotice { tone: "ok" | "warn" | "err"; text: string; openArchitect: boolean }
 /** Delivery outcome of the one automatic discussion message; uncertain/failed/unavailable are never resent automatically. */

@@ -42,14 +42,33 @@ export interface QualityReportPreview { text: string; truncated: boolean }
 export const QUALITY_BUSY = "Code quality is busy; wait for the current operation to finish.";
 export function defaultQualityConfig(): QualityConfig { return { version: 1, mode: "sonarqubeCommunity", runtime: { kind: "podman", connection: "" }, communityPort: 9000, enterpriseUrl: "" }; }
 export function modeSelectors(mode: QualityMode): { analyzer: "sonarqube" | "alternate"; connection: "community" | "enterprise" } { return { analyzer: mode === "alternate" ? "alternate" : "sonarqube", connection: mode === "sonarqubeEnterprise" ? "enterprise" : "community" }; }
-export function selectorMode(analyzer: "sonarqube" | "alternate", connection: "community" | "enterprise"): QualityMode { return analyzer === "alternate" ? "alternate" : connection === "enterprise" ? "sonarqubeEnterprise" : "sonarqubeCommunity"; }
-export function modeLabel(mode: QualityMode | null): string { return mode === null ? "Not active" : mode === "alternate" ? "MegaLinter + Opengrep + Semgrep CE" : mode === "sonarqubeEnterprise" ? "SonarQube Enterprise" : "SonarQube Community"; }
+export function selectorMode(analyzer: "sonarqube" | "alternate", connection: "community" | "enterprise"): QualityMode {
+  if (analyzer === "alternate") return "alternate";
+  return connection === "enterprise" ? "sonarqubeEnterprise" : "sonarqubeCommunity";
+}
+export function modeLabel(mode: QualityMode | null): string {
+  if (mode === null) return "Not active";
+  if (mode === "alternate") return "MegaLinter + Opengrep + Semgrep CE";
+  return mode === "sonarqubeEnterprise" ? "SonarQube Enterprise" : "SonarQube Community";
+}
 export function runtimeLabel(runtime: QualityRuntime): string {
   const unix = typeof navigator !== "undefined" && !/Win/i.test(navigator.platform);
-  return runtime.kind === "podman" ? `Podman · ${runtime.connection || (unix ? "local default" : "app-managed machine (not resolved)")}` : runtime.kind === "dockerWsl" ? `Docker in WSL · ${runtime.distro || "select a distro"}` : runtime.kind === "dockerNative" ? "Docker Engine (native)" : "Docker Desktop";
+  if (runtime.kind === "podman") {
+    const fallback = unix ? "local default" : "app-managed machine (not resolved)";
+    return `Podman · ${runtime.connection || fallback}`;
+  }
+  if (runtime.kind === "dockerWsl") return `Docker in WSL · ${runtime.distro || "select a distro"}`;
+  return runtime.kind === "dockerNative" ? "Docker Engine (native)" : "Docker Desktop";
 }
 /** Drive-letter and UNC folders are Windows paths (case-insensitive, either separator); any other folder is an exact Unix path. */
-export const qualityFolderKey = (folder: string): string => /^([a-zA-Z]:([\\/]|$)|\\\\)/.test(folder) ? folder.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() : folder.replace(/\/+$/, "");
+export function qualityFolderKey(folder: string): string {
+  const windows = /^([a-zA-Z]:([\\/]|$)|\\\\)/.test(folder);
+  const normalized = windows ? folder.replaceAll("\\", "/") : folder;
+  let end = normalized.length;
+  while (end > 0 && normalized[end - 1] === "/") end--;
+  const key = normalized.slice(0, end);
+  return windows ? key.toLowerCase() : key;
+}
 /** An async result belongs to both a folder and the generation that requested it. */
 export class QualityGeneration {
   private value = 0;
@@ -63,11 +82,11 @@ export function filterQualityFindings(findings: readonly QualityFinding[], filte
   const text = filter.text.trim().toLowerCase();
   return findings.filter(f => (!filter.tool || f.tools.includes(filter.tool)) && (!filter.severity || f.severity === filter.severity) && (!text || [f.message, f.ruleId, f.path ?? "", f.category, ...f.tools].join(" ").toLowerCase().includes(text)));
 }
-export function findingTools(findings: readonly QualityFinding[]): string[] { return [...new Set(findings.flatMap(f => f.tools))].sort(); }
+export function findingTools(findings: readonly QualityFinding[]): string[] { return [...new Set(findings.flatMap(f => f.tools))].sort((a, b) => a.localeCompare(b)); }
 /** Union attribution only for an identical finding id; backend owns semantic deduplication. */
 export function mergeFindingAttribution(findings: readonly QualityFinding[]): QualityFinding[] {
   const result = new Map<string, QualityFinding>();
-  for (const finding of findings) { const previous = result.get(finding.id); result.set(finding.id, { ...finding, tools: [...new Set([...(previous?.tools ?? []), ...finding.tools])].sort() }); }
+  for (const finding of findings) { const previous = result.get(finding.id); result.set(finding.id, { ...finding, tools: [...new Set([...(previous?.tools ?? []), ...finding.tools])].sort((a, b) => a.localeCompare(b)) }); }
   return [...result.values()];
 }
 export function qualityPage<T>(items: readonly T[], requested: number, size = 100): { items: T[]; page: number; pages: number; total: number } {
@@ -78,7 +97,10 @@ export function qualityPage<T>(items: readonly T[], requested: number, size = 10
 export function scanPresentation(scan: Pick<QualityScan, "status" | "findings" | "qualityGate">): { label: string; tone: "ok" | "warn" | "err" | "dim" } {
   if (scan.status === "complete") return { label: scan.findings.length ? `Completed · ${scan.findings.length} findings` : "Completed · zero findings in analyzed coverage", tone: scan.qualityGate === "failed" ? "warn" : "ok" };
   const labels: Record<Exclude<QualityScanStatus, "complete">, string> = { running: "Running", cancelling: "Cancelling · waiting for work to stop", cancelled: "Cancelled · analysis incomplete", partial: "Partial · coverage incomplete", error: "Failed · not a clean result", interrupted: "Interrupted · analysis incomplete" };
-  return { label: labels[scan.status], tone: scan.status === "error" ? "err" : scan.status === "running" ? "dim" : "warn" };
+  let tone: "err" | "dim" | "warn" = "warn";
+  if (scan.status === "error") tone = "err";
+  else if (scan.status === "running") tone = "dim";
+  return { label: labels[scan.status], tone };
 }
 export function isActiveScan(scan: QualityScan | null): boolean { return scan?.status === "running" || scan?.status === "cancelling"; }
 
@@ -131,8 +153,8 @@ export function qualityLocked(snapshot: QualityClientSnapshot): boolean { return
 interface QualityClientDependencies { read(): Promise<QualityState>; setTimer(fn: () => void, ms: number): unknown; clearTimer(handle: unknown): void }
 /** One admission and polling owner shared by every mounted settings/page surface. */
 export class QualityClient {
-  private deps: QualityClientDependencies;
-  private listeners = new Set<(snapshot: QualityClientSnapshot) => void>();
+  private readonly deps: QualityClientDependencies;
+  private readonly listeners = new Set<(snapshot: QualityClientSnapshot) => void>();
   private timer: unknown = null;
   private generation = 0;
   private request = 0;
@@ -145,7 +167,11 @@ export class QualityClient {
     if (this.listeners.size === 1) { void this.refresh(); this.schedule(); }
     return () => { this.listeners.delete(listener); this.schedule(); };
   };
-  private publish(patch: Partial<QualityClientSnapshot>): void { this.value = { ...this.value, ...patch }; for (const listener of this.listeners) listener(this.value); this.schedule(); }
+  private publish(patch: Partial<QualityClientSnapshot>): void {
+    this.value = { ...this.value, ...patch };
+    for (const listener of this.listeners) listener(this.value);
+    this.schedule();
+  }
   private schedule(): void {
     const wanted = this.listeners.size > 0 || this.value.pending || this.value.uncertain || this.value.state?.busy;
     if (!wanted && this.timer !== null) { this.deps.clearTimer(this.timer); this.timer = null; }
@@ -179,7 +205,9 @@ export class QualityClient {
 /** Initial read-only probing must finish before installation/start can be offered. */
 export function setupAction(q: QualityState | null): { install: boolean; ready: boolean; label: string } {
   const ready = !!q && q.prerequisites.some(item => JSON.stringify(item.runtime) === JSON.stringify(q.config.runtime)) && q.setup.steps.some(step => step.id === "runtime");
-  return { ready, install: q?.setup.installRequired ?? true, label: q?.setup.installRequired ? q.setup.resume ? "Continue setup" : "Install and setup" : "Start and scan" };
+  let label = "Start and scan";
+  if (q?.setup.installRequired) label = q.setup.resume ? "Continue setup" : "Install and setup";
+  return { ready, install: q?.setup.installRequired ?? true, label };
 }
 
 /** One lazy entry per mounted ownership epoch; polling and explicit resume never enqueue another start. */
@@ -202,9 +230,9 @@ export class QualityViewEntry {
 export class QualityRevealLifetime {
   private generation = 0;
   private timer: unknown = null;
-  private clear: () => void;
-  private setTimer: (fn: () => void, ms: number) => unknown;
-  private clearTimer: (id: unknown) => void;
+  private readonly clear: () => void;
+  private readonly setTimer: (fn: () => void, ms: number) => unknown;
+  private readonly clearTimer: (id: unknown) => void;
   constructor(clear: () => void, setTimer: (fn: () => void, ms: number) => unknown, clearTimer: (id: unknown) => void) {
     this.clear = clear; this.setTimer = setTimer; this.clearTimer = clearTimer;
   }
@@ -216,5 +244,10 @@ export class QualityRevealLifetime {
     target.addEventListener("blur", dismiss); target.addEventListener("pagehide", dismiss);
     return () => { target.removeEventListener("blur", dismiss); target.removeEventListener("pagehide", dismiss); this.close(); };
   }
-  close(): void { this.generation++; if (this.timer !== null) this.clearTimer(this.timer); this.timer = null; this.clear(); }
+  close(): void {
+    this.generation++;
+    if (this.timer !== null) this.clearTimer(this.timer);
+    this.timer = null;
+    this.clear();
+  }
 }

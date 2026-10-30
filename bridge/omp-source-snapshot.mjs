@@ -33,14 +33,17 @@ export function scrub(value) {
 }
 
 // File text shown to the model: credential-looking lines are replaced, line numbers stay exact.
+const REDACTED = '[redacted: possible credential]';
+const KEY_BEGIN = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
+const KEY_END = /-----END [A-Z ]*PRIVATE KEY-----/;
 export function redactLines(body) {
-  let key = false;
+  let inKey = false;
   let redacted = 0;
   const lines = body.split('\n').map(line => {
-    if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(line)) { key = !/-----END [A-Z ]*PRIVATE KEY-----/.test(line); redacted++; return '[redacted: possible credential]'; }
-    if (key) { if (/-----END [A-Z ]*PRIVATE KEY-----/.test(line)) key = false; redacted++; return '[redacted: possible credential]'; }
-    if (containsSecret(line)) { redacted++; return '[redacted: possible credential]'; }
-    return line;
+    if (KEY_BEGIN.test(line) || inKey) inKey = !KEY_END.test(line);
+    else if (!containsSecret(line)) return line;
+    redacted++;
+    return REDACTED;
   });
   return { text: lines.join('\n'), redacted };
 }
@@ -241,51 +244,55 @@ function page(section, snapshotId, all, offset, limit, extra = {}) {
 }
 
 const INSPECT_KEYS = new Set(['requestId', 'section', 'id', 'offset', 'limit']);
+const compareItems = (a, b) => {
+  if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+  if (a.name < b.name) return -1;
+  return a.name > b.name ? 1 : 0;
+};
 
-/** Bounded, read-only queries over the saved source index of this request's snapshot. Returns the JSON text. */
-export function systemOverviewInspect(dir, params, actor) {
+function inspectArguments(params) {
   if (!object(params) || !SECTIONS.includes(params.section)) throw new Error(`section must be one of ${SECTIONS.join(', ')}`);
   if (Object.keys(params).some(key => !INSPECT_KEYS.has(key))) throw new Error('unknown argument; only requestId, section, id, offset and limit are accepted');
   const offset = nonNegative(params.offset ?? 0, 'offset');
   const limit = params.limit ?? 50;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error('limit must be an integer from 1 to 200');
   if (params.id !== undefined && params.id !== null && (typeof params.id !== 'string' || params.id.length > 1000)) throw new Error('id must be a string');
-  const { folder, request } = openRequest(dir, params.requestId, actor, VISUALIZATION_KINDS);
-  assertOpen(folder);
-  const { tables } = loadIndex(dir, folder, request);
+  return { offset, limit, id: params.id ?? undefined };
+}
+
+function inspectInventory({ tables, request, offset, limit, id }) {
+  const target = id === undefined || id === '' ? '' : normalizeRelative(id, false);
+  const children = directoryTree(tables).get(target);
+  if (!children) throw new Error('That directory is not part of the inventory.');
+  const items = [...children.values()].sort(compareItems);
+  const summary = target === '' && offset === 0
+    ? { summary: { files: tables.files.length, directories: tables.directories.size, symbols: tables.symbols.length, sites: tables.sites.length, edges: tables.edges.length, languages: countBy(tables.files, file => file.language), statuses: countBy(tables.files, file => file.status), sourceHash: tables.raw.sourceHash } }
+    : {};
+  return page('inventory', request.snapshotId, items, offset, limit, { path: target, ...summary });
+}
+
+function inspectCoverage({ tables, request, offset, limit }) {
   const { raw } = tables;
-  const id = params.id ?? undefined;
-  if (params.section === 'inventory') {
-    const target = id === undefined || id === '' ? '' : normalizeRelative(id, false);
-    const children = directoryTree(tables).get(target);
-    if (!children) throw new Error('That directory is not part of the inventory.');
-    const items = [...children.values()].sort((a, b) => (a.type === b.type ? (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) : a.type === 'directory' ? -1 : 1));
-    const summary = target === '' && offset === 0
-      ? { summary: { files: tables.files.length, directories: tables.directories.size, symbols: tables.symbols.length, sites: tables.sites.length, edges: tables.edges.length, languages: countBy(tables.files, file => file.language), statuses: countBy(tables.files, file => file.status), sourceHash: raw.sourceHash } }
-      : {};
-    return page('inventory', request.snapshotId, items, offset, limit, { path: target, ...summary });
-  }
-  if (params.section === 'coverage') {
-    const unparsed = tables.files.filter(file => file.status !== 'parsed').map(fileRow);
-    const head = offset === 0 ? { coverage: raw.coverage ?? null, limitations: raw.limitations ?? [], extractorVersions: raw.extractorVersions ?? {} } : {};
-    return page('coverage', request.snapshotId, unparsed, offset, limit, head);
-  }
-  if (params.section === 'files') {
-    if (id !== undefined) {
-      const file = tables.filesById.get(id) ?? tables.filesByPath.get(id);
-      if (!file) throw new Error('No such file in the source index.');
-      return page('files', request.snapshotId, (tables.symbolsByFile.get(file.id) ?? []).map(symbolRow), offset, limit, { file: fileRow(file), siteTotal: (tables.sitesByFile.get(file.id) ?? []).length });
-    }
-    return page('files', request.snapshotId, tables.files.map(fileRow), offset, limit);
-  }
-  if (params.section === 'symbols') {
-    if (id !== undefined) {
-      const symbol = tables.symbolsById.get(id);
-      if (!symbol) throw new Error('No such symbol in the source index.');
-      return page('symbols', request.snapshotId, (tables.sitesByCaller.get(symbol.id) ?? []).map(siteRow), offset, limit, { symbol: symbolRow(symbol) });
-    }
-    return page('symbols', request.snapshotId, tables.symbols.map(symbolRow), offset, limit);
-  }
+  const unparsed = tables.files.filter(file => file.status !== 'parsed').map(fileRow);
+  const head = offset === 0 ? { coverage: raw.coverage ?? null, limitations: raw.limitations ?? [], extractorVersions: raw.extractorVersions ?? {} } : {};
+  return page('coverage', request.snapshotId, unparsed, offset, limit, head);
+}
+
+function inspectFiles({ tables, request, offset, limit, id }) {
+  if (id === undefined) return page('files', request.snapshotId, tables.files.map(fileRow), offset, limit);
+  const file = tables.filesById.get(id) ?? tables.filesByPath.get(id);
+  if (!file) throw new Error('No such file in the source index.');
+  return page('files', request.snapshotId, (tables.symbolsByFile.get(file.id) ?? []).map(symbolRow), offset, limit, { file: fileRow(file), siteTotal: (tables.sitesByFile.get(file.id) ?? []).length });
+}
+
+function inspectSymbols({ tables, request, offset, limit, id }) {
+  if (id === undefined) return page('symbols', request.snapshotId, tables.symbols.map(symbolRow), offset, limit);
+  const symbol = tables.symbolsById.get(id);
+  if (!symbol) throw new Error('No such symbol in the source index.');
+  return page('symbols', request.snapshotId, (tables.sitesByCaller.get(symbol.id) ?? []).map(siteRow), offset, limit, { symbol: symbolRow(symbol) });
+}
+
+function inspectNeighbors({ tables, request, offset, limit, id }) {
   if (id === undefined || !(tables.filesById.has(id) || tables.symbolsById.has(id))) throw new Error('neighbors needs the id of an indexed file or symbol.');
   const items = [
     ...(tables.edgesOut.get(id) ?? []).map(edge => edgeItem(tables, edge, 'out')),
@@ -294,6 +301,17 @@ export function systemOverviewInspect(dir, params, actor) {
     ...(tables.sitesByCaller.get(id) ?? tables.sitesByFile.get(id)?.filter(site => !site.callerId) ?? []).filter(site => !site.targetId).map(site => ({ type: 'unresolvedSite', ...siteRow(site) })),
   ];
   return page('neighbors', request.snapshotId, items, offset, limit, { node: describeNode(tables, id) });
+}
+
+const INSPECTORS = { inventory: inspectInventory, coverage: inspectCoverage, files: inspectFiles, symbols: inspectSymbols, neighbors: inspectNeighbors };
+
+/** Bounded, read-only queries over the saved source index of this request's snapshot. Returns the JSON text. */
+export function systemOverviewInspect(dir, params, actor) {
+  const { offset, limit, id } = inspectArguments(params);
+  const { folder, request } = openRequest(dir, params.requestId, actor, VISUALIZATION_KINDS);
+  assertOpen(folder);
+  const { tables } = loadIndex(dir, folder, request);
+  return INSPECTORS[params.section]({ tables, request, offset, limit, id });
 }
 
 // ---- read_target_structure -------------------------------------------------------------------------------------
@@ -306,7 +324,7 @@ export function readTargetStructure(dir, params, actor) {
   assertOpen(folder);
   const file = path.join(folder, 'target.md');
   const found = stat(file);
-  if (!found || !found.isFile() || found.isSymbolicLink()) throw new Error('This request has no target Markdown.');
+  if (!found?.isFile() || found.isSymbolicLink()) throw new Error('This request has no target Markdown.');
   const fd = openSync(file, 'r');
   let bytes;
   try {

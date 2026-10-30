@@ -12,6 +12,12 @@ export const graphifyNodeId = (ref: GraphifyRef): string => `n:${ref.idKind}:${r
 const baseNoteName = (path: string): string => path.slice(path.lastIndexOf("/") + 1).replace(/\.(md|markdown)$/i, "");
 const parentOf = (path: string): string => { const cut = path.lastIndexOf("/"); return cut < 0 ? "" : path.slice(0, cut); };
 
+/** Code-unit order, never locale order: the model order must not depend on the machine. */
+function comparePaths(a: string, b: string): number {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
+
 // ---------- note graph ----------
 
 export interface VaultStats {
@@ -60,7 +66,7 @@ export class VaultModelBuilder {
       folders.set(id, node({ id, kind: "folder", label: path.slice(path.lastIndexOf("/") + 1), subtitle: path, synthetic: true, path, parentId: ensureFolder(parentOf(path)) }));
       return id;
     };
-    for (const note of [...this.notes.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+    for (const note of [...this.notes.values()].sort((a, b) => comparePaths(a.path, b.path))) {
       nodes.push(node({
         id: noteNodeId(note.path), kind: "note", label: note.title || baseNoteName(note.path), subtitle: note.path, path: note.path, ref: note.path,
         parentId: ensureFolder(parentOf(note.path)), evidence: "none",
@@ -83,6 +89,24 @@ export interface GraphifyStats {
   communities: number;
 }
 
+const sourceText = (file: string | null, location: string | null): string => {
+  if (!file) return "";
+  return location ? `${file}:${location}` : file;
+};
+
+const graphifyModelNode = (item: GraphifyNode, id: string, parentId: string | null): ModelNode => node({
+  id, kind: item.fileType || "node", label: item.label || item.ref.id, subtitle: sourceText(item.sourceFile, item.sourceLocation),
+  path: item.sourceFile, ref: id, parentId, evidence: "none", description: item.origin ? `Origin: ${item.origin}` : "",
+});
+
+function graphifyModelEdge(link: GraphifyLink): ModelEdge {
+  const evidence = sourceText(link.sourceFile, link.sourceLocation);
+  return {
+    id: link.id, source: graphifyNodeId(link.source), target: graphifyNodeId(link.target), direction: link.directed ? "directed" : "undirected", relation: link.relation,
+    grade: link.confidence ?? "unknown", derived: false, label: link.relation, count: 1, evidenceIds: evidence ? [evidence] : [], truncated: false,
+  };
+}
+
 export class GraphifyModelBuilder {
   private readonly nodes: GraphifyNode[] = [];
   private readonly links: GraphifyLink[] = [];
@@ -94,6 +118,15 @@ export class GraphifyModelBuilder {
   addCommunities(items: readonly GraphifyCommunity[]): void { for (const item of items) this.communities.set(item.id, item); }
   addHyperedges(items: readonly GraphifyHyperedge[]): void { this.hyperedges += items.length; }
 
+  private container(community: number, containers: Map<number, ModelNode>): string {
+    const id = communityId(community);
+    if (!containers.has(community)) {
+      const known = this.communities.get(community);
+      containers.set(community, node({ id, kind: "community", label: known?.label || `Community ${community}`, subtitle: known ? `${known.size.toLocaleString()} nodes` : "", synthetic: true }));
+    }
+    return id;
+  }
+
   build(): { model: GraphModel; stats: GraphifyStats } {
     const nodes: ModelNode[] = [];
     const containers = new Map<number, ModelNode>();
@@ -102,18 +135,7 @@ export class GraphifyModelBuilder {
       const id = graphifyNodeId(item.ref);
       if (seen.has(id)) continue;
       seen.add(id);
-      let parentId: string | null = null;
-      if (item.community !== null) {
-        parentId = communityId(item.community);
-        if (!containers.has(item.community)) {
-          const known = this.communities.get(item.community);
-          containers.set(item.community, node({ id: parentId, kind: "community", label: known?.label || `Community ${item.community}`, subtitle: known ? `${known.size.toLocaleString()} nodes` : "", synthetic: true }));
-        }
-      }
-      nodes.push(node({
-        id, kind: item.fileType || "node", label: item.label || item.ref.id, subtitle: item.sourceFile ? `${item.sourceFile}${item.sourceLocation ? `:${item.sourceLocation}` : ""}` : "",
-        path: item.sourceFile, ref: id, parentId, evidence: "none", description: item.origin ? `Origin: ${item.origin}` : "",
-      }));
+      nodes.push(graphifyModelNode(item, id, item.community === null ? null : this.container(item.community, containers)));
     }
     const edges: ModelEdge[] = [];
     const confidence: Record<string, number> = {};
@@ -122,11 +144,7 @@ export class GraphifyModelBuilder {
       const label = link.confidence ?? "none";
       confidence[label] = (confidence[label] ?? 0) + 1;
       if (link.dangling) dangling++;
-      edges.push({
-        id: link.id, source: graphifyNodeId(link.source), target: graphifyNodeId(link.target), direction: link.directed ? "directed" : "undirected", relation: link.relation,
-        grade: link.confidence ?? "unknown", derived: false, label: link.relation, count: 1,
-        evidenceIds: link.sourceFile ? [`${link.sourceFile}${link.sourceLocation ? `:${link.sourceLocation}` : ""}`] : [], truncated: false,
-      });
+      edges.push(graphifyModelEdge(link));
     }
     return {
       model: { nodes: [...containers.values(), ...nodes], edges },

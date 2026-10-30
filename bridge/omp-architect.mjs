@@ -6,6 +6,7 @@ import { registerDependencyContextTool } from './omp-architect-context.mjs';
 import { registerDependencyUpdateTool } from './omp-dependency-updates.mjs';
 import { registerProjectInsightTools } from './omp-project-insight.mjs';
 import { registerStructureSources } from './omp-structure-sources.mjs';
+import { publishExclusively } from './omp-insight-base.mjs';
 
 // Only The Architect registers these app-owned dependency classification and security report tools.
 export const KEY = /^[0-9a-f]{16}$/;
@@ -46,7 +47,11 @@ function writeJson(file, value) {
   mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try { writeFileSync(temporary, JSON.stringify(value)); renameSync(temporary, file); }
-  finally { try { unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+  catch (error) {
+    try { unlinkSync(temporary); }
+    catch { /* the write failure is the one to report */ }
+    throw error;
+  }
 }
 export function saveInhouse(dir, { key, items }) {
   if (typeof key !== 'string' || !KEY.test(key)) throw new Error('invalid key');
@@ -124,7 +129,10 @@ function httpsUrl(value) {
 
 function fileExists(file) {
   try { lstatSync(file); return true; }
-  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 function readBoundedJson(file, maximum) {
@@ -171,7 +179,10 @@ export function validSourcePath(value) {
 function insideProject(folder, relative) {
   let real;
   try { real = realpathSync(path.join(folder, relative)); }
-  catch (error) { if (['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error.code)) return true; throw error; }
+  catch (error) {
+    if (['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error.code)) return true;
+    throw error;
+  }
   const offset = path.relative(realpathSync(folder), real);
   return offset === '' || (offset !== '..' && !offset.startsWith(`..${path.sep}`) && !path.isAbsolute(offset));
 }
@@ -279,25 +290,13 @@ function publishResult(dir, payload, actor, kind, validate, build) {
   validate(payload, request.folder);
   const bytes = JSON.stringify(build(payload, actor));
   if (Buffer.byteLength(bytes) > MAX_REPORT_BYTES) throw new Error('report file too large');
-  const file = path.join(folder, 'result.json');
-  const lock = path.join(folder, 'result.lock');
-  const temporary = path.join(folder, `result.${process.pid}.${randomUUID()}.tmp`);
   // Exclusive publication lock covers the exists check and rename across processes. Never overwrite a report.
-  const fd = openSync(lock, 'wx');
-  try {
-    if (fileExists(file)) throw new Error('report already completed');
+  publishExclusively(folder, bytes, () => {
+    if (fileExists(path.join(folder, 'result.json'))) throw new Error('report already completed');
     // Check again under the publication lock: a replaced or ended request must never receive a stale report.
     validateRequest(readBoundedJson(requestFile, MAX_REQUEST_BYTES), payload.requestId, actor, kind);
     assertOpen(folder);
-    writeFileSync(temporary, bytes, { flag: 'wx' });
-    renameSync(temporary, file);
-  } finally {
-    try { unlinkSync(temporary); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    finally {
-      try { closeSync(fd); } finally { unlinkSync(lock); }
-    }
-  }
+  });
   return { requestId: payload.requestId, saved: true };
 }
 

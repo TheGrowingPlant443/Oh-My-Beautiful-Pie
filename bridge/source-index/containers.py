@@ -40,6 +40,9 @@ _JS_TYPES = {
     "text/jsx", "text/babel", "text/typescript", "application/typescript",
 }
 _MAX_DEPTH = 200
+_WS = b" \t\r\n"
+_FENCE = re.compile(rb"---[ \t]*(\r?\n|$)")
+_NOT_PARSED = "script region not parsed"
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +83,23 @@ def _skip_template(src: bytes, i: int, depth: int = 0) -> int:
     return n
 
 
+def _skip_token(src: bytes, j: int, template_depth: int) -> int:
+    """Index after the string, template or comment starting at ``src[j]``; ``j + 1`` for any other byte."""
+    c = src[j]
+    if c == 0x22 or c == 0x27:
+        return _skip_string(src, j, c)
+    if c == 0x60:
+        return _skip_template(src, j, template_depth)
+    if c == 0x2F:
+        nxt = src[j + 1:j + 2]
+        if nxt == b"/":
+            k = src.find(b"\n", j)
+            return len(src) if k < 0 else k
+        if nxt == b"*":
+            return _skip_past(src, b"*/", j + 2)
+    return j + 1
+
+
 def _skip_braces(src: bytes, i: int, depth: int = 0) -> int:
     """``src[i] == '{'``: return the index after the matching ``}`` (JS string/template/comment aware)."""
     n = len(src)
@@ -95,24 +115,81 @@ def _skip_braces(src: bytes, i: int, depth: int = 0) -> int:
             level -= 1
             if level == 0:
                 return j + 1
-        elif c == 0x22 or c == 0x27:
-            j = _skip_string(src, j, c)
+        else:
+            j = _skip_token(src, j, depth + 1)
             continue
-        elif c == 0x60:
-            j = _skip_template(src, j, depth + 1)
-            continue
-        elif c == 0x2F:
-            nxt = src[j + 1:j + 2]
-            if nxt == b"/":
-                k = src.find(b"\n", j)
-                j = n if k < 0 else k
-                continue
-            if nxt == b"*":
-                k = src.find(b"*/", j + 2)
-                j = n if k < 0 else k + 2
-                continue
         j += 1
     return n
+
+
+def _skip_ws(src: bytes, j: int) -> int:
+    n = len(src)
+    while j < n and src[j] in _WS:
+        j += 1
+    return j
+
+
+def _skip_past(src: bytes, needle: bytes, pos: int) -> int:
+    """Index after the next ``needle`` at or beyond ``pos`` (or len)."""
+    k = src.find(needle, pos)
+    return len(src) if k < 0 else k + len(needle)
+
+
+def _skip_delimited(src: bytes, i: int, opener: bytes, closer: bytes) -> int | None:
+    """Index after ``opener ... closer`` starting at ``src[i]`` (or len), ``None`` when ``src[i]`` does not start with ``opener``."""
+    if not src.startswith(opener, i):
+        return None
+    return _skip_past(src, closer, i + len(opener))
+
+
+def _find_close(src: bytes, name: bytes, pos: int):
+    """Match of the next ``</name`` close tag at or beyond ``pos``, or ``None``."""
+    return re.compile(rb"</" + re.escape(name) + rb"[\s/>]", re.I).search(src, pos)
+
+
+def _skip_raw_text(src: bytes, name: bytes, pos: int) -> int | None:
+    """Index after the close tag of a raw-text element, or ``None`` when it never closes."""
+    m = _find_close(src, name, pos)
+    return None if m is None else _skip_past(src, b">", m.start())
+
+
+def _parse_attr_value(src: bytes, j: int, mustache: bool) -> tuple[str, int]:
+    """Parse an attribute value at ``src[j]`` (after ``=`` and whitespace): ``(text, index_after)``."""
+    n = len(src)
+    if j < n and src[j] in b"\"'":
+        q = src[j]
+        v = j + 1
+        p = v
+        while p < n and src[p] != q:
+            if mustache and src[p] == 0x7B:
+                p = _skip_braces(src, p)
+                continue
+            p += 1
+        return src[v:p].decode("utf-8", "replace"), min(p + 1, n)
+    if mustache and j < n and src[j] == 0x7B:
+        p = _skip_braces(src, j)
+        return src[j:p].decode("utf-8", "replace"), p
+    v = j
+    while j < n and src[j] not in b" \t\r\n>":
+        j += 1
+    return src[v:j].decode("utf-8", "replace"), j
+
+
+def _parse_attr(src: bytes, j: int, mustache: bool, attrs: dict[str, Any]) -> int:
+    """Parse one attribute at ``src[j]`` into ``attrs``; return the index after it."""
+    n = len(src)
+    k = j
+    while k < n and src[k] not in b" \t\r\n=>/" and not (mustache and src[k] == 0x7B):
+        k += 1
+    if k == j:
+        return j + 1
+    aname = src[j:k].decode("utf-8", "replace").lower()
+    j = _skip_ws(src, k)
+    if j >= n or src[j] != 0x3D:  # =
+        attrs[aname] = True
+        return j
+    attrs[aname], j = _parse_attr_value(src, _skip_ws(src, j + 1), mustache)
+    return j
 
 
 def _parse_tag(src: bytes, i: int, mustache: bool):
@@ -129,57 +206,70 @@ def _parse_tag(src: bytes, i: int, mustache: bool):
     attrs: dict[str, Any] = {}
     while j < n:
         c = src[j]
-        if c in b" \t\r\n":
+        if c in _WS:
             j += 1
-            continue
-        if c == 0x3E:  # >
+        elif c == 0x3E:  # >
             return name, attrs, j + 1, False
-        if c == 0x2F and src[j + 1:j + 2] == b">":
-            return name, attrs, j + 2, True
-        if c == 0x2F:
+        elif c == 0x2F:
+            if src[j + 1:j + 2] == b">":
+                return name, attrs, j + 2, True
             j += 1
-            continue
-        if mustache and c == 0x7B:
+        elif mustache and c == 0x7B:
             j = _skip_braces(src, j)
-            continue
-        # attribute name
-        k = j
-        while k < n and src[k] not in b" \t\r\n=>/" and not (mustache and src[k] == 0x7B):
-            k += 1
-        if k == j:
-            j += 1
-            continue
-        aname = src[j:k].decode("utf-8", "replace").lower()
-        j = k
-        while j < n and src[j] in b" \t\r\n":
-            j += 1
-        if j < n and src[j] == 0x3D:  # =
-            j += 1
-            while j < n and src[j] in b" \t\r\n":
-                j += 1
-            if j < n and src[j] in b"\"'":
-                q = src[j]
-                v = j + 1
-                p = v
-                while p < n and src[p] != q:
-                    if mustache and src[p] == 0x7B:
-                        p = _skip_braces(src, p)
-                        continue
-                    p += 1
-                attrs[aname] = src[v:p].decode("utf-8", "replace")
-                j = min(p + 1, n)
-            elif mustache and j < n and src[j] == 0x7B:
-                p = _skip_braces(src, j)
-                attrs[aname] = src[j:p].decode("utf-8", "replace")
-                j = p
-            else:
-                v = j
-                while j < n and src[j] not in b" \t\r\n>":
-                    j += 1
-                attrs[aname] = src[v:j].decode("utf-8", "replace")
         else:
-            attrs[aname] = True
+            j = _parse_attr(src, j, mustache, attrs)
     return name, attrs, n, False
+
+
+def _close_tag(src: bytes, stack: list[bytes], i: int) -> int:
+    """``src[i:i+2] == '</'``: pop the matching open element (if any); return the index after the tag."""
+    m = _NAME_RE.match(src, i + 2)
+    if m is not None:
+        nm = m.group(0).lower()
+        for idx in range(len(stack) - 1, -1, -1):
+            if stack[idx] == nm:
+                del stack[idx:]
+                break
+    return _skip_past(src, b">", i)
+
+
+def _script_element(src: bytes, attrs: dict, end: int, top: bool, self_closing: bool) -> tuple[int | None, dict]:
+    """Next scan index and block; a None index marks an unclosed script extending to EOF."""
+    block = {"attrs": attrs, "start": end, "end": end, "top": top, "closed": True}
+    if self_closing:
+        return end, block
+    m = _SCRIPT_CLOSE.search(src, end)
+    if m is None:
+        block["end"] = len(src)
+        block["closed"] = False
+        return None, block
+    block["end"] = m.start()
+    return _skip_past(src, b">", m.start()), block
+
+
+def _html_markup(src: bytes, i: int, mustache: bool, stack: list[bytes], all_top: bool) -> tuple[int | None, dict | None]:
+    """Handle ``src[i] == '<'``: ``(next_index, script_block_or_None)``; a ``None`` index ends the scan."""
+    special = _skip_delimited(src, i, b"<!--", b"-->")
+    if special is None:
+        special = _skip_delimited(src, i, b"<![CDATA[", b"]]>")
+    if special is not None:
+        return special, None
+    if src[i + 1:i + 2] == b"/":
+        return _close_tag(src, stack, i), None
+    tag = _parse_tag(src, i, mustache)
+    if tag is None:
+        return i + 1, None
+    name, attrs, end, self_closing = tag
+    lower = name.lower()
+    if lower == b"script":
+        return _script_element(src, attrs, end, not stack or all_top, self_closing)
+    if lower in _RAW_TEXT and not self_closing:
+        return _skip_raw_text(src, lower, end), None
+    if not self_closing and lower not in _VOID:
+        stack.append(lower)
+        if len(stack) > 10_000:
+            del stack[:5_000]
+    return end, None
 
 
 def _scan_html(src: bytes, *, mustache: bool, start: int = 0, all_scripts_top_level: bool = False):
@@ -189,172 +279,111 @@ def _scan_html(src: bytes, *, mustache: bool, start: int = 0, all_scripts_top_le
     ``<textarea>``/``<title>`` raw text and ``{...}`` expressions are skipped.
     """
     n = len(src)
-    i = start
+    i: int | None = start
     stack: list[bytes] = []
-    while i < n:
+    while i is not None and i < n:
         c = src[i]
         if c == 0x3C:  # <
-            if src.startswith(b"<!--", i):
-                k = src.find(b"-->", i + 4)
-                i = n if k < 0 else k + 3
-                continue
-            if src.startswith(b"<![CDATA[", i):
-                k = src.find(b"]]>", i)
-                i = n if k < 0 else k + 3
-                continue
-            if src[i + 1:i + 2] == b"/":
-                m = _NAME_RE.match(src, i + 2)
-                k = src.find(b">", i)
-                if m is not None:
-                    nm = m.group(0).lower()
-                    for idx in range(len(stack) - 1, -1, -1):
-                        if stack[idx] == nm:
-                            del stack[idx:]
-                            break
-                i = n if k < 0 else k + 1
-                continue
-            tag = _parse_tag(src, i, mustache)
-            if tag is None:
-                i += 1
-                continue
-            name, attrs, end, self_closing = tag
-            lower = name.lower()
-            if lower == b"script":
-                if self_closing:
-                    yield {"attrs": attrs, "start": end, "end": end, "top": not stack or all_scripts_top_level, "closed": True}
-                    i = end
-                    continue
-                m = _SCRIPT_CLOSE.search(src, end)
-                if m is None:
-                    yield {"attrs": attrs, "start": end, "end": n, "top": not stack or all_scripts_top_level, "closed": False}
-                    return
-                yield {"attrs": attrs, "start": end, "end": m.start(), "top": not stack or all_scripts_top_level, "closed": True}
-                k = src.find(b">", m.start())
-                i = n if k < 0 else k + 1
-                continue
-            if lower in _RAW_TEXT and not self_closing:
-                m = re.compile(rb"</" + re.escape(lower) + rb"[\s/>]", re.I).search(src, end)
-                if m is None:
-                    return
-                k = src.find(b">", m.start())
-                i = n if k < 0 else k + 1
-                continue
-            if not self_closing and lower not in _VOID:
-                stack.append(lower)
-                if len(stack) > 10_000:
-                    del stack[:5_000]
-            i = end
-            continue
-        if mustache and c == 0x7B:
+            i, block = _html_markup(src, i, mustache, stack, all_scripts_top_level)
+            if block is not None:
+                yield block
+        elif mustache and c == 0x7B:
             i = _skip_braces(src, i)
-            continue
-        i += 1
+        else:
+            i += 1
+
+
+def _skip_template_block(src: bytes, pos: int) -> int:
+    """``pos`` is just after an opening ``<template>``: return the index after its matching close tag (or len)."""
+    n = len(src)
+    depth = 1
+    opener = re.compile(rb"<template[\s/>]", re.I)
+    closer = re.compile(rb"</template[\s/>]", re.I)
+    while depth > 0:
+        o = opener.search(src, pos)
+        c = closer.search(src, pos)
+        if c is None:
+            return n
+        if o is not None and o.start() < c.start():
+            depth += 1
+            pos = o.end()
+        else:
+            depth -= 1
+            pos = _skip_past(src, b">", c.start())
+    return pos
+
+
+def _vue_block(src: bytes, i: int) -> tuple[int | None, dict | None]:
+    """Handle ``src[i] == '<'`` at SFC top level: ``(next_index, script_block_or_None)``; a ``None`` index ends the scan."""
+    skipped = _skip_delimited(src, i, b"<!--", b"-->")
+    if skipped is not None:
+        return skipped, None
+    tag = _parse_tag(src, i, False)
+    if tag is None:
+        return i + 1, None
+    name, attrs, end, self_closing = tag
+    lower = name.lower()
+    if self_closing:
+        return end, None
+    if lower == b"template":
+        return _skip_template_block(src, end), None
+    m = _find_close(src, lower, end)
+    block = None
+    if lower == b"script":
+        block = {"attrs": attrs, "start": end, "end": len(src) if m is None else m.start(), "closed": m is not None}
+    if m is None:
+        return None, block
+    return _skip_past(src, b">", m.start()), block
 
 
 def _scan_vue_blocks(src: bytes):
     """Top-level SFC blocks: yield ``{attrs, start, end, closed}`` for ``<script>`` blocks only."""
     n = len(src)
-    i = 0
-    while i < n:
+    i: int | None = 0
+    while i is not None and i < n:
         if src[i] != 0x3C:
             i += 1
             continue
-        if src.startswith(b"<!--", i):
-            k = src.find(b"-->", i + 4)
-            i = n if k < 0 else k + 3
-            continue
-        tag = _parse_tag(src, i, False)
-        if tag is None:
-            i += 1
-            continue
-        name, attrs, end, self_closing = tag
-        lower = name.lower()
-        if self_closing:
-            i = end
-            continue
-        if lower == b"template":
-            depth = 1
-            pos = end
-            opener = re.compile(rb"<template[\s/>]", re.I)
-            closer = re.compile(rb"</template[\s/>]", re.I)
-            while depth > 0:
-                o = opener.search(src, pos)
-                c = closer.search(src, pos)
-                if c is None:
-                    pos = n
-                    break
-                if o is not None and o.start() < c.start():
-                    depth += 1
-                    pos = o.end()
-                else:
-                    depth -= 1
-                    k = src.find(b">", c.start())
-                    pos = n if k < 0 else k + 1
-            i = pos
-            continue
-        closer = re.compile(rb"</" + re.escape(lower) + rb"[\s/>]", re.I)
-        m = closer.search(src, end)
-        if lower == b"script":
-            if m is None:
-                yield {"attrs": attrs, "start": end, "end": n, "closed": False}
-                return
-            yield {"attrs": attrs, "start": end, "end": m.start(), "closed": True}
-        if m is None:
-            return
-        k = src.find(b">", m.start())
-        i = n if k < 0 else k + 1
+        i, block = _vue_block(src, i)
+        if block is not None:
+            yield block
 
 
-def _astro_frontmatter(src: bytes):
-    """Return ``(start, end, after)`` of the frontmatter region or ``None`` (``after`` = index past the closing fence line)."""
-    n = len(src)
-    i = 3 if src.startswith(b"\xef\xbb\xbf") else 0
-    while i < n and src[i] in b" \t\r\n":
-        i += 1
+def _astro_frontmatter_open(src: bytes) -> int | None:
+    """Index after the opening ``---`` fence line (BOM and leading whitespace allowed), or ``None``."""
+    i = _skip_ws(src, 3 if src.startswith(b"\xef\xbb\xbf") else 0)
     if not src.startswith(b"---", i):
         return None
     eol = src.find(b"\n", i)
     if eol < 0 or src[i + 3:eol].strip() != b"":
         return None
-    start = eol + 1
+    return eol + 1
+
+
+def _astro_advance(src: bytes, j: int) -> int | None:
+    """Index after the string, template or comment at ``src[j]`` (``j + 1`` otherwise); ``None`` for an unterminated block comment."""
+    if src.startswith(b"/*", j) and src.find(b"*/", j + 2) < 0:
+        return None
+    return _skip_token(src, j, 0)
+
+
+def _astro_frontmatter(src: bytes):
+    """Return ``(start, end, after)`` of the frontmatter region or ``None`` (``after`` = index past the closing fence line)."""
+    start = _astro_frontmatter_open(src)
+    if start is None:
+        return None
+    n = len(src)
     j = start
     at_line_start = True
-    fence = re.compile(rb"---[ \t]*(\r?\n|$)")
     while j < n:
         if at_line_start:
-            m = fence.match(src, j)
+            m = _FENCE.match(src, j)
             if m is not None:
                 return start, j, m.end()
-            at_line_start = False
-        c = src[j]
-        if c == 0x0A:
-            at_line_start = True
-            j += 1
-            continue
-        if c == 0x22 or c == 0x27:
-            k = _skip_string(src, j, c)
-            at_line_start = at_line_start or False
-            j = k
-            continue
-        if c == 0x60:
-            j = _skip_template(src, j)
-            # a template may span lines; the next char decides line start
-            at_line_start = j > 0 and src[j - 1:j] == b"\n"
-            continue
-        if c == 0x2F:
-            nxt = src[j + 1:j + 2]
-            if nxt == b"/":
-                k = src.find(b"\n", j)
-                j = n if k < 0 else k
-                continue
-            if nxt == b"*":
-                k = src.find(b"*/", j + 2)
-                if k < 0:
-                    return None
-                at_line_start = False
-                j = k + 2
-                continue
-        j += 1
+        at_line_start = src[j] == 0x0A
+        j = j + 1 if at_line_start else _astro_advance(src, j)
+        if j is None:
+            return None
     return None
 
 
@@ -365,7 +394,12 @@ def _astro_frontmatter(src: bytes):
 def _region_language(attrs: dict, default: str) -> tuple[str | None, str | None]:
     """Return ``(language, skipReason)`` for a script element's attributes."""
     typ = attrs.get("type")
-    typ = typ.strip().lower() if isinstance(typ, str) else ("" if typ is None else str(typ))
+    if typ is None:
+        typ = ""
+    elif isinstance(typ, str):
+        typ = typ.strip().lower()
+    else:
+        typ = str(typ)
     if typ not in _JS_TYPES:
         return None, f"non-JavaScript script type '{typ}' (data block) not parsed"
     lang = attrs.get("lang")
@@ -398,33 +432,39 @@ def _unique(names: dict[str, int], base: str) -> str:
     return base if count == 1 else f"{base}#{count}"
 
 
+def _usable_language(plan: _Plan, block: dict, default: str, noun: str) -> str | None:
+    """Record diagnostics for a script block; return its language, or ``None`` when it is skipped or empty."""
+    lang, skip = _region_language(block["attrs"], default)
+    if not block["closed"]:
+        plan.partial = True
+        plan.diagnostics.append(f"unterminated <script> {noun}: region extends to end of file")
+    if lang is None:
+        if skip and "non-JavaScript" in skip:
+            plan.diagnostics.append(skip)
+        else:
+            plan.partial = True
+            plan.diagnostics.append(skip or _NOT_PARSED)
+        return None
+    if block["start"] >= block["end"]:
+        return None
+    return lang
+
+
 def _plan_svelte(src: bytes) -> _Plan:
     plan = _Plan()
     names: dict[str, int] = {}
     for block in _scan_html(src, mustache=True):
-        lang, skip = _region_language(block["attrs"], "javascript")
-        if not block["closed"]:
-            plan.partial = True
-            plan.diagnostics.append("unterminated <script> element: region extends to end of file")
+        lang = _usable_language(plan, block, "javascript", "element")
         if lang is None:
-            if skip and "non-JavaScript" in skip:
-                plan.diagnostics.append(skip)
-            else:
-                plan.partial = True
-                plan.diagnostics.append(skip or "script region not parsed")
-            continue
-        if block["start"] >= block["end"]:
             continue
         attrs = block["attrs"]
         if block["top"]:
             is_module = ("module" in attrs) or str(attrs.get("context", "")).lower() == "module"
-            name = _unique(names, "module" if is_module else "instance")
             kind = "module" if is_module else "instance"
         else:
-            name = _unique(names, "embedded")
             kind = "embedded"
             plan.diagnostics.append("script nested inside an element is a DOM script, not component scope; parsed as an independent 'embedded' region")
-        plan.regions.append({"name": name, "kind": kind, "language": lang, "ranges": [(block["start"], block["end"])]})
+        plan.regions.append({"name": _unique(names, kind), "kind": kind, "language": lang, "ranges": [(block["start"], block["end"])]})
     return plan
 
 
@@ -432,63 +472,69 @@ def _plan_vue(src: bytes) -> _Plan:
     plan = _Plan()
     names: dict[str, int] = {}
     for block in _scan_vue_blocks(src):
-        lang, skip = _region_language(block["attrs"], "javascript")
-        if not block["closed"]:
-            plan.partial = True
-            plan.diagnostics.append("unterminated <script> block: region extends to end of file")
+        lang = _usable_language(plan, block, "javascript", "block")
         if lang is None:
-            if skip and "non-JavaScript" in skip:
-                plan.diagnostics.append(skip)
-            else:
-                plan.partial = True
-                plan.diagnostics.append(skip or "script region not parsed")
             continue
-        if block["start"] >= block["end"]:
-            continue
-        is_setup = "setup" in block["attrs"]
-        kind = "instance" if is_setup else "module"
-        name = _unique(names, kind)
-        plan.regions.append({"name": name, "kind": kind, "language": lang, "ranges": [(block["start"], block["end"])]})
+        kind = "instance" if "setup" in block["attrs"] else "module"
+        plan.regions.append({"name": _unique(names, kind), "kind": kind, "language": lang, "ranges": [(block["start"], block["end"])]})
     return plan
+
+
+def _plan_astro_frontmatter(plan: _Plan, names: dict[str, int], src: bytes) -> int:
+    """Record the frontmatter region (if any); return the offset where ``<script>`` scanning starts."""
+    front = _astro_frontmatter(src)
+    if front is None:
+        if src.lstrip().startswith(b"---"):
+            plan.partial = True
+            plan.diagnostics.append("Astro frontmatter fence is not properly closed; frontmatter not parsed")
+        return 0
+    s, e, after = front
+    if s < e:
+        plan.regions.append({"name": "instance", "kind": "instance", "language": "typescript", "ranges": [(s, e)]})
+        names["instance"] = 1
+    return after
 
 
 def _plan_astro(src: bytes) -> _Plan:
     plan = _Plan()
     names: dict[str, int] = {}
-    start = 0
-    front = _astro_frontmatter(src)
-    if front is not None:
-        s, e, after = front
-        if s < e:
-            plan.regions.append({"name": "instance", "kind": "instance", "language": "typescript", "ranges": [(s, e)]})
-            names["instance"] = 1
-        start = after
-    elif src.lstrip().startswith(b"---"):
-        plan.partial = True
-        plan.diagnostics.append("Astro frontmatter fence is not properly closed; frontmatter not parsed")
+    start = _plan_astro_frontmatter(plan, names, src)
     for block in _scan_html(src, mustache=True, start=start, all_scripts_top_level=True):
-        lang, skip = _region_language(block["attrs"], "typescript")
-        if not block["closed"]:
-            plan.partial = True
-            plan.diagnostics.append("unterminated <script> element: region extends to end of file")
+        lang = _usable_language(plan, block, "typescript", "element")
         if lang is None:
-            if skip and "non-JavaScript" in skip:
-                plan.diagnostics.append(skip)
-            else:
-                plan.partial = True
-                plan.diagnostics.append(skip or "script region not parsed")
-            continue
-        if block["start"] >= block["end"]:
             continue
         plan.regions.append({"name": _unique(names, "module"), "kind": "module", "language": lang, "ranges": [(block["start"], block["end"])]})
     return plan
+
+
+def _ejs_tag(src: bytes, j: int) -> tuple[bytes, int, int, int] | None:
+    """Parse the EJS tag at ``src[j:j+2] == '<%'``: ``(modifier, code_start, code_end, tag_end)``, or ``None`` when unterminated."""
+    k = j + 2
+    mod = src[k:k + 1]
+    if mod in (b"=", b"-", b"_", b"#"):
+        k += 1
+    end = src.find(b"%>", k)
+    if end < 0:
+        return None
+    code_end = end
+    if code_end > k and src[code_end - 1:code_end] in (b"-", b"_"):
+        code_end -= 1
+    return mod, k, code_end, end
+
+
+def _ejs_record(mod: bytes, rng: tuple[int, int], scriptlets: list[tuple[int, int]], exprs: list[tuple[int, int]]) -> None:
+    if mod == b"#" or rng[1] <= rng[0]:
+        return
+    if mod in (b"=", b"-"):
+        exprs.append(rng)
+    else:
+        scriptlets.append(rng)
 
 
 def _plan_ejs(src: bytes) -> _Plan:
     plan = _Plan()
     scriptlets: list[tuple[int, int]] = []
     exprs: list[tuple[int, int]] = []
-    n = len(src)
     i = 0
     while True:
         j = src.find(b"<%", i)
@@ -497,25 +543,13 @@ def _plan_ejs(src: bytes) -> _Plan:
         if src.startswith(b"<%%", j):
             i = j + 3
             continue
-        k = j + 2
-        mod = src[k:k + 1]
-        if mod in (b"=", b"-", b"_", b"#"):
-            k += 1
-        end = src.find(b"%>", k)
-        if end < 0:
+        tag = _ejs_tag(src, j)
+        if tag is None:
             plan.partial = True
             plan.diagnostics.append(f"unterminated EJS tag at byte {j}; remainder not parsed")
             break
-        code_end = end
-        if code_end > k and src[code_end - 1:code_end] in (b"-", b"_"):
-            code_end -= 1
-        if mod == b"#":
-            pass
-        elif code_end > k:
-            if mod in (b"=", b"-"):
-                exprs.append((k, code_end))
-            else:
-                scriptlets.append((k, code_end))
+        mod, k, code_end, end = tag
+        _ejs_record(mod, (k, code_end), scriptlets, exprs)
         i = end + 2
     if scriptlets:
         plan.regions.append({"name": "instance", "kind": "instance", "language": "javascript", "ranges": scriptlets})
@@ -533,6 +567,38 @@ _NOTES = {
 }
 
 
+def _region_order(region: dict) -> int:
+    # module-scope regions first so that instance regions can chain to them
+    return {"module": 0, "instance": 1}.get(region["kind"], 2)
+
+
+def _region_owner(region: dict, module_ids: dict[str, str], instance_id: str | None) -> str | None:
+    if region["kind"] == "instance" and module_ids:
+        return next(iter(module_ids.values()))
+    if region["kind"] == "expression":
+        return instance_id
+    return None
+
+
+def _extract_region(ctx: common.Context, region: dict, owner: str | None) -> str | None:
+    """Parse and extract one region; return its module symbol id, or ``None`` when its grammar is unavailable."""
+    ranges = region["ranges"]
+    ctx.set_region(region["name"], region["language"])
+    try:
+        tree = ctx.parse(region["language"], ranges)
+    except common.GrammarUnavailable as exc:
+        ctx.mark_partial(f"region '{region['name']}' not parsed: grammar unavailable ({exc})")
+        return None
+    return lang_js.run_region(
+        ctx,
+        region["language"],
+        tree,
+        region=region["name"],
+        module_range=(ranges[0][0], ranges[-1][1]),
+        owner=owner,
+    )
+
+
 def extract(language: str, source: bytes, ctx: common.Context) -> dict:
     plan = _PLANNERS[language](source)
     if plan.partial:
@@ -540,38 +606,15 @@ def extract(language: str, source: bytes, ctx: common.Context) -> dict:
     for note in plan.diagnostics:
         ctx.diag(note)
     ctx.diag(_NOTES[language])
-    # Region order: module-scope regions first so that instance regions can chain to them.
     module_ids: dict[str, str] = {}
-    ordered = sorted(plan.regions, key=lambda r: 0 if r["kind"] == "module" else 1 if r["kind"] == "instance" else 2)
     instance_id: str | None = None
-    for region in ordered:
-        owner = None
-        if region["kind"] in ("instance",) and module_ids:
-            owner = next(iter(module_ids.values()))
-        elif region["kind"] == "expression":
-            owner = instance_id
-        elif region["kind"] == "module" and language == "astro":
-            owner = None
-        ranges = region["ranges"]
-        ctx.set_region(region["name"], region["language"])
-        try:
-            tree = ctx.parse(region["language"], ranges)
-        except common.ParseTimeout:
-            raise
-        except common.GrammarUnavailable as exc:
-            ctx.mark_partial(f"region '{region['name']}' not parsed: grammar unavailable ({exc})")
+    for region in sorted(plan.regions, key=_region_order):
+        mid = _extract_region(ctx, region, _region_owner(region, module_ids, instance_id))
+        if mid is None:
             continue
-        mid = lang_js.run_region(
-            ctx,
-            region["language"],
-            tree,
-            region=region["name"],
-            module_range=(ranges[0][0], ranges[-1][1]),
-            owner=owner,
-        )
         if region["kind"] == "module":
             module_ids[region["name"]] = mid
-        if region["kind"] == "instance":
+        elif region["kind"] == "instance":
             instance_id = mid
     ctx.set_region("main", language)
     return ctx.result()

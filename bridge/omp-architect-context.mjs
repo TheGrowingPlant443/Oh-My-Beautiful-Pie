@@ -15,7 +15,10 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 
 function fileStat(file) {
   try { return lstatSync(file); }
-  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 function readBoundedJson(file, maximum = MAX_JSON_BYTES) {
@@ -57,7 +60,7 @@ export function* readLines(file) {
 function safeDirectory(parent, name) {
   const candidate = path.join(parent, name);
   const stat = fileStat(candidate);
-  if (!stat || !stat.isDirectory() || stat.isSymbolicLink() || realpathSync(candidate) !== path.join(realpathSync(parent), name)) throw new Error('unknown or invalid directory');
+  if (!stat?.isDirectory() || stat.isSymbolicLink() || realpathSync(candidate) !== path.join(realpathSync(parent), name)) throw new Error('unknown or invalid directory');
   return candidate;
 }
 
@@ -75,29 +78,44 @@ function sameProducer(request, actor) {
     typeof actor.launchId === 'string' && typeof actor.sessionId === 'string';
 }
 
-// Resolve a request id to its app-owned, actor-bound request. The id selects exactly one of the fixed request roots.
-export function resolveRequest(dir, requestId, actor) {
-  if (typeof requestId !== 'string' || !REQUEST_ID.test(requestId)) throw new Error('invalid request id');
-  const root = realpathSync(dir);
+// The request roots that hold a folder for this id; the id must select exactly one.
+function requestMatches(root, requestId) {
   const matches = [];
   for (const name of REQUEST_ROOTS) {
     const parent = path.join(root, name);
     const stat = fileStat(parent);
-    if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) continue;
-    const folder = path.join(parent, requestId);
-    const folderStat = fileStat(folder);
+    if (!stat?.isDirectory() || stat.isSymbolicLink()) continue;
+    const folderStat = fileStat(path.join(parent, requestId));
     if (!folderStat) continue;
     if (!folderStat.isDirectory() || folderStat.isSymbolicLink()) throw new Error('invalid request directory');
     matches.push({ name, folder: safeDirectory(parent, requestId) });
   }
+  return matches;
+}
+
+function requestKind(name, request) {
+  if (name === 'project-security') {
+    if (request.kind !== 'project') throw new Error('invalid project request');
+    return 'project';
+  }
+  if (name === 'dependency-update-plans') {
+    if (request.kind !== 'updatePlan') throw new Error('invalid update-plan request');
+    return 'updatePlan';
+  }
+  const kind = request.kind ?? 'security';
+  if (!['security', 'usage'].includes(kind)) throw new Error('invalid request kind');
+  return kind;
+}
+
+// Resolve a request id to its app-owned, actor-bound request. The id selects exactly one of the fixed request roots.
+export function resolveRequest(dir, requestId, actor) {
+  if (typeof requestId !== 'string' || !REQUEST_ID.test(requestId)) throw new Error('invalid request id');
+  const matches = requestMatches(realpathSync(dir), requestId);
   if (matches.length !== 1) throw new Error('unknown request id');
   const { name, folder } = matches[0];
   const request = readBoundedJson(path.join(folder, 'request.json'));
   if (!object(request) || request.requestId !== requestId) throw new Error('request file does not match its id');
-  const kind = name === 'project-security' ? 'project' : name === 'dependency-update-plans' ? 'updatePlan' : (request.kind ?? 'security');
-  if (name === 'project-security' && request.kind !== 'project') throw new Error('invalid project request');
-  if (name === 'dependency-update-plans' && request.kind !== 'updatePlan') throw new Error('invalid update-plan request');
-  if (name === 'security' && !['security', 'usage'].includes(kind)) throw new Error('invalid request kind');
+  const kind = requestKind(name, request);
   if (typeof request.contextId !== 'string' || !CONTEXT_ID.test(request.contextId)) throw new Error('this request has no saved dependency context (legacy or empty review)');
   if (!sameProducer(request, actor)) throw new Error('request is bound to a different Architect launch, session or generation');
   return { kind, folder, request, contextId: request.contextId };
@@ -119,7 +137,7 @@ export function openContext(dir, contextId) {
   if (!object(summary) || summary.id !== contextId || summary.contentHash !== contextId) throw new Error('dependency context summary does not match its id');
   for (const [file, bytes] of [['packages.jsonl', summary.packagesBytes], ['edges.jsonl', summary.edgesBytes]]) {
     const stat = fileStat(path.join(folder, file));
-    if (!stat || !stat.isFile() || stat.isSymbolicLink() || stat.size !== bytes) throw new Error('dependency context is incomplete');
+    if (!stat?.isFile() || stat.isSymbolicLink() || stat.size !== bytes) throw new Error('dependency context is incomplete');
   }
   return { folder, summary };
 }
@@ -172,7 +190,7 @@ function childStatus(dir, childId) {
   if (typeof childId !== 'string' || !REQUEST_ID.test(childId)) return 'unknown';
   const folder = path.join(realpathSync(dir), 'security', childId);
   const stat = fileStat(folder);
-  if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) return 'unknown';
+  if (!stat?.isDirectory() || stat.isSymbolicLink()) return 'unknown';
   if (fileStat(path.join(folder, 'result.json'))) return 'complete';
   try {
     const terminal = readBoundedJson(path.join(folder, 'terminal.json'));
@@ -182,16 +200,22 @@ function childStatus(dir, childId) {
   return 'pending';
 }
 
+function entryStatus(dir, entry) {
+  if (entry.state === 'skipped') return 'skipped';
+  if (entry.state === 'failed') return 'error';
+  return childStatus(dir, entry.requestId);
+}
+
 function workSection(dir, resolved, offset, limit) {
   if (resolved?.kind !== 'project') throw new Error('section work is only valid for a project review request');
   const file = path.join(resolved.folder, 'work.jsonl');
   const stat = fileStat(file);
-  if (!stat || !stat.isFile() || stat.isSymbolicLink()) throw new Error('project work manifest is missing');
+  if (!stat?.isFile() || stat.isSymbolicLink()) throw new Error('project work manifest is missing');
   let total = 0;
   for (const line of readLines(file)) if (line.trim()) total += 1;
   const page = pageRecords(file, total, offset, limit, line => {
     const entry = JSON.parse(line);
-    const status = entry.state === 'skipped' ? 'skipped' : entry.state === 'failed' ? 'error' : childStatus(dir, entry.requestId);
+    const status = entryStatus(dir, entry);
     return { packageId: entry.packageId, requestId: entry.requestId, state: entry.state, status, reason: entry.reason ?? null };
   });
   return { ...page, projectRequestId: resolved.request.requestId };
@@ -238,7 +262,9 @@ export function formatProjectResult(state, requestId) {
   if (state.summary) lines.push('', state.summary);
   lines.push('', `Coverage (${state.coverage.length} direct dependencies):`);
   for (const item of state.coverage) {
-    lines.push(`- ${item.packageId} — ${item.status}${item.reason ? `: ${item.reason}` : ''}${item.requestId ? ` (review ${item.requestId})` : ''}`);
+    const reason = item.reason ? `: ${item.reason}` : '';
+    const review = item.requestId ? ` (review ${item.requestId})` : '';
+    lines.push(`- ${item.packageId} — ${item.status}${reason}${review}`);
   }
   if (state.limitations.length > 0) lines.push('', 'Limitations:', ...state.limitations.map(item => `- ${item}`));
   return lines.join('\n');

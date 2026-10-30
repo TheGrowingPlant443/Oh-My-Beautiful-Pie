@@ -27,18 +27,18 @@ export function profileDirectory(root, id) {
 
 /** The installed Windows locations the SDK probes, in its order. Nothing is downloaded or executed. */
 export function windowsChromiumCandidates(env = process.env) {
-  const programFiles = env.ProgramFiles ?? 'C:\\Program Files';
-  const programFilesX86 = env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)';
+  const programFiles = env.ProgramFiles ?? String.raw`C:\Program Files`;
+  const programFilesX86 = env['ProgramFiles(x86)'] ?? String.raw`C:\Program Files (x86)`;
   const local = env.LOCALAPPDATA;
   const join = path.win32.join;
   return [
-    join(programFiles, 'Google\\Chrome\\Application\\chrome.exe'),
-    join(programFilesX86, 'Google\\Chrome\\Application\\chrome.exe'),
-    ...(local ? [join(local, 'Google\\Chrome\\Application\\chrome.exe')] : []),
-    join(programFiles, 'Chromium\\Application\\chrome.exe'),
-    ...(local ? [join(local, 'Chromium\\Application\\chrome.exe')] : []),
-    join(programFiles, 'Microsoft\\Edge\\Application\\msedge.exe'),
-    join(programFilesX86, 'Microsoft\\Edge\\Application\\msedge.exe'),
+    join(programFiles, String.raw`Google\Chrome\Application\chrome.exe`),
+    join(programFilesX86, String.raw`Google\Chrome\Application\chrome.exe`),
+    ...(local ? [join(local, String.raw`Google\Chrome\Application\chrome.exe`)] : []),
+    join(programFiles, String.raw`Chromium\Application\chrome.exe`),
+    ...(local ? [join(local, String.raw`Chromium\Application\chrome.exe`)] : []),
+    join(programFiles, String.raw`Microsoft\Edge\Application\msedge.exe`),
+    join(programFilesX86, String.raw`Microsoft\Edge\Application\msedge.exe`),
   ];
 }
 
@@ -106,10 +106,12 @@ export class NativeChannel {
 // One browser start. It owns the shared deadline and cancellation for spawn -> connect -> initialization, and records
 // what native owns for it so exactly that job can be retired no matter where the start stops.
 class LaunchOperation {
-  constructor(owner, requestId, ms) {
+  constructor(owner, requestId) {
     this.id = randomUUID(); this.instanceId = owner.id; this.generation = owner.generation; this.requestId = requestId;
     this.owned = null; this.browser = null; this.retiring = null; this.retired = false; this.gone = false; this.spawnSent = false;
     this.cancelled = false; this.settled = false; this.reason = null;
+  }
+  start(ms) {
     this.aborted = new Promise((_, reject) => { this.reject = reject; });
     this.aborted.catch(() => {});
     this.timer = setTimeout(() => this.abort(new BrowserError('browser_launch_timeout', 'Chrome did not finish starting within 20 seconds and was closed; try Browser again.')), ms);
@@ -155,7 +157,7 @@ export class BrowserService {
   }
   owner(id, generation) {
     const owner = this.owners.get(id);
-    if (!owner || !owner.active || owner.generation !== generation || this.stopping) throw new Error('stale_generation');
+    if (!owner?.active || owner.generation !== generation || this.stopping) throw new Error('stale_generation');
     return owner;
   }
   // A human "Browser" request docks one session's browser without touching the global Embedded preference.
@@ -181,43 +183,80 @@ export class BrowserService {
     if (!this.native) return Promise.reject(new BrowserError('browser_native_unavailable', 'Native browser ownership is unavailable'));
     return timeout(this.native.request(action, { helperSession: this.helperSession, ...payload }), ms, `${action} timed out`);
   }
+  configure(p) {
+    if (typeof p.headless !== 'boolean' || typeof p.embedded !== 'boolean') throw new Error('invalid browser settings');
+    this.settings = { headless: p.headless, embedded: p.embedded };
+    // An explicit global change supersedes any per-session "Browser" request; running browsers keep their mode.
+    for (const owner of this.owners.values()) {
+      if (!owner.active) continue;
+      owner.forceVisible = false;
+      this.state(owner, owner.state, owner.error ?? null);
+    }
+    return null;
+  }
+  register(p) {
+    if (typeof p.instanceId !== 'string' || !p.instanceId || !Number.isSafeInteger(p.generation) || p.generation < 0) throw new Error('invalid browser owner');
+    return this.serial(p.instanceId, async () => {
+      if (this.stopping) throw new Error('browser service closed');
+      const previous = this.owners.get(p.instanceId);
+      if (previous?.active && previous.generation === p.generation) return null;
+      // The old generation's browser job must be verified gone before its replacement can exist.
+      if (previous) { previous.active = false; await this.closeOwner(previous); }
+      if (this.stopping) throw new Error('browser service closed');
+      this.owners.set(p.instanceId, { id: p.instanceId, generation: p.generation, active: true, epoch: 0, forceVisible: false,
+        headless: this.settings.headless, state: 'closed', tabs: new Map(), pendingTabs: new Map(), browser: null, native: null, op: null, launching: null, closing: null });
+      return null;
+    });
+  }
+  async shutdown() {
+    this.stopping = true;
+    const owners = [...this.owners.values()];
+    for (const owner of owners) owner.active = false;
+    await Promise.allSettled(this.turns.values());
+    const results = await Promise.allSettled(owners.map(owner => this.closeOwner(owner)));
+    this.server?.stop(true);
+    const failed = results.find(result => result.status === 'rejected');
+    if (failed) throw failed.reason;
+    return null;
+  }
+  async openVisible(owner, p, requestId) {
+    if (typeof p.restartHeadless !== 'boolean') throw new Error('invalid browser visibility request');
+    await owner.closing; await owner.launching?.catch(() => {});
+    this.owner(owner.id, owner.generation);
+    if (owner.browser?.connected && owner.headless) {
+      // Only this explicitly consented path may discard a running browser's tabs.
+      if (!p.restartHeadless) throw new Error('browser_headless_restart_required');
+      await this.closeOwner(owner); this.owner(owner.id, owner.generation);
+    }
+    const previous = owner.forceVisible;
+    owner.forceVisible = true;
+    try {
+      await this.ensureBrowser(owner, requestId);
+      this.owner(owner.id, owner.generation);
+      await this.ensureVisiblePage(owner);
+      this.owner(owner.id, owner.generation);
+    } catch (error) { owner.forceVisible = previous; throw error; }
+    this.state(owner, owner.state, owner.error ?? null);
+    return this.row(owner);
+  }
   async dispatch(action, p = {}, requestId = null) {
     if (this.stopping && action !== 'shutdown') throw new Error('browser service closed');
-    if (action === 'configure') {
-      if (typeof p.headless !== 'boolean' || typeof p.embedded !== 'boolean') throw new Error('invalid browser settings');
-      this.settings = { headless: p.headless, embedded: p.embedded };
-      // An explicit global change supersedes any per-session "Browser" request; running browsers keep their mode.
-      for (const o of this.owners.values()) if (o.active) { o.forceVisible = false; this.state(o, o.state, o.error ?? null); }
-      return null;
+    switch (action) {
+      case 'configure': return this.configure(p);
+      case 'register': return this.register(p);
+      case 'snapshot': return [...this.owners.values()].filter(owner => owner.active).map(owner => this.row(owner));
+      case 'shutdown': return this.shutdown();
+      case 'revoke':
+        return this.serial(p.instanceId, async () => {
+          const owner = this.owner(p.instanceId, p.generation);
+          owner.active = false;
+          await this.closeOwner(owner);
+          return null;
+        });
+      default: return this.dispatchOwner(action, p, requestId);
     }
-    if (action === 'register') {
-      if (typeof p.instanceId !== 'string' || !p.instanceId || !Number.isSafeInteger(p.generation) || p.generation < 0) throw new Error('invalid browser owner');
-      return this.serial(p.instanceId, async () => {
-        if (this.stopping) throw new Error('browser service closed');
-        const previous = this.owners.get(p.instanceId);
-        if (previous?.active && previous.generation === p.generation) return null;
-        // The old generation's browser job must be verified gone before its replacement can exist.
-        if (previous) { previous.active = false; await this.closeOwner(previous); }
-        if (this.stopping) throw new Error('browser service closed');
-        this.owners.set(p.instanceId, { id: p.instanceId, generation: p.generation, active: true, epoch: 0, forceVisible: false,
-          headless: this.settings.headless, state: 'closed', tabs: new Map(), pendingTabs: new Map(), browser: null, native: null, op: null, launching: null, closing: null });
-        return null;
-      });
-    }
-    if (action === 'snapshot') return [...this.owners.values()].filter(o => o.active).map(o => this.row(o));
-    if (action === 'shutdown') {
-      this.stopping = true;
-      const owners = [...this.owners.values()]; for (const owner of owners) owner.active = false;
-      await Promise.allSettled([...this.turns.values()]);
-      const results = await Promise.allSettled(owners.map(o => this.closeOwner(o)));
-      this.server?.stop(true);
-      const failed = results.find(result => result.status === 'rejected');
-      if (failed) throw failed.reason;
-      return null;
-    }
-    if (action === 'revoke') {
-      return this.serial(p.instanceId, async () => { const owner = this.owner(p.instanceId, p.generation); owner.active = false; await this.closeOwner(owner); return null; });
-    }
+  }
+  async dispatchOwner(action, p, requestId) {
     const owner = this.owner(p.instanceId, p.generation);
     if (action === 'closeTab') {
       const tabs = p.name === null ? [...owner.tabs.values()] : [owner.tabs.get(p.name)].filter(Boolean);
@@ -226,25 +265,16 @@ export class BrowserService {
     }
     // Ticket-free discovery for the adapter: never launches a browser, binds hand-opened pages as tab-N.
     if (action === 'listTabs') return owner.browser?.connected && !owner.closing ? this.listTabs(owner) : [];
-    if (action === 'openVisible') {
-      if (typeof p.restartHeadless !== 'boolean') throw new Error('invalid browser visibility request');
-      await owner.closing; await owner.launching?.catch(() => {});
-      this.owner(owner.id, owner.generation);
-      if (owner.browser?.connected && owner.headless) {
-        // Only this explicitly consented path may discard a running browser's tabs.
-        if (!p.restartHeadless) throw new Error('browser_headless_restart_required');
-        await this.closeOwner(owner); this.owner(owner.id, owner.generation);
-      }
-      const previous = owner.forceVisible;
-      owner.forceVisible = true;
-      try { await this.ensureBrowser(owner, requestId); this.owner(owner.id, owner.generation); await this.ensureVisiblePage(owner); this.owner(owner.id, owner.generation); }
-      catch (error) { owner.forceVisible = previous; throw error; }
-      this.state(owner, owner.state, owner.error ?? null);
-      return this.row(owner);
-    }
+    if (action === 'openVisible') return this.openVisible(owner, p, requestId);
+    this.checkTabRequest(action, p);
+    return this.ensureTab(owner, p, requestId);
+  }
+  checkTabRequest(action, p) {
     if (p.target !== undefined && (typeof p.target !== 'string' || !p.target || p.target.length > 512)) throw new Error('invalid browser tab target');
     if (typeof p.name !== 'string' || !p.name) throw new Error('browser tab name is required');
     if (action !== 'ensureTab') throw new Error('unknown browser service action');
+  }
+  async ensureTab(owner, p, requestId) {
     if (owner.closing) throw new Error('Browser is closing; reopen it with browser.open');
     await this.ensureBrowser(owner, requestId);
     this.owner(owner.id, owner.generation);
@@ -254,23 +284,8 @@ export class BrowserService {
       if (!pending) {
         const browser = owner.browser;
         const op = owner.op;
-        pending = timeout(this.exclusive(owner, async () => {
-          let page;
-          if (p.target !== undefined) {
-            const hit = await this.pageByTarget(owner, p.target);
-            // Renaming an automatically attached tab: the page stays open under the requested name.
-            if (hit.tab) this.invalidateTab(owner, hit.tab);
-            page = hit.page;
-          } else {
-            const mayAdopt = !owner.adoptedBlank;
-            owner.adoptedBlank = true;
-            const initial = mayAdopt ? await browser.pages() : [];
-            page = initial.length === 1 && initial[0].url() === 'about:blank' ? initial[0] : await browser.newPage();
-          }
-          if (!owner.active || owner.browser !== browser || owner.closing) { if (p.target === undefined) await page.close(); throw new Error('stale_generation'); }
-          return this.bindPage(owner, p.name, page, false);
-        }), 20000, tabTimeout).catch(async error => {
-          if (error.message === tabTimeout && op) await this.terminateOp(op).catch(blocked => this.log('tab-timeout retirement blocked', owner.id, String(blocked.message ?? blocked)));
+        pending = timeout(this.exclusive(owner, () => this.createTab(owner, p, browser)), 20000, tabTimeout).catch(async error => {
+          if (error.message === tabTimeout && op) await this.terminateOp(op).catch(error_ => this.log('tab-timeout retirement blocked', owner.id, String(error_.message ?? error_)));
           throw error;
         }).finally(() => owner.pendingTabs.delete(p.name));
         owner.pendingTabs.set(p.name, pending);
@@ -280,6 +295,25 @@ export class BrowserService {
     if (!owner.active || owner.tabs.get(p.name) !== tab) throw new Error(closedTab);
     // browserURL resolves /json/version against the origin, discarding paths.
     return { epoch:owner.epoch, tabEpoch:tab.epoch, cdpUrl:`http://${tab.capability}.localhost:${this.server.port}` };
+  }
+  async createTab(owner, p, browser) {
+    let page;
+    if (p.target !== undefined) {
+      const hit = await this.pageByTarget(owner, p.target);
+      // Renaming an automatically attached tab: the page stays open under the requested name.
+      if (hit.tab) this.invalidateTab(owner, hit.tab);
+      page = hit.page;
+    } else {
+      const mayAdopt = !owner.adoptedBlank;
+      owner.adoptedBlank = true;
+      const initial = mayAdopt ? await browser.pages() : [];
+      page = initial.length === 1 && initial[0].url() === 'about:blank' ? initial[0] : await browser.newPage();
+    }
+    if (!owner.active || owner.browser !== browser || owner.closing) {
+      if (p.target === undefined) await page.close();
+      throw new Error('stale_generation');
+    }
+    return this.bindPage(owner, p.name, page, false);
   }
   // Page creation and tab binding are serialized so a hand-opened tab is never bound twice.
   exclusive(owner, work) {
@@ -305,7 +339,10 @@ export class BrowserService {
       for (const page of await owner.browser.pages()) {
         if (page.isClosed() || page.url().startsWith('devtools://') || bound.has(page)) continue;
         let name;
-        do { name = `tab-${owner.autoTabs = (owner.autoTabs ?? 0) + 1}`; } while (owner.tabs.has(name));
+        do {
+          owner.autoTabs = (owner.autoTabs ?? 0) + 1;
+          name = `tab-${owner.autoTabs}`;
+        } while (owner.tabs.has(name));
         try { await this.bindPage(owner, name, page, true); } catch (error) { if (!page.isClosed()) throw error; }
       }
     });
@@ -328,7 +365,8 @@ export class BrowserService {
     const hit = hits.find(row => !row.tab || row.tab.auto);
     if (hit) return hit;
     if (hits.length) throw new Error(`The matching page is already attached as tab ${JSON.stringify(hits[0].tab.name)}`);
-    throw new Error(`No browser page matched ${JSON.stringify(target)}. Available pages:\n${rows.map(row => `- ${row.title || '(untitled)'}  ${row.url}`).join('\n') || '(none)'}`);
+    const available = rows.map(row => `- ${row.title || '(untitled)'}  ${row.url}`).join('\n') || '(none)';
+    throw new Error(`No browser page matched ${JSON.stringify(target)}. Available pages:\n${available}`);
   }
   async listTabs(owner) {
     await this.syncPages(owner);
@@ -357,7 +395,8 @@ export class BrowserService {
   async ensureBrowser(owner, requestId = null) {
     if (owner.browser?.connected && owner.native) return;
     if (!owner.launching) {
-      const op = new LaunchOperation(owner, requestId, LAUNCH_DEADLINE_MS);
+      const op = new LaunchOperation(owner, requestId);
+      op.start(LAUNCH_DEADLINE_MS);
       owner.op = op;
       owner.launching = this.launch(owner, op).finally(() => { op.settle(); owner.launching = null; });
     }
@@ -415,7 +454,7 @@ export class BrowserService {
       let message = String(error.message ?? error).replace(/(?:wss?|https?):\/\/(?:127\.0\.0\.1|\[::1\]|localhost)[^\s]*/g, '[browser endpoint]');
       op.abort(error);
       try { await this.terminateOp(op); }
-      catch (blocked) { message += ` (cleanup is blocked and will be retried: ${String(blocked.message ?? blocked)})`; }
+      catch (error_) { message += ` (cleanup is blocked and will be retried: ${String(error_.message ?? error_)})`; }
       this.log('launch', owner.id, 'phase=failed', message);
       if (message !== 'stale_generation') this.state(owner, 'error', message);
       else if (owner.active && !owner.closing) this.state(owner, 'closed');
@@ -434,7 +473,7 @@ export class BrowserService {
     op.gone = true;
     if (!op.settled) op.abort(new BrowserError('browser_disconnected', 'Chrome closed while it was starting'));
     if (owner.op === op && owner.browser === browser) {
-      for (const tab of [...owner.tabs.values()]) this.invalidateTab(owner, tab);
+      for (const tab of owner.tabs.values()) this.invalidateTab(owner, tab);
       owner.browser = null; owner.native = null;
       this.state(owner, 'closed');
     }
@@ -443,7 +482,7 @@ export class BrowserService {
   invalidateTab(owner, tab) {
     if (owner.tabs.get(tab.name) === tab) owner.tabs.delete(tab.name);
     this.capabilities.delete(tab.capability);
-    for (const proxy of [...tab.sockets]) proxy.close();
+    for (const proxy of tab.sockets) proxy.close();
   }
   trackExit(id, promise) {
     const settled = promise.then(() => {}, error => this.log('retirement blocked', id, String(error.message ?? error)));
@@ -477,10 +516,10 @@ export class BrowserService {
   closeOwner(owner) {
     if (owner.closing) return owner.closing;
     owner.closing = (async () => {
-      for (const tab of [...owner.tabs.values()]) this.invalidateTab(owner, tab);
+      for (const tab of owner.tabs.values()) this.invalidateTab(owner, tab);
       owner.op?.abort(new Error('stale_generation'));
       await owner.launching?.catch(() => {});
-      await Promise.allSettled([...owner.pendingTabs.values()]);
+      await Promise.allSettled(owner.pendingTabs.values());
       await this.exits.get(owner.id);
       try {
         for (const op of new Set([owner.op, this.blocked.get(owner.id)])) if (op) await this.terminateOp(op);
@@ -505,8 +544,8 @@ export class BrowserService {
     });
   }
   fetch(req, server) {
-    const remote = server.requestIP(req)?.address;
-    if (remote !== '127.0.0.1' && remote !== '::ffff:127.0.0.1' && remote !== '::1') return new Response('Forbidden',{status:403});
+    const remote = server.requestIP(req)?.address.replace(/^::ffff:/, '');
+    if (remote !== '127.0.0.1' && remote !== '::1') return new Response('Forbidden',{status:403});
     const url = new URL(req.url);
     const match = /^\/cdp\/([a-f0-9]{48})\/(\d+)\/(\d+)\/devtools\/browser$/.exec(url.pathname);
     const hostCapability = /^([a-f0-9]{48})\.localhost$/.exec(url.hostname)?.[1];
@@ -524,6 +563,12 @@ export class BrowserService {
   }
 }
 
+const BROWSER_TARGET_METHODS = new Set(['Target.attachToTarget', 'Target.getTargetInfo']);
+const DENIED_METHODS = new Set(['Target.sendMessageToTarget', 'Target.setRemoteLocations', 'Target.createBrowserContext', 'Target.disposeBrowserContext']);
+const BROWSER_METHODS = new Set(['Browser.getVersion', 'Browser.getWindowForTarget', 'Browser.setDownloadBehavior']);
+const BROWSER_SCOPE_METHODS = new Set(['Target.getTargets', 'Target.getTargetInfo', 'Target.attachToTarget', 'Target.attachToBrowserTarget', 'Target.detachFromTarget',
+  'Target.setDiscoverTargets', 'Target.setAutoAttach', 'Target.createTarget', 'Target.closeTarget', 'Target.activateTarget', 'Target.getBrowserContexts', 'Schema.getDomains', ...BROWSER_METHODS]);
+
 // Every connection sees one named page plus its own descendants, never peer pages.
 class ScopedCdpProxy {
   constructor(tab) { this.tab=tab; this.allowed=new Set([tab.targetId,tab.owner.browserTargetId,...(tab.containerId?[tab.containerId]:[])]); this.frames=new Set([tab.targetId]);this.downloadGuids=new Set();this.sessions=new Map(); this.pending=new Map(); this.internalPending=new Map(); this.downstreamIds=new Set(); this.nextId=0; this.closed=false; this.creating=0;this.delayed=[]; }
@@ -536,7 +581,7 @@ class ScopedCdpProxy {
     this.upstream.onclose=()=>this.close();
   }
   send(value) { if (!this.closed) this.socket.send(JSON.stringify(value)); }
-  internal(method,params={},sessionId) {
+  internal(method, params, sessionId) {
     if(this.internalPending.size+this.pending.size>=1024)return Promise.reject(new Error('Too many pending CDP commands'));
     const id=++this.nextId;
     const result=new Promise((resolve,reject)=>{this.internalPending.set(id,{resolve,reject});this.upstream.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}));});
@@ -550,108 +595,165 @@ class ScopedCdpProxy {
     }
     return false;
   }
+  reserve(message) {
+    if (!Number.isSafeInteger(message.id) || typeof message.method!=='string' || this.downstreamIds.has(message.id)) throw new Error('Invalid CDP request');
+    if (this.downstreamIds.size>=1024) throw new Error('Too many pending CDP requests');
+    this.downstreamIds.add(message.id);
+  }
+  checkTargets(params,sessionId) {
+    if (sessionId && !this.sessions.has(sessionId)) throw new Error('CDP session is outside this named tab');
+    for(const key of ['targetId','openerId']) if(params[key] && !this.allowed.has(params[key])) throw new Error('CDP target is outside this named tab');
+    if (params.sessionId && !this.sessions.has(params.sessionId)) throw new Error('CDP session is outside this named tab');
+  }
+  checkMethod(method,params,sessionId) {
+    if (params.targetId===this.tab.owner.browserTargetId && !BROWSER_TARGET_METHODS.has(method)) throw new Error('CDP browser target cannot be controlled through this named tab');
+    if (DENIED_METHODS.has(method) || (method.startsWith('Browser.') && !BROWSER_METHODS.has(method))) throw new Error('CDP operation is outside this named tab');
+    const browserScope = !sessionId || this.sessions.get(sessionId)===this.tab.owner.browserTargetId;
+    if (browserScope && !BROWSER_SCOPE_METHODS.has(method)) throw new Error('CDP browser operation is outside this named tab');
+  }
+  // Validates one downstream request against this tab's scope and returns the request to forward.
+  scope(message) {
+    const {method,params={},sessionId}=message;
+    this.checkTargets(params,sessionId);
+    this.checkMethod(method,params,sessionId);
+    if (method==='Target.createTarget' && (params.browserContextId || params.newWindow)) throw new Error('CDP new window/context is outside this named tab');
+    const implicit = (method==='Target.getTargetInfo' && !sessionId) || method==='Browser.getWindowForTarget';
+    return implicit && !params.targetId ? {...message,params:{...params,targetId:this.tab.targetId}} : message;
+  }
   async receive(data) {
     let message; let reserved=false;
     try {
       if (Buffer.byteLength(data)>MAX_FRAME) throw new Error('CDP frame exceeds transport limit');
       message=JSON.parse(String(data));
-      if (!Number.isSafeInteger(message.id) || typeof message.method!=='string' || this.downstreamIds.has(message.id)) throw new Error('Invalid CDP request');
-      if (this.downstreamIds.size>=1024) throw new Error('Too many pending CDP requests');
-      this.downstreamIds.add(message.id);reserved=true;
+      this.reserve(message);
+      reserved=true;
       await this.opened;
-      if(this.closed)return;
-      const {method,params={},sessionId}=message;
-      if (sessionId && !this.sessions.has(sessionId)) throw new Error('CDP session is outside this named tab');
-      for(const key of ['targetId','openerId']) if(params[key] && !this.allowed.has(params[key])) throw new Error('CDP target is outside this named tab');
-      if (params.sessionId && !this.sessions.has(params.sessionId)) throw new Error('CDP session is outside this named tab');
-      if (params.targetId===this.tab.owner.browserTargetId && !['Target.attachToTarget','Target.getTargetInfo'].includes(method)) throw new Error('CDP browser target cannot be controlled through this named tab');
-      if (['Target.sendMessageToTarget','Target.setRemoteLocations','Target.createBrowserContext','Target.disposeBrowserContext'].includes(method) || (method.startsWith('Browser.') && !['Browser.getVersion','Browser.getWindowForTarget','Browser.setDownloadBehavior'].includes(method))) throw new Error('CDP operation is outside this named tab');
-      const browserScope = !sessionId || this.sessions.get(sessionId)===this.tab.owner.browserTargetId;
-      if (browserScope && !['Target.getTargets','Target.getTargetInfo','Target.attachToTarget','Target.attachToBrowserTarget','Target.detachFromTarget','Target.setDiscoverTargets','Target.setAutoAttach','Target.createTarget','Target.closeTarget','Target.activateTarget','Target.getBrowserContexts','Browser.getVersion','Browser.getWindowForTarget','Browser.setDownloadBehavior','Schema.getDomains'].includes(method)) throw new Error('CDP browser operation is outside this named tab');
-      if (method==='Target.getTargetInfo' && !params.targetId && !sessionId) { message={...message,params:{...params,targetId:this.tab.targetId}}; }
-      if (method==='Browser.getWindowForTarget' && !params.targetId) message={...message,params:{...params,targetId:this.tab.targetId}};
-      if (method==='Target.createTarget' && (params.browserContextId || params.newWindow)) throw new Error('CDP new window/context is outside this named tab');
+      if (this.closed) return;
+      message=this.scope(message);
       const id=++this.nextId;
-      this.pending.set(id,{...message});this.downstreamIds.add(message.id);
-      if(method==='Target.createTarget')this.creating++;
+      this.pending.set(id,{...message});
+      if (message.method==='Target.createTarget') this.creating++;
       this.upstream.send(JSON.stringify({...message,id}));
-    } catch(error) { if(reserved)this.downstreamIds.delete(message.id);if(message?.id!==undefined)this.send({id:message.id,error:{code:-32000,message:String(error.message??error)}});else this.close(); }
+    } catch(error) { this.replyError(message,reserved,error); }
+  }
+  replyError(message,reserved,error) {
+    if (reserved) this.downstreamIds.delete(message.id);
+    if (message?.id!==undefined) this.send({id:message.id,error:{code:-32000,message:String(error.message??error)}});
+    else this.close();
   }
   forward(message) {
     if (this.closed) return;
-    if (message.id!==undefined) {
-      const internal=this.internalPending.get(message.id);
-      if(internal){this.internalPending.delete(message.id);if(message.error)internal.reject(new Error(message.error.message));else internal.resolve(message.result);return;}
-      const request=this.pending.get(message.id);if(!request)return;
-      this.pending.delete(message.id);this.downstreamIds.delete(request.id);
-      if (request.method==='Target.getTargets' && message.result) message.result.targetInfos=message.result.targetInfos.filter(info=>this.permits(info,request.sessionId));
-      if (request.method==='Page.getFrameTree' && message.result?.frameTree) {
-        const collect=tree=>{this.frames.add(tree.frame.id);for(const child of tree.childFrames??[])collect(child);};collect(message.result.frameTree);
-      }
-      if (request.method==='Target.getTargetInfo' && message.result && !this.permits(message.result.targetInfo,request.sessionId)) message={error:{code:-32000,message:'CDP target is outside this named tab'}};
-      if (request.method==='Target.createTarget') {
-        void (async()=>{
-          try {
-            if(message.result?.targetId){
-              const target=await this.tab.owner.browser.waitForTarget(target=>target._targetId===message.result.targetId,{timeout:10000});
-              const page=await target.page();if(!page)throw new Error('Created CDP target has no page');
-              const parent=await page._client().parentSession().send('Target.getTargetInfo');
-              this.allowed.add(message.result.targetId);
-              if(parent.targetInfo.type==='tab')this.allowed.add(parent.targetInfo.targetId);
-            }
-          }catch{message={error:{code:-32000,message:'Could not bind the newly created browser target'}};}
-          finally{
-            this.creating--;
-            if(!this.creating){const delayed=this.delayed;this.delayed=[];for(const event of delayed)this.forward(event);}
-            this.send({...message,id:request.id});
-          }
-        })().catch(()=>this.close());
-        return;
-      }
-      if (request.method==='Target.attachToBrowserTarget' && message.result?.sessionId) this.sessions.set(message.result.sessionId,this.tab.owner.browserTargetId);
-      if (request.method==='Target.attachToTarget' && message.result?.sessionId) this.sessions.set(message.result.sessionId,request.params.targetId);
-      this.send({...message,id:request.id});return;
+    if (message.id===undefined) this.event(message); else this.respond(message);
+  }
+  respond(message) {
+    const internal=this.internalPending.get(message.id);
+    if (internal) {
+      this.internalPending.delete(message.id);
+      if (message.error) internal.reject(new Error(message.error.message)); else internal.resolve(message.result);
+      return;
     }
-    const {method,params={},sessionId}=message;
-    if(this.creating && method.startsWith('Target.')){
-      if(method==='Target.attachedToTarget'&&params.waitingForDebugger)void this.internal('Runtime.runIfWaitingForDebugger',{},params.sessionId).catch(()=>this.close());
-      if(this.delayed.length>=1024){this.close();return;}
-      this.delayed.push(message);return;
+    const request=this.pending.get(message.id);
+    if (!request) return;
+    this.pending.delete(message.id); this.downstreamIds.delete(request.id);
+    const answer=this.filterResult(request,message);
+    if (request.method==='Target.createTarget') { void this.bindCreated(request,answer).catch(()=>this.close()); return; }
+    this.trackSession(request,answer);
+    this.send({...answer,id:request.id});
+  }
+  filterResult(request,message) {
+    if (request.method==='Target.getTargets' && message.result) message.result.targetInfos=message.result.targetInfos.filter(info=>this.permits(info,request.sessionId));
+    if (request.method==='Page.getFrameTree' && message.result?.frameTree) this.collectFrames(message.result.frameTree);
+    if (request.method==='Target.getTargetInfo' && message.result && !this.permits(message.result.targetInfo,request.sessionId)) return {error:{code:-32000,message:'CDP target is outside this named tab'}};
+    return message;
+  }
+  collectFrames(tree) {
+    this.frames.add(tree.frame.id);
+    for (const child of tree.childFrames??[]) this.collectFrames(child);
+  }
+  trackSession(request,message) {
+    const sessionId=message.result?.sessionId;
+    if (!sessionId) return;
+    if (request.method==='Target.attachToBrowserTarget') this.sessions.set(sessionId,this.tab.owner.browserTargetId);
+    else if (request.method==='Target.attachToTarget') this.sessions.set(sessionId,request.params.targetId);
+  }
+  async allowCreated(targetId) {
+    const target=await this.tab.owner.browser.waitForTarget(candidate=>candidate._targetId===targetId,{timeout:10000});
+    const page=await target.page();
+    if (!page) throw new Error('Created CDP target has no page');
+    const parent=await page._client().parentSession().send('Target.getTargetInfo');
+    this.allowed.add(targetId);
+    if (parent.targetInfo.type==='tab') this.allowed.add(parent.targetInfo.targetId);
+  }
+  // Events held back while a created target is being bound are replayed afterwards, then the creating request is answered.
+  async bindCreated(request,message) {
+    let answer=message;
+    try {
+      if (message.result?.targetId) await this.allowCreated(message.result.targetId);
+    } catch { answer={error:{code:-32000,message:'Could not bind the newly created browser target'}}; }
+    finally {
+      this.creating--;
+      if (!this.creating) { const delayed=this.delayed; this.delayed=[]; for (const event of delayed) this.forward(event); }
+      this.send({...answer,id:request.id});
     }
+  }
+  delay(message) {
+    const {method,params={}}=message;
+    if (method==='Target.attachedToTarget' && params.waitingForDebugger) void this.internal('Runtime.runIfWaitingForDebugger',{},params.sessionId).catch(()=>this.close());
+    if (this.delayed.length>=1024) { this.close(); return; }
+    this.delayed.push(message);
+  }
+  // Detaching before Runtime acknowledges resume can leave another page paused.
+  async detachUnpermitted(params,sessionId) {
+    if (params.waitingForDebugger) await this.internal('Runtime.runIfWaitingForDebugger',{},params.sessionId);
+    await this.internal('Target.detachFromTarget',{sessionId:params.sessionId},sessionId);
+  }
+  // Whether an upstream event belongs to this tab; permitted attaches and detaches also update the session table.
+  admitEvent(method,params,sessionId) {
     if (method==='Target.attachedToTarget') {
-      if (this.permits(params.targetInfo,sessionId)) this.sessions.set(params.sessionId,params.targetInfo.targetId);
-      else {
-        // Detaching before Runtime acknowledges resume can leave another page paused.
-        void (async()=>{
-          if(params.waitingForDebugger)await this.internal('Runtime.runIfWaitingForDebugger',{},params.sessionId);
-          await this.internal('Target.detachFromTarget',{sessionId:params.sessionId},sessionId);
-        })().catch(()=>this.close());
-        return;
-      }
-    } else if (method==='Target.detachedFromTarget') {
-      if(!this.sessions.has(params.sessionId))return;this.sessions.delete(params.sessionId);
-    } else if (params.targetInfo && !this.permits(params.targetInfo,sessionId)) return;
-    else if (params.targetId && !this.allowed.has(params.targetId)) return;
-    if (sessionId && !this.sessions.has(sessionId)) return;
-    if(method==='Browser.downloadWillBegin'){
-      if(!this.frames.has(params.frameId))return;
-      this.downloadGuids.add(params.guid);
-    }else if(method==='Browser.downloadProgress'){
-      if(!this.downloadGuids.has(params.guid))return;
-      if(params.state==='completed'||params.state==='canceled')this.downloadGuids.delete(params.guid);
+      if (this.permits(params.targetInfo,sessionId)) { this.sessions.set(params.sessionId,params.targetInfo.targetId); return true; }
+      void this.detachUnpermitted(params,sessionId).catch(()=>this.close());
+      return false;
     }
-    if(method==='Page.frameNavigated'&&params.frame)this.frames.add(params.frame.id);
-    if(method==='Page.frameAttached')this.frames.add(params.frameId);
-    if(method==='Page.frameDetached')this.frames.delete(params.frameId);
+    if (method==='Target.detachedFromTarget') {
+      if (!this.sessions.has(params.sessionId)) return false;
+      this.sessions.delete(params.sessionId);
+      return true;
+    }
+    if (params.targetInfo && !this.permits(params.targetInfo,sessionId)) return false;
+    return !params.targetId || this.allowed.has(params.targetId);
+  }
+  trackDownload(method,params) {
+    if (method==='Browser.downloadWillBegin') {
+      if (!this.frames.has(params.frameId)) return false;
+      this.downloadGuids.add(params.guid);
+    } else if (method==='Browser.downloadProgress') {
+      if (!this.downloadGuids.has(params.guid)) return false;
+      if (params.state==='completed'||params.state==='canceled') this.downloadGuids.delete(params.guid);
+    }
+    return true;
+  }
+  trackFrames(method,params) {
+    if (method==='Page.frameNavigated' && params.frame) this.frames.add(params.frame.id);
+    if (method==='Page.frameAttached') this.frames.add(params.frameId);
+    if (method==='Page.frameDetached') this.frames.delete(params.frameId);
+  }
+  event(message) {
+    const {method,params={},sessionId}=message;
+    if (this.creating && method.startsWith('Target.')) { this.delay(message); return; }
+    if (!this.admitEvent(method,params,sessionId)) return;
+    if (sessionId && !this.sessions.has(sessionId)) return;
+    if (!this.trackDownload(method,params)) return;
+    this.trackFrames(method,params);
     if (method==='Target.targetDestroyed') this.allowed.delete(params.targetId);
     this.send(message);
   }
   close() {
-    if(this.closed)return;this.closed=true;
-    this.tab.sockets.delete(this);this.pending.clear();this.downstreamIds.clear();
-    for(const call of this.internalPending.values())call.reject(new Error('CDP disconnected'));
-    this.internalPending.clear();this.delayed=[];
-    this.socket?.close();this.upstream?.close();
+    if (this.closed) return;
+    this.closed=true;
+    this.tab.sockets.delete(this); this.pending.clear(); this.downstreamIds.clear();
+    for (const call of this.internalPending.values()) call.reject(new Error('CDP disconnected'));
+    this.internalPending.clear(); this.delayed=[];
+    this.socket?.close(); this.upstream?.close();
   }
 }
 
@@ -669,21 +771,36 @@ if (import.meta.main) {
   const helperSession=session||randomBytes(16).toString('hex');
   const native=new NativeChannel(output);
   const service=new BrowserService(root,sdkDir,state=>{log('state',state.instanceId,state.state,`pid=${state.pid}`,state.error??'');output({type:'state',data:state});},{native,log,helperSession});
-  await service.start();output({type:'ready',helperSession});
+  await service.start(); output({type:'ready',helperSession});
   let chunks=[];let bytes=0;
+  const respond=frame=>{
+    const started=Date.now();
+    // Keep stdin free for native replies and concurrent supervisor actions.
+    return service.dispatch(frame.action,frame.payload,frame.id).then(data=>{
+      log(frame.action,'ok',`${Date.now()-started}ms`);
+      return {type:'response',id:frame.id,ok:true,data};
+    }).catch(error=>{
+      log(frame.action,'failed',`${Date.now()-started}ms`,String(error.message??error));
+      return {type:'response',id:frame.id,ok:false,error:String(error.message??error)};
+    }).then(output);
+  };
   try {
     for await (const chunk of process.stdin) {
       let offset=0;
       while(offset<chunk.length){
         const newline=chunk.indexOf(10,offset);const end=newline<0?chunk.length:newline;
-        const part=chunk.subarray(offset,end);bytes+=part.length;if(bytes>MAX_FRAME)throw new Error('browser frame exceeds transport limit');chunks.push(part);offset=end+1;
+        const part=chunk.subarray(offset,end);bytes+=part.length;
+        if(bytes>MAX_FRAME)throw new Error('browser frame exceeds transport limit');
+        chunks.push(part);offset=end+1;
         if(newline<0)break;
         const frame=JSON.parse(Buffer.concat(chunks,bytes).toString('utf8'));chunks=[];bytes=0;
         // Native answers to this helper's own requests are demultiplexed from the supervisor's actions.
-        if(frame.type==='native_response'){if(typeof frame.id==='string')native.receive(frame);continue;}
+        if(frame.type==='native_response'){
+          if(typeof frame.id==='string')native.receive(frame);
+          continue;
+        }
         if(typeof frame.id!=='string'||typeof frame.action!=='string')throw new Error('invalid browser frame');
-        const started=Date.now();
-        void service.dispatch(frame.action,frame.payload,frame.id).then(data=>{log(frame.action,'ok',`${Date.now()-started}ms`);output({type:'response',id:frame.id,ok:true,data});},error=>{log(frame.action,'failed',`${Date.now()-started}ms`,String(error.message??error));output({type:'response',id:frame.id,ok:false,error:String(error.message??error)});});
+        void respond(frame);
       }
     }
   } catch (error) { log('stdin loop failed',String(error?.stack??error)); process.exitCode=1; }

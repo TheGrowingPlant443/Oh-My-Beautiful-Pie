@@ -54,7 +54,7 @@ class RustRecipeTests(unittest.TestCase):
     def test_declarations(self):
         r = self.r
         fns = {s["qualifiedName"] for s in syms(r, "function")}
-        self.assertTrue({"inline::q", "main", "main::nested", "shadow", "ping", "pong", "unused", "Größe", "größe"} <= fns)
+        self.assertLessEqual({"inline::q", "main", "main::nested", "shadow", "ping", "pong", "unused", "Größe", "größe"}, fns)
         methods = {s["qualifiedName"]: s for s in syms(r, "method")}
         self.assertEqual(set(methods), {"Tr::dflt", "S::new", "S::m", "S::sig"})
         self.assertTrue(methods["S::new"]["bindings"]["static"])
@@ -93,6 +93,31 @@ class RustRecipeTests(unittest.TestCase):
         self.assertEqual(by_spec["alloc"]["alias"], "al")
         self.assertTrue(by_spec["alloc"]["externCrate"])
 
+    def test_absolute_use_leaves_keep_aliases_order_and_spans(self):
+        source = "pub use ::root::{self as Alias, branch::{self, leaf as _, *}};\n"
+        result = run(lang_rust, "rust", source)
+        imports = sites(result, "reexports")
+        bindings = [site["binding"] for site in imports]
+        self.assertEqual(
+            [(b["specifier"], b["alias"], b["local"], b["namespace"], b.get("selfImport", False)) for b in bindings],
+            [
+                ("::root", "Alias", "Alias", False, True),
+                ("::root::branch", None, "branch", False, True),
+                ("::root::branch::leaf", "_", None, False, False),
+                ("::root::branch", None, None, True, False),
+            ],
+        )
+        self.assertTrue(all(b["absolute"] for b in bindings))
+        data = source.encode("utf-8")
+        self.assertEqual(
+            [data[s["span"]["byteStart"]:s["span"]["byteEnd"]].decode() for s in imports],
+            ["self as Alias", "self", "leaf as _", "*"],
+        )
+        self.assertEqual(
+            [(d["name"], d["siteId"]) for d in declarations(result, None)],
+            [("Alias", imports[0]["id"]), ("branch", imports[1]["id"])],
+        )
+
     def test_pub_use_is_reexport_relation(self):
         re_ = sites(self.r, "reexports")
         self.assertEqual([s["binding"]["specifier"] for s in re_], ["super::c::D"])
@@ -104,7 +129,7 @@ class RustRecipeTests(unittest.TestCase):
         self.assertEqual(set(mods), {"inner", "routed"})
         self.assertEqual(mods["routed"]["path"], "other/x.rs")
         self.assertIsNone(mods["inner"]["path"])
-        self.assertEqual(syms(self.r, "namespace", "inline")[0]["bindings"]["body"], True)
+        self.assertTrue(syms(self.r, "namespace", "inline")[0]["bindings"]["body"])
 
     def test_macro_invocations_are_separate_unsupported_facts(self):
         r = self.r
@@ -177,9 +202,10 @@ class RustRecipeTests(unittest.TestCase):
         self.assertTrue(any("syntax" in d for d in r["diagnostics"]))
 
     def test_deep_use_nesting_is_bounded_not_crashing(self):
-        deep = "use " + "a::{" * 80 + "b" + "}" * 80 + ";\n"
+        deep = "use " + "a::{" * 80 + "b" + "}" * 80 + ";\nuse kept::leaf;\n"
         r = run(lang_rust, "rust", deep)
         self.assertTrue(r["partial"])
+        self.assertEqual([s["binding"]["specifier"] for s in sites(r, "imports")], ["kept::leaf"])
 
 
 class RustUnavailableTests(unittest.TestCase):

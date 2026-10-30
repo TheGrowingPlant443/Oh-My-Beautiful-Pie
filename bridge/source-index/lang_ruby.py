@@ -53,7 +53,7 @@ def _literal(ctx, node):
     """Raw contents of a non-interpolated string literal, else None."""
     if node is None or node.type != "string":
         return None
-    parts = [c for c in node.named_children]
+    parts = list(node.named_children)
     if any(c.type not in ("string_content", "escape_sequence") for c in parts):
         return None
     if not parts:
@@ -74,6 +74,37 @@ def _receiver_kind(node):
     if t in ("constant", "scope_resolution"):
         return "path"
     return "expression"
+
+
+def _split_path(text):
+    """``A::B::C`` -> (``A::B``, ``C``); no ``::`` -> (None, text)."""
+    if "::" in text:
+        return tuple(text.rsplit("::", 1))
+    return None, text
+
+
+def _path_binding(text, role):
+    prefix, last = _split_path(text)
+    return {"kind": "path" if prefix else "identifier", "name": last, "receiver": prefix,
+            "receiverKind": "path" if prefix else None, "role": role}
+
+
+def _fqn(parent_name, name):
+    return ((parent_name + "::" if parent_name else "") + name).replace(".", "::")
+
+
+def _call_raw_end(node, args, block):
+    if args is not None:
+        return args.start_byte
+    if block is not None:
+        return block.start_byte
+    return node.end_byte
+
+
+def _require_target(loader, items):
+    if loader == "autoload" and len(items) > 1:
+        return items[1]
+    return items[0] if items else None
 
 
 class _Walker:
@@ -115,22 +146,24 @@ class _Walker:
         return sc is not None and sc.kind in ("class", "namespace")
 
     # -- params -------------------------------------------------------------
+    def param_name(self, p):
+        if p.type == "identifier":
+            return self.ctx.text(p)
+        if p.type in PARAM_NAMED:
+            n = p.child_by_field_name("name")
+            return self.ctx.text(n) if n is not None else None
+        return None
+
     def declare_params(self, params, kind="parameter"):
         if params is None:
             return
         for p in params.named_children:
-            name = None
-            if p.type == "identifier":
-                name = self.ctx.text(p)
-            elif p.type in PARAM_NAMED:
-                n = p.child_by_field_name("name")
-                name = self.ctx.text(n) if n is not None else None
-            elif p.type == "destructured_parameter":
+            if p.type == "destructured_parameter":
                 for q in p.named_children:
                     if q.type == "identifier":
                         self.declare_here(self.ctx.text(q), kind, node=q, mutable=True)
-                continue
-            self.declare_here(name, kind, node=p, mutable=True)
+            else:
+                self.declare_here(self.param_name(p), kind, node=p, mutable=True)
 
     # -- sites ---------------------------------------------------------------
     def call_site(self, node):
@@ -140,52 +173,54 @@ class _Walker:
         args = node.child_by_field_name("arguments")
         block = node.child_by_field_name("block")
         name = ctx.text(method) if method is not None else None
-        if recv is None and name in REQUIRE_LOADERS and args is not None:
-            self.require_site(node, name, args)
-            return
-        if recv is None and name in MIXINS and args is not None:
-            for a in args.named_children:
-                if a.type in ("constant", "scope_resolution"):
-                    text = ctx.text(a)
-                    last = text.rsplit("::", 1)[-1]
-                    recv_text = text.rsplit("::", 1)[0] if "::" in text else None
-                    ctx.add_site(
-                        "references", _cap(text), a, conditional=self.cond > 0,
-                        binding={"kind": "path" if recv_text else "identifier", "name": last, "receiver": recv_text,
-                                 "receiverKind": "path" if recv_text else None, "role": "mixin", "mixin": name},
-                    )
-            return
-        end = args.start_byte if args is not None else (block.start_byte if block is not None else node.end_byte)
+        if recv is None and args is not None:
+            if name in REQUIRE_LOADERS:
+                self.require_site(node, name, args)
+                return
+            if name in MIXINS:
+                self.mixin_sites(args, name)
+                return
+        end = _call_raw_end(node, args, block)
         raw = ctx.source[node.start_byte:end].decode("utf-8", "replace").rstrip()
-        binding: dict = {"name": name, "receiver": None, "receiverKind": None}
+        binding = self.call_binding(recv, name)
         dynamic = name in DYNAMIC_CALLS or method is None
-        if recv is not None:
-            rtext = ctx.text(recv)
-            binding["receiver"] = _cap(rtext, binding)
-            binding["receiverKind"] = _receiver_kind(recv)
-            if name == "new" and binding["receiverKind"] in ("path", "identifier"):
-                binding["kind"] = "new"
-                binding["method"] = "new"
-                if "::" in rtext:
-                    binding["receiver"], binding["name"] = rtext.rsplit("::", 1)
-                else:
-                    binding["receiver"], binding["name"] = None, rtext
-                binding["receiverKind"] = "path" if binding["receiver"] else None
-            else:
-                binding["kind"] = "member"
-        else:
-            binding["kind"] = "identifier"
         if dynamic:
             binding["dynamic"] = True
             if method is None:
                 binding["name"] = None  # `callable.(args)`
         ctx.add_site("calls", _cap(raw, binding), node, conditional=self.cond > 0, dynamic=dynamic, binding=binding)
 
+    def mixin_sites(self, args, mixin):
+        ctx = self.ctx
+        for a in args.named_children:
+            if a.type in ("constant", "scope_resolution"):
+                text = ctx.text(a)
+                binding = _path_binding(text, "mixin")
+                binding["mixin"] = mixin
+                ctx.add_site("references", _cap(text), a, conditional=self.cond > 0, binding=binding)
+
+    def call_binding(self, recv, name):
+        binding: dict = {"name": name, "receiver": None, "receiverKind": None}
+        if recv is None:
+            binding["kind"] = "identifier"
+            return binding
+        rtext = self.ctx.text(recv)
+        binding["receiver"] = _cap(rtext, binding)
+        binding["receiverKind"] = _receiver_kind(recv)
+        if name == "new" and binding["receiverKind"] in ("path", "identifier"):
+            binding["kind"] = "new"
+            binding["method"] = "new"
+            binding["receiver"], binding["name"] = _split_path(rtext)
+            binding["receiverKind"] = "path" if binding["receiver"] else None
+        else:
+            binding["kind"] = "member"
+        return binding
+
     def require_site(self, node, loader, args):
         ctx = self.ctx
         items = args.named_children
         # autoload :Const, "path" -> path is the second argument
-        target = items[1] if loader == "autoload" and len(items) > 1 else (items[0] if items else None)
+        target = _require_target(loader, items)
         raw = ctx.source[node.start_byte:args.end_byte].decode("utf-8", "replace")
         literal = _literal(ctx, target)
         binding = {
@@ -201,115 +236,129 @@ class _Walker:
     # -- traversal -------------------------------------------------------------
     def enter(self, node):
         if not node.is_named:
-            return True  # keyword tokens share names with node types (`class`, `module`, `yield`)
-        ctx = self.ctx
+            return  # keyword tokens share names with node types (`class`, `module`, `yield`)
         t = node.type
         if t in CONDITIONAL:
             self.cond += 1
             self.cond_nodes.add(node.id)
         if t == "class":
-            name_node = node.child_by_field_name("name")
-            name = ctx.text(name_node)
-            sup = node.child_by_field_name("superclass")
-            bindings = {"extends": []}
-            sup_text = None
-            if sup is not None:
-                inner = sup.named_children[0] if sup.named_children else None
-                sup_text = ctx.text(inner) if inner is not None else None
-                if sup_text:
-                    bindings["extends"] = [sup_text]
-            if not bindings["extends"]:
-                del bindings["extends"]
-            outer = ctx.owner
-            parent_name = ctx.qualified(None)
-            sym = self.push_declared(node, "class", name, bindings, name_node)
-            bindings_fqn = (parent_name + "::" if parent_name else "") + name
-            sym.setdefault("bindings", {})["fqn"] = bindings_fqn.replace(".", "::")
-            if sup is not None and sup_text:
-                last = sup_text.rsplit("::", 1)[-1]
-                prefix = sup_text.rsplit("::", 1)[0] if "::" in sup_text else None
-                ctx.add_site(
-                    "references", _cap(sup_text), sup, caller=outer,
-                    binding={"kind": "path" if prefix else "identifier", "name": last, "receiver": prefix,
-                             "receiverKind": "path" if prefix else None, "role": "extends"},
-                )
-            return True
-        if t == "module":
-            name_node = node.child_by_field_name("name")
-            name = ctx.text(name_node)
-            parent_name = ctx.qualified(None)
-            sym = self.push_declared(node, "namespace", name, {}, name_node)
-            sym["bindings"]["fqn"] = ((parent_name + "::" if parent_name else "") + name).replace(".", "::")
-            return True
-        if t == "singleton_class":
+            self.enter_class(node)
+        elif t == "module":
+            self.enter_module(node)
+        elif t == "singleton_class":
             self.push(node, "namespace", "<<self", node_kind="singleton_class", bindings={"singleton": True})
-            return True
-        if t in ("method", "singleton_method"):
-            name_node = node.child_by_field_name("name")
-            name = ctx.text(name_node)
-            static = t == "singleton_method" or self.singleton_scope()
-            kind = "method" if (self.in_class_scope() or t == "singleton_method") else "function"
-            if name == "initialize" and kind == "method":
-                kind = "constructor"
-            bindings = {"static": bool(static)}
-            if t == "singleton_method":
-                obj = node.child_by_field_name("object")
-                bindings["receiver"] = ctx.text(obj) if obj is not None else None
-            sym = ctx.add_symbol(kind, name, node, bindings=bindings, push=False, node_kind=t)
-            self.declare_here(name, "function", sym, name_node, mutable=True)
-            ctx.push_scope(sym["id"], name, kind)
-            self.pushed[node.id] = self.cond
-            self.cond = 0
-            self.declare_params(node.child_by_field_name("parameters"))
-            return True
-        if t in ("block", "do_block") and node.parent is not None and node.parent.type == "lambda":
-            return True  # the lambda symbol already represents this body
-        if t in ("lambda", "block", "do_block"):
-            parent = node.parent
-            label = "<lambda>" if t == "lambda" else "<block>"
-            bindings: dict = {}
-            if t != "lambda" and parent is not None and parent.type == "call":
-                m = parent.child_by_field_name("method")
-                if m is not None:
-                    bindings["blockOf"] = ctx.text(m)
-            outer = ctx.owner
-            outer_range = self.scope_range()
-            sym = self.push(node, "lambda", label, node_kind=t, bindings=bindings)
-            self.declare_params(node.child_by_field_name("parameters"))
-            # `name = ->(x) { }`: the variable holds this closure
-            if t == "lambda" and parent is not None and parent.type == "assignment":
-                left = parent.child_by_field_name("left")
-                if left is not None and left.type == "identifier":
-                    name = ctx.text(left)
-                    sym["bindings"]["assignedTo"] = name
-                    self.declare_variable(name, left, sym=sym, owner=outer, scope=outer_range)
-            return True
-        if t == "assignment" or t == "operator_assignment":
-            left = node.child_by_field_name("left")
-            right = node.child_by_field_name("right")
-            if left is not None and left.type == "identifier":
-                if not (t == "assignment" and right is not None and right.type == "lambda"):
-                    self.declare_variable(ctx.text(left), left)
-            elif left is not None and left.type in ("constant", "scope_resolution"):
-                self.declare_here(ctx.text(left), "variable", node=left, mutable=False)
-            return True
-        if t == "call":
+        elif t in ("method", "singleton_method"):
+            self.enter_method(node)
+        elif t in ("lambda", "block", "do_block"):
+            self.enter_closure(node)
+        elif t in ("assignment", "operator_assignment"):
+            self.enter_assignment(node)
+        elif t == "call":
             self.call_site(node)
-            return True
-        if t == "super":
-            sc = self.enclosing_method_name()
-            ctx.add_site(
-                "calls", "super", node, conditional=self.cond > 0,
-                binding={"kind": "identifier", "name": sc, "receiver": "super", "receiverKind": "super", "super": True},
-            )
-            return True
-        if t == "yield":
-            ctx.add_site(
-                "calls", "yield", node, conditional=self.cond > 0, dynamic=True,
-                binding={"kind": "dynamic", "name": "yield", "receiver": None, "receiverKind": None, "dynamic": True},
-            )
-            return True
-        return True
+        elif t == "super":
+            self.super_site(node)
+        elif t == "yield":
+            self.yield_site(node)
+
+    def superclass_text(self, sup):
+        if sup is None or not sup.named_children:
+            return None
+        return self.ctx.text(sup.named_children[0])
+
+    def enter_class(self, node):
+        ctx = self.ctx
+        name_node = node.child_by_field_name("name")
+        name = ctx.text(name_node)
+        sup = node.child_by_field_name("superclass")
+        sup_text = self.superclass_text(sup)
+        bindings = {"extends": [sup_text]} if sup_text else {}
+        outer = ctx.owner
+        parent_name = ctx.qualified(None)
+        sym = self.push_declared(node, "class", name, bindings, name_node)
+        sym.setdefault("bindings", {})["fqn"] = _fqn(parent_name, name)
+        if sup_text:
+            ctx.add_site("references", _cap(sup_text), sup, caller=outer, binding=_path_binding(sup_text, "extends"))
+
+    def enter_module(self, node):
+        ctx = self.ctx
+        name_node = node.child_by_field_name("name")
+        name = ctx.text(name_node)
+        parent_name = ctx.qualified(None)
+        sym = self.push_declared(node, "namespace", name, {}, name_node)
+        sym["bindings"]["fqn"] = _fqn(parent_name, name)
+
+    def enter_method(self, node):
+        ctx = self.ctx
+        t = node.type
+        name_node = node.child_by_field_name("name")
+        name = ctx.text(name_node)
+        static = t == "singleton_method" or self.singleton_scope()
+        kind = "method" if (self.in_class_scope() or t == "singleton_method") else "function"
+        if name == "initialize" and kind == "method":
+            kind = "constructor"
+        bindings = {"static": bool(static)}
+        if t == "singleton_method":
+            obj = node.child_by_field_name("object")
+            bindings["receiver"] = ctx.text(obj) if obj is not None else None
+        sym = ctx.add_symbol(kind, name, node, bindings=bindings, push=False, node_kind=t)
+        self.declare_here(name, "function", sym, name_node, mutable=True)
+        ctx.push_scope(sym["id"], name, kind)
+        self.pushed[node.id] = self.cond
+        self.cond = 0
+        self.declare_params(node.child_by_field_name("parameters"))
+
+    def block_bindings(self, node):
+        parent = node.parent
+        if node.type == "lambda" or parent is None or parent.type != "call":
+            return {}
+        m = parent.child_by_field_name("method")
+        return {"blockOf": self.ctx.text(m)} if m is not None else {}
+
+    def enter_closure(self, node):
+        t = node.type
+        parent = node.parent
+        if t != "lambda" and parent is not None and parent.type == "lambda":
+            return  # the lambda symbol already represents this body
+        label = "<lambda>" if t == "lambda" else "<block>"
+        outer = self.ctx.owner
+        outer_range = self.scope_range()
+        sym = self.push(node, "lambda", label, node_kind=t, bindings=self.block_bindings(node))
+        self.declare_params(node.child_by_field_name("parameters"))
+        # `name = ->(x) { }`: the variable holds this closure
+        if t == "lambda" and parent is not None and parent.type == "assignment":
+            self.bind_lambda(sym, parent, outer, outer_range)
+
+    def bind_lambda(self, sym, assignment, outer, outer_range):
+        left = assignment.child_by_field_name("left")
+        if left is not None and left.type == "identifier":
+            name = self.ctx.text(left)
+            sym["bindings"]["assignedTo"] = name
+            self.declare_variable(name, left, sym=sym, owner=outer, scope=outer_range)
+
+    def enter_assignment(self, node):
+        left = node.child_by_field_name("left")
+        right = node.child_by_field_name("right")
+        if left is None:
+            return
+        if left.type == "identifier":
+            lambda_assignment = node.type == "assignment" and right is not None and right.type == "lambda"
+            if not lambda_assignment:
+                self.declare_variable(self.ctx.text(left), left)
+        elif left.type in ("constant", "scope_resolution"):
+            self.declare_here(self.ctx.text(left), "variable", node=left, mutable=False)
+
+    def super_site(self, node):
+        self.ctx.add_site(
+            "calls", "super", node, conditional=self.cond > 0,
+            binding={"kind": "identifier", "name": self.enclosing_method_name(), "receiver": "super",
+                     "receiverKind": "super", "super": True},
+        )
+
+    def yield_site(self, node):
+        self.ctx.add_site(
+            "calls", "yield", node, conditional=self.cond > 0, dynamic=True,
+            binding={"kind": "dynamic", "name": "yield", "receiver": None, "receiverKind": None, "dynamic": True},
+        )
 
     def declare_variable(self, name, node, sym=None, owner=..., scope=None):
         """First binding in a scope is a ``variable``; later ones are ``assignment`` (rebinding)."""
@@ -350,7 +399,7 @@ class _Walker:
             self.cond = self.pushed.pop(node.id)
 
 
-def extract(language: str, source: bytes, ctx: "common.Context") -> dict:
+def extract(_language: str, _source: bytes, ctx: "common.Context") -> dict:
     tree = ctx.parse()
     root = tree.root_node
     ctx.module_symbol(root)

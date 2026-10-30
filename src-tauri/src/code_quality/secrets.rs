@@ -4,8 +4,13 @@
 //! tests use `MemorySecrets`. There is never a plaintext fallback.
 //! Secret values never appear in serializable state, logs, argv or `Debug` output.
 use super::types::{CredentialStoreStatus, Result};
-use sha2::{Digest, Sha256};
+#[cfg(test)]
+use parking_lot::Mutex;
+use sha2::Sha256;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::path::Path;
+use uuid::Uuid;
 
 pub trait SecretStore: Send + Sync {
     fn write(&self, target: &str, secret: &str) -> Result<()>;
@@ -14,7 +19,11 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, target: &str) -> Result<()>;
     /// Cheap, non-blocking view of whether the backing store works (may be a cached result).
     fn status(&self) -> CredentialStoreStatus {
-        CredentialStoreStatus { name: "credential store".into(), available: true, message: None }
+        CredentialStoreStatus {
+            name: "credential store".into(),
+            available: true,
+            message: None,
+        }
     }
     /// Blocking, fresh check run before anything is stored. `Err` names the missing prerequisite.
     fn verify(&self) -> Result<()> {
@@ -22,20 +31,26 @@ pub trait SecretStore: Send + Sync {
     }
 }
 
+#[must_use]
 pub fn sha256_hex(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    use sha2::Digest;
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
 /// Windows paths are case-insensitive; Unix paths are exact (`/repo/A` and `/repo/a` are different folders).
+#[must_use]
 pub fn path_identity(path: &str) -> String {
-    if cfg!(windows) { path.to_lowercase() } else { path.to_string() }
+    if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    }
 }
 
 /// `OMPManager.CodeQuality/<SHA256(config-root)>/<SHA256(identity)>/<kind>`.
 /// `identity` distinguishes the server: the Community resource-set id, or the normalized
 /// Enterprise origin plus context path, so one server's token is never reused for another.
+#[must_use]
 pub fn target_name(config_root: &Path, identity: &str, kind: &str) -> String {
     format!(
         "OMPManager.CodeQuality/{}/{}/{}",
@@ -45,11 +60,12 @@ pub fn target_name(config_root: &Path, identity: &str, kind: &str) -> String {
     )
 }
 
-/// Random 32-character URL-safe password for the managed PostgreSQL database.
+/// Random 48-character URL-safe password for the managed PostgreSQL database.
+#[must_use]
 pub fn random_password() -> String {
-    let mut out = String::with_capacity(36);
+    let mut out = String::with_capacity(64);
     for _ in 0..2 {
-        out.push_str(&uuid::Uuid::new_v4().simple().to_string());
+        out.push_str(&Uuid::new_v4().simple().to_string());
     }
     out.truncate(48);
     out
@@ -58,10 +74,11 @@ pub fn random_password() -> String {
 /// Random SonarQube admin password: always 42 characters with upper case, lower case, digit and
 /// special character so Sonar's password policy accepts it. Kept at or below 50 characters, which
 /// stays under every length cap SonarQube applies (and bcrypt's 72-byte input limit); the two
-/// 16-hex-digit random groups carry 128 bits of entropy.
+/// 16-hex-digit random groups carry 120 random bits after the UUID version bits.
+#[must_use]
 pub fn random_sonar_password() -> String {
     let group = || {
-        let mut text = uuid::Uuid::new_v4().simple().to_string();
+        let mut text = Uuid::new_v4().simple().to_string();
         text.truncate(16);
         text
     };
@@ -71,13 +88,15 @@ pub fn random_sonar_password() -> String {
 #[cfg(test)]
 #[derive(Default)]
 pub struct MemorySecrets {
-    values: parking_lot::Mutex<std::collections::HashMap<String, String>>,
+    values: Mutex<HashMap<String, String>>,
 }
 
 #[cfg(test)]
 impl SecretStore for MemorySecrets {
     fn write(&self, target: &str, secret: &str) -> Result<()> {
-        self.values.lock().insert(target.to_string(), secret.to_string());
+        self.values
+            .lock()
+            .insert(target.to_string(), secret.to_string());
         Ok(())
     }
     fn read(&self, target: &str) -> Result<Option<String>> {
@@ -90,103 +109,149 @@ impl SecretStore for MemorySecrets {
 }
 
 #[cfg(windows)]
-pub use windows_store::WindowsSecrets;
+use windows_sys::Win32::Foundation;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, FILETIME};
+#[cfg(windows)]
+use windows_sys::Win32::Security::Credentials;
+#[cfg(windows)]
+use windows_sys::Win32::Security::Credentials::{
+    CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+};
 
 #[cfg(windows)]
-mod windows_store {
-    use super::{Result, SecretStore};
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
-    use windows_sys::Win32::Security::Credentials::{
-        CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
-    };
+#[derive(Default)]
+pub struct WindowsSecrets;
 
-    #[derive(Default)]
-    pub struct WindowsSecrets;
+#[cfg(windows)]
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
 
-    fn wide(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    impl SecretStore for WindowsSecrets {
-        fn status(&self) -> super::CredentialStoreStatus {
-            super::CredentialStoreStatus { name: "Windows Credential Manager".into(), available: true, message: None }
-        }
-        fn write(&self, target: &str, secret: &str) -> Result<()> {
-            let mut name = wide(target);
-            let mut user = wide("omp-manager");
-            let mut blob: Vec<u8> = secret.as_bytes().to_vec();
-            let credential = CREDENTIALW {
-                Flags: 0,
-                Type: CRED_TYPE_GENERIC,
-                TargetName: name.as_mut_ptr(),
-                Comment: std::ptr::null_mut(),
-                LastWritten: unsafe { std::mem::zeroed() },
-                CredentialBlobSize: blob.len() as u32,
-                CredentialBlob: blob.as_mut_ptr(),
-                Persist: CRED_PERSIST_LOCAL_MACHINE,
-                AttributeCount: 0,
-                Attributes: std::ptr::null_mut(),
-                TargetAlias: std::ptr::null_mut(),
-                UserName: user.as_mut_ptr(),
-            };
-            let ok = unsafe { CredWriteW(&credential, 0) };
-            let error = std::io::Error::last_os_error();
-            blob.iter_mut().for_each(|b| *b = 0);
-            if ok == 0 {
-                return Err(format!("Windows Credential Manager could not save the credential: {error}"));
-            }
-            Ok(())
-        }
-        fn read(&self, target: &str) -> Result<Option<String>> {
-            let name = wide(target);
-            let mut found: *mut CREDENTIALW = std::ptr::null_mut();
-            let ok = unsafe { CredReadW(name.as_ptr(), CRED_TYPE_GENERIC, 0, &mut found) };
-            if ok == 0 {
-                let code = unsafe { GetLastError() };
-                if code == ERROR_NOT_FOUND {
-                    return Ok(None);
-                }
-                return Err(format!("Windows Credential Manager could not read the credential: {}", std::io::Error::from_raw_os_error(code as i32)));
-            }
-            let text = unsafe {
-                let credential = &*found;
-                let bytes = std::slice::from_raw_parts(credential.CredentialBlob, credential.CredentialBlobSize as usize);
-                let text = String::from_utf8(bytes.to_vec());
-                CredFree(found as *const _);
-                text
-            };
-            text.map(Some).map_err(|_| "Stored credential is not valid text".to_string())
-        }
-        fn delete(&self, target: &str) -> Result<()> {
-            let name = wide(target);
-            if unsafe { CredDeleteW(name.as_ptr(), CRED_TYPE_GENERIC, 0) } == 0 {
-                let code = unsafe { GetLastError() };
-                if code == ERROR_NOT_FOUND {
-                    return Ok(());
-                }
-                return Err(format!("Windows Credential Manager could not delete the credential: {}", std::io::Error::from_raw_os_error(code as i32)));
-            }
-            Ok(())
+#[cfg(windows)]
+impl SecretStore for WindowsSecrets {
+    fn status(&self) -> CredentialStoreStatus {
+        CredentialStoreStatus {
+            name: "Windows Credential Manager".into(),
+            available: true,
+            message: None,
         }
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn credential_manager_round_trip() {
-            let store = WindowsSecrets;
-            let target = format!("OMPManager.CodeQuality.test/{}", uuid::Uuid::new_v4());
-            assert_eq!(store.read(&target).unwrap(), None);
-            store.write(&target, "squ_round_trip").unwrap();
-            assert_eq!(store.read(&target).unwrap().as_deref(), Some("squ_round_trip"));
-            store.write(&target, "squ_replaced").unwrap();
-            assert_eq!(store.read(&target).unwrap().as_deref(), Some("squ_replaced"));
-            store.delete(&target).unwrap();
-            assert_eq!(store.read(&target).unwrap(), None);
-            store.delete(&target).unwrap();
+    fn write(&self, target: &str, secret: &str) -> Result<()> {
+        let mut name = wide(target);
+        let mut user = wide("omp-manager");
+        let mut blob: Vec<u8> = secret.as_bytes().to_vec();
+        let credential = CREDENTIALW {
+            Flags: 0,
+            Type: CRED_TYPE_GENERIC,
+            TargetName: name.as_mut_ptr(),
+            Comment: std::ptr::null_mut(),
+            LastWritten: FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+            CredentialBlobSize: blob.len() as u32,
+            CredentialBlob: blob.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            AttributeCount: 0,
+            Attributes: std::ptr::null_mut(),
+            TargetAlias: std::ptr::null_mut(),
+            UserName: user.as_mut_ptr(),
+        };
+        // Win32 has no safe credential-store API; all backing buffers stay alive through the call.
+        // SAFETY: credential's pointers refer to the live, terminated UTF-16 names and sized blob.
+        let ok = unsafe { Credentials::CredWriteW(&credential, 0) };
+        let error = std::io::Error::last_os_error();
+        blob.fill(0);
+        if ok == 0 {
+            return Err(format!(
+                "Windows Credential Manager could not save the credential: {error}"
+            ));
         }
+        Ok(())
+    }
+    fn read(&self, target: &str) -> Result<Option<String>> {
+        let name = wide(target);
+        let mut found: *mut CREDENTIALW = std::ptr::null_mut();
+        // SAFETY: name is terminated UTF-16, and found is a valid output pointer for CredReadW.
+        let ok = unsafe { Credentials::CredReadW(name.as_ptr(), CRED_TYPE_GENERIC, 0, &mut found) };
+        if ok == 0 {
+            // SAFETY: GetLastError has no preconditions and immediately follows the failed API.
+            let code = unsafe { Foundation::GetLastError() };
+            if code == ERROR_NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(format!(
+                "Windows Credential Manager could not read the credential: {}",
+                std::io::Error::from_raw_os_error(code as i32)
+            ));
+        }
+        // SAFETY: successful CredReadW owns a live credential until CredFree; nonempty blobs
+        // have the reported readable length. Handle empty blobs without constructing a null slice.
+        let text = unsafe {
+            let credential = &*found;
+            let bytes = if credential.CredentialBlobSize == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(
+                    credential.CredentialBlob,
+                    credential.CredentialBlobSize as usize,
+                )
+                .to_vec()
+            };
+            let text = String::from_utf8(bytes);
+            Credentials::CredFree(found as *const _);
+            text
+        };
+        text.map(Some)
+            .map_err(|_| "Stored credential is not valid text".to_string())
+    }
+    fn delete(&self, target: &str) -> Result<()> {
+        let name = wide(target);
+        // SAFETY: name is terminated UTF-16 and the remaining arguments are fixed Win32 flags.
+        if unsafe { Credentials::CredDeleteW(name.as_ptr(), CRED_TYPE_GENERIC, 0) } == 0 {
+            // SAFETY: GetLastError has no preconditions and immediately follows the failed API.
+            let code = unsafe { Foundation::GetLastError() };
+            if code == ERROR_NOT_FOUND {
+                return Ok(());
+            }
+            return Err(format!(
+                "Windows Credential Manager could not delete the credential: {}",
+                std::io::Error::from_raw_os_error(code as i32)
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(windows, test))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn credential_manager_round_trip() {
+        let store = WindowsSecrets;
+        let target = format!("OMPManager.CodeQuality.test/{}", Uuid::new_v4());
+        assert_eq!(store.read(&target).unwrap(), None);
+        store.write(&target, "squ_round_trip").unwrap();
+        assert_eq!(
+            store.read(&target).unwrap().as_deref(),
+            Some("squ_round_trip")
+        );
+        store.write(&target, "squ_replaced").unwrap();
+        assert_eq!(
+            store.read(&target).unwrap().as_deref(),
+            Some("squ_replaced")
+        );
+        store.write(&target, "").unwrap();
+        assert_eq!(
+            store.read(&target).unwrap().as_deref(),
+            Some(""),
+            "empty blobs have no readable pointer"
+        );
+        store.delete(&target).unwrap();
+        assert_eq!(store.read(&target).unwrap(), None);
+        store.delete(&target).unwrap();
     }
 }
 
@@ -209,14 +274,23 @@ mod tests {
     #[test]
     fn unix_config_roots_differing_only_in_case_never_share_credential_names() {
         let (upper, lower) = (Path::new("/cfg/A"), Path::new("/cfg/a"));
-        assert_ne!(target_name(upper, "community:set", "token"), target_name(lower, "community:set", "token"));
-        assert_eq!(target_name(upper, "community:set", "token"), target_name(Path::new("/cfg/A"), "community:set", "token"));
+        assert_ne!(
+            target_name(upper, "community:set", "token"),
+            target_name(lower, "community:set", "token")
+        );
+        assert_eq!(
+            target_name(upper, "community:set", "token"),
+            target_name(Path::new("/cfg/A"), "community:set", "token")
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_config_roots_keep_case_insensitive_credential_names() {
-        assert_eq!(target_name(Path::new("C:/Cfg"), "community:set", "token"), target_name(Path::new("c:/cfg"), "community:set", "token"));
+        assert_eq!(
+            target_name(Path::new("C:/Cfg"), "community:set", "token"),
+            target_name(Path::new("c:/cfg"), "community:set", "token")
+        );
     }
 
     #[test]

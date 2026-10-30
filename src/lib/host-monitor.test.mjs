@@ -645,6 +645,11 @@ test('contexts compare by id, generation and normalised folder', () => {
   assert.equal(sameContext(CTX, null), false);
 });
 
+test('context paths with long separator runs normalise without changing the folder', () => {
+  assert.equal(sameContext(CTX, { ...CTX, projectPath: 'C:\\work\\repo' + '\\'.repeat(100_000) }), true);
+  assert.equal(sameContext(CTX, { ...CTX, projectPath: 'C:/work/other' }), false);
+});
+
 test('counts render unavailable, partial and exact values', () => {
   const base = summaryOf('v', 1);
   assert.equal(metricLabel(base, 'processes'), '11');

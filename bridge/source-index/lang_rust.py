@@ -35,6 +35,7 @@ _ITEMS = frozenset({
 _BLOCKS = ("block", "declaration_list", "source_file")
 _IDENT = frozenset({"identifier"})
 _CFG = re.compile(r"^#\s*\[\s*cfg\s*\(")
+_RECEIVER_KINDS = {"self": "self", "identifier": "identifier", "scoped_identifier": "path"}
 
 
 class RustVisitor(Visitor):
@@ -80,63 +81,67 @@ class RustVisitor(Visitor):
         vis = self._visibility(node)
         start, end = self.range_of_ancestor(node, _BLOCKS)
         for leaf, spec, alias, glob, self_import in self._use_leaves(arg, ""):
-            imported = None if glob else (spec.rsplit("::", 1)[-1] or None)
-            local = None
-            if not glob:
-                local = alias if alias is not None else imported
-                if local == "_":
-                    local = None
-            binding = {
-                "kind": "use", "specifier": spec, "imported": imported, "alias": alias, "default": False,
-                "namespace": glob, "reexport": bool(vis), "typeOnly": False, "typeKind": None,
-                "local": local, "visibility": vis, "absolute": spec.startswith("::"),
-            }
-            if self_import:
-                binding["selfImport"] = True
-            site = self.site("reexports" if vis else "imports", leaf, spec, binding, node_kind=leaf.type)
-            if local:
-                self.ctx.declare(local, "import", start, end, site_id=site["id"])
+            self._declare_use_leaf(leaf, spec, alias, glob, self_import, vis, start, end)
         return False
+
+    def _declare_use_leaf(self, leaf, spec, alias, glob, self_import, vis, start, end):
+        imported = None if glob else (spec.rsplit("::", 1)[-1] or None)
+        local = None
+        if not glob:
+            local = alias if alias is not None else imported
+            if local == "_":
+                local = None
+        binding = {
+            "kind": "use", "specifier": spec, "imported": imported, "alias": alias, "default": False,
+            "namespace": glob, "reexport": bool(vis), "typeOnly": False, "typeKind": None,
+            "local": local, "visibility": vis, "absolute": spec.startswith("::"),
+        }
+        if self_import:
+            binding["selfImport"] = True
+        site = self.site("reexports" if vis else "imports", leaf, spec, binding, node_kind=leaf.type)
+        if local:
+            self.ctx.declare(local, "import", start, end, site_id=site["id"])
 
     def _use_leaves(self, node, prefix: str, depth: int = 0):
         if depth > 64:
             self.ctx.mark_partial("use tree nesting exceeds 64 levels; deeper leaves not recorded")
             return
         t = node.type
-
-        def join(p: str, n: str) -> str:
-            return f"{p}::{n}" if p and not n.startswith("::") else (n if not p else p + n)
-
         if t in ("identifier", "crate", "super", "self", "scoped_identifier", "metavariable"):
-            txt = self.text(node)
             if t == "self" and prefix:
                 yield node, prefix, None, False, True
             else:
-                yield node, join(prefix, txt), None, False, False
-        elif t == "use_as_clause":
-            path = node.child_by_field_name("path")
-            alias = node.child_by_field_name("alias")
-            if path is None:
-                return
-            txt = self.text(path)
-            spec = prefix if (path.type == "self" and prefix) else join(prefix, txt)
-            yield node, spec, self.text(alias) if alias is not None else None, False, path.type == "self"
-        elif t == "use_wildcard":
+                yield node, _join_use(prefix, self.text(node)), None, False, False
+            return
+        if t == "use_as_clause":
+            yield from self._aliased_use_leaves(node, prefix)
+            return
+        if t == "use_wildcard":
             kids = [c for c in node.children if c.is_named]
-            path = join(prefix, self.text(kids[0])) if kids else prefix
+            path = _join_use(prefix, self.text(kids[0])) if kids else prefix
             yield node, path, None, True, False
-        elif t == "scoped_use_list":
+            return
+        if t == "scoped_use_list":
             path = node.child_by_field_name("path")
-            lst = node.child_by_field_name("list")
-            new_prefix = join(prefix, self.text(path)) if path is not None else prefix
-            if lst is not None:
-                for c in lst.children:
-                    if c.is_named:
-                        yield from self._use_leaves(c, new_prefix, depth + 1)
+            new_prefix = _join_use(prefix, self.text(path)) if path is not None else prefix
+            yield from self._use_list_leaves(node.child_by_field_name("list"), new_prefix, depth)
         elif t == "use_list":
-            for c in node.children:
-                if c.is_named:
-                    yield from self._use_leaves(c, prefix, depth + 1)
+            yield from self._use_list_leaves(node, prefix, depth)
+
+    def _aliased_use_leaves(self, node, prefix: str):
+        path = node.child_by_field_name("path")
+        alias = node.child_by_field_name("alias")
+        if path is None:
+            return
+        spec = prefix if (path.type == "self" and prefix) else _join_use(prefix, self.text(path))
+        yield node, spec, self.text(alias) if alias is not None else None, False, path.type == "self"
+
+    def _use_list_leaves(self, lst, prefix: str, depth: int):
+        if lst is None:
+            return
+        for c in lst.children:
+            if c.is_named:
+                yield from self._use_leaves(c, prefix, depth + 1)
 
     def visit_extern_crate_declaration(self, node):
         name = node.child_by_field_name("name")
@@ -288,32 +293,48 @@ class RustVisitor(Visitor):
         if cont is not None and cont.type in ("impl_item", "trait_item"):
             if not signature:
                 kind = "method"
-            if cont.type == "impl_item":
-                trait = cont.child_by_field_name("trait")
-                t = cont.child_by_field_name("type")
-                bindings["implFor"] = self.text(t) if t is not None else None
-                bindings["implTrait"] = self.text(trait) if trait is not None else None
-                in_impl_trait = trait is not None
-            else:
-                bindings["traitMethod"] = True
+            in_impl_trait = self._impl_bindings(cont, bindings)
             if in_impl_trait or cont.type == "trait_item":
                 exported = None
         elif cont is not None and cont.type == "foreign_mod_item":
             bindings["foreign"] = True
-            ext = child_of_type(cont, "extern_modifier")
-            bindings["abi"] = kit_walk.strip_quotes(self.text(ext).replace("extern", "", 1).strip()) if ext is not None else None
+            bindings["abi"] = self._foreign_abi(cont)
         sym = self.open_symbol(node, kind, name, bindings=bindings, exported=exported)
         names, has_self = self._declare_params(node.child_by_field_name("parameters"), body)
         sym["bindings"]["parameters"] = names
         sym["bindings"]["static"] = kind == "method" and not has_self
         sym["bindings"]["hasSelf"] = has_self
-        if kind == "function":
-            start, end = self.range_of_ancestor(node, _BLOCKS)
-            self.ctx.declare(name, "function", start, end, symbol_id=sym["id"], owner=self._outer_owner())
-        elif kind == "signature" and cont is not None and cont.type == "foreign_mod_item":
-            start, end = self.range_of_ancestor(cont, _BLOCKS)
+        target = self._declaring_node(kind, node, cont)
+        if target is not None:
+            start, end = self.range_of_ancestor(target, _BLOCKS)
             self.ctx.declare(name, "function", start, end, symbol_id=sym["id"], owner=self._outer_owner())
         return None
+
+    def _foreign_abi(self, cont):
+        ext = child_of_type(cont, "extern_modifier")
+        if ext is None:
+            return None
+        return kit_walk.strip_quotes(self.text(ext).replace("extern", "", 1).strip())
+
+    @staticmethod
+    def _declaring_node(kind, node, cont):
+        """Node whose enclosing block scopes the function name; None when it is not a free name."""
+        if kind == "function":
+            return node
+        if kind == "signature" and cont is not None and cont.type == "foreign_mod_item":
+            return cont
+        return None
+
+    def _impl_bindings(self, cont, bindings) -> bool:
+        """Record impl/trait container facts; True when inside ``impl Trait for T``."""
+        if cont.type != "impl_item":
+            bindings["traitMethod"] = True
+            return False
+        trait = cont.child_by_field_name("trait")
+        t = cont.child_by_field_name("type")
+        bindings["implFor"] = self.text(t) if t is not None else None
+        bindings["implTrait"] = self.text(trait) if trait is not None else None
+        return trait is not None
 
     def visit_function_item(self, node):
         return self._fn(node, signature=False)
@@ -353,14 +374,14 @@ class RustVisitor(Visitor):
                          value=value if direct else None)
         return None
 
-    def _scoped_patterns(self, node, pat_node, start, end, kind="variable"):
+    def _scoped_patterns(self, pat_node, start, end, kind="variable"):
         if pat_node is None:
             return
         for ident in self._pattern_names(pat_node):
             self.ctx.declare(self.text(ident), kind, start, end, mutable=True, position=ident.start_byte)
 
     def visit_match_arm(self, node):
-        self._scoped_patterns(node, node.child_by_field_name("pattern"), node.start_byte, node.end_byte)
+        self._scoped_patterns(node.child_by_field_name("pattern"), node.start_byte, node.end_byte)
         return None
 
     def visit_let_condition(self, node):
@@ -368,12 +389,11 @@ class RustVisitor(Visitor):
         while p is not None and p.type not in ("if_expression", "while_expression", "block", "source_file"):
             p = p.parent
         end = p.end_byte if p is not None else node.end_byte
-        self._scoped_patterns(node, node.child_by_field_name("pattern"), node.end_byte, end)
+        self._scoped_patterns(node.child_by_field_name("pattern"), node.end_byte, end)
         return None
 
     def visit_for_expression(self, node):
-        self._scoped_patterns(node, node.child_by_field_name("pattern"), node.start_byte, node.end_byte)
-        return None
+        return self.visit_match_arm(node)
 
     def _const_like(self, node):
         name = self.field_text(node, "name")
@@ -402,33 +422,12 @@ class RustVisitor(Visitor):
     def _callee(self, fn, depth: int = 0):
         """(binding, dynamic) for a call's function expression."""
         t = fn.type
-        raw = self.text(fn)
         if t == "identifier":
-            return {"kind": "identifier", "name": raw, "receiver": None, "receiverKind": None}, False
+            return {"kind": "identifier", "name": self.text(fn), "receiver": None, "receiverKind": None}, False
         if t == "scoped_identifier":
-            path = fn.child_by_field_name("path")
-            name = fn.child_by_field_name("name")
-            recv = self.text(path) if path is not None else ""
-            if path is None and raw.startswith("::"):
-                recv = "::"
-            if path is not None and raw.startswith("::") and not recv.startswith("::"):
-                recv = "::" + recv
-            rk = "path"
-            b = {"kind": "path", "name": self.text(name) if name is not None else None,
-                 "receiver": recv or None, "receiverKind": rk}
-            if path is not None and path.type == "generic_type":
-                b["generic"] = True
-            return b, False
+            return self._scoped_callee(fn), False
         if t == "field_expression":
-            value = fn.child_by_field_name("value")
-            field = fn.child_by_field_name("field")
-            if field is not None and field.type == "field_identifier":
-                vt = value.type if value is not None else None
-                rk = "self" if vt == "self" else ("identifier" if vt == "identifier" else ("path" if vt == "scoped_identifier" else "expression"))
-                return {"kind": "member", "name": self.text(field), "receiver": self.text(value) if value is not None else None,
-                        "receiverKind": rk}, False
-            # tuple field holding a callable: `x.0()`
-            return {"kind": "dynamic", "name": None, "receiver": None, "receiverKind": None, "dynamic": True}, True
+            return self._field_callee(fn)
         if t == "generic_function":
             inner = fn.child_by_field_name("function")
             if inner is not None and depth < 8:
@@ -436,7 +435,31 @@ class RustVisitor(Visitor):
                 b = dict(b)
                 b["generic"] = True
                 return b, d
-        return {"kind": "dynamic", "name": None, "receiver": None, "receiverKind": None, "dynamic": True}, True
+        return _dynamic_callee()
+
+    def _scoped_callee(self, fn):
+        raw = self.text(fn)
+        path = fn.child_by_field_name("path")
+        name = fn.child_by_field_name("name")
+        recv = self.text(path) if path is not None else ""
+        if path is None and raw.startswith("::"):
+            recv = "::"
+        if path is not None and raw.startswith("::") and not recv.startswith("::"):
+            recv = "::" + recv
+        b = {"kind": "path", "name": self.text(name) if name is not None else None,
+             "receiver": recv or None, "receiverKind": "path"}
+        if path is not None and path.type == "generic_type":
+            b["generic"] = True
+        return b
+
+    def _field_callee(self, fn):
+        value = fn.child_by_field_name("value")
+        field = fn.child_by_field_name("field")
+        if field is None or field.type != "field_identifier":
+            return _dynamic_callee()  # tuple field holding a callable: `x.0()`
+        rk = _RECEIVER_KINDS.get(value.type if value is not None else None, "expression")
+        return {"kind": "member", "name": self.text(field), "receiver": self.text(value) if value is not None else None,
+                "receiverKind": rk}, False
 
     def visit_call_expression(self, node):
         fn = node.child_by_field_name("function")
@@ -458,5 +481,15 @@ class RustVisitor(Visitor):
         return False  # token trees are not parsed as expressions
 
 
-def extract(language: str, source: bytes, ctx: common.Context) -> dict:
+def _join_use(prefix: str, name: str) -> str:
+    if not prefix:
+        return name
+    return prefix + name if name.startswith("::") else f"{prefix}::{name}"
+
+
+def _dynamic_callee():
+    return {"kind": "dynamic", "name": None, "receiver": None, "receiverKind": None, "dynamic": True}, True
+
+
+def extract(_language: str, _source: bytes, ctx: common.Context) -> dict:
     return kit_walk.run_extract(ctx, RustVisitor)

@@ -8,13 +8,13 @@ import {profileDirectory} from '../omp-browser-service.mjs';
 import {TestNativeHost} from './native-host.mjs';
 
 // Loaded as an explicit extension by the real OMP CLI. Chrome is closed the way a user closes it
-// (WM_CLOSE, then a hard kill for app restart) and the same OMP session must be able to reopen it.
+// (graceful close, then a hard kill for app restart) and the same OMP session must be able to reopen it.
 export default async function relaunchScenario(pi) {
   const root=process.env.BROWSER_TEST_ROOT;
   const host=new TestNativeHost(root);
-  let session;
+  const captured={};
   const originalInfos=pi.pi.AgentSession.prototype.getAllToolInfos;
-  function captureInfos(...args){session=this;return originalInfos.apply(this,args);}
+  function captureInfos(...args){captured.session=this;return originalInfos.apply(this,args);}
   pi.pi.AgentSession.prototype.getAllToolInfos=captureInfos;
   let helper,sequence=0,buffered='',pending=new Map();
   async function startHelper(){
@@ -40,8 +40,14 @@ export default async function relaunchScenario(pi) {
     return new Promise((resolve,reject)=>{pending.set(id,{resolve,reject});helper.stdin.write(JSON.stringify({id,action,payload})+'\n');});
   }
   const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+  // Absolute Windows tool paths: a writable PATH entry must not substitute these.
+  const windowsTool=relative=>path.win32.join(process.env.SystemRoot??String.raw`C:\Windows`,'System32',relative);
   async function until(predicate,message){
-    for(let i=0;i<100;i++){const value=await predicate();if(value)return value;await sleep(100);}
+    for(let i=0;i<100;i++){
+      const value=await predicate();
+      if(value){return value;}
+      await sleep(100);
+    }
     throw new Error(message);
   }
   async function pages(){
@@ -62,8 +68,8 @@ export default async function relaunchScenario(pi) {
     let exitCode=0;
     try {
       pi.getAllTools();
-      assert.ok(session,'Main native OMP session was not captured');
-      const tool=session.getToolByName('eval');
+      assert.ok(captured.session,'Main native OMP session was not captured');
+      const tool=captured.session.getToolByName('eval');
       async function cell(code){
         const result=await tool.execute('flow-'+crypto.randomUUID(),{language:'js',code,timeout:40});
         const text=result.content.filter(block=>block.type==='text').map(block=>block.text).join('\n');
@@ -76,9 +82,10 @@ export default async function relaunchScenario(pi) {
       assert.deepEqual(first.names,['browser']);
       const [{pid}]=await control('snapshot');
       // Closing Chrome the way a user does must not leave its tabs to be restored on the next open.
-      // .NET MainWindowHandle can pick Chrome's background owner window after --no-startup-window.
-      // Close the visible browser frame belonging to this owned root, never an arbitrary Chrome window.
-      execFileSync('powershell',['-NoProfile','-Command',`
+      if(process.platform==='win32'){
+        // .NET MainWindowHandle can pick Chrome's background owner window after --no-startup-window.
+        // Close the visible browser frame belonging to this owned root, never an arbitrary Chrome window.
+        execFileSync(windowsTool(String.raw`WindowsPowerShell\v1.0\powershell.exe`),['-NoProfile','-Command',`
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -106,14 +113,23 @@ $script:closed=0
   return $true
 },[IntPtr]::Zero) | Out-Null
 if (!$script:closed) { throw 'Owned Chrome has no visible browser frame' }
-`]);
+        `]);
+      } else {
+        const port=(await readFile(path.join(profileDirectory(root,'terminal'),'DevToolsActivePort'),'utf8')).split('\n')[0];
+        const targets=await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+        for(const target of targets.filter(target=>target.type==='page')){
+          const closed=await fetch(`http://127.0.0.1:${port}/json/close/${encodeURIComponent(target.id)}`);
+          assert.equal(closed.ok,true,'the owned browser tab must close gracefully');
+        }
+      }
       await until(async()=>(await control('snapshot'))[0].state==='closed','Closing Chrome did not mark the browser closed');
       const reopened=await cell(open);
       assert.deepEqual(reopened.names,['browser']);
       assert.deepEqual(await pages(),['data:text/html,<title>marker</title>remembered'],'Reopened Chrome must contain only the AI tab');
       // App restart: the helper and Chrome are killed together, then a new helper owns the same terminal id.
       const [{pid:second}]=await control('snapshot');
-      execFileSync('taskkill',['/PID',String(helper.pid),'/T','/F'],{stdio:'ignore'});
+      if(process.platform==='win32')execFileSync(windowsTool('taskkill.exe'),['/PID',String(helper.pid),'/T','/F'],{stdio:'ignore'});
+      else helper.kill('SIGKILL');
       // The supervisor retires every browser job of a helper run that ended; the next run starts over the same profile.
       await host.waitForExit(second);
       await startHelper();
@@ -124,7 +140,7 @@ if (!$script:closed) { throw 'Owned Chrome has no visible browser frame' }
       console.log('Closed Chrome reopens with only the AI tab, also after an app restart');
     } catch(error) {console.error(error);exitCode=1;}
     finally {
-      try {if(session)await session.dispose();}
+      try {if(captured.session)await captured.session.dispose();}
       finally {
         if(pi.pi.AgentSession.prototype.getAllToolInfos===captureInfos)pi.pi.AgentSession.prototype.getAllToolInfos=originalInfos;
         try{await control('shutdown');}catch{}

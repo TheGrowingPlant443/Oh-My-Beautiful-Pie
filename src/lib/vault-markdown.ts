@@ -24,13 +24,19 @@ export interface EmbedResult { html: string; notice: string | null }
 
 export const NOT_A_DOCUMENT = "Not a Markdown vault document";
 
-const escapeHtml = (text: string): string => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const escapeHtml = (text: string): string => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 
 export function slugify(text: string): string {
   return text.normalize("NFKC").toLowerCase().trim().replace(/[^\p{L}\p{N}\s-]/gu, "").replace(/\s+/g, "-");
 }
+/** Last non-empty `#` segment of an Obsidian nested reference, or the whole text when there is none. */
+function lastHeading(fragment: string): string {
+  const parts = fragment.split("#");
+  for (let i = parts.length - 1; i >= 0; i--) if (parts[i]) return parts[i];
+  return fragment;
+}
 /** Last heading level of an Obsidian nested reference (`Note#Section#Sub`). */
-export const fragmentSlug = (fragment: string): string => slugify(fragment.split("#").filter(Boolean).pop() ?? fragment);
+export const fragmentSlug = (fragment: string): string => slugify(lastHeading(fragment));
 
 function safeDecode(text: string): string {
   try { return decodeURIComponent(text); } catch { return text; }
@@ -54,7 +60,7 @@ export function classifyHref(href: string): HrefClass {
   }
   if (value.startsWith("//")) return { kind: "scheme" };
   const hash = value.indexOf("#");
-  const path = safeDecode(hash < 0 ? value : value.slice(0, hash)).replace(/\\/g, "/");
+  const path = safeDecode(hash < 0 ? value : value.slice(0, hash)).replaceAll("\\", "/");
   const fragment = hash < 0 ? null : safeDecode(value.slice(hash + 1));
   return path === "" ? { kind: "anchor", fragment: fragment ?? "" } : { kind: "relative", path, fragment };
 }
@@ -66,9 +72,9 @@ interface WikiMeta { embed: boolean; target: string; fragment: string | null; la
 function wikilinkRule(state: StateInline, silent: boolean): boolean {
   const src = state.src;
   let pos = state.pos;
-  const embed = src.charCodeAt(pos) === 0x21;
+  const embed = src.codePointAt(pos) === 0x21;
   if (embed) pos++;
-  if (src.charCodeAt(pos) !== 0x5b || src.charCodeAt(pos + 1) !== 0x5b) return false;
+  if (src.codePointAt(pos) !== 0x5b || src.codePointAt(pos + 1) !== 0x5b) return false;
   const start = pos + 2;
   const end = src.indexOf("]]", start);
   if (end < 0 || end + 2 > state.posMax) return false;
@@ -76,8 +82,8 @@ function wikilinkRule(state: StateInline, silent: boolean): boolean {
   if (!inner.trim() || inner.includes("\n") || inner.includes("[") || inner.includes("]")) return false;
   let bar = -1;
   for (let i = 0; i < inner.length; i++) if (inner[i] === "|" && inner[i - 1] !== "\\") { bar = i; break; }
-  const targetPart = (bar < 0 ? inner : inner.slice(0, bar)).replace(/\\\|/g, "|");
-  const label = bar < 0 ? null : inner.slice(bar + 1).replace(/\\\|/g, "|").trim() || null;
+  const targetPart = (bar < 0 ? inner : inner.slice(0, bar)).replaceAll(String.raw`\|`, "|");
+  const label = bar < 0 ? null : inner.slice(bar + 1).replaceAll(String.raw`\|`, "|").trim() || null;
   const hash = targetPart.indexOf("#");
   const target = (hash < 0 ? targetPart : targetPart.slice(0, hash)).trim();
   const fragment = hash < 0 ? null : targetPart.slice(hash + 1).trim() || null;
@@ -99,6 +105,30 @@ const inlineText = (token: Token | undefined): string => {
   return out;
 };
 
+/** Obsidian block identifier: a trailing ` ^id` names the paragraph and is not shown. */
+function applyBlockId(token: Token, inline: Token | undefined): void {
+  const last = inline?.children?.at(-1);
+  const found = last?.type === "text" ? /(?:^|\s)\^([A-Za-z0-9-]+)$/.exec(last.content) : null;
+  if (!inline || !last || !found) return;
+  token.attrSet("data-block", found[1]);
+  last.content = last.content.slice(0, last.content.length - found[0].length);
+  if (inline.content.endsWith(found[0])) inline.content = inline.content.slice(0, inline.content.length - found[0].length);
+}
+
+/** Task list item: a leading `[ ]`/`[x]` in the first paragraph of a list item. */
+function applyTaskBox(state: StateCore, open: Token | undefined, inline: Token | undefined): void {
+  const children = inline?.children;
+  const first = children?.[0];
+  if (open?.type !== "list_item_open" || !children || first?.type !== "text") return;
+  const task = /^\[([ xX])\]\s+/.exec(first.content);
+  if (!task) return;
+  first.content = first.content.slice(task[0].length);
+  const box = new state.Token("task_box", "", 0);
+  box.meta = { checked: task[1] !== " " };
+  children.unshift(box);
+  open.attrJoin("class", "task-list-item");
+}
+
 function postRule(state: StateCore): boolean {
   const env = state.env as unknown as RenderEnv;
   const tokens = state.tokens;
@@ -111,28 +141,8 @@ function postRule(state: StateCore): boolean {
       env.slugs.set(base, seen + 1);
       token.attrSet("data-anchor", seen === 0 ? base : `${base}-${seen}`);
     } else if (token.type === "paragraph_open") {
-      // Obsidian block identifier: a trailing ` ^id` names the paragraph and is not shown.
-      const inline = tokens[i + 1];
-      const last = inline?.children?.[inline.children.length - 1];
-      const found = last && last.type === "text" ? /(?:^|\s)\^([A-Za-z0-9-]+)$/.exec(last.content) : null;
-      if (found) {
-        token.attrSet("data-block", found[1]);
-        last!.content = last!.content.slice(0, last!.content.length - found[0].length);
-        if (inline.content.endsWith(found[0])) inline.content = inline.content.slice(0, inline.content.length - found[0].length);
-      }
-      // Task list item: a leading `[ ]`/`[x]` in the first paragraph of a list item.
-      const open = tokens[i - 1];
-      const first = inline?.children?.[0];
-      if (open?.type === "list_item_open" && first?.type === "text") {
-        const task = /^\[([ xX])\]\s+/.exec(first.content);
-        if (task) {
-          first.content = first.content.slice(task[0].length);
-          const box = new state.Token("task_box", "", 0);
-          box.meta = { checked: task[1] !== " " };
-          inline.children!.unshift(box);
-          open.attrJoin("class", "task-list-item");
-        }
-      }
+      applyBlockId(token, tokens[i + 1]);
+      applyTaskBox(state, tokens[i - 1], tokens[i + 1]);
     }
   }
   return true;
@@ -155,7 +165,45 @@ function describe(resolution: VaultResolution | undefined): { cls: string; title
 }
 
 function noteAnchor(path: string, fragment: string | null, labelHtml: string): string {
-  return `<a href="#" class="vault-link note" data-kind="note" data-path="${escapeHtml(path)}"${fragment ? ` data-fragment="${escapeHtml(fragment)}"` : ""}>${labelHtml}</a>`;
+  const fragmentAttribute = fragment ? ` data-fragment="${escapeHtml(fragment)}"` : "";
+  return `<a href="#" class="vault-link note" data-kind="note" data-path="${escapeHtml(path)}"${fragmentAttribute}>${labelHtml}</a>`;
+}
+
+function wikiLabel(meta: WikiMeta): string {
+  if (meta.label !== null) return meta.label;
+  if (!meta.target) return meta.fragment ?? "";
+  if (!meta.fragment) return meta.target;
+  return `${meta.target} › ${meta.fragment.split("#").at(-1)}`;
+}
+
+function embedHtml(env: RenderEnv, path: string, meta: WikiMeta, shown: string): string {
+  const embed = env.embeds.get(`${path}#${meta.fragment ?? ""}`);
+  const head = `<div class="vault-embed-head">${noteAnchor(path, meta.fragment, escapeHtml(shown))}</div>`;
+  const body = embed ? `<div class="vault-embed-body">${embed.html}</div>` : "";
+  const notice = embed?.notice ? `<p class="vault-embed-notice">${escapeHtml(embed.notice)}</p>` : "";
+  return `<div class="vault-embed" data-embed-path="${escapeHtml(path)}">${head}${body}${notice}</div>`;
+}
+
+/** Opening tag for a Markdown link: every anchor points at "#"; the target lives in data-* for the host's click handler. */
+function openLink(target: HrefClass, env: RenderEnv): { html: string; tag: "a" | "span" } {
+  switch (target.kind) {
+    case "anchor":
+      return { tag: "a", html: `<a href="#" class="vault-link anchor" data-kind="anchor" data-fragment="${escapeHtml(target.fragment)}">` };
+    case "external":
+      if (target.https) return { tag: "a", html: `<a href="#" class="vault-link external" data-kind="external" data-url="${escapeHtml(target.url)}" title="${escapeHtml(target.url)}">` };
+      return { tag: "span", html: `<span class="vault-link inert" title="Only https links can be opened">` };
+    case "scheme":
+      return { tag: "span", html: `<span class="vault-link inert" title="This kind of link is never opened">` };
+    default: {
+      const resolution = resolutionOf(env, target.path);
+      if (resolution?.status === "resolved" && resolution.path) {
+        const fragment = target.fragment ? ` data-fragment="${escapeHtml(target.fragment)}"` : "";
+        return { tag: "a", html: `<a href="#" class="vault-link note" data-kind="note" data-path="${escapeHtml(resolution.path)}"${fragment}>` };
+      }
+      const { cls, title } = describe(resolution);
+      return { tag: "span", html: `<span class="vault-link ${cls}" title="${escapeHtml(title)}">` };
+    }
+  }
 }
 
 export function createMarkdown(): MarkdownItInstance {
@@ -170,54 +218,39 @@ export function createMarkdown(): MarkdownItInstance {
   rules.wikilink = (tokens, idx, _options, rawEnv) => {
     const env = rawEnv as unknown as RenderEnv;
     const meta = tokens[idx].meta as unknown as WikiMeta;
-    const shown = meta.label ?? (meta.target ? (meta.fragment ? `${meta.target} › ${meta.fragment.split("#").pop()}` : meta.target) : meta.fragment ?? "");
+    const shown = wikiLabel(meta);
     if (!meta.target) return `<a href="#" class="vault-link anchor" data-kind="anchor" data-fragment="${escapeHtml(meta.fragment ?? "")}">${escapeHtml(shown)}</a>`;
     const resolution = resolutionOf(env, meta.target);
     if (resolution?.status === "resolved" && resolution.path) {
-      if (meta.embed) {
-        const embed = env.embeds.get(`${resolution.path}#${meta.fragment ?? ""}`);
-        const head = `<div class="vault-embed-head">${noteAnchor(resolution.path, meta.fragment, escapeHtml(shown))}</div>`;
-        const notice = embed?.notice ? `<p class="vault-embed-notice">${escapeHtml(embed.notice)}</p>` : "";
-        return `<div class="vault-embed" data-embed-path="${escapeHtml(resolution.path)}">${head}${embed ? `<div class="vault-embed-body">${embed.html}</div>` : ""}${notice}</div>`;
-      }
-      return noteAnchor(resolution.path, meta.fragment, escapeHtml(shown));
+      return meta.embed ? embedHtml(env, resolution.path, meta, shown) : noteAnchor(resolution.path, meta.fragment, escapeHtml(shown));
     }
     const { cls, title } = describe(resolution);
     return inertSpan(cls, title, shown);
   };
 
-  // Links: every anchor points at "#"; the target lives in data-* for the host's click handler.
   rules.link_open = (tokens, idx, _options, rawEnv) => {
-    const env = rawEnv as unknown as RenderEnv;
-    const href = String(tokens[idx].attrGet("href") ?? "");
-    const target = classifyHref(href);
-    let html: string;
-    let tag: "a" | "span" = "a";
-    if (target.kind === "anchor") html = `<a href="#" class="vault-link anchor" data-kind="anchor" data-fragment="${escapeHtml(target.fragment)}">`;
-    else if (target.kind === "external" && target.https) html = `<a href="#" class="vault-link external" data-kind="external" data-url="${escapeHtml(target.url)}" title="${escapeHtml(target.url)}">`;
-    else if (target.kind === "external") { tag = "span"; html = `<span class="vault-link inert" title="Only https links can be opened">`; }
-    else if (target.kind === "scheme") { tag = "span"; html = `<span class="vault-link inert" title="This kind of link is never opened">`; }
-    else {
-      const resolution = resolutionOf(env, target.path);
-      if (resolution?.status === "resolved" && resolution.path) html = `<a href="#" class="vault-link note" data-kind="note" data-path="${escapeHtml(resolution.path)}"${target.fragment ? ` data-fragment="${escapeHtml(target.fragment)}"` : ""}>`;
-      else { tag = "span"; const { cls, title } = describe(resolution); html = `<span class="vault-link ${cls}" title="${escapeHtml(title)}">`; }
-    }
-    tokens[idx].meta = { ...(tokens[idx].meta ?? {}), tag };
+    const { html, tag } = openLink(classifyHref(String(tokens[idx].attrGet("href") ?? "")), rawEnv as unknown as RenderEnv);
+    tokens[idx].meta = { ...tokens[idx].meta, tag };
     return html;
   };
   rules.link_close = (tokens, idx) => {
     // Pair with the nearest unclosed link_open.
     let depth = 0;
     for (let i = idx - 1; i >= 0; i--) {
-      if (tokens[i].type === "link_close") depth++;
-      else if (tokens[i].type === "link_open") { if (depth === 0) return tokens[i].meta?.tag === "span" ? "</span>" : "</a>"; depth--; }
+      const type = tokens[i].type;
+      if (type === "link_close") depth++;
+      else if (type === "link_open") {
+        if (depth === 0) return tokens[i].meta?.tag === "span" ? "</span>" : "</a>";
+        depth--;
+      }
     }
     return "</a>";
   };
 
   rules.image = (tokens, idx) => {
     const alt = inlineText(tokens[idx]);
-    return `<span class="vault-link inert vault-image" title="Images are not loaded">[image${alt ? `: ${escapeHtml(alt)}` : ""}]</span>`;
+    const label = alt ? `: ${escapeHtml(alt)}` : "";
+    return `<span class="vault-link inert vault-image" title="Images are not loaded">[image${label}]</span>`;
   };
 
   const plainFence = rules.fence!;
@@ -235,19 +268,25 @@ export function createMarkdown(): MarkdownItInstance {
 
 export interface CollectedRefs { targets: string[]; embeds: { raw: string; fragment: string | null }[] }
 
+function collectToken(token: Token, targets: Set<string>, embeds: CollectedRefs["embeds"]): void {
+  if (token.type === "wikilink") {
+    const meta = token.meta as unknown as WikiMeta;
+    if (!meta.target) return;
+    targets.add(meta.target);
+    if (meta.embed) embeds.push({ raw: meta.target, fragment: meta.fragment });
+  } else if (token.type === "link_open") {
+    const target = classifyHref(String(token.attrGet("href") ?? ""));
+    if (target.kind === "relative") targets.add(target.path);
+  }
+}
+
 /** Link targets a document needs resolved (deduplicated) and the embeds it contains. */
 export function collectRefs(tokens: readonly Token[]): CollectedRefs {
   const targets = new Set<string>();
   const embeds: { raw: string; fragment: string | null }[] = [];
   const visit = (list: readonly Token[]): void => {
     for (const token of list) {
-      if (token.type === "wikilink") {
-        const meta = token.meta as unknown as WikiMeta;
-        if (meta.target) { targets.add(meta.target); if (meta.embed) embeds.push({ raw: meta.target, fragment: meta.fragment }); }
-      } else if (token.type === "link_open") {
-        const target = classifyHref(String(token.attrGet("href") ?? ""));
-        if (target.kind === "relative") targets.add(target.path);
-      }
+      collectToken(token, targets, embeds);
       if (token.children) visit(token.children);
     }
   };
@@ -279,7 +318,7 @@ export async function renderSegment(md: MarkdownItInstance, source: string, env:
     if (services.cancelled()) return null;
     batch.forEach((raw, i) => {
       const answer = answers[i];
-      env.resolutions.set(raw, answer && answer.raw === raw ? answer : { raw, status: "missing", path: null, candidates: [] });
+      env.resolutions.set(raw, answer?.raw === raw ? answer : { raw, status: "missing", path: null, candidates: [] });
     });
   }
   for (const embed of refs.embeds) {
@@ -323,47 +362,71 @@ export function renderProperties(properties: string): string {
 }
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
-const HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
 
-/** Section of a note named by `#Heading` (up to the next heading of the same or a higher level) or `#^block`. Null when not found. */
-export function extractFragment(text: string, fragment: string): string | null {
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
-  const name = fragment.split("#").filter(Boolean).pop() ?? fragment;
-  if (name.startsWith("^")) {
-    const id = name.slice(1);
-    const ending = new RegExp(`(?:^|\\s)\\^${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`);
-    let fence: string | null = null;
-    let start = 0;
-    for (let i = 0; i <= lines.length; i++) {
-      const line = i < lines.length ? lines[i] : "";
-      const opened = FENCE.exec(line);
-      if (opened && fence === null) fence = opened[1][0];
-      else if (opened && fence === opened[1][0]) fence = null;
-      if (fence === null && (line.trim() === "" || i === lines.length)) {
-        const block = lines.slice(start, i);
-        if (block.length && ending.test(block[block.length - 1])) {
-          block[block.length - 1] = block[block.length - 1].replace(ending, "");
-          return block.join("\n");
-        }
-        start = i + 1;
-      }
-    }
-    return null;
+/** Parses an ATX heading line; the closing `#` run and surrounding blanks are not part of the text. */
+function parseHeading(line: string): { level: number; text: string } | null {
+  let start = 0;
+  while (start < 3 && line[start] === " ") start++;
+  let level = 0;
+  while (line[start + level] === "#") level++;
+  const after = line[start + level];
+  if (level < 1 || level > 6 || (after !== " " && after !== "\t")) return null;
+  let from = start + level;
+  while (line[from] === " " || line[from] === "\t") from++;
+  let end = line.length;
+  const trimEnd = (chars: string): void => { while (end > from && chars.includes(line[end - 1])) end--; };
+  trimEnd(" \t");
+  trimEnd("#");
+  trimEnd(" \t");
+  return { level, text: line.slice(from, end) };
+}
+
+/** Fence state after `line`: opened by a fence line, closed by a fence line of the same kind, otherwise unchanged. */
+function nextFence(line: string, fence: string | null): string | null {
+  const opened = FENCE.exec(line);
+  if (!opened) return fence;
+  if (fence === null) return opened[1][0];
+  return fence === opened[1][0] ? null : fence;
+}
+
+/** The paragraph or list block that ends in ` ^id`, without the identifier. */
+function extractBlock(lines: string[], id: string): string | null {
+  const escaped = id.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+  const ending = new RegExp(String.raw`(?:^|\s)\^${escaped}\s*$`);
+  let fence: string | null = null;
+  let start = 0;
+  for (let i = 0; i <= lines.length; i++) {
+    const line = lines[i] ?? "";
+    fence = nextFence(line, fence);
+    if (fence !== null || line.trim() !== "") continue;
+    const last = lines[i - 1];
+    if (i > start && ending.test(last)) return [...lines.slice(start, i - 1), last.replace(ending, "")].join("\n");
+    start = i + 1;
   }
+  return null;
+}
+
+function extractHeading(lines: string[], name: string): string | null {
   const wanted = slugify(name);
   let fence: string | null = null;
   let level = 0;
   let from = -1;
   for (let i = 0; i < lines.length; i++) {
-    const opened = FENCE.exec(lines[i]);
-    if (opened && fence === null) { fence = opened[1][0]; continue; }
-    if (opened && fence === opened[1][0]) { fence = null; continue; }
-    if (fence !== null) continue;
-    const heading = HEADING.exec(lines[i]);
+    const inside = fence !== null;
+    fence = nextFence(lines[i], fence);
+    if (inside || fence !== null) continue;
+    const heading = parseHeading(lines[i]);
     if (!heading) continue;
     if (from < 0) {
-      if (slugify(heading[2]) === wanted) { from = i; level = heading[1].length; }
-    } else if (heading[1].length <= level) return lines.slice(from, i).join("\n");
+      if (slugify(heading.text) === wanted) { from = i; level = heading.level; }
+    } else if (heading.level <= level) return lines.slice(from, i).join("\n");
   }
   return from < 0 ? null : lines.slice(from).join("\n");
+}
+
+/** Section of a note named by `#Heading` (up to the next heading of the same or a higher level) or `#^block`. Null when not found. */
+export function extractFragment(text: string, fragment: string): string | null {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const name = lastHeading(fragment);
+  return name.startsWith("^") ? extractBlock(lines, name.slice(1)) : extractHeading(lines, name);
 }

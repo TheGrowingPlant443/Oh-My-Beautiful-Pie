@@ -1,2 +1,5 @@
 # Vendored upstream SRS template: byte-for-byte as pinned (hashes recorded in REVISION); never normalise line endings.
 resources/srs-template/* -text
+
+# The shipped analyzer manifest hashes these original rule bytes.
+bridge/code-quality/rules/omp-quality.yml -text

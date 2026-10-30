@@ -38,11 +38,12 @@ export function evidenceExcluded(name, directory) {
 
 const SECRET_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /\b(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}/,
+  /\b(?:ghp|gho|ghu|ghs|github_pat)_\w{20,}/,
   /\bAKIA[0-9A-Z]{16}\b/,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}/,
   /\bsk-[A-Za-z0-9_-]{20,}/,
-  /\b(?:api[_-]?key|secret|token|passw(?:or)?d|authorization|bearer|private[_-]?key)\b["']?\s*[:=]\s*["']?[^\s"'`]{8,}/i,
+  /\b(?:api[_-]?key|private[_-]?key|passw(?:or)?d)\b["']?\s*[:=]\s*["']?[^\s"'`]{8,}/i,
+  /\b(?:secret|token|authorization|bearer)\b["']?\s*[:=]\s*["']?[^\s"'`]{8,}/i,
   /:\/\/[^\s/:@]+:[^\s/@]+@/,
 ];
 /** Findings may name an environment variable, never carry a secret or its value. */
@@ -56,7 +57,10 @@ export function validRelativePath(value) {
 
 export function stat(file) {
   try { return lstatSync(file); }
-  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 export function readBoundedJson(file, maximum) {
@@ -164,7 +168,7 @@ export function resolveEvidence(root, relative) {
 export function normalizeRelative(value, allowRoot) {
   if (allowRoot && (value === undefined || value === '' || value === '.')) return '';
   if (!validRelativePath(value)) throw new Error('path must be a clean project-relative path');
-  return value.split(/[\\/]/).join('/');
+  return value.replaceAll(/[\\/]/g, '/');
 }
 
 export function nonNegative(value, label) {
@@ -172,13 +176,18 @@ export function nonNegative(value, label) {
   return value;
 }
 
+const byName = (a, b) => {
+  if (a.name < b.name) return -1;
+  return a.name > b.name ? 1 : 0;
+};
+
 /** One page (MAX_LIST_ENTRIES) of a directory in stable name order; `nextOffset` continues the listing. */
 export function listEvidence(root, relative, offset = 0) {
   nonNegative(offset, 'offset');
   const current = resolveEvidence(root, relative);
   if (!lstatSync(current).isDirectory()) throw new Error('That path is not a directory.');
   const visible = [];
-  for (const entry of readdirSync(current, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+  for (const entry of readdirSync(current, { withFileTypes: true }).sort(byName)) {
     // Links, excluded directories and secret-looking files are omitted without a trace.
     if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile()) || evidenceExcluded(entry.name, entry.isDirectory())) continue;
     visible.push(entry);
@@ -192,21 +201,27 @@ export function listEvidence(root, relative, offset = 0) {
   return { path: relative, offset, entries, total: visible.length, nextOffset: next, truncated: next !== null };
 }
 
+const sequenceLength = byte => {
+  if (byte >= 0xf0) return 4;
+  if (byte >= 0xe0) return 3;
+  return byte >= 0xc0 ? 2 : 1;
+};
+
+// Bytes of an unfinished multi-byte sequence at the end of the window (0 when it ends on a character boundary).
+function incompleteTail(buffer, start, end) {
+  for (let back = 1; back <= 3 && end - back >= start; back++) {
+    const byte = buffer[end - back];
+    if ((byte & 0xc0) === 0x80) continue;
+    return sequenceLength(byte) > back ? back : 0;
+  }
+  return 0;
+}
+
 // Start on a character boundary and never cut a multi-byte sequence at the end.
 export function utf8Window(buffer, length, final) {
   let start = 0;
   while (start < length && (buffer[start] & 0xc0) === 0x80) start++;
-  let end = length;
-  if (!final) {
-    for (let back = 1; back <= 3 && end - back >= start; back++) {
-      const byte = buffer[end - back];
-      if ((byte & 0xc0) === 0x80) continue;
-      const need = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1;
-      if (need > back) end -= back;
-      break;
-    }
-  }
-  return { start, end };
+  return { start, end: final ? length : length - incompleteTail(buffer, start, length) };
 }
 
 /** 64 KiB UTF-8 window of one file. `inspect(file, absoluteStart, absoluteEnd)` may add fields (receipts, hashes). */
@@ -234,6 +249,34 @@ export function readEvidence(root, relative, offset, inspect) {
 // ---- immutable publication -------------------------------------------------------------------------------------
 
 /**
+ * Writes `bytes` as `<folder>/result.json` under the exclusive `result.lock`; a result is never overwritten.
+ * `recheck()` runs under the lock and throws when the request no longer accepts a result. The descriptor, temporary
+ * file and lock are always released; the first failure is reported, so cleanup never hides the cause.
+ */
+export function publishExclusively(folder, bytes, recheck) {
+  const lock = path.join(folder, 'result.lock');
+  const temporary = path.join(folder, `result.${process.pid}.${randomUUID()}.tmp`);
+  const fd = openSync(lock, 'wx');
+  const failures = [];
+  const attempt = step => {
+    try { step(); }
+    catch (error) { failures.push(error); }
+  };
+  attempt(() => {
+    recheck();
+    writeFileSync(temporary, bytes, { flag: 'wx' });
+    renameSync(temporary, path.join(folder, 'result.json'));
+  });
+  attempt(() => {
+    try { unlinkSync(temporary); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  });
+  attempt(() => closeSync(fd));
+  attempt(() => unlinkSync(lock));
+  if (failures.length > 0) throw failures[0];
+}
+
+/**
  * `dir` comes only from OMP_MANAGER_ARCHITECT_DIR. Exclusive publication lock; a result is never overwritten.
  * `validate(payload, projectFolder, { request, requestDir, dir })` throws on a bad payload; `build(payload, actor, context)`
  * returns the stored result.
@@ -245,22 +288,10 @@ export function publishResult(dir, payload, actor, kind, validate, build) {
   validate(payload, request.folder, context);
   const bytes = JSON.stringify(build(payload, actor, context));
   if (Buffer.byteLength(bytes) > MAX_RESULT_BYTES) throw new Error('result file too large');
-  const file = path.join(folder, 'result.json');
-  const lock = path.join(folder, 'result.lock');
-  const temporary = path.join(folder, `result.${process.pid}.${randomUUID()}.tmp`);
-  const fd = openSync(lock, 'wx');
-  try {
+  publishExclusively(folder, bytes, () => {
     // Checked again under the lock: an ended or replaced request must never receive a stale result.
     validateRequest(readBoundedJson(path.join(folder, 'request.json'), MAX_REQUEST_BYTES), payload.requestId, actor, kind);
     assertOpen(folder);
-    writeFileSync(temporary, bytes, { flag: 'wx' });
-    renameSync(temporary, file);
-  } finally {
-    try { unlinkSync(temporary); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    finally {
-      try { closeSync(fd); } finally { unlinkSync(lock); }
-    }
-  }
+  });
   return { requestId: payload.requestId, saved: true };
 }

@@ -1,6 +1,6 @@
-import { SRS_ALLOWLISTS, registerVisualizationGuard } from './omp-visualization-guard.mjs';
+import { registerVisualizationGuard } from './omp-visualization-guard.mjs';
 import { installHostMonitorBridge } from './omp-host-monitor.mjs';
-export { SRS_ALLOWLISTS };
+export { SRS_ALLOWLISTS } from './omp-visualization-guard.mjs';
 
 export const MAX_SRS_FRAME = 1024 * 1024;
 export const MAX_SRS_CHUNK = 64 * 1024;
@@ -11,7 +11,16 @@ export const SRS_DOCUMENT_TYPES = ['master', 'requirement', 'domain', 'flow', 'i
 export const SRS_TOOL_NAMES = ['srs_inspect', 'srs_read_evidence', 'srs_write_document_chunk', 'srs_commit_document', 'srs_checkpoint', 'srs_finish_stage'];
 const sameStage = (a, b) => !!a && !!b && a.jobId === b.jobId && a.attemptId === b.attemptId && a.stageId === b.stageId;
 const stageIds = stage => ({ jobId: stage.jobId, attemptId: stage.attemptId, stageId: stage.stageId, nonce: stage.nonce });
-const bounded = value => { if (Buffer.byteLength(JSON.stringify(value)) > MAX_SRS_FRAME) throw new Error('srs_transport_limit: Page/chunk exceeds 1 MiB; continue in bounded calls.'); return value; };
+const bounded = value => {
+  if (Buffer.byteLength(JSON.stringify(value)) > MAX_SRS_FRAME) throw new Error('srs_transport_limit: Page/chunk exceeds 1 MiB; continue in bounded calls.');
+  return value;
+};
+const matchesStage = (stage, ids) => !!stage && stage.jobId === ids.jobId && (!ids.attemptId || stage.attemptId === ids.attemptId) && (!ids.stageId || stage.stageId === ids.stageId);
+function admissionState(found, ended, current) {
+  if (!found) return 'absent';
+  if (ended || current?.state === 'cancelled') return 'ended';
+  return current?.state === 'active' || current?.state === 'submitted' ? 'active' : 'queued';
+}
 /** Exact UTF-8 (no lone surrogates) and at most 64 KiB; used for chunks because a JSON-schema refinement cannot reach the provider. */
 export const exactUtf8Chunk = value => typeof value === 'string' && Buffer.byteLength(value) <= MAX_SRS_CHUNK && Buffer.from(value, 'utf8').toString('utf8') === value;
 
@@ -110,9 +119,9 @@ export function installSrsBridge(pi, { request, workspace, currentContext }) {
         const content = [{ type: 'text', text: JSON.stringify(result) }];
         if (name === 'srs_read_evidence' && result.kind === 'image' && result.image) {
           if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(result.image.mimeType) || typeof result.image.data !== 'string') throw new Error('unsupported native image evidence');
-          const { image: _image, ...metadata } = result;
+          const { image, ...metadata } = result;
           content[0].text = JSON.stringify(metadata);
-          content.push({ type: 'image', mimeType: result.image.mimeType, data: result.image.data });
+          content.push({ type: 'image', mimeType: image.mimeType, data: image.data });
         }
         return { content, details: result };
       } catch (error) { return failure(error); }
@@ -170,6 +179,18 @@ export function installSrsBridge(pi, { request, workspace, currentContext }) {
       throw error;
     }
   }
+  function stageStatus(ctx, payload) {
+    const ids = schemas.status.parse(controlBody(payload));
+    const ready = available();
+    const found = ready ? marker(ids) : null;
+    const stage = guard.srs(ctx);
+    const current = matchesStage(stage, ids) ? stage : null;
+    const status = workspace.quiescence();
+    const ended = found && workspace.nativeSessionEntries().some(entry => entry.type === 'custom' && entry.customType === 'omp-srs-stage-ended' && sameStage(entry.data, found.data));
+    return { sessionId: workspace.identity().sessionId, ...status, guardAvailable: ready,
+      active: current?.state === 'active' ? { jobId: current.jobId, attemptId: current.attemptId, stageId: current.stageId } : null,
+      admission: { stageId: ids.stageId ?? found?.data.stageId ?? null, found: !!found, nonce: found?.data.nonce ?? null, state: admissionState(found, ended, current) } };
+  }
   return {
     guard,
     monitor,
@@ -195,19 +216,7 @@ export function installSrsBridge(pi, { request, workspace, currentContext }) {
     async control(action, payload, ctx = currentContext()) {
       if (ctx?.agent?.kind !== 'main') throw new Error('not_controlled');
       if (action === 'srs_stage_prompt') return stagePrompt(ctx, payload);
-      if (action === 'srs_stage_status') {
-        const ids = schemas.status.parse(controlBody(payload));
-        const ready = available();
-        const found = ready ? marker(ids) : null;
-        const stage = guard.srs(ctx);
-        const current = stage && stage.jobId === ids.jobId && (!ids.attemptId || stage.attemptId === ids.attemptId) && (!ids.stageId || stage.stageId === ids.stageId) ? stage : null;
-        const status = workspace.quiescence();
-        const ended = found && workspace.nativeSessionEntries().some(entry => entry.type === 'custom' && entry.customType === 'omp-srs-stage-ended' && sameStage(entry.data, found.data));
-        return { sessionId: workspace.identity().sessionId, ...status, guardAvailable: ready,
-          active: current && current.state === 'active' ? { jobId: current.jobId, attemptId: current.attemptId, stageId: current.stageId } : null,
-          admission: { stageId: ids.stageId ?? found?.data.stageId ?? null, found: !!found, nonce: found?.data.nonce ?? null,
-            state: !found ? 'absent' : ended || current?.state === 'cancelled' ? 'ended' : current?.state === 'active' || current?.state === 'submitted' ? 'active' : 'queued' } };
-      }
+      if (action === 'srs_stage_status') return stageStatus(ctx, payload);
       if (action === 'srs_pause') {
         const ids = schemas.pause.parse(controlBody(payload));
         const paused = guard.pauseSrs(ctx, ids);

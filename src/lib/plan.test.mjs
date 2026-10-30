@@ -11,6 +11,15 @@ test('markdown headings keep their line, level and trimmed title', () => {
   ]);
 });
 
+test('heading titles keep inner hashes and need a space after at most six markers', () => {
+  const text = ['## a # b ##', '#### C#', '####### seven', '#nospace', '#   x   ###   '].join('\n');
+  assert.deepEqual(planHeadlines(text), [
+    { line: 0, level: 2, title: 'a # b' },
+    { line: 1, level: 4, title: 'C' },
+    { line: 4, level: 1, title: 'x' },
+  ]);
+});
+
 test('a heading-looking line inside a code fence is not a headline', () => {
   const text = ['# Real', '```sh', '# comment', '```', '## Also real'].join('\r\n');
   assert.deepEqual(planHeadlines(text).map(h => h.title), ['Real', 'Also real']);

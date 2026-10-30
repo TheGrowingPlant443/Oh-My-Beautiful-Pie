@@ -1,14 +1,15 @@
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
 import {
-  ID, KINDS, MAX_LIST_ENTRIES, MAX_READ_BYTES, MAX_REQUEST_BYTES, MAX_RESULT_BYTES, VISUALIZATION_KINDS, assertOpen, clean, containsSecret, evidenceExcluded, insightRoot, inside, lineValid, list, listEvidence, normalizeRelative,
+  ID, KINDS, MAX_REQUEST_BYTES, MAX_RESULT_BYTES, VISUALIZATION_KINDS, assertOpen, clean, containsSecret, inside, lineValid, list, listEvidence, normalizeRelative,
   nullableText, object, openRequest, producerFields, publishResult, readBoundedJson, readEvidence, requestFolder, stat, text, textList, validRelativePath,
 } from './omp-insight-base.mjs';
 import { readTargetStructure, snapshotReference, systemOverviewInspect, visualizationEvidence } from './omp-source-snapshot.mjs';
 import { CERTAINTIES, COVERAGE_STATUSES, HELICOPTER_CERTAINTIES, HELICOPTER_NODE_KINDS, MAPPING_OPERATIONS, SYSTEM_NODE_KINDS, SYSTEM_RELATIONS, formatVisualizationResult, saveHelicopter, saveRepositoryStructure, saveSystemOverview } from './omp-system-results.mjs';
 import { MAX_PROMPT_BYTES, TOOLS, createVisualizationGuard, registerVisualizationGuard } from './omp-visualization-guard.mjs';
 
-export { KINDS, MAX_LIST_ENTRIES, MAX_READ_BYTES, containsSecret, evidenceExcluded, insightRoot, validRelativePath };
+export { MAX_LIST_ENTRIES, MAX_READ_BYTES, evidenceExcluded, insightRoot } from './omp-insight-base.mjs';
+export { KINDS, containsSecret, validRelativePath };
 
 // Architect-only project-insight tools: a read-only, request-bound repository evidence reader and the producer-bound
 // result submissions (dependencyDiscovery, requirements, systemOverview, helicopter, structureCurrent, structureProposed). `dir` is
@@ -33,7 +34,10 @@ const ENVIRONMENTS = ['host', 'wsl', 'container'];
 function insideProject(folder, relative) {
   let real;
   try { real = realpathSync(path.join(folder, relative)); }
-  catch (error) { if (['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error.code)) return true; throw error; }
+  catch (error) {
+    if (['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error.code)) return true;
+    throw error;
+  }
   return inside(realpathSync(folder), real);
 }
 
@@ -125,19 +129,23 @@ export { saveHelicopter, saveRepositoryStructure, saveSystemOverview };
 
 const bullets = items => items.map(item => `  - ${item}`);
 
+function discoveryLine(item) {
+  const where = item.citations.map(citation => (citation.line ? `${citation.path}:${citation.line}` : citation.path)).join(', ');
+  const relationship = item.relationship ? `, ${item.relationship}` : '';
+  const notes = item.notes ? `: ${item.notes}` : '';
+  return `  - ${item.name} [${item.ecosystem ?? 'unknown ecosystem'}] declared ${item.declaredVersion ?? 'unknown'}${relationship} (${where})${notes}`;
+}
+
 export function formatInsightResult(request, result) {
   if (VISUALIZATION_KINDS.includes(request.kind)) return formatVisualizationResult(request, result);
   if (request.kind !== 'dependencyDiscovery' && request.kind !== 'requirements') throw new Error(`no console replay for request kind "${String(request.kind).slice(0, 80)}"`);
-  const header = request.kind === 'dependencyDiscovery'
+  const discovery = request.kind === 'dependencyDiscovery';
+  const header = discovery
     ? `Dependency discovery (Architect findings from repository files; nothing was installed or changed)\nProject: ${request.folder}`
     : `Project requirements findings (Architect findings, unverified; the app's own detections are separate)\nProject: ${request.folder}`;
   const out = [header, ''];
-  if (request.kind === 'dependencyDiscovery') {
-    out.push(`Dependencies (${result.items.length}):`);
-    for (const item of result.items) {
-      const where = item.citations.map(citation => (citation.line ? `${citation.path}:${citation.line}` : citation.path)).join(', ');
-      out.push(`  - ${item.name} [${item.ecosystem ?? 'unknown ecosystem'}] declared ${item.declaredVersion ?? 'unknown'}${item.relationship ? `, ${item.relationship}` : ''} (${where})${item.notes ? `: ${item.notes}` : ''}`);
-    }
+  if (discovery) {
+    out.push(`Dependencies (${result.items.length}):`, ...result.items.map(discoveryLine));
   } else {
     out.push(`Requirements (${result.items.length}):`);
     for (const item of result.items) out.push(`  - ${item.name} [${item.category}, ${item.need}, ${item.environment}]: ${item.explanation}`);

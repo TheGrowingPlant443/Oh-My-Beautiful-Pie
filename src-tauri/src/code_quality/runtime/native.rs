@@ -7,9 +7,14 @@
 //! The app never installs a container engine and never creates a Podman machine. It detects, probes
 //! and explains. A missing or stopped engine is an actionable `Err`, never a silent fallback to
 //! another runtime.
-use super::*;
-use crate::code_quality::types::{Prerequisite, QualityOptions};
+use super::cli_engine::{self, CliEngine, Engine, EngineProbe, RunControl, PROBE_TIMEOUT};
+use crate::code_quality::types::{Prerequisite, QualityOptions, QualityRuntime, Result};
 use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const MIN_MAP_COUNT: u64 = 524_288;
 const MIN_FILE_MAX: u64 = 131_072;
@@ -21,20 +26,42 @@ fn standard_dirs() -> Vec<PathBuf> {
         dirs.push(home.join(".nix-profile/bin"));
         dirs.push(home.join(".local/bin"));
     }
-    dirs.extend(["/run/current-system/sw/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/opt/podman/bin"]
-        .map(PathBuf::from));
+    dirs.extend(
+        [
+            "/run/current-system/sw/bin",
+            "/usr/bin",
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/opt/podman/bin",
+        ]
+        .map(PathBuf::from),
+    );
     dirs
 }
 
 fn program(name: &str) -> Option<PathBuf> {
-    discover_program(name, &standard_dirs().iter().map(|dir| dir.join(name)).collect::<Vec<_>>())
+    cli_engine::discover_program(
+        name,
+        &standard_dirs()
+            .iter()
+            .map(|dir| dir.join(name))
+            .collect::<Vec<_>>(),
+    )
 }
 
-pub(super) fn podman_program() -> Option<PathBuf> { program("podman") }
-pub(super) fn docker_program() -> Option<PathBuf> { program("docker") }
+pub(super) fn podman_program() -> Option<PathBuf> {
+    program("podman")
+}
+pub(super) fn docker_program() -> Option<PathBuf> {
+    program("docker")
+}
 
-pub(crate) fn macos() -> bool { cfg!(target_os = "macos") }
+#[must_use]
+pub(crate) fn macos() -> bool {
+    cfg!(target_os = "macos")
+}
 
+#[must_use]
 pub(crate) fn missing_podman() -> String {
     if macos() {
         "Podman is not installed. Install it with Homebrew (`brew install podman`), then create and start a machine yourself (`podman machine init`, `podman machine start`) and Recheck. OMP Manager never installs software or creates machines on macOS.".into()
@@ -43,6 +70,7 @@ pub(crate) fn missing_podman() -> String {
     }
 }
 
+#[must_use]
 pub(crate) fn missing_docker() -> String {
     if macos() {
         "Docker Desktop is not installed. Install it from https://www.docker.com/products/docker-desktop/ (or Homebrew: `brew install --cask docker`), start it and Recheck. OMP Manager never installs software on macOS.".into()
@@ -56,7 +84,7 @@ pub(super) fn resolve(runtime: QualityRuntime) -> Result<(QualityRuntime, PathBu
     match runtime {
         QualityRuntime::Podman { connection } => {
             let prefix = if connection.is_empty() { Vec::new() } else {
-                validate_selector(&connection, "Podman connection")?;
+                cli_engine::validate_selector(&connection, "Podman connection")?;
                 vec!["--connection".into(), connection.clone()]
             };
             Ok((QualityRuntime::Podman { connection }, podman_program().ok_or_else(missing_podman)?, prefix))
@@ -89,8 +117,13 @@ pub(super) struct Info {
 
 pub(super) fn parse_podman_info(v: &Value) -> Result<Info> {
     let host = v.get("host").ok_or("Invalid Podman info response.")?;
-    let rootless = host.pointer("/security/rootless").and_then(Value::as_bool).unwrap_or(false);
-    let controllers: Option<Vec<&str>> = host.get("cgroupControllers").and_then(Value::as_array)
+    let rootless = host
+        .pointer("/security/rootless")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let controllers: Option<Vec<&str>> = host
+        .get("cgroupControllers")
+        .and_then(Value::as_array)
         .map(|list| list.iter().filter_map(Value::as_str).collect());
     // Rootless cgroup v2 only gets the controllers systemd delegated to the user. `--cpus` needs `cpu`.
     let cpu_limits_unsupported = match (&controllers, rootless) {
@@ -101,10 +134,24 @@ pub(super) fn parse_podman_info(v: &Value) -> Result<Info> {
     };
     Ok(Info {
         os: host.get("os").and_then(Value::as_str).unwrap_or("").into(),
-        id: host.get("hostname").and_then(Value::as_str).unwrap_or("").into(),
-        graph: v.pointer("/store/graphRoot").and_then(Value::as_str).unwrap_or("").into(),
-        memory_bytes: host.get("memTotal").and_then(Value::as_u64).ok_or("Engine probe omitted available VM memory.")?,
-        remote: host.get("serviceIsRemote").and_then(Value::as_bool).unwrap_or(false),
+        id: host
+            .get("hostname")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        graph: v
+            .pointer("/store/graphRoot")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .into(),
+        memory_bytes: host
+            .get("memTotal")
+            .and_then(Value::as_u64)
+            .ok_or("Engine probe omitted available VM memory.")?,
+        remote: host
+            .get("serviceIsRemote")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         operating_system: String::new(),
         cpu_limits_unsupported,
     })
@@ -115,7 +162,9 @@ pub(super) fn parse_docker_info(v: &Value) -> Result<Info> {
         os: v["OSType"].as_str().unwrap_or("").into(),
         id: v["ID"].as_str().unwrap_or("").into(),
         graph: String::new(),
-        memory_bytes: v["MemTotal"].as_u64().ok_or("Engine probe omitted available VM memory.")?,
+        memory_bytes: v["MemTotal"]
+            .as_u64()
+            .ok_or("Engine probe omitted available VM memory.")?,
         remote: false,
         operating_system: v["OperatingSystem"].as_str().unwrap_or("").into(),
         cpu_limits_unsupported: (v.get("CpuCfsQuota").and_then(Value::as_bool) == Some(false))
@@ -124,11 +173,17 @@ pub(super) fn parse_docker_info(v: &Value) -> Result<Info> {
 }
 
 /// Reads the two kernel settings SonarQube's search engine checks. Absent/unreadable → `None`.
+#[must_use]
 pub(super) fn read_limits_at(proc_sys: &Path) -> (Option<u64>, Option<u64>) {
-    let read = |name: &str| fs::read_to_string(proc_sys.join(name)).ok().and_then(|t| t.trim().parse::<u64>().ok());
+    let read = |name: &str| {
+        fs::read_to_string(proc_sys.join(name))
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok())
+    };
     (read("vm/max_map_count"), read("fs/file-max"))
 }
 
+#[must_use]
 pub(crate) fn limits_low(max_map_count: Option<u64>, file_max: Option<u64>) -> bool {
     max_map_count.is_some_and(|v| v < MIN_MAP_COUNT) || file_max.is_some_and(|v| v < MIN_FILE_MAX)
 }
@@ -136,14 +191,42 @@ pub(crate) fn limits_low(max_map_count: Option<u64>, file_max: Option<u64>) -> b
 /// The Podman machine a macOS client talks to: the explicit connection's machine, else the default one.
 /// The app never creates or starts a machine; a stopped/missing one is reported.
 #[cfg(target_os = "macos")]
-fn running_machine(engine: &CliEngine, ctl: &Ctl) -> Result<String> {
-    let out = engine.success(&["machine", "list", "--format", "json"], PROBE_TIMEOUT, ctl, "List Podman machines")?;
-    let machines: Vec<Value> = serde_json::from_slice(&out.stdout).map_err(|_| "Invalid Podman machine list.".to_string())?;
-    let wanted = match &engine.runtime { QualityRuntime::Podman { connection } if !connection.is_empty() => Some(connection.as_str()), _ => None };
-    let running: Vec<&Value> = machines.iter().filter(|m| m["Running"].as_bool() == Some(true)).collect();
-    let chosen = running.iter().find(|m| wanted.is_some_and(|w| m["Name"].as_str().map(|n| n.trim_end_matches('*')) == Some(w)))
-        .or_else(|| running.iter().find(|m| m["Default"].as_bool() == Some(true)))
-        .or_else(|| if running.len() == 1 { running.first() } else { None });
+fn running_machine(engine: &CliEngine, control: &RunControl) -> Result<String> {
+    let out = engine.success(
+        &["machine", "list", "--format", "json"],
+        PROBE_TIMEOUT,
+        control,
+        "List Podman machines",
+    )?;
+    let machines: Vec<Value> = serde_json::from_slice(&out.stdout)
+        .map_err(|_| "Invalid Podman machine list.".to_string())?;
+    let wanted = match &engine.runtime {
+        QualityRuntime::Podman { connection } if !connection.is_empty() => {
+            Some(connection.as_str())
+        }
+        _ => None,
+    };
+    let running: Vec<&Value> = machines
+        .iter()
+        .filter(|m| m["Running"].as_bool() == Some(true))
+        .collect();
+    let chosen = running
+        .iter()
+        .find(|m| {
+            wanted.is_some_and(|w| m["Name"].as_str().map(|n| n.trim_end_matches('*')) == Some(w))
+        })
+        .or_else(|| {
+            running
+                .iter()
+                .find(|m| m["Default"].as_bool() == Some(true))
+        })
+        .or_else(|| {
+            if running.len() == 1 {
+                running.first()
+            } else {
+                None
+            }
+        });
     match chosen.and_then(|m| m["Name"].as_str()) {
         Some(name) => Ok(name.trim_end_matches('*').to_owned()),
         None if machines.is_empty() => Err("No Podman machine exists. Create and start one yourself (`podman machine init` then `podman machine start`), then Recheck. OMP Manager does not create machines on macOS.".into()),
@@ -151,44 +234,103 @@ fn running_machine(engine: &CliEngine, ctl: &Ctl) -> Result<String> {
     }
 }
 
-pub(super) fn probe(engine: &CliEngine, ctl: &Ctl) -> Result<EngineProbe> {
+pub(super) fn probe(engine: &CliEngine, control: &RunControl) -> Result<EngineProbe> {
     let podman = matches!(engine.runtime, QualityRuntime::Podman { .. });
-    if matches!(engine.runtime, QualityRuntime::DockerNative | QualityRuntime::DockerDesktop) {
+    if matches!(
+        engine.runtime,
+        QualityRuntime::DockerNative | QualityRuntime::DockerDesktop
+    ) {
         // The selected context must be this machine's own engine socket, never a TCP/ssh remote.
-        let out = engine.success(&["context", "inspect"], PROBE_TIMEOUT, ctl, "Inspect the Docker context")?;
-        let contexts: Value = serde_json::from_slice(&out.stdout).map_err(|_| "Invalid Docker context response.".to_string())?;
-        let host = contexts.pointer("/0/Endpoints/docker/Host").and_then(Value::as_str).unwrap_or("");
+        let out = engine.success(
+            &["context", "inspect"],
+            PROBE_TIMEOUT,
+            control,
+            "Inspect the Docker context",
+        )?;
+        let contexts: Value = serde_json::from_slice(&out.stdout)
+            .map_err(|_| "Invalid Docker context response.".to_string())?;
+        let host = contexts
+            .pointer("/0/Endpoints/docker/Host")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if !host.starts_with("unix://") {
             return Err(format!("The Docker context points at '{host}', not a local engine socket. Select a local context (`docker context use default`); OMP Manager does not use remote engines."));
         }
     }
-    let out = engine.success(&["info", "--format", "{{json .}}"], PROBE_TIMEOUT, ctl, "Probe selected container engine")
+    let out = engine
+        .success(
+            &["info", "--format", "{{json .}}"],
+            PROBE_TIMEOUT,
+            control,
+            "Probe selected container engine",
+        )
         .map_err(|e| explain_probe_failure(&engine.runtime, e))?;
-    let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| "Invalid or oversized engine info response.".to_string())?;
-    let info = if podman { parse_podman_info(&v)? } else { parse_docker_info(&v)? };
-    if info.os != "linux" { return Err("The selected quality runtime must provide a Linux container engine.".into()); }
-    if info.id.is_empty() { return Err("The engine did not return a stable daemon identity.".into()); }
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|_| "Invalid or oversized engine info response.".to_string())?;
+    let info = if podman {
+        parse_podman_info(&v)?
+    } else {
+        parse_docker_info(&v)?
+    };
+    if info.os != "linux" {
+        return Err("The selected quality runtime must provide a Linux container engine.".into());
+    }
+    if info.id.is_empty() {
+        return Err("The engine did not return a stable daemon identity.".into());
+    }
     match &engine.runtime {
-        QualityRuntime::Podman { connection } if connection.is_empty() && !macos() && info.remote => {
+        QualityRuntime::Podman { connection }
+            if connection.is_empty() && !macos() && info.remote =>
+        {
             return Err("Podman is configured as a remote client. Select its connection explicitly instead of the local default.".into());
         }
-        QualityRuntime::DockerNative if info.operating_system.to_lowercase().contains("docker desktop") => {
+        QualityRuntime::DockerNative
+            if info
+                .operating_system
+                .to_lowercase()
+                .contains("docker desktop") =>
+        {
             return Err("The active Docker context is Docker Desktop, not the native Docker Engine. Switch with `docker context use default`.".into());
         }
-        QualityRuntime::DockerDesktop if !info.operating_system.to_lowercase().contains("docker desktop") => {
-            return Err("The desktop-linux context does not identify the local Docker Desktop daemon.".into());
+        QualityRuntime::DockerDesktop
+            if !info
+                .operating_system
+                .to_lowercase()
+                .contains("docker desktop") =>
+        {
+            return Err(
+                "The desktop-linux context does not identify the local Docker Desktop daemon."
+                    .into(),
+            );
         }
         _ => {}
     }
     #[cfg(target_os = "macos")]
-    let machine = if podman { Some(running_machine(engine, ctl)?) } else { None };
+    let machine = if podman {
+        Some(running_machine(engine, control)?)
+    } else {
+        None
+    };
     #[cfg(not(target_os = "macos"))]
     let machine: Option<String> = None;
-    let identity = machine.as_deref().and_then(|m| machine_created(engine, m, ctl)).unwrap_or_default();
-    let fingerprint = if podman { format!("podman:{}:{}:{identity}", info.id, info.graph) } else { format!("docker:{}", info.id) };
-    let (max_map_count, file_max) = limits(engine, machine.as_deref(), ctl);
-    Ok(EngineProbe { fingerprint, os: info.os, memory_bytes: info.memory_bytes, max_map_count, file_max,
-        cpu_limits_unsupported: info.cpu_limits_unsupported })
+    let identity = machine
+        .as_deref()
+        .and_then(|m| machine_created(engine, m, control))
+        .unwrap_or_default();
+    let fingerprint = if podman {
+        format!("podman:{}:{}:{identity}", info.id, info.graph)
+    } else {
+        format!("docker:{}", info.id)
+    };
+    let (max_map_count, file_max) = limits(engine, machine.as_deref(), control);
+    Ok(EngineProbe {
+        fingerprint,
+        os: info.os,
+        memory_bytes: info.memory_bytes,
+        max_map_count,
+        file_max,
+        cpu_limits_unsupported: info.cpu_limits_unsupported,
+    })
 }
 
 fn explain_probe_failure(runtime: &QualityRuntime, error: String) -> String {
@@ -205,44 +347,76 @@ fn explain_probe_failure(runtime: &QualityRuntime, error: String) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn machine_created(engine: &CliEngine, machine: &str, ctl: &Ctl) -> Option<String> {
-    let out = engine.success(&["machine", "inspect", machine], PROBE_TIMEOUT, ctl, "Inspect Podman machine").ok()?;
+fn machine_created(engine: &CliEngine, machine: &str, control: &RunControl) -> Option<String> {
+    let out = engine
+        .success(
+            &["machine", "inspect", machine],
+            PROBE_TIMEOUT,
+            control,
+            "Inspect Podman machine",
+        )
+        .ok()?;
     let value: Value = serde_json::from_slice(&out.stdout).ok()?;
-    value.as_array()?.first()?["Created"].as_str().map(str::to_owned)
+    value.as_array()?.first()?["Created"]
+        .as_str()
+        .map(str::to_owned)
 }
 #[cfg(not(target_os = "macos"))]
-fn machine_created(_: &CliEngine, _: &str, _: &Ctl) -> Option<String> { None }
+fn machine_created(_: &CliEngine, _: &str, _: &RunControl) -> Option<String> {
+    None
+}
 
 /// Linux reads its own kernel settings (the engine shares them); a remote Podman connection cannot be
 /// inspected from here. macOS reads them from inside the machine VM, which manages them itself.
-fn limits(engine: &CliEngine, machine: Option<&str>, ctl: &Ctl) -> (Option<u64>, Option<u64>) {
+fn limits(
+    engine: &CliEngine,
+    machine: Option<&str>,
+    control: &RunControl,
+) -> (Option<u64>, Option<u64>) {
     #[cfg(target_os = "macos")]
     if let Some(machine) = machine {
         let mut cmd = Command::new(&engine.program);
-        cmd.args(["machine", "ssh", machine, "cat", "/proc/sys/vm/max_map_count", "/proc/sys/fs/file-max"]);
-        return match run_bounded(cmd, None, PROBE_TIMEOUT, ctl) {
+        cmd.args([
+            "machine",
+            "ssh",
+            machine,
+            "cat",
+            "/proc/sys/vm/max_map_count",
+            "/proc/sys/fs/file-max",
+        ]);
+        return match cli_engine::run_bounded(cmd, None, PROBE_TIMEOUT, control) {
             Ok(out) if out.status.success() => {
-                let numbers: Vec<u64> = out.text().split_whitespace().filter_map(|s| s.parse().ok()).collect();
+                let numbers: Vec<u64> = out
+                    .text()
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
                 (numbers.first().copied(), numbers.get(1).copied())
             }
             _ => (None, None),
         };
     }
-    let _ = (machine, ctl);
-    if macos() { return (None, None); }
+    let _ = (machine, control);
+    if macos() {
+        return (None, None);
+    }
     match &engine.runtime {
         QualityRuntime::Podman { connection } if !connection.is_empty() => (None, None),
         _ => read_limits_at(Path::new("/proc/sys")),
     }
 }
 
-pub(super) fn ensure_started(engine: &CliEngine, ctl: &Ctl) -> Result<()> {
-    let first = match engine.probe(ctl) { Ok(_) => return Ok(()), Err(e) => e };
+pub(super) fn ensure_started(engine: &CliEngine, control: &RunControl) -> Result<()> {
+    let first = match engine.probe(control) {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
     match &engine.runtime {
         QualityRuntime::DockerDesktop if macos() => {
             let mut cmd = Command::new("/usr/bin/open");
             cmd.args(["-a", "Docker"]);
-            run_bounded(cmd, None, PROBE_TIMEOUT, ctl)?.require_success("Start Docker Desktop")?;
+            cli_engine::run_bounded(cmd, None, PROBE_TIMEOUT, control)?
+                .require_success("Start Docker Desktop")?;
         }
         QualityRuntime::Podman { .. } if macos() => {
             return Err(format!("{first}\nNo Podman machine is running. Start yours (`podman machine start`); OMP Manager does not create or start machines on macOS."));
@@ -255,52 +429,102 @@ pub(super) fn ensure_started(engine: &CliEngine, ctl: &Ctl) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut last = first;
     while Instant::now() < deadline {
-        if ctl.cancelled() { return Err("Start runtime cancelled.".into()); }
-        match engine.probe(ctl) { Ok(_) => return Ok(()), Err(e) => last = e }
+        if control.cancelled() {
+            return Err("Start runtime cancelled.".into());
+        }
+        match engine.probe(control) {
+            Ok(_) => return Ok(()),
+            Err(e) => last = e,
+        }
         thread::sleep(Duration::from_secs(1));
     }
     Err(format!("Selected runtime did not become ready: {last}"))
 }
 
 /// Cached answer to "may `--cpus` be passed to this engine?" (`Some(reason)` = no).
-pub(super) fn cpu_limit_problem(engine: &CliEngine, ctl: &Ctl) -> Option<String> {
-    engine.cpu_limits.get_or_init(|| {
-        let out = engine.success(&["info", "--format", "{{json .}}"], PROBE_TIMEOUT, ctl, "Probe CPU limit support").ok()?;
-        let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-        if matches!(engine.runtime, QualityRuntime::Podman { .. }) { parse_podman_info(&v).ok()?.cpu_limits_unsupported }
-        else { parse_docker_info(&v).ok()?.cpu_limits_unsupported }
-    }).clone()
+pub(super) fn cpu_limit_problem<'engine>(
+    engine: &'engine CliEngine,
+    control: &RunControl,
+) -> Option<&'engine str> {
+    engine
+        .cpu_limits
+        .get_or_init(|| {
+            let out = engine
+                .success(
+                    &["info", "--format", "{{json .}}"],
+                    PROBE_TIMEOUT,
+                    control,
+                    "Probe CPU limit support",
+                )
+                .ok()?;
+            let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+            if matches!(engine.runtime, QualityRuntime::Podman { .. }) {
+                parse_podman_info(&v).ok()?.cpu_limits_unsupported
+            } else {
+                parse_docker_info(&v).ok()?.cpu_limits_unsupported
+            }
+        })
+        .as_deref()
 }
 
 /// Prerequisite rows for this platform's runtimes. Never installs, starts or pulls anything.
-pub(crate) fn probe_prerequisites(config_root: &Path, selected: &QualityRuntime) -> (Vec<Prerequisite>, QualityOptions) {
-    let ctl = Ctl::silent();
-    let connections = super::super::install::podman_connections(&ctl).map(|list| list.iter()
-        .filter_map(|v| v["Name"].as_str().map(str::to_owned)).collect()).unwrap_or_default();
-    let options = QualityOptions { podman_connections: connections, ..QualityOptions::default() };
-    let podman = match selected {
-        QualityRuntime::Podman { connection } => QualityRuntime::Podman { connection: connection.clone() },
-        _ => QualityRuntime::Podman { connection: String::new() },
+pub(crate) fn probe_prerequisites(
+    config_root: &Path,
+    selected: &QualityRuntime,
+) -> (Vec<Prerequisite>, QualityOptions) {
+    let control = RunControl::silent();
+    let connections = super::super::install::podman_connections(&control)
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v["Name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let options = QualityOptions {
+        podman_connections: connections,
+        ..QualityOptions::default()
     };
-    let docker = if macos() { QualityRuntime::DockerDesktop } else { QualityRuntime::DockerNative };
+    let podman = match selected {
+        QualityRuntime::Podman { connection } => QualityRuntime::Podman {
+            connection: connection.clone(),
+        },
+        _ => QualityRuntime::Podman {
+            connection: String::new(),
+        },
+    };
+    let docker = if macos() {
+        QualityRuntime::DockerDesktop
+    } else {
+        QualityRuntime::DockerNative
+    };
     let mut result = Vec::new();
     for runtime in [podman, docker] {
         let installed = match &runtime {
             QualityRuntime::Podman { .. } => podman_program().is_some(),
-            QualityRuntime::DockerDesktop => docker_program().is_some() && Path::new("/Applications/Docker.app").exists(),
+            QualityRuntime::DockerDesktop => {
+                docker_program().is_some() && Path::new("/Applications/Docker.app").exists()
+            }
             _ => docker_program().is_some(),
         };
-        let probe = CliEngine::new(runtime.clone(), config_root).and_then(|engine| engine.probe(&ctl));
+        let probe = CliEngine::try_new(runtime.clone(), config_root)
+            .and_then(|engine| engine.probe(&control));
         let message = match &probe {
             Err(error) => Some(error.clone()),
             Ok(p) => runtime_notes(&runtime, p),
         };
-        result.push(Prerequisite { runtime, installed, ready: probe.is_ok(), needs_restart: false, message });
+        result.push(Prerequisite {
+            runtime,
+            installed,
+            ready: probe.is_ok(),
+            needs_restart: false,
+            message,
+        });
     }
     (result, options)
 }
 
 /// Facts about a *working* engine the user should still see (never errors).
+#[must_use]
 pub(crate) fn runtime_notes(runtime: &QualityRuntime, probe: &EngineProbe) -> Option<String> {
     let mut notes = Vec::new();
     if limits_low(probe.max_map_count, probe.file_max) {
@@ -312,7 +536,10 @@ pub(crate) fn runtime_notes(runtime: &QualityRuntime, probe: &EngineProbe) -> Op
         });
     }
     if let Some(reason) = &probe.cpu_limits_unsupported {
-        notes.push(format!("CPU limits are not applied on {}: {reason}.", runtime.label()));
+        notes.push(format!(
+            "CPU limits are not applied on {}: {reason}.",
+            runtime.label()
+        ));
     }
     (!notes.is_empty()).then(|| notes.join("\n"))
 }
@@ -326,10 +553,17 @@ pub(crate) fn pkexec_program() -> Option<PathBuf> {
 /// Raises `vm.max_map_count`/`fs.file-max` after explicit consent, never lowering a value. Linux: the
 /// fixed script is piped into `pkexec /bin/sh -s` (no script path is ever executed as root, so the
 /// user-writable config folder cannot be raced). macOS: inside the Podman machine VM.
-pub(crate) fn raise_vm_limits(engine: &dyn Engine, config_root: &Path, ctl: &Ctl) -> Result<()> {
+pub(crate) fn raise_vm_limits(
+    engine: &dyn Engine,
+    config_root: &Path,
+    control: &RunControl,
+) -> Result<()> {
     let script = super::super::install::materialize_vm_limits_script(config_root)?;
     let read = || -> (Option<u64>, Option<u64>) {
-        engine.probe(ctl).map(|p| (p.max_map_count, p.file_max)).unwrap_or((None, None))
+        engine
+            .probe(control)
+            .map(|p| (p.max_map_count, p.file_max))
+            .unwrap_or((None, None))
     };
     let cmd = match engine.runtime() {
         QualityRuntime::Podman { connection } if macos() => {
@@ -345,7 +579,7 @@ pub(crate) fn raise_vm_limits(engine: &dyn Engine, config_root: &Path, ctl: &Ctl
         QualityRuntime::Podman { .. } | QualityRuntime::DockerNative => pkexec_command(pkexec_program())?,
         _ => return Err("This runtime has no Linux VM limits to raise from this platform.".into()),
     };
-    raise_with(cmd, &script, &read, ctl)
+    raise_with(cmd, &script, &read, control)
 }
 
 fn pkexec_command(pkexec: Option<PathBuf>) -> Result<Command> {
@@ -356,9 +590,16 @@ fn pkexec_command(pkexec: Option<PathBuf>) -> Result<Command> {
 }
 
 /// Runs the privileged helper and requires the limits to hold afterwards.
-fn raise_with(cmd: Command, script: &Path, read: &dyn Fn() -> (Option<u64>, Option<u64>), ctl: &Ctl) -> Result<()> {
-    let out = run_bounded(cmd, Some(script), Duration::from_secs(300), ctl)?;
-    if out.cancelled { return Err("Raising the VM limits was cancelled; nothing was changed.".into()); }
+fn raise_with(
+    cmd: Command,
+    script: &Path,
+    read: &dyn Fn() -> (Option<u64>, Option<u64>),
+    control: &RunControl,
+) -> Result<()> {
+    let out = cli_engine::run_bounded(cmd, Some(script), Duration::from_secs(300), control)?;
+    if out.cancelled {
+        return Err("Raising the VM limits was cancelled; nothing was changed.".into());
+    }
     match out.status.code() {
         Some(126) => return Err("Administrator approval was declined or dismissed, so the VM limits were not changed.".into()),
         Some(127) if !macos() => return Err("pkexec could not ask for administrator approval (no polkit authentication agent is running in this session). Run as root instead: sysctl -w vm.max_map_count=524288 fs.file-max=131072".into()),
@@ -375,50 +616,79 @@ fn raise_with(cmd: Command, script: &Path, read: &dyn Fn() -> (Option<u64>, Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::Ordering;
+    use uuid::Uuid;
 
     // Trimmed from `podman info --format json` of rootless Podman 5.8.9 on this machine.
     const PODMAN_ROOTLESS: &str = r#"{"host":{"os":"linux","hostname":"cachyos-martin","memTotal":133622087680,"cgroupControllers":["memory","pids"],"cgroupManager":"systemd","serviceIsRemote":false,"security":{"rootless":true}},"store":{"graphRoot":"/home/martin/.local/share/containers/storage"}}"#;
 
     fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("omp-native-{}", uuid::Uuid::new_v4().simple()));
+        let dir = std::env::temp_dir().join(format!("omp-native-{}", Uuid::new_v4().simple()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     fn script(path: &Path, text: &str) {
         fs::write(path, text).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(path, Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
     fn parses_rootless_podman_info_and_flags_the_missing_cpu_controller() {
         let info = parse_podman_info(&serde_json::from_str(PODMAN_ROOTLESS).unwrap()).unwrap();
-        assert_eq!((info.os.as_str(), info.id.as_str()), ("linux", "cachyos-martin"));
+        assert_eq!(
+            (info.os.as_str(), info.id.as_str()),
+            ("linux", "cachyos-martin")
+        );
         assert_eq!(info.graph, "/home/martin/.local/share/containers/storage");
         assert_eq!(info.memory_bytes, 133_622_087_680);
         assert!(!info.remote);
         let reason = info.cpu_limits_unsupported.unwrap();
-        assert!(reason.contains("memory, pids") && reason.contains("Delegate=cpu"), "{reason}");
+        assert!(
+            reason.contains("memory, pids") && reason.contains("Delegate=cpu"),
+            "{reason}"
+        );
     }
 
     #[test]
     fn cpu_limits_stay_enabled_when_the_controller_is_delegated_or_the_engine_is_rootful() {
-        let delegated = PODMAN_ROOTLESS.replace(r#"["memory","pids"]"#, r#"["cpu","memory","pids"]"#);
-        assert_eq!(parse_podman_info(&serde_json::from_str(&delegated).unwrap()).unwrap().cpu_limits_unsupported, None);
+        let delegated =
+            PODMAN_ROOTLESS.replace(r#"["memory","pids"]"#, r#"["cpu","memory","pids"]"#);
+        assert_eq!(
+            parse_podman_info(&serde_json::from_str(&delegated).unwrap())
+                .unwrap()
+                .cpu_limits_unsupported,
+            None
+        );
         let rootful = PODMAN_ROOTLESS.replace(r#""rootless":true"#, r#""rootless":false"#);
-        assert_eq!(parse_podman_info(&serde_json::from_str(&rootful).unwrap()).unwrap().cpu_limits_unsupported, None);
+        assert_eq!(
+            parse_podman_info(&serde_json::from_str(&rootful).unwrap())
+                .unwrap()
+                .cpu_limits_unsupported,
+            None
+        );
         // An engine that does not report controllers at all is not assumed to lack them.
         let silent = PODMAN_ROOTLESS.replace(r#""cgroupControllers":["memory","pids"],"#, "");
-        assert_eq!(parse_podman_info(&serde_json::from_str(&silent).unwrap()).unwrap().cpu_limits_unsupported, None);
+        assert_eq!(
+            parse_podman_info(&serde_json::from_str(&silent).unwrap())
+                .unwrap()
+                .cpu_limits_unsupported,
+            None
+        );
         let empty = PODMAN_ROOTLESS.replace(r#"["memory","pids"]"#, "[]");
-        assert!(parse_podman_info(&serde_json::from_str(&empty).unwrap()).unwrap().cpu_limits_unsupported.unwrap().contains("none"));
+        assert!(parse_podman_info(&serde_json::from_str(&empty).unwrap())
+            .unwrap()
+            .cpu_limits_unsupported
+            .unwrap()
+            .contains("none"));
     }
 
     #[test]
     fn podman_info_without_memory_is_refused() {
-        let v: Value = serde_json::from_str(r#"{"host":{"os":"linux","hostname":"h"},"store":{}}"#).unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"host":{"os":"linux","hostname":"h"},"store":{}}"#).unwrap();
         assert!(parse_podman_info(&v).is_err());
         assert!(parse_podman_info(&serde_json::json!({})).is_err());
     }
@@ -427,10 +697,18 @@ mod tests {
     fn parses_docker_info_and_cpu_quota_support() {
         let v = serde_json::json!({"ID":"ABCD:1234","OSType":"linux","MemTotal":8589934592u64,"OperatingSystem":"Arch Linux","CpuCfsQuota":true});
         let info = parse_docker_info(&v).unwrap();
-        assert_eq!((info.os.as_str(), info.id.as_str(), info.memory_bytes), ("linux", "ABCD:1234", 8 << 30));
+        assert_eq!(
+            (info.os.as_str(), info.id.as_str(), info.memory_bytes),
+            ("linux", "ABCD:1234", 8 << 30)
+        );
         assert_eq!(info.cpu_limits_unsupported, None);
-        let no_quota = serde_json::json!({"ID":"x","OSType":"linux","MemTotal":1u64,"CpuCfsQuota":false});
-        assert!(parse_docker_info(&no_quota).unwrap().cpu_limits_unsupported.unwrap().contains("CFS"));
+        let no_quota =
+            serde_json::json!({"ID":"x","OSType":"linux","MemTotal":1u64,"CpuCfsQuota":false});
+        assert!(parse_docker_info(&no_quota)
+            .unwrap()
+            .cpu_limits_unsupported
+            .unwrap()
+            .contains("CFS"));
         assert!(parse_docker_info(&serde_json::json!({"ID":"x"})).is_err());
     }
 
@@ -443,27 +721,106 @@ mod tests {
         fs::write(root.join("vm/max_map_count"), "262144\n").unwrap();
         fs::write(root.join("fs/file-max"), "9223372036854775807\n").unwrap();
         let (map, files) = read_limits_at(&root);
-        assert_eq!((map, files), (Some(262_144), Some(9_223_372_036_854_775_807)));
+        assert_eq!(
+            (map, files),
+            (Some(262_144), Some(9_223_372_036_854_775_807))
+        );
         assert!(limits_low(map, files));
         assert!(!limits_low(Some(524_288), Some(131_072)));
-        assert!(!limits_low(None, None), "unknown limits are not reported as low");
-        assert!(limits_low(Some(524_287), Some(1 << 30)) && limits_low(Some(1 << 30), Some(131_071)));
+        assert!(
+            !limits_low(None, None),
+            "unknown limits are not reported as low"
+        );
+        assert!(
+            limits_low(Some(524_287), Some(1 << 30)) && limits_low(Some(1 << 30), Some(131_071))
+        );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn malformed_kernel_limits_remain_unknown_without_discarding_the_other_limit() {
+        let root = scratch();
+        fs::create_dir_all(root.join("vm")).unwrap();
+        fs::create_dir_all(root.join("fs")).unwrap();
+        fs::write(root.join("fs/file-max"), "131072\n").unwrap();
+        for invalid in ["-1", "18446744073709551616", "524288 extra", ""] {
+            fs::write(root.join("vm/max_map_count"), invalid).unwrap();
+            assert_eq!(
+                read_limits_at(&root),
+                (None, Some(131_072)),
+                "malformed map count must not invent a passing value: {invalid:?}"
+            );
+        }
+        fs::write(root.join("vm/max_map_count"), "524288\n").unwrap();
+        fs::write(root.join("fs/file-max"), [0xff, 0xfe]).unwrap();
+        assert_eq!(read_limits_at(&root), (Some(524_288), None));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn probe_failure_guidance_retains_the_cause_without_prescribing_privilege_escalation() {
+        let permission = explain_probe_failure(
+            &QualityRuntime::DockerNative,
+            "connect /var/run/docker.sock: Permission Denied".into(),
+        );
+        assert!(permission.starts_with("connect /var/run/docker.sock: Permission Denied"));
+        assert!(permission.contains("docker` group"));
+        assert!(permission.contains("never uses sudo"));
+        for diagnostic in ["Cannot connect to socket", "Is the Docker daemon running?"] {
+            let stopped = explain_probe_failure(&QualityRuntime::DockerNative, diagnostic.into());
+            assert!(stopped.starts_with(diagnostic));
+            assert!(stopped.contains("never starts system services"));
+        }
+        let unrelated = "engine reported a corrupt storage database";
+        assert_eq!(
+            explain_probe_failure(&QualityRuntime::DockerNative, unrelated.into()),
+            unrelated
+        );
+        assert_eq!(
+            explain_probe_failure(
+                &QualityRuntime::Podman {
+                    connection: "chosen".into()
+                },
+                "permission denied on storage".into(),
+            ),
+            "permission denied on storage"
+        );
     }
 
     #[test]
     fn resolution_is_explicit_per_platform_and_never_falls_back() {
         // Windows-only runtimes are typed errors here, whatever tools happen to be installed.
-        assert!(resolve(QualityRuntime::DockerWsl { distro: "Ubuntu".into() }).unwrap_err().contains("only available on Windows"));
+        assert!(resolve(QualityRuntime::DockerWsl {
+            distro: "Ubuntu".into()
+        })
+        .unwrap_err()
+        .contains("only available on Windows"));
         if !macos() {
-            assert!(resolve(QualityRuntime::DockerDesktop).unwrap_err().contains("not offered on Linux"));
+            assert!(resolve(QualityRuntime::DockerDesktop)
+                .unwrap_err()
+                .contains("not offered on Linux"));
         }
-        assert!(resolve(QualityRuntime::Podman { connection: "--evil".into() }).is_err());
-        if let Ok((runtime, _, prefix)) = resolve(QualityRuntime::Podman { connection: String::new() }) {
-            assert_eq!(runtime, QualityRuntime::Podman { connection: String::new() });
-            assert!(prefix.is_empty(), "an empty connection means the local default, with no --connection flag");
+        assert!(resolve(QualityRuntime::Podman {
+            connection: "--evil".into()
+        })
+        .is_err());
+        if let Ok((runtime, _, prefix)) = resolve(QualityRuntime::Podman {
+            connection: String::new(),
+        }) {
+            assert_eq!(
+                runtime,
+                QualityRuntime::Podman {
+                    connection: String::new()
+                }
+            );
+            assert!(
+                prefix.is_empty(),
+                "an empty connection means the local default, with no --connection flag"
+            );
         }
-        if let Ok((_, _, prefix)) = resolve(QualityRuntime::Podman { connection: "work-box".into() }) {
+        if let Ok((_, _, prefix)) = resolve(QualityRuntime::Podman {
+            connection: "work-box".into(),
+        }) {
             assert_eq!(prefix, ["--connection", "work-box"]);
         }
     }
@@ -474,10 +831,12 @@ mod tests {
             assert!(missing_podman().contains("nix profile add nixpkgs#podman"));
         }
         for text in [missing_podman(), missing_docker()] {
-            assert!(text.contains("never installs") || text.contains("never installs software"), "{text}");
+            assert!(
+                text.contains("never installs") || text.contains("never installs software"),
+                "{text}"
+            );
         }
     }
-
 
     /// The raise path against a fake `pkexec` that records its argv and stdin and "applies" the change
     /// to a fake `/proc/sys`: proves the script travels on stdin to `/bin/sh -s`, and the result is verified.
@@ -493,44 +852,93 @@ mod tests {
         script(&fake, &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{d}/argv'\ncat > '{d}/stdin'\nprintf 524288 > '{p}/vm/max_map_count'\nexit 0\n",
             d = dir.display(), p = proc.display()));
         let script_file = dir.join("raise.sh");
-        fs::write(&script_file, include_str!("../../../../bridge/code-quality/raise-vm-limits.sh")).unwrap();
+        fs::write(
+            &script_file,
+            include_str!("../../../../bridge/code-quality/raise-vm-limits.sh"),
+        )
+        .unwrap();
         let read = || read_limits_at(&proc);
         assert!(limits_low(read().0, read().1));
-        raise_with(pkexec_command(Some(fake.clone())).unwrap(), &script_file, &read, &Ctl::silent()).unwrap();
-        assert_eq!(fs::read_to_string(dir.join("argv")).unwrap(), "/bin/sh\n-s\n");
+        raise_with(
+            pkexec_command(Some(fake.clone())).unwrap(),
+            &script_file,
+            &read,
+            &RunControl::silent(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("argv")).unwrap(),
+            "/bin/sh\n-s\n"
+        );
         let piped = fs::read_to_string(dir.join("stdin")).unwrap();
-        assert!(piped.contains("never lower") || piped.contains("Never lower"), "the fixed helper reached stdin");
-        assert_eq!(read(), (Some(524_288), Some(1_000_000)), "an already higher value is retained");
+        assert!(
+            piped.contains("never lower") || piped.contains("Never lower"),
+            "the fixed helper reached stdin"
+        );
+        assert_eq!(
+            read(),
+            (Some(524_288), Some(1_000_000)),
+            "an already higher value is retained"
+        );
         assert!(!limits_low(read().0, read().1));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn privileged_raise_rejects_failed_helpers_and_unverified_outcomes() {
+        use std::sync::atomic::AtomicBool;
+
         let dir = scratch();
         let script_file = dir.join("raise.sh");
         fs::write(&script_file, "exit 0\n").unwrap();
         let never_raised = || (Some(65_530u64), Some(1_000_000u64));
-        let checked = std::sync::atomic::AtomicBool::new(false);
-        let read = || { checked.store(true, Ordering::Relaxed); never_raised() };
+        let checked = AtomicBool::new(false);
+        let read = || {
+            checked.store(true, Ordering::Relaxed);
+            never_raised()
+        };
         for code in [126, 127] {
             let fake = dir.join(format!("pkexec-{code}"));
             script(&fake, &format!("#!/bin/sh\ncat >/dev/null\nexit {code}\n"));
-            assert!(raise_with(pkexec_command(Some(fake)).unwrap(), &script_file, &read, &Ctl::silent()).is_err());
-            assert!(!checked.load(Ordering::Relaxed), "failed helper must not reach post-success verification");
+            assert!(raise_with(
+                pkexec_command(Some(fake)).unwrap(),
+                &script_file,
+                &read,
+                &RunControl::silent()
+            )
+            .is_err());
+            assert!(
+                !checked.load(Ordering::Relaxed),
+                "failed helper must not reach post-success verification"
+            );
         }
         // The helper claims success but the kernel value did not change: never reported as raised.
         let liar = dir.join("pkexec-liar");
         script(&liar, "#!/bin/sh\ncat >/dev/null\nexit 0\n");
-        let error = raise_with(pkexec_command(Some(liar)).unwrap(), &script_file, &never_raised, &Ctl::silent()).unwrap_err();
+        let error = raise_with(
+            pkexec_command(Some(liar)).unwrap(),
+            &script_file,
+            &never_raised,
+            &RunControl::silent(),
+        )
+        .unwrap_err();
         assert!(error.contains("could not be verified"), "{error}");
         // A failing helper (not root) is an error with its diagnostic.
         let failing = dir.join("pkexec-fail");
         script(&failing, "#!/bin/sh\ncat >/dev/null\necho 'Raising SonarQube Linux VM limits requires root.' >&2\nexit 1\n");
-        let error = raise_with(pkexec_command(Some(failing)).unwrap(), &script_file, &never_raised, &Ctl::silent()).unwrap_err();
+        let error = raise_with(
+            pkexec_command(Some(failing)).unwrap(),
+            &script_file,
+            &never_raised,
+            &RunControl::silent(),
+        )
+        .unwrap_err();
         assert!(error.contains("requires root"), "{error}");
         // No pkexec at all: explicit manual instruction, never a silent skip.
-        assert!(pkexec_command(None).err().unwrap().contains("sysctl -w vm.max_map_count=524288"));
+        assert!(pkexec_command(None)
+            .err()
+            .unwrap()
+            .contains("sysctl -w vm.max_map_count=524288"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -541,10 +949,19 @@ mod tests {
         script(&fake, "#!/bin/sh\nsleep 30\n");
         let script_file = dir.join("raise.sh");
         fs::write(&script_file, "exit 0\n").unwrap();
-        let ctl = Ctl::silent();
-        let cancelling = ctl.clone();
-        let task = thread::spawn(move || { thread::sleep(Duration::from_millis(150)); cancelling.cancel.store(true, Ordering::Relaxed); });
-        let error = raise_with(pkexec_command(Some(fake)).unwrap(), &script_file, &|| (None, None), &ctl).unwrap_err();
+        let control = RunControl::silent();
+        let cancelling = control.clone();
+        let task = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            cancelling.cancel.store(true, Ordering::Relaxed);
+        });
+        let error = raise_with(
+            pkexec_command(Some(fake)).unwrap(),
+            &script_file,
+            &|| (None, None),
+            &control,
+        )
+        .unwrap_err();
         task.join().unwrap();
         assert!(error.contains("cancelled"), "{error}");
         let _ = fs::remove_dir_all(&dir);

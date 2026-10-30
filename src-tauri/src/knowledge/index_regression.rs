@@ -1,14 +1,23 @@
 //! Transport and binding regressions. Fixtures are synthetic or isolated temporary vaults; no external stores.
-use super::*;
+use super::super::dto::{ScopeRequest, VaultBinding, VaultMode};
 use super::super::integrations::Environment;
+use super::{
+    paged, scan_vault, Built, Event, HashSet, KnowledgeService, Note, NoteState, RawLink,
+    VaultIndex, VaultLinkKind, VaultLinkQuery, VaultQueryAnswer, MAX_DISPLAY_BYTES, MAX_LINE,
+    MAX_PAGE_BYTES, MAX_SEARCH_BYTES, MAX_TARGET_BYTES,
+};
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 struct Temp(PathBuf);
 
 impl Temp {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("omp-index-regression-{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("omp-index-regression-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         Self(crate::setup::canonical(&path).unwrap())
     }
@@ -22,26 +31,44 @@ impl Drop for Temp {
 
 fn note(path: String, title: String) -> Note {
     Note {
-        path, title, bytes: 0, hash: "fixture-hash".into(), mtime: 0, state: NoteState::Indexed,
-        headings: Vec::new(), blocks: HashSet::new(), links: Vec::new(),
+        path,
+        title,
+        bytes: 0,
+        hash: "fixture-hash".into(),
+        mtime: 0,
+        state: NoteState::Indexed,
+        headings: Vec::new(),
+        blocks: HashSet::new(),
+        links: Vec::new(),
     }
 }
 
 fn index(notes: Vec<Note>) -> VaultIndex {
-    VaultIndex::assemble(7, Built {
-        notes: notes.into_iter().map(Arc::new).collect(), unreadable: 0, warnings: Vec::new(), hash: "fixture-index".into(),
-    })
+    VaultIndex::assemble(
+        7,
+        Built {
+            notes: notes.into_iter().map(Arc::new).collect(),
+            unreadable: 0,
+            warnings: Vec::new(),
+            hash: "fixture-index".into(),
+        },
+    )
 }
 
 fn answer_page(answer: &VaultQueryAnswer) -> serde_json::Value {
     let bytes = serde_json::to_vec(answer).unwrap();
-    assert!(bytes.len() <= MAX_PAGE_BYTES, "entire response must fit, not just its rows");
+    assert!(
+        bytes.len() <= MAX_PAGE_BYTES,
+        "entire response must fit, not just its rows"
+    );
     serde_json::from_slice(&bytes).unwrap()
 }
 
 #[test]
 fn longest_page_prefix_includes_json_escaping_and_envelope() {
-    let rows: Vec<String> = (0..200).map(|i| format!("{i}:{}", "\u{1f}\"\\🦀".repeat(1600))).collect();
+    let rows: Vec<String> = (0..200)
+        .map(|i| format!("{i}:{}", "\u{1f}\"\\🦀".repeat(1600)))
+        .collect();
     let vault_id = "quoted\"vault\\🦀";
     let page = paged(vault_id, u64::MAX, rows.len(), 0, 200, |i| rows[i].clone()).unwrap();
     let count = page.items.len();
@@ -56,12 +83,18 @@ fn longest_page_prefix_includes_json_escaping_and_envelope() {
     assert!(serde_json::to_vec(&extended).unwrap().len() > MAX_PAGE_BYTES);
     let mut offset = count;
     while offset < rows.len() {
-        let next = paged(vault_id, u64::MAX, rows.len(), offset, 200, |i| rows[i].clone()).unwrap();
+        let next = paged(vault_id, u64::MAX, rows.len(), offset, 200, |i| {
+            rows[i].clone()
+        })
+        .unwrap();
         assert_eq!(next.total, 200);
         assert_eq!(next.offset, offset as u64);
         assert_eq!(next.items, rows[offset..offset + next.items.len()]);
         offset += next.items.len();
-        assert_eq!(next.next_offset, (offset < rows.len()).then_some(offset as u64));
+        assert_eq!(
+            next.next_offset,
+            (offset < rows.len()).then_some(offset as u64)
+        );
         assert!(serde_json::to_vec(&next).unwrap().len() <= MAX_PAGE_BYTES);
     }
     assert_eq!(offset, 200);
@@ -73,8 +106,20 @@ fn longest_page_prefix_includes_json_escaping_and_envelope() {
 
 #[test]
 fn two_hundred_note_query_succeeds_with_a_smaller_prefix() {
-    let indexed = index((0..200).map(|i| note(format!("{i:03}.md"), "\u{1f}".repeat(MAX_DISPLAY_BYTES))).collect());
-    let answer = indexed.answer("vault", &VaultLinkQuery::Notes { offset: 0, limit: 200 }).unwrap();
+    let indexed = index(
+        (0..200)
+            .map(|i| note(format!("{i:03}.md"), "\u{1f}".repeat(MAX_DISPLAY_BYTES)))
+            .collect(),
+    );
+    let answer = indexed
+        .answer(
+            "vault",
+            &VaultLinkQuery::Notes {
+                offset: 0,
+                limit: 200,
+            },
+        )
+        .unwrap();
     let value = answer_page(&answer);
     let count = value["items"].as_array().unwrap().len();
     assert!(count > 0 && count < 200);
@@ -95,15 +140,35 @@ fn near_eight_mib_heading_is_exactly_indexed_but_bounded_for_display() {
     assert_eq!(indexed.notes[0].title, heading);
     assert_eq!(indexed.notes[0].headings[0].text, heading);
     assert!(indexed.anchor_exists(0, &heading));
-    let notes = indexed.answer("vault", &VaultLinkQuery::Notes { offset: 0, limit: 200 }).unwrap();
+    let notes = indexed
+        .answer(
+            "vault",
+            &VaultLinkQuery::Notes {
+                offset: 0,
+                limit: 200,
+            },
+        )
+        .unwrap();
     let value = answer_page(&notes);
     let title = value["items"][0]["title"].as_str().unwrap();
     assert!(title.len() <= MAX_DISPLAY_BYTES);
     assert!(heading.starts_with(title));
     assert_eq!(value["items"][0]["titleTruncated"], true);
-    let search = indexed.answer("vault", &VaultLinkQuery::Search { text: "rare-needle".into(), offset: 0, limit: 200 }).unwrap();
+    let search = indexed
+        .answer(
+            "vault",
+            &VaultLinkQuery::Search {
+                text: "rare-needle".into(),
+                offset: 0,
+                limit: 200,
+            },
+        )
+        .unwrap();
     let value = answer_page(&search);
-    assert_eq!(value["total"], 1, "matching uses full heading, not its display prefix");
+    assert_eq!(
+        value["total"], 1,
+        "matching uses full heading, not its display prefix"
+    );
     assert_eq!(value["items"][0]["path"], "huge.md");
     assert_eq!(value["items"][0]["titleTruncated"], true);
     assert_eq!(value["items"][0]["snippetTruncated"], true);
@@ -111,15 +176,27 @@ fn near_eight_mib_heading_is_exactly_indexed_but_bounded_for_display() {
 }
 
 fn ambiguous_index(candidate_count: usize, occurrences: usize) -> VaultIndex {
-    let mut notes: Vec<Note> = (0..candidate_count).map(|i| {
-        let folder = "x".repeat(230);
-        note(format!("{i:03}/{folder}/{folder}/{folder}/{folder}/Shared.md"), "Shared".into())
-    }).collect();
+    let mut notes: Vec<Note> = (0..candidate_count)
+        .map(|i| {
+            let folder = "x".repeat(230);
+            note(
+                format!("{i:03}/{folder}/{folder}/{folder}/{folder}/Shared.md"),
+                "Shared".into(),
+            )
+        })
+        .collect();
     let mut source = note("source.md".into(), "Source".into());
-    source.links = (0..occurrences).map(|i| RawLink {
-        kind: VaultLinkKind::Wiki, line: i as u64 + 1, target: "Shared".into(), fragment: None,
-        label: None, external: false, anchor_only: false,
-    }).collect();
+    source.links = (0..occurrences)
+        .map(|i| RawLink {
+            kind: VaultLinkKind::Wiki,
+            line: i as u64 + 1,
+            target: "Shared".into(),
+            fragment: None,
+            label: None,
+            external: false,
+            anchor_only: false,
+        })
+        .collect();
     notes.push(source);
     index(notes)
 }
@@ -127,7 +204,15 @@ fn ambiguous_index(candidate_count: usize, occurrences: usize) -> VaultIndex {
 #[test]
 fn large_ambiguous_links_are_paged_without_shortening_path_identities() {
     let indexed = ambiguous_index(201, 200);
-    let answer = indexed.answer("vault", &VaultLinkQuery::Links { offset: 0, limit: 200 }).unwrap();
+    let answer = indexed
+        .answer(
+            "vault",
+            &VaultLinkQuery::Links {
+                offset: 0,
+                limit: 200,
+            },
+        )
+        .unwrap();
     let value = answer_page(&answer);
     let items = value["items"].as_array().unwrap();
     assert!(!items.is_empty() && items.len() < 200);
@@ -136,11 +221,28 @@ fn large_ambiguous_links_are_paged_without_shortening_path_identities() {
     assert_eq!(items[0]["candidateTotal"], 201);
     assert_eq!(items[0]["candidatesTruncated"], true);
     assert_eq!(items[0]["candidates"].as_array().unwrap().len(), 200);
-    assert_eq!(indexed.links[0].candidates.len(), 201, "the index retains every identity");
-    for (candidate, path) in items[0]["candidates"].as_array().unwrap().iter().zip(&indexed.notes) {
+    assert_eq!(
+        indexed.links[0].candidates.len(),
+        201,
+        "the index retains every identity"
+    );
+    for (candidate, path) in items[0]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(&indexed.notes)
+    {
         assert_eq!(candidate.as_str().unwrap(), path.path);
     }
-    let next = indexed.answer("vault", &VaultLinkQuery::Links { offset: items.len(), limit: 200 }).unwrap();
+    let next = indexed
+        .answer(
+            "vault",
+            &VaultLinkQuery::Links {
+                offset: items.len(),
+                limit: 200,
+            },
+        )
+        .unwrap();
     let next = answer_page(&next);
     assert_eq!(next["offset"], items.len());
     assert_ne!(items[0]["id"], next["items"][0]["id"]);
@@ -153,14 +255,28 @@ fn long_link_fields_keep_originals_and_explicit_unicode_safe_display_metadata() 
     let label = "ø".repeat(600);
     let events = super::super::markdown::scan_text(&format!("[[{target}#{fragment}|{label}]]"));
     let mut source = note("source.md".into(), "Source".into());
-    source.links = events.into_iter().filter_map(|event| match event { Event::Link(link) => Some(link), _ => None }).collect();
+    source.links = events
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Link(link) => Some(link),
+            _ => None,
+        })
+        .collect();
     assert_eq!(source.links.len(), 1);
     assert_eq!(source.links[0].target, target);
     assert_eq!(source.links[0].fragment.as_deref(), Some(fragment.as_str()));
     assert_eq!(source.links[0].label.as_deref(), Some(label.as_str()));
     let indexed = index(vec![source]);
     assert_eq!(indexed.links[0].raw, target);
-    let answer = indexed.answer("vault", &VaultLinkQuery::Links { offset: 0, limit: 200 }).unwrap();
+    let answer = indexed
+        .answer(
+            "vault",
+            &VaultLinkQuery::Links {
+                offset: 0,
+                limit: 200,
+            },
+        )
+        .unwrap();
     let value = answer_page(&answer);
     let row = &value["items"][0];
     for (field, original) in [("raw", &target), ("fragment", &fragment), ("label", &label)] {
@@ -175,12 +291,49 @@ fn long_link_fields_keep_originals_and_explicit_unicode_safe_display_metadata() 
 #[test]
 fn resolve_validates_each_field_and_the_escaped_request_transport() {
     let indexed = index(Vec::new());
-    for targets in [vec!["x".repeat(MAX_TARGET_BYTES + 1)], vec!["x".into(); 201], vec!["\u{1f}".repeat(MAX_TARGET_BYTES); 200]] {
-        assert!(indexed.answer("vault", &VaultLinkQuery::Resolve { from_path: String::new(), targets }).is_err());
+    for targets in [
+        vec!["x".repeat(MAX_TARGET_BYTES + 1)],
+        vec!["x".into(); 201],
+        vec!["\u{1f}".repeat(MAX_TARGET_BYTES); 200],
+    ] {
+        assert!(indexed
+            .answer(
+                "vault",
+                &VaultLinkQuery::Resolve {
+                    from_path: String::new(),
+                    targets
+                }
+            )
+            .is_err());
     }
-    assert!(indexed.answer("vault", &VaultLinkQuery::Resolve { from_path: "x".repeat(1025), targets: Vec::new() }).is_err());
-    assert!(indexed.answer("vault", &VaultLinkQuery::Search { text: "x".repeat(MAX_SEARCH_BYTES + 1), offset: 0, limit: 200 }).is_err());
-    let empty = indexed.answer("vault", &VaultLinkQuery::Resolve { from_path: String::new(), targets: Vec::new() }).unwrap();
+    assert!(indexed
+        .answer(
+            "vault",
+            &VaultLinkQuery::Resolve {
+                from_path: "x".repeat(1025),
+                targets: Vec::new()
+            }
+        )
+        .is_err());
+    assert!(indexed
+        .answer(
+            "vault",
+            &VaultLinkQuery::Search {
+                text: "x".repeat(MAX_SEARCH_BYTES + 1),
+                offset: 0,
+                limit: 200
+            }
+        )
+        .is_err());
+    let empty = indexed
+        .answer(
+            "vault",
+            &VaultLinkQuery::Resolve {
+                from_path: String::new(),
+                targets: Vec::new(),
+            },
+        )
+        .unwrap();
     let value = answer_page(&empty);
     assert_eq!(value["total"], 0);
     assert_eq!(value["nextOffset"], serde_json::Value::Null);
@@ -189,7 +342,15 @@ fn resolve_validates_each_field_and_the_escaped_request_transport() {
 #[test]
 fn resolve_response_uses_transport_bounded_prefix_and_exact_total() {
     let indexed = ambiguous_index(201, 0);
-    let answer = indexed.answer("vault", &VaultLinkQuery::Resolve { from_path: "source.md".into(), targets: vec!["Shared".into(); 200] }).unwrap();
+    let answer = indexed
+        .answer(
+            "vault",
+            &VaultLinkQuery::Resolve {
+                from_path: "source.md".into(),
+                targets: vec!["Shared".into(); 200],
+            },
+        )
+        .unwrap();
     let value = answer_page(&answer);
     let count = value["items"].as_array().unwrap().len();
     assert!(count > 0 && count < 200);
@@ -200,7 +361,14 @@ fn resolve_response_uses_transport_bounded_prefix_and_exact_total() {
 }
 
 fn bind(service: &KnowledgeService, root: &Path) -> VaultBinding {
-    let prepared = service.prepare_knowledge_vault(ScopeRequest::Global, None, &root.to_string_lossy(), VaultMode::Markdown).unwrap();
+    let prepared = service
+        .prepare_knowledge_vault(
+            ScopeRequest::Global,
+            None,
+            &root.to_string_lossy(),
+            VaultMode::Markdown,
+        )
+        .unwrap();
     assert!(prepared.conflicts.is_empty());
     service.confirm_knowledge_vault(&prepared.token).unwrap()
 }
@@ -209,7 +377,11 @@ fn bind(service: &KnowledgeService, root: &Path) -> VaultBinding {
 fn delayed_lazy_build_cannot_publish_an_old_root_after_rebind() {
     let temp = Temp::new();
     fs::create_dir_all(temp.0.join("home")).unwrap();
-    let service = KnowledgeService::with_environment(temp.0.join("config"), temp.0.join("home"), Environment::isolated());
+    let service = KnowledgeService::with_environment(
+        temp.0.join("config"),
+        temp.0.join("home"),
+        Environment::isolated(),
+    );
     let old_root = temp.0.join("old");
     let new_root = temp.0.join("new");
     fs::create_dir_all(&old_root).unwrap();
@@ -231,9 +403,20 @@ fn delayed_lazy_build_cannot_publish_an_old_root_after_rebind() {
     let rebound = bind(&service, &new_root);
     assert_eq!(rebound.vault_id, binding.vault_id);
     resume_tx.send(()).unwrap();
-    assert!(delayed.join().unwrap(), "the stale captured binding must be refused before publication");
+    assert!(
+        delayed.join().unwrap(),
+        "the stale captured binding must be refused before publication"
+    );
     assert!(service.cached_index(&binding.vault_id).is_none());
-    let answer = service.query_vault_links(&binding.vault_id, &VaultLinkQuery::Notes { offset: 0, limit: 200 }).unwrap();
+    let answer = service
+        .query_vault_links(
+            &binding.vault_id,
+            &VaultLinkQuery::Notes {
+                offset: 0,
+                limit: 200,
+            },
+        )
+        .unwrap();
     let value = answer_page(&answer);
     assert_eq!(value["total"], 1);
     assert_eq!(value["items"][0]["path"], "new.md");

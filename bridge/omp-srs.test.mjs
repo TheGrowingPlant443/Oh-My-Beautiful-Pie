@@ -586,7 +586,7 @@ test('installed SDK compaction, willContinue and automatic continuation keep SRS
     const config = path.relative(os.homedir(), path.join(root, 'config'));
     assert.equal(config.split(path.sep).includes('..'), false);
     const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', [fileURLToPath(new URL('./fixtures/srs-compaction-sdk.mjs', import.meta.url))], {
-      env: { ...process.env, SRS_COMPACTION_TEST_ROOT: root, PI_CODING_AGENT_DIR: path.join(root, 'agent'), PI_CONFIG_DIR: config, PI_NATIVES_DIR: nativeRoot, OMP_PROFILE: 'default', PI_COMPILED: 'false' },
+      env: { ...process.env, SRS_COMPACTION_TEST_ROOT: root, PI_CODING_AGENT_DIR: path.join(root, 'agent'), PI_CONFIG_DIR: config, PI_NATIVES_DIR: nativeRoot, OMP_PROFILE: 'default', PI_COMPILED: '' },
       timeout: 100000, maxBuffer: 1024 * 1024,
     });
     assert.match(stdout, /Installed SDK compaction\/willContinue\/automatic-continuation SRS guard verified/);

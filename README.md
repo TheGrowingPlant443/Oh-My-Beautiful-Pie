@@ -24,6 +24,8 @@ cargo tauri build --no-bundle -- --locked
 
 Output: `src-tauri/target/release/omp-manager.exe`. It embeds the UI; no Vite server is needed for the release executable.
 
+Maintainers: manually run **Native apps** in GitHub Actions, choosing the branch/commit to check. Its Windows x64 job builds the embedded frontend and release executable with the native MSVC toolchain, runs the backend tests, and uploads `OMP-Manager-windows-x64.zip`. The workflow runs only through **Run workflow**, never automatically on pushes or pull requests. Download the ZIP from the run's **Artifacts**; it is unsigned and still requires the Windows runtime prerequisites above. This also runs the existing macOS build alongside Windows.
+
 ### macOS release downloads
 
 The [GitHub releases](https://github.com/TheGrowingPlant443/Oh-My-Beautiful-Pie/releases) provide a native **Apple Silicon (arm64)** `.app` ZIP for **macOS 15 or later**. Extract the ZIP and move **OMP Manager.app** into Applications. This download does not require Nix; the Nix packages below are a separate installation path. Intel release downloads are not provided.
@@ -32,13 +34,13 @@ The app is ad-hoc signed, not Apple Developer ID signed or notarized. Gatekeeper
 
 Install **OMP 18.12.6**, its matching SDK, Bun and Node.js separately; these downloads embed the UI and bridge scripts, not those runtimes. Finder launch uses the same executable/SDK discovery described below. Optional parser, browser, container and local-knowledge features retain their documented prerequisites. Terminal launch with overrides is available through `/Applications/OMP Manager.app/Contents/MacOS/omp-manager`.
 
-Maintainers: manually run **macOS app** in GitHub Actions on the release commit. It builds on a native Apple Silicon macOS 15 runner, materializes locked frontend/Cargo dependencies through Nix, compiles with the runner's native Rust/Apple toolchain, runs backend tests, checks the packaged CLI and system-library linkage, and uploads the arm64 ZIP. Attach the ZIP and its SHA-256 checksum to a release targeting that same commit. The workflow does not publish automatically, and its headless checks do not verify Finder interaction, Keychain prompts or container integration; releases remain previews until those are checked on a real Mac.
+Maintainers: manually run **Native apps** in GitHub Actions on the release commit. It builds on a native Apple Silicon macOS 15 runner, materializes locked frontend/Cargo dependencies through Nix, compiles with the runner's native Rust/Apple toolchain, runs backend tests, checks the packaged CLI and system-library linkage, and uploads the arm64 ZIP. Attach the ZIP and its SHA-256 checksum to a release targeting that same commit. The workflow does not publish automatically, and its headless checks do not verify Finder interaction, Keychain prompts or container integration; releases remain previews until those are checked on a real Mac.
 
 ### Linux and macOS
 
 The flake exposes native `x86_64-linux`, `aarch64-linux`, `x86_64-darwin` and `aarch64-darwin` packages. Build on the target OS/architecture (or use a matching Nix remote builder); Linux cannot runtime-test the macOS app. macOS builds, Finder launch, Keychain prompts and Podman-machine integration require verification on a real Mac; they are not claimed tested by a Linux build.
 
-Prerequisites are a working Nix installation with `nix-command` and `flakes` enabled, a graphical user session, and an existing **OMP 18.12.6** executable. The app does not install or replace your OMP executable, model configuration, credentials or sessions. The first Nix build can download a substantial Rust/WebKit/Node closure and compile Rust dependencies; all npm dependency materialization and frontend compilation happen inside Nix derivations, not in your checkout.
+Prerequisites are a working Nix installation with `nix-command` and `flakes` enabled and a graphical user session. The package supplies its own matching **OMP 18.12.6** CLI; it does not install or replace your global OMP executable, model configuration, credentials or sessions. The first Nix build can download a substantial Rust/WebKit/Node closure and compile Rust dependencies; all npm dependency materialization and frontend compilation happen inside Nix derivations, not in your checkout.
 
 From the repository root:
 
@@ -46,8 +48,6 @@ From the repository root:
 # Build the frontend and release Rust binary; no Tauri CLI or Vite server is needed.
 nix build .#omp-manager
 
-# Omit this when the matching omp is already discoverable.
-export OMP_BIN="$HOME/.local/bin/omp"
 ./result/bin/omp-manager
 
 # Equivalent build-and-run entry point:
@@ -56,20 +56,23 @@ nix run .
 
 `packages.default` is `omp-manager`; `packages.frontend` contains the generated UI, and `packages.sdk` contains the pinned bridge SDK. The Rust package builds with `tauri/custom-protocol` so the UI, bridge modules, source-index scripts, scanner assets and SRS templates are embedded. Source filtering excludes `target`, `node_modules`, `dist`, worktrees and unrelated root files. Linux uses GTK 3/WebKitGTK 4.1 and bundled GIO/schema paths; macOS uses native WebKit/frameworks from the Nix stdenv's Apple SDK. This is a Nix package, not an AppImage, DMG, signed/notarized installer or cross-platform executable.
 
+The frontend and compiled Cargo dependencies have separate Nix cache boundaries. Rust, bridge and resource edits reuse an unchanged frontend; application and frontend edits reuse compiled Rust dependencies through pinned [Crane](https://github.com/ipetkov/crane). Cargo manifests/lockfile, toolchain, features/profile and native build inputs still invalidate the dependency cache. The first build seeds it; an unchanged build reuses the complete package. Changed application code still compiles and links with the existing full release LTO and one codegen unit. Nix garbage collection can remove cached build outputs, requiring them to be rebuilt.
+
 #### OMP executable and SDK
 
-The package wrapper supplies Bun, Node.js, Git, the existing Tree-sitter Python environment, and an immutable **`@oh-my-pi/pi-coding-agent` 18.12.6** SDK. The SDK is built from `nix/omp-sdk/package.json` plus its integrity-pinned, hydrated `registry-lock.json`. Lifecycle scripts are disabled, including optional native/ONNX download hooks; no package is installed at app startup. The bridge consumes the SDK's source, not an SDK-installed replacement `omp`.
+The package wrapper supplies Bun, Node.js, Git, the existing Tree-sitter Python environment, and an immutable **`@oh-my-pi/pi-coding-agent` 18.12.6** SDK and CLI. The SDK is built from `nix/omp-sdk/package.json` plus its integrity-pinned, hydrated `registry-lock.json`. Lifecycle scripts are disabled, including optional native/ONNX download hooks; no package is installed at app startup. The bridge imports SDK source, and its matching CLI runs through the packaged Bun without changing agent-tool `PATH` precedence. `BUN_BIN` can override that interpreter.
 
 To build/use the SDK separately:
 
 ```sh
 nix build .#sdk --out-link result-sdk
 export OMP_SDK_DIR="$PWD/result-sdk/node_modules/@oh-my-pi/pi-coding-agent"
-export OMP_BIN="$HOME/.local/bin/omp"
 nix run .
 ```
 
 Normally omit `OMP_SDK_DIR`: the packaged launcher and `nix develop` set its default to the pinned SDK. An explicit `OMP_SDK_DIR` wins and is exclusive: point it at the package directory containing `package.json`, `src/config/settings.ts` and `src/config/registry.ts`, **not** at the enclosing `node_modules`. The app checks the executable's `omp/<version>` against the SDK version and refuses a mismatch. When updating OMP, update the SDK version and its complete integrity-bearing registry lock together and recheck the bridge against that exact executable; changing only the manifest is insufficient.
+
+`OMP_BIN` can override the packaged CLI, but matching version numbers alone do not guarantee SDK source-import compatibility. The standalone compiled 18.12.6 binary failed those imports during Linux verification; the package default and development shell use the SDK's own CLI instead.
 
 For an unwrapped binary, discovery also covers Bun's existing global SDK (`BUN_INSTALL` or `~/.bun/install/global/node_modules/...`), `${XDG_DATA_HOME:-$HOME/.local/share}/omp-manager/sdk/node_modules/...`, `~/.local/share/omp-manager/sdk/node_modules/...`, macOS `~/Library/Application Support/omp-manager/sdk/node_modules/...`, and an SDK beside/in the resolved OMP installation. These are discovery locations, not instructions to run a non-Nix installer. `OMP_BIN` and `BUN_BIN` override executable discovery. Unix desktop launch also searches existing `~/.local/bin`, `~/.bun/bin`, `~/.nix-profile/bin`, `~/.cargo/bin` and conventional system locations after inherited `PATH`.
 
@@ -323,6 +326,18 @@ Pending human decisions are the running sessions' live native requests, held in 
 - Human decision answers and the native Agent Hub use authenticated, main-window-only commands and the app's own bridge; the installed OMP SDK's files are never modified, and the in-memory hooks the bridge installs for them are removed when it shuts down. The Manager and models cannot answer a human-only confirmation, open the hub or select a target Markdown.
 - System overview runs a local Python parser process over an app-owned copy of the repository: no network, nothing from the repository is executed, built or imported, and no package is installed. It is not an OS sandbox. An Architect-generated diagram is a model interpretation of source and configuration, never proof of runtime behaviour.
 
+## Rust coding standard
+
+The backend follows the [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html) in its application-code context. Chromium/Fuchsia-specific build, layout, concurrency and test-framework rules do not apply to this Cargo/Tauri application. Keep conventional Cargo layout, serialized DTOs and IPC contracts stable; use the guide's explicit exceptions where shared ownership or direct application APIs are clearer than additional abstractions.
+
+Use the pinned stable formatter; `src-tauri/rustfmt.toml` sets 100-column formatting and lowercase hexadecimal literals:
+
+```sh
+nix develop path:. -c cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+```
+
+Single-module imports, justified unsafe boundaries, borrowing, meaningful error/invariant context and API naming are reviewed in the source. Unstable rustfmt options are not enabled; the guide permits omitting formatting options unavailable on stable Rust.
+
 ## Verification
 
 ```sh
@@ -332,6 +347,17 @@ npm run check
 npm run build
 ```
 
+On Linux/macOS, run the full JavaScript/TypeScript, Python and Rust suites with real coverage:
+
+```sh
+nix develop path:. -c npm run test:coverage
+```
+
+The shell supplies locked frontend dependencies, the pinned SDK and CLI, all declared parser grammars, and a matched upstream Rust/LLVM coverage toolchain through Nix. Groovy and Kotlin use the upstream schemas required by the visitors; PHP uses its original dual-entry-point Python binding. The runner links Nix dependencies when `node_modules` is absent, preserves an existing dependency tree, and uses Nix-vendored Cargo dependencies offline. Native SDK tests require the native-addon cache. Set `PUPPETEER_EXECUTABLE_PATH` to an installed Chrome executable (or its platform GPU wrapper) to enable the isolated browser integration cases; target-OS checks retain their explicit prerequisites.
+Set `OMP_BROWSER_NATIVE=1` in the same environment to exercise the Rust supervisor's real-browser ownership, helper-crash retirement, profile-lease and revocation proof as well; it is separate from the JavaScript fixture's native-host harness.
+Rust's instrumented build cache stays in the per-user cache (`XDG_CACHE_HOME`, or `~/.cache`), not in the checkout or Nix flake input; Python coverage includes subprocesses, combines their real measurements, and does not write source-tree bytecode.
+
+Reports are `.quality-coverage/javascript.lcov`, `.quality-coverage/python.xml` and `.quality-coverage/rust.lcov`, using original repository source paths. `sonar-project.properties` declares their [supported SonarQube import formats](https://docs.sonarsource.com/sonarqube-server/analyzing-source-code/test-coverage/test-coverage-parameters). Snapshots include explicitly declared, regular relative coverage files even when gitignored, without admitting linked files, protected metadata or explicitly excluded paths. Failed suites remove the final report set; no synthetic coverage, source exclusions or quality-gate changes are used.
 On macOS, first canonicalize the temporary-directory alias so security-sensitive fixtures use real paths: `TMPDIR="$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.gettempdir()))')"; export TMPDIR`. The macOS release workflow applies this before running the complete Rust suite, including a native process-identity/cancellation smoke check. The package-insights deadline regression holds the second response behind a bounded channel rather than requiring the first response to land within a narrow sleep-based window.
 
 Exercised on Windows: independent real OMP children; terminal handshake, input and response; preview-only startup; stop/restart and saved conversation continuity; application close/reopen with no autostart; native folder picker; native reconnect listing; plan viewing; compact tree with no dashboard terminals; and responsive preview sizing.
@@ -353,7 +379,7 @@ Controller authorization is not a filesystem sandbox: OMP's ordinary tools retai
 ```sh
 "$LOCALAPPDATA/Graphify/venv/Scripts/python.exe" -I -B -m unittest discover -s bridge/source-index -p "test_*.py"
 OMP_SDK_DIR=<installed @oh-my-pi/pi-coding-agent> node --experimental-strip-types --no-warnings --test bridge/omp-native-ui.test.mjs
-OMP_HOST_MONITOR_NATIVE=1 cargo test --manifest-path src-tauri/Cargo.toml --locked host_monitor::tests::native_snapshot_smoke
+OMP_HOST_MONITOR_NATIVE=1 cargo test --manifest-path src-tauri/Cargo.toml --locked host_monitor::host_monitor_service::tests::native_snapshot_smoke
 ```
 
 The Python command runs the parser, resolver and language-profile tests with hermetic fixtures, here with the Graphify interpreter the app picks by default on Windows; substitute any interpreter that has the Tree-sitter grammar packages (the one `OMP_SYSTEM_OVERVIEW_PYTHON` would name). A grammar that is not installed makes its tests report as skipped with *grammar unavailable for <language>* and the real reason; skips are not passes. The second command, and the installed-SDK local-paste proof in `bridge/omp-structure-sources.test.mjs`, are opt-in: without `OMP_SDK_DIR` they are skipped. With it they run the real SDK's interactive UI against scratch `PI_CODING_AGENT_DIR`/`PI_CONFIG_DIR` roots, exercising the raw-UI capture, handler proxies and approve/select/input/editor/Ask settlement rather than plain mocks. The other bridge tests (`omp-agent-hub`, `omp-visualization-guard`, `omp-system-overview`, `omp-project-insight`, `omp-structure-sources`) and the pure `src/lib` tests (decision store, tabs, projections and layout, structure view, visualization tickets) run with the Node command above. These tests use fixtures and do not call a model; they do not replace a native WebView walk-through.

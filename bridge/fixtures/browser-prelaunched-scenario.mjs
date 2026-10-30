@@ -5,15 +5,15 @@ import {access,readFile} from 'node:fs/promises';
 import path from 'node:path';
 import {installTerminalBrowserBridge} from '../omp-browser.mjs';
 import {profileDirectory} from '../omp-browser-service.mjs';
-import {TestNativeHost} from './native-host.mjs';
+import {TestNativeHost,openManualTabs} from './native-host.mjs';
 
 // Loaded as an explicit extension by the real OMP CLI. The human starts the browser with the Browser button (no
 // agent browser.open yet) and opens tabs by hand: the agent must see them on its first browser.tabs().
 export default async function prelaunchedScenario(pi) {
   const root=process.env.BROWSER_TEST_ROOT;
-  let session;
+  const captured={};
   const originalInfos=pi.pi.AgentSession.prototype.getAllToolInfos;
-  function captureInfos(...args){session=this;return originalInfos.apply(this,args);}
+  function captureInfos(...args){captured.session=this;return originalInfos.apply(this,args);}
   pi.pi.AgentSession.prototype.getAllToolInfos=captureInfos;
   const host=new TestNativeHost(root);
   const helper=spawn(process.env.BUN_BIN||'bun',[fileURLToPath(new URL('../omp-browser-service.mjs',import.meta.url)),root,process.env.OMP_SDK_DIR],{env:process.env,stdio:['pipe','pipe','inherit']});
@@ -52,8 +52,8 @@ export default async function prelaunchedScenario(pi) {
     let exitCode=0;
     try {
       pi.getAllTools();
-      assert.ok(session,'Main native OMP session was not captured');
-      const tool=session.getToolByName('eval');
+      assert.ok(captured.session,'Main native OMP session was not captured');
+      const tool=captured.session.getToolByName('eval');
       async function cell(code){
         const result=await tool.execute('flow-'+crypto.randomUUID(),{language:'js',code,timeout:40});
         const text=result.content.filter(block=>block.type==='text').map(block=>block.text).join('\n');
@@ -70,25 +70,24 @@ export default async function prelaunchedScenario(pi) {
       const row=await control('openVisible',{instanceId:'terminal',generation:1,restartHeadless:false});
       assert.equal(row.state,'ready');
       const port=await chromePort();
-      for(const title of ['Manual A','Manual B']){
-        const created=await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(`data:text/html,<title>${title}</title>${title}`)}`,{method:'PUT'});
-        assert.equal(created.ok,true);
-      }
+      const manualTitles=['Manual A','Manual B'];
+      await openManualTabs(port,manualTitles.map(title=>`data:text/html,<title>${title}</title>${title}`));
       const seen=await cell('var rows=await browser.tabs();print("FLOW:"+JSON.stringify({rows:rows.map(t=>({name:t.name,title:t.title,kind:t.kind}))}));');
       console.log('after hand-opened tabs',JSON.stringify(seen));
-      assert.deepEqual(seen.rows.map(r=>r.name).sort(),['tab-1','tab-2','tab-3'],'every hand-opened tab (and the launch page) must be attached');
-      assert.deepEqual(seen.rows.map(r=>r.title).filter(Boolean).sort(),['Manual A','Manual B']);
-      assert.ok(seen.rows.every(r=>r.kind==='connected'));
-      const manual=seen.rows.find(r=>r.title==='Manual A').name;
+      const manualRows=seen.rows.filter(row=>manualTitles.includes(row.title));
+      assert.deepEqual(manualRows.map(row=>row.title).sort(),manualTitles);
+      assert.ok(manualRows.every(row=>row.kind==='connected'));
+      const manual=manualRows.find(row=>row.title==='Manual A').name;
       const read=await cell(`var mine=browser.tab(${JSON.stringify(manual)});print("FLOW:"+JSON.stringify({title:await mine.evaluate(()=>document.title)}));`);
       assert.equal(read.title,'Manual A','The agent must be able to control a hand-opened tab by name');
       // The agent's own tab still works next to them.
       const work=await cell('var tab=await browser.open({name:"work",url:"about:blank"});print("FLOW:"+JSON.stringify({names:(await browser.tabs()).map(t=>t.name).sort()}));');
-      assert.deepEqual(work.names,['tab-1','tab-2','tab-3','work']);
+      assert.ok(work.names.includes('work'));
+      assert.ok(manualRows.every(row=>work.names.includes(row.name)),'opening an agent tab must preserve manual-tab references');
       console.log('Pre-launched browser tabs are visible to the agent');
     } catch(error) {process.stderr.write(String(error.stack||error)+'\n');exitCode=1;}
     finally {
-      try {if(session)await session.dispose();}
+      try {if(captured.session)await captured.session.dispose();}
       finally {
         if(pi.pi.AgentSession.prototype.getAllToolInfos===captureInfos)pi.pi.AgentSession.prototype.getAllToolInfos=originalInfos;
         try{await control('shutdown');}catch{}

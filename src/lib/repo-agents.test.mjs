@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { sameRepoAgents } from "./repo-agents.ts";
+import { repoKey, sameRepoAgents } from "./repo-agents.ts";
 
 const row = (id, patch = {}) => ({ id, name: id, projectPath: "C:\\Work\\Repo", status: "running", planTarget: null, helper: null, ...patch });
 const helper = (id, target, patch = {}) => row(id, { projectPath: `C:\\cfg\\helpers\\${target}\\git`, helper: { target, purpose: "git", repo: "x" }, ...patch });
@@ -15,6 +15,13 @@ test("sessions match on folder ignoring slash style, case and trailing slash; st
   const a = row("a", { projectPath: "C:\\Work\\Repo\\" });
   const all = [a, row("b", { projectPath: "c:/work/repo" }), row("c", { projectPath: "C:/Other" }), row("d", { projectPath: "c:/work/repo", status: "stopped" })];
   assert.deepEqual(ids(sameRepoAgents(all, a)), ["b"]);
+});
+
+test("repoKey normalizes extended-length, UNC and trailing separators", () => {
+  assert.equal(repoKey("  \\\\?\\C:\\Work\\Repo\\\\ "), "c:/work/repo");
+  assert.equal(repoKey("\\\\?\\UNC\\Server\\Share\\"), "//server/share");
+  assert.equal(repoKey("/"), "");
+  assert.equal(repoKey("/Ünï/Dir//"), "/ünï/dir");
 });
 
 test("helpers of the session are listed after sessions, sorted by name; other folders' helpers are not", () => {

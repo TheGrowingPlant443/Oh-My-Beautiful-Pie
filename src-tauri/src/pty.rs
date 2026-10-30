@@ -1,13 +1,17 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
+use serde_json::Value;
 use tauri::ipc::{Channel, InvokeResponseBody};
+use vt100::{Callbacks, Parser, Screen};
 
+use crate::host_monitor::ProcessIdentity;
 use crate::instance::{Definition, InstanceKind};
 use crate::manager::BridgeLaunch;
 
@@ -20,10 +24,10 @@ type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 struct CursorReplies {
     bytes: Vec<u8>,
 }
-impl vt100::Callbacks for CursorReplies {
+impl Callbacks for CursorReplies {
     fn unhandled_csi(
         &mut self,
-        screen: &mut vt100::Screen,
+        screen: &mut Screen,
         i1: Option<u8>,
         i2: Option<u8>,
         params: &[&[u16]],
@@ -45,14 +49,14 @@ impl vt100::Callbacks for CursorReplies {
 struct Output {
     bytes: VecDeque<u8>,
     channel: Option<Channel<InvokeResponseBody>>,
-    parser: vt100::Parser<CursorReplies>,
+    parser: Parser<CursorReplies>,
 }
 impl Output {
     fn new() -> Self {
         Self {
             bytes: VecDeque::new(),
             channel: None,
-            parser: vt100::Parser::new_with_callbacks(
+            parser: Parser::new_with_callbacks(
                 DEFAULT_ROWS,
                 DEFAULT_COLS,
                 0,
@@ -85,29 +89,65 @@ pub struct Pty {
     pub rows: u16,
     exit: Option<u32>,
     /// PID plus creation time captured while the PTY owns the child handle; read-only attribution for the host monitor.
-    root: Option<crate::host_monitor::ProcessIdentity>,
+    root: Option<ProcessIdentity>,
 }
 
 impl Pty {
     pub fn spawn(definition: &Definition, bridge: &BridgeLaunch) -> Result<Self, String> {
+        let app_root = bridge
+            .extension_path
+            .parent()
+            .ok_or("invalid bridge directory")?;
+        let local = Self::local_setup(definition, bridge, app_root)?;
+        let local_enabled = local["local"] == true;
+
+        let mut cmd = CommandBuilder::new(crate::toolchain::omp_program());
+        cmd.cwd(&definition.input.project_path);
+        Self::add_session_args(&mut cmd, definition, &local, local_enabled)?;
+        Self::add_extensions(&mut cmd, definition, bridge, app_root, local_enabled)?;
+        Self::add_bridge_env(&mut cmd, definition, bridge);
+        Self::start(cmd)
+    }
+    fn local_setup(
+        definition: &Definition,
+        bridge: &BridgeLaunch,
+        app_root: &Path,
+    ) -> Result<Value, String> {
         let input = &definition.input;
-        let app_root = bridge.extension_path.parent().ok_or("invalid bridge directory")?;
         // Read-only helpers keep their restricted tool surface, regardless of their model.
         let has_local_assets = definition.helper.is_none()
-            && ["AGENTS.md", "RULES.md", "SKILLS.md", "agent-instructions", "rules", "skills", "tools", "extensions"]
-                .iter().any(|name| bridge.local_ai_setup_dir.join(name).exists());
-        let local = if has_local_assets {
-            crate::config::native_request(app_root, &bridge.home_dir, serde_json::json!({
+            && [
+                "AGENTS.md",
+                "RULES.md",
+                "SKILLS.md",
+                "agent-instructions",
+                "rules",
+                "skills",
+                "tools",
+                "extensions",
+            ]
+            .iter()
+            .any(|name| bridge.local_ai_setup_dir.join(name).exists());
+        if !has_local_assets {
+            return Ok(serde_json::json!({"local": false}));
+        }
+        crate::config::native_request(
+            app_root,
+            &bridge.home_dir,
+            serde_json::json!({
                 "action": "local_setup", "cwd": input.project_path, "profile": input.profile,
                 "configFiles": input.configs, "model": input.model,
                 "sessionPath": definition.session_path.as_ref().filter(|p| p.is_file())
-            }))?
-        } else { serde_json::json!({"local": false}) };
-        let local_enabled = local["local"] == true;
-
-        let program = crate::toolchain::omp_program();
-        let mut cmd = CommandBuilder::new(program);
-        cmd.cwd(&input.project_path);
+            }),
+        )
+    }
+    fn add_session_args(
+        cmd: &mut CommandBuilder,
+        definition: &Definition,
+        local: &Value,
+        local_enabled: bool,
+    ) -> Result<(), String> {
+        let input = &definition.input;
         cmd.args(["--cwd", &input.project_path]);
         cmd.args([
             "--profile",
@@ -122,7 +162,9 @@ impl Pty {
             cmd.arg(config);
         }
         if local_enabled {
-            let selector = local["selector"].as_str().ok_or("Local AI setup model resolution is unavailable")?;
+            let selector = local["selector"]
+                .as_str()
+                .ok_or("Local AI setup model resolution is unavailable")?;
             cmd.args(["--model", selector]);
             if let Some(thinking) = local["thinkingLevel"].as_str() {
                 cmd.args(["--thinking", thinking]);
@@ -140,43 +182,63 @@ impl Pty {
             cmd.arg(path);
         }
         // A helper agent (Code diff / Git tree) has no built-in tools at all; its tools are the bridge's repo_inspect and code_quality_report.
-        let helper = definition.helper.as_ref();
-        if helper.is_some() {
+        if definition.helper.is_some() {
             cmd.arg("--no-tools");
         }
+        Ok(())
+    }
+    fn add_extensions(
+        cmd: &mut CommandBuilder,
+        definition: &Definition,
+        bridge: &BridgeLaunch,
+        app_root: &Path,
+        local_enabled: bool,
+    ) -> Result<(), String> {
         cmd.env("OMP_MANAGER_LOCAL_AI_SETUP_DIR", &bridge.local_ai_setup_dir);
-        cmd.env("OMP_MANAGER_LOCAL_AI_SETUP_MODE", if local_enabled { "local" } else { "ordinary" });
+        cmd.env(
+            "OMP_MANAGER_LOCAL_AI_SETUP_MODE",
+            if local_enabled { "local" } else { "ordinary" },
+        );
         cmd.arg("--extension");
         cmd.arg(app_root.join("local-ai-guard.ts"));
         if local_enabled {
             cmd.arg("--extension");
             cmd.arg(&bridge.local_ai_setup_dir);
-            for package in crate::setup::scoped_plugin_paths(&bridge.local_ai_setup_dir, "Local AI models")? {
-                cmd.arg("--extension");
-                cmd.arg(package);
-            }
+            Self::add_scoped_packages(cmd, &bridge.local_ai_setup_dir, "Local AI models")?;
         }
         cmd.arg("--extension");
         cmd.arg(&bridge.extension_path);
         cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_DIR");
         cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_ROLE");
         let private_setup = match definition.kind {
-            InstanceKind::Manager => Some((&bridge.manager_setup_dir, "manager")),
-            InstanceKind::Architect => Some((&bridge.architect_setup_dir, "architect")),
+            InstanceKind::Manager => Some((&bridge.manager_setup_dir, "manager", "Manager")),
+            InstanceKind::Architect => {
+                Some((&bridge.architect_setup_dir, "architect", "Architect"))
+            }
             _ => None,
         };
-        if let Some((root, role)) = private_setup {
+        let Some((root, role, label)) = private_setup else {
+            return Ok(());
+        };
+        cmd.arg("--extension");
+        cmd.arg(root);
+        cmd.env("OMP_MANAGER_PRIVATE_SETUP_DIR", root);
+        cmd.env("OMP_MANAGER_PRIVATE_SETUP_ROLE", role);
+        // Private packages remain confined to their coordinator's directory.
+        Self::add_scoped_packages(cmd, root, label)
+    }
+    fn add_scoped_packages(
+        cmd: &mut CommandBuilder,
+        root: &Path,
+        label: &str,
+    ) -> Result<(), String> {
+        for package in crate::setup::scoped_plugin_paths(root, label)? {
             cmd.arg("--extension");
-            cmd.arg(root);
-            cmd.env("OMP_MANAGER_PRIVATE_SETUP_DIR", root);
-            cmd.env("OMP_MANAGER_PRIVATE_SETUP_ROLE", role);
-            // Private packages remain confined to their coordinator's directory.
-            let label = if definition.kind == InstanceKind::Manager { "Manager" } else { "Architect" };
-            for package in crate::setup::scoped_plugin_paths(root, label)? {
-                cmd.arg("--extension");
-                cmd.arg(package);
-            }
+            cmd.arg(package);
         }
+        Ok(())
+    }
+    fn add_bridge_env(cmd: &mut CommandBuilder, definition: &Definition, bridge: &BridgeLaunch) {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("WT_SESSION", &definition.id);
@@ -199,7 +261,7 @@ impl Pty {
         if definition.kind == InstanceKind::Architect {
             cmd.env("OMP_MANAGER_ARCHITECT_DIR", &bridge.architect_dir);
         }
-        if let Some(link) = helper {
+        if let Some(link) = definition.helper.as_ref() {
             cmd.env("OMP_MANAGER_HELPER_REPO", &link.repo);
         } else {
             cmd.env("OMP_MANAGER_BROWSER_REQUIRED", "1");
@@ -215,7 +277,6 @@ impl Pty {
         cmd.env("PI_BROWSER_RELAY", "0");
         cmd.env("PI_BROWSER_TERN", "0");
         cmd.env("PI_BROWSER_CMUX", "0");
-        Self::start(cmd)
     }
     /// The user's own shell: no OMP arguments, no bridge credentials, nothing from the manager environment.
     pub fn spawn_shell(cwd: &str) -> Result<Self, String> {
@@ -231,7 +292,7 @@ impl Pty {
         Self::start(cmd)
     }
     fn start(cmd: CommandBuilder) -> Result<Self, String> {
-        let pair = native_pty_system()
+        let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
                 rows: DEFAULT_ROWS,
                 cols: DEFAULT_COLS,
@@ -242,7 +303,9 @@ impl Pty {
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-        let root = child.process_id().and_then(crate::host_monitor::capture_identity);
+        let root = child
+            .process_id()
+            .and_then(crate::host_monitor::capture_identity);
         let writer: Writer = Arc::new(Mutex::new(
             pair.master.take_writer().map_err(|e| e.to_string())?,
         ));
@@ -268,7 +331,7 @@ impl Pty {
         self.child.process_id()
     }
     /// Creation identity of the launched root, captured at launch; `None` when it could not be read.
-    pub fn root_identity(&self) -> Option<crate::host_monitor::ProcessIdentity> {
+    pub fn root_identity(&self) -> Option<ProcessIdentity> {
         self.root
     }
     /// Immediate termination for a shell the user closed; OMP uses `stop` for a graceful Ctrl-C first.
@@ -290,6 +353,7 @@ impl Pty {
         }
         Ok(())
     }
+    #[must_use]
     pub fn last_output(&self) -> u64 {
         self.shared.last_output.load(Ordering::Relaxed)
     }
@@ -460,38 +524,67 @@ mod tests {
     fn killing_a_shell_ends_the_background_processes_it_started() {
         let folder = std::env::temp_dir();
         let mut shell = Pty::spawn_shell(folder.to_str().unwrap()).unwrap();
-        shell.write("sh -c 'sleep 600 & echo CHILD_PID=$!; wait'\n").unwrap();
+        shell
+            .write("sh -c 'sleep 600 & echo CHILD_PID=$!; wait'\n")
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         let child: libc::pid_t = loop {
             let text = shell.screen().unwrap().text;
-            let found = text.lines().filter_map(|line| line.rsplit_once("CHILD_PID=").map(|(_, pid)| pid)).find_map(|pid| pid.trim().parse().ok());
+            let found = text
+                .lines()
+                .filter_map(|line| line.rsplit_once("CHILD_PID=").map(|(_, pid)| pid))
+                .find_map(|pid| pid.trim().parse().ok());
             if let Some(pid) = found {
                 break pid;
             }
-            assert!(Instant::now() < deadline, "the shell never printed the child pid: {text:?}");
+            assert!(
+                Instant::now() < deadline,
+                "the shell never printed the child pid: {text:?}"
+            );
             std::thread::sleep(Duration::from_millis(50));
         };
-        // SAFETY: signal 0 only probes for existence.
-        assert_eq!(unsafe { libc::kill(child, 0) }, 0, "the background process is alive before the kill");
+        assert_eq!(
+            // SAFETY: signal 0 probes the numeric child PID without sending a signal or accessing Rust memory.
+            unsafe { libc::kill(child, 0) },
+            0,
+            "the background process is alive before the kill"
+        );
         shell.kill().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         // The orphaned sleep is reparented and reaped by init/subreaper; wait for it to disappear.
+        // SAFETY: signal 0 accepts a numeric PID and only probes existence; it does not access Rust memory.
         while unsafe { libc::kill(child, 0) } == 0 && !is_zombie(child) {
-            assert!(Instant::now() < deadline, "the background process survived the shell's kill");
+            assert!(
+                Instant::now() < deadline,
+                "the background process survived the shell's kill"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
 
     #[cfg(target_os = "linux")]
     fn is_zombie(pid: libc::pid_t) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z')))
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+        })
     }
 
     #[cfg(target_os = "macos")]
     fn is_zombie(pid: libc::pid_t) -> bool {
+        // SAFETY: proc_pidinfo receives a full writable proc_bsdinfo; it is read only after a complete result.
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
-        let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
         read == size && unsafe { info.assume_init() }.pbi_status == 5
     }
 }
