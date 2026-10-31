@@ -44,7 +44,7 @@ test('native batch accounting includes siblings not yet dispatched and waits for
 
 test('missing native move hooks fail explicitly rather than adopting registry-only cwd', async () => {
   const workspace = installWorkspaceChanges({ pi: {} }, { emit() {}, request() {}, hasPendingDecisions: () => false });
-  await assert.rejects(workspace.control('workspace_change', { requestId: 'request', targetFolder: path.resolve('destination') }), { message: WORKSPACE_COMPATIBILITY_ERROR });
+  await assert.rejects(workspace.control('workspace_change', { requestId: 'request', targetFolder: path.resolve('destination') }), error => error.message.startsWith(WORKSPACE_COMPATIBILITY_ERROR));
   await workspace.dispose();
 });
 
@@ -121,6 +121,15 @@ async function workspaceFixture({ pause, beginError } = {}) {
     change: { requestId: 'workspace-request', sessionId: 'workspace-session', workspaceEpoch: 0,
       targetFolder: path.resolve('workspace-target') } };
 }
+
+test('an initialized host missing a native relocation capability rejects instead of leaving pending intent', async () => {
+  const f = await workspaceFixture();
+  try {
+    f.mode.session.moveSession = undefined;
+    await assert.rejects(f.workspace.control('workspace_change', f.change), /wait for session startup, then retry or reopen/);
+    assert.equal(f.records.length, 0);
+  } finally { await f.workspace.dispose(); }
+});
 
 for (const pause of ['flush', 'finalize']) {
   test(`idle workspace commits stay outside the native move barrier when a provider joins during ${pause}`, async () => {

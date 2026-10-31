@@ -78,6 +78,8 @@ pub struct Definition {
     #[serde(flatten)]
     pub input: CreateInput,
     pub session_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_folder: Option<String>,
     #[serde(default)]
     pub kind: InstanceKind,
     #[serde(default)]
@@ -110,6 +112,7 @@ pub struct Instance {
     pub id: String,
     pub name: String,
     pub project_path: String,
+    pub project_folder: Option<String>,
     pub profile: String,
     pub agent_file: Option<PathBuf>,
     pub configs: Vec<PathBuf>,
@@ -194,6 +197,7 @@ pub struct WorkspaceCommit {
     pub coordinator_id: String,
     pub expected: ControlLease,
     pub target_folder: String,
+    pub project_folder: Option<String>,
     pub session_id: Option<String>,
     pub session_file: Option<PathBuf>,
     pub workspace_epoch: u64,
@@ -406,6 +410,7 @@ impl Record {
             id: self.definition.id.clone(),
             name: input.name.clone(),
             project_path: input.project_path.clone(),
+            project_folder: self.definition.project_folder.clone(),
             profile: input.profile.clone(),
             agent_file: input.agent_file.clone(),
             configs: input.configs.clone(),
@@ -994,7 +999,7 @@ impl Registry {
         if !is_agent_definition(&record.definition) {
             return Err("Only agent working directories can be changed".into());
         }
-        if commit.source.is_some() {
+        if commit.source.is_some() || commit.project_folder.is_some() {
             return Err("invalid_workspace_binding".into());
         }
         if !self.is_real_project_folder(target) {
@@ -1085,6 +1090,7 @@ impl Registry {
         let old_destination = records[i].definition.clone();
         let old_source = source_change.map(|s| (s, records[s].definition.manager_id.clone()));
         records[i].definition.input.project_path = target;
+        records[i].definition.project_folder = commit.project_folder.clone();
         records[i].definition.session_path = commit.session_file.clone();
         if let Some(source) = source_change {
             records[source].definition.manager_id = Some(commit.coordinator_id.clone());
@@ -1552,6 +1558,7 @@ impl Registry {
             id: uuid::Uuid::new_v4().to_string(),
             input,
             session_path: path,
+            project_folder: None,
             kind,
             manager_id,
             plan_target,
@@ -1642,6 +1649,12 @@ impl Registry {
         records[i].definition.session_path = path;
         if let Some(cwd) = cwd {
             records[i].definition.input.project_path = cwd.to_string_lossy().into_owned();
+            if !same_folder(
+                &records[i].definition.input.project_path,
+                &old_definition.input.project_path,
+            ) {
+                records[i].definition.project_folder = None;
+            }
         }
         if dirty || old_definition.input.project_path != records[i].definition.input.project_path {
             if let Err(error) = self.save(&records) {
@@ -1765,6 +1778,56 @@ impl Registry {
             }
         }
     }
+    /// Upgrade old saved coordinators only while stopped, relocating native history transactionally.
+    fn prepare_coordinator_directory(&self, id: &str, origin: Origin<'_>) -> Result<(), String> {
+        {
+            let records = self.records.lock().map_err(|e| e.to_string())?;
+            let i = index(&records, id)?;
+            authorize(&records, i, origin, true)?;
+            if records[i].workspace_request.is_some() {
+                return Err("workspace_change_busy".into());
+            }
+        }
+        let metadata = self.workspace_metadata(id)?;
+        let mut definition = metadata.definition.clone();
+        if definition.kind == InstanceKind::Instance || metadata.running {
+            return Ok(());
+        }
+        let project = definition
+            .project_folder
+            .as_deref()
+            .unwrap_or(&definition.input.project_path)
+            .to_owned();
+        let working = crate::workspace::coordinator_directory(self.config_root(), id, &project)?;
+        if same_folder(&working, &definition.input.project_path) {
+            return Ok(());
+        }
+        definition.input.project_path = working.clone();
+        definition.project_folder = Some(project);
+        let commit = |identity: &Value| -> Result<(), String> {
+            definition.session_path = identity["sessionFile"].as_str().map(PathBuf::from);
+            let mut records = self.records.lock().map_err(|e| e.to_string())?;
+            let i = index(&records, id)?;
+            let old = std::mem::replace(&mut records[i].definition, definition);
+            if let Err(error) = self.save(&records) {
+                records[i].definition = old;
+                return Err(error);
+            }
+            records[i].reader = session::TailReader::default();
+            Ok(())
+        };
+        if let Some(file) = &metadata.definition.session_path {
+            crate::workspace_native::relocate(
+                self.config_root(),
+                &self.home,
+                json!({"sessionFile":file,"targetFolder":working,
+                    "profile":metadata.definition.input.profile,"cwd":metadata.definition.input.project_path}),
+                commit,
+            )
+        } else {
+            commit(&json!({"sessionFile":null}))
+        }
+    }
     pub fn start(&self, id: &str, origin: Origin<'_>) -> Result<(), String> {
         self.start_with(id, origin, false)
     }
@@ -1774,6 +1837,7 @@ impl Registry {
         // loading plus native launch on one side of it. Taken before the lifecycle/records locks, never nested.
         let _instruction_admission = crate::setup::instruction_read_admission()?;
         let _lifecycle = self.lifecycle.lock();
+        self.prepare_coordinator_directory(id, origin)?;
         let (definition, generation, hub) = {
             let mut records = self.records.lock().map_err(|e| e.to_string())?;
             let i = index(&records, id)?;
@@ -2172,6 +2236,7 @@ mod tests {
             request_id: uuid::Uuid::new_v4().to_string(),
             coordinator_id: id.into(),
             target_folder: folder.to_string_lossy().into_owned(),
+            project_folder: None,
             workspace_epoch: expected.workspace_epoch + 1,
             session_id: expected.session_id.clone(),
             session_file: registry
@@ -2182,6 +2247,75 @@ mod tests {
             expected,
             source,
         }
+    }
+
+    #[test]
+    fn legacy_coordinators_migrate_before_launch_and_restore_definition_on_save_failure() {
+        let (folder, registry) = workspace_fixture();
+        let project = folder.join("a");
+        crate::code_diff::git_timed(&project, &["init", "--quiet"], None, 30).unwrap();
+        crate::code_diff::git_timed(
+            &project,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "Fixture",
+            ],
+            None,
+            30,
+        )
+        .unwrap();
+        fs::write(project.join("uncommitted"), "keep").unwrap();
+        let manager = registry.create_manager(input(&project)).unwrap();
+        let architect = registry.create_architect(input(&project)).unwrap();
+        assert!(!fs::read_to_string(&registry.file)
+            .unwrap()
+            .contains("projectFolder"));
+        registry
+            .prepare_coordinator_directory(&manager.id, Origin::Human)
+            .unwrap();
+        let migrated = registry.inspect(&manager.id, Origin::Human).unwrap();
+        assert_eq!(
+            migrated.project_folder.as_deref(),
+            Some(manager.project_path.as_str())
+        );
+        assert_ne!(migrated.project_path, manager.project_path);
+        fs::create_dir(registry.file.with_extension("json.tmp")).unwrap();
+        assert!(registry
+            .prepare_coordinator_directory(&architect.id, Origin::Human)
+            .is_err());
+        let unchanged = registry.inspect(&architect.id, Origin::Human).unwrap();
+        assert_eq!(unchanged.project_path, architect.project_path);
+        assert!(unchanged.project_folder.is_none());
+        fs::remove_dir(registry.file.with_extension("json.tmp")).unwrap();
+        registry
+            .prepare_coordinator_directory(&architect.id, Origin::Human)
+            .unwrap();
+        let migrated_architect = registry.inspect(&architect.id, Origin::Human).unwrap();
+        assert_ne!(migrated.project_path, migrated_architect.project_path);
+        assert_eq!(
+            fs::read_to_string(project.join("uncommitted")).unwrap(),
+            "keep"
+        );
+        registry
+            .apply_identity(
+                &manager.id,
+                0,
+                &json!({"cwd":folder.join("b"),"workspaceEpoch":1}),
+            )
+            .unwrap();
+        assert!(registry
+            .inspect(&manager.id, Origin::Human)
+            .unwrap()
+            .project_folder
+            .is_none());
+        fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

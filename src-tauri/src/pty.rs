@@ -21,10 +21,10 @@ const REPLAY_LIMIT: usize = 256 * 1024;
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 
 #[derive(Default)]
-struct CursorReplies {
+struct TerminalReplies {
     bytes: Vec<u8>,
 }
-impl Callbacks for CursorReplies {
+impl Callbacks for TerminalReplies {
     fn unhandled_csi(
         &mut self,
         screen: &mut Screen,
@@ -33,6 +33,11 @@ impl Callbacks for CursorReplies {
         params: &[&[u16]],
         action: char,
     ) {
+        if action == 'c' && i1.is_none() && i2.is_none() && params == [&[0u16][..]] {
+            // Match xterm's VT100 with Advanced Video response; do not advertise unsupported extensions.
+            self.bytes.extend_from_slice(b"\x1b[?1;2c");
+            return;
+        }
         if action != 'n'
             || i2.is_some()
             || !matches!(i1, None | Some(b'?'))
@@ -49,7 +54,7 @@ impl Callbacks for CursorReplies {
 struct Output {
     bytes: VecDeque<u8>,
     channel: Option<Channel<InvokeResponseBody>>,
-    parser: Parser<CursorReplies>,
+    parser: Parser<TerminalReplies>,
 }
 impl Output {
     fn new() -> Self {
@@ -60,7 +65,7 @@ impl Output {
                 DEFAULT_ROWS,
                 DEFAULT_COLS,
                 0,
-                CursorReplies::default(),
+                TerminalReplies::default(),
             ),
         }
     }
@@ -208,6 +213,7 @@ impl Pty {
         }
         cmd.arg("--extension");
         cmd.arg(&bridge.extension_path);
+        cmd.arg("--omp-manager-bridge");
         cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_DIR");
         cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_ROLE");
         let private_setup = match definition.kind {
@@ -505,7 +511,7 @@ mod tests {
     use super::*;
     #[test]
     fn screen_and_cursor_queries_survive_split_input() {
-        let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, CursorReplies::default());
+        let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, TerminalReplies::default());
         parser.process("café".as_bytes());
         parser.process(b"\x1b[");
         parser.process(b"6n");
@@ -516,6 +522,64 @@ mod tests {
         assert_eq!(parser.callbacks().bytes, b"\x1b[?1;5R");
         parser.screen_mut().set_size(40, 100);
         assert_eq!(parser.screen().size(), (40, 100));
+    }
+
+    #[test]
+    fn primary_device_attributes_are_answered_once_across_every_chunk_boundary() {
+        for query in [b"\x1b[c".as_slice(), b"\x1b[0c"] {
+            for split in 0..=query.len() {
+                let mut output = Output::new();
+                output.parser.process(&query[..split]);
+                output.parser.process(&query[split..]);
+                assert_eq!(output.parser.callbacks().bytes, b"\x1b[?1;2c");
+                output.parser.callbacks_mut().bytes.clear();
+                output
+                    .parser
+                    .process(b"text\x1b[>c\x1b[?c\x1b[1c\x1b[0;0c\x1b[0:1c");
+                assert!(output.parser.callbacks().bytes.is_empty());
+                assert_eq!(output.parser.screen().contents(), "text");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fish_starts_and_accepts_input_without_an_attached_terminal() {
+        let Some(fish) = crate::toolchain::find_program("fish") else {
+            eprintln!("skipped: fish is not installed");
+            return;
+        };
+        let mut cmd = CommandBuilder::new(fish);
+        cmd.args(["--no-config", "--interactive"]);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        // The prompt marker is emitted only after fish completes its startup terminal queries.
+        cmd.args([
+            "--init-command",
+            "function fish_prompt; printf 'FISH_READY> '; end",
+        ]);
+        let mut shell = Pty::start(cmd).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = shell.screen().unwrap().text;
+            assert!(!text.contains("Primary Device Attribute"), "{text}");
+            if text.contains("FISH_READY>") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fish startup stalled: {text:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shell.write("printf '\\n%s\\n' INPUT_PRESERVED\n").unwrap();
+        loop {
+            let text = shell.screen().unwrap().text;
+            assert!(!text.contains("Primary Device Attribute"), "{text}");
+            if text.lines().any(|line| line == "INPUT_PRESERVED") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fish lost shell input: {text:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shell.kill().unwrap();
     }
 
     /// Everything the shell started that stayed in its process group ends with it (the Windows job's Unix counterpart).

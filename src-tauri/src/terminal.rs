@@ -425,7 +425,15 @@ impl TerminalService {
                 .collect::<Result<Vec<_>>>()?
         };
         self.with_owner(id, generation, |owner| {
-            owner.session_id = payload["sessionId"].as_str().map(String::from);
+            let session_id = payload["sessionId"].as_str();
+            // A workspace move publishes identity only, not a replacement terminal snapshot.
+            if payload.get("terminal").is_none()
+                && session_id.is_some()
+                && owner.session_id.as_deref() == session_id
+            {
+                return Ok(());
+            }
+            owner.session_id = session_id.map(String::from);
             owner.supported = terminal["supported"].as_bool() == Some(true);
             owner.error = if terminal.is_null() {
                 Some(UNAVAILABLE.into())
@@ -1324,6 +1332,45 @@ mod tests {
             page.entries.iter().all(|e| e.instance_id == "a"),
             "another owner's rows never leak in"
         );
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn identity_only_moves_preserve_capture_only_for_the_same_session_and_generation() {
+        let folder = scratch("move-readiness");
+        let service = TerminalService::new(&folder);
+        let command = summary(&exec(9), "s", 10, None, "running");
+        let snapshot = json!({"sessionId":"s","terminal":{
+            "supported":true,"error":null,"held":true,"active":[command]
+        }});
+        service.apply_snapshot("a", 1, &snapshot).unwrap();
+        service
+            .apply_snapshot(
+                "a",
+                1,
+                &json!({"sessionId":"s","cwd":"/moved","workspaceEpoch":1}),
+            )
+            .unwrap();
+        let owner = service.build_owner(&source("a", Some("s"), None));
+        assert!(owner.supported);
+        assert!(owner.error.is_none());
+        assert!(owner.held);
+        assert_eq!(owner.active, vec![command]);
+        assert!(service
+            .apply_snapshot("a", 0, &json!({"sessionId":"s"}))
+            .is_err());
+        for (before, generation, payload) in [
+            (1, 2, json!({"sessionId":"s"})),
+            (2, 2, json!({"sessionId":"different"})),
+            (2, 2, json!({"sessionId":"s","terminal":null})),
+        ] {
+            service.apply_snapshot("a", before, &snapshot).unwrap();
+            service.apply_snapshot("a", generation, &payload).unwrap();
+            let owner = service.build_owner(&source("a", Some("s"), None));
+            assert!(!owner.supported);
+            assert_eq!(owner.error.as_deref(), Some(UNAVAILABLE));
+            assert!(owner.active.is_empty());
+        }
         fs::remove_dir_all(folder).unwrap();
     }
 

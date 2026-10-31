@@ -57,6 +57,7 @@ struct Job {
     repositories: Vec<String>,
     committed: bool,
     ready_claimed: bool,
+    execution_folder: String,
     connection: Option<String>,
 }
 #[derive(Default)]
@@ -103,6 +104,96 @@ fn write_computed_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(format!("Writing computed workspace folders: {error}"));
     }
     Ok(())
+}
+
+/// Keep coordinator edits off the user's checkout. Retained worktrees are never reset or removed.
+pub(crate) fn coordinator_directory(root: &Path, id: &str, folder: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let project = crate::setup::canonical(Path::new(folder))
+        .map_err(|error| format!("Coordinator project {folder}: {error}"))?;
+    if !project
+        .ancestors()
+        .any(|parent| parent.join(".git").exists())
+    {
+        return Ok(project.to_string_lossy().into_owned());
+    }
+    let git = |directory: &Path, args: &[&str]| {
+        crate::code_diff::git_timed(directory, args, None, 120)
+            .map_err(|error| format!("Coordinator Git workspace for {folder}: {error}"))
+    };
+    let repository = PathBuf::from(
+        String::from_utf8(git(&project, &["rev-parse", "--show-toplevel"])?)
+            .map_err(|error| format!("Git repository path is not UTF-8: {error}"))?
+            .trim(),
+    );
+    let common = |directory: &Path| -> Result<PathBuf> {
+        let path = String::from_utf8(git(directory, &["rev-parse", "--git-common-dir"])?)
+            .map_err(|error| format!("Git metadata path is not UTF-8: {error}"))?;
+        crate::setup::canonical(&directory.join(path.trim()))
+            .map_err(|error| format!("Git metadata directory: {error}"))
+    };
+    let common_directory = common(&project)?;
+    let mut key = Sha256::new();
+    key.update(id.as_bytes());
+    key.update([0]);
+    key.update(common_directory.to_string_lossy().as_bytes());
+    let key = key.finalize();
+    let destination = root
+        .join("workspace")
+        .join("worktrees")
+        .join(format!("{key:x}"));
+    if !destination.exists() {
+        std::fs::create_dir_all(destination.parent().ok_or("Invalid worktree path")?)
+            .map_err(|error| format!("Creating coordinator worktree directory: {error}"))?;
+        git(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &destination.to_string_lossy(),
+                "HEAD",
+            ],
+        )?;
+    }
+    let registered = git(&project, &["worktree", "list", "--porcelain", "-z"])?;
+    let canonical = crate::setup::canonical(&destination)
+        .map_err(|error| format!("Coordinator worktree {}: {error}", destination.display()))?;
+    let registered = registered.split(|byte| *byte == 0).any(|record| {
+        record.strip_prefix(b"worktree ").is_some_and(|path| {
+            crate::setup::canonical(Path::new(String::from_utf8_lossy(path).as_ref()))
+                .is_ok_and(|path| path == canonical)
+        })
+    });
+    if !registered
+        || !destination.join(".git").is_file()
+        || std::fs::symlink_metadata(&destination)
+            .map_err(|error| error.to_string())?
+            .file_type()
+            .is_symlink()
+        || common(&canonical)? != common_directory
+    {
+        return Err(format!(
+            "Coordinator workspace {} is not a registered worktree of {folder}; preserve its files and choose another project or repair its Git registration",
+            destination.display()
+        ));
+    }
+    let repository = crate::setup::canonical(&repository).map_err(|error| error.to_string())?;
+    let relative = project
+        .strip_prefix(&repository)
+        .map_err(|error| error.to_string())?;
+    let working = if relative.as_os_str().is_empty() {
+        canonical
+    } else {
+        canonical.join(relative)
+    };
+    if !working.is_dir() {
+        return Err(format!(
+            "Project subfolder {} is absent from the committed worktree; commit it in the original project before selecting it",
+            relative.display()
+        ));
+    }
+    Ok(working.to_string_lossy().into_owned())
 }
 pub struct WorkspaceService {
     registry: Arc<Registry>,
@@ -369,7 +460,16 @@ impl WorkspaceService {
         if metadata.lease.generation != expected_generation {
             return Err("stale_generation".into());
         }
-        let target = Self::canonical(&folder)?;
+        let folder = if instance::same_folder(&folder, &metadata.definition.input.project_path) {
+            metadata
+                .definition
+                .project_folder
+                .as_deref()
+                .unwrap_or(&folder)
+        } else {
+            &folder
+        };
+        let target = Self::canonical(folder)?;
         if metadata.definition.kind == InstanceKind::Instance
             && !self.registry.is_real_project_folder(&target)
         {
@@ -513,6 +613,7 @@ impl WorkspaceService {
                 change.request_id.clone(),
                 Job {
                     change: change.clone(),
+                    execution_folder: change.target_folder.clone(),
                     expected,
                     source,
                     dependency,
@@ -645,6 +746,14 @@ impl WorkspaceService {
         ) {
             self.refresh_ownership(request, &mut job)?;
         }
+        if metadata.definition.kind != InstanceKind::Instance {
+            job.execution_folder = coordinator_directory(
+                &self.root,
+                &job.change.coordinator_id,
+                &job.change.target_folder,
+            )?;
+            self.state.lock().jobs.insert(request.into(), job.clone());
+        }
         if !metadata.running {
             return self.dispatch_offline(request, job);
         }
@@ -669,7 +778,7 @@ impl WorkspaceService {
         Ok(())
     }
     fn send_workspace_change(&self, request: &str, job: &Job) -> Result<()> {
-        self.hub.workspace_control(&job.change.coordinator_id,&job.expected,"workspace_change",json!({"requestId":request,"targetFolder":job.change.target_folder,"kind":job.change.kind,"repositoryFolders":job.repositories}))?;
+        self.hub.workspace_control(&job.change.coordinator_id,&job.expected,"workspace_change",json!({"requestId":request,"targetFolder":job.execution_folder,"kind":job.change.kind,"repositoryFolders":job.repositories}))?;
         Ok(())
     }
     fn dispatch_offline(&self, request: &str, mut job: Job) -> Result<()> {
@@ -766,7 +875,13 @@ impl WorkspaceService {
                     request_id: job.change.request_id.clone(),
                     coordinator_id: job.change.coordinator_id.clone(),
                     expected: job.expected.clone(),
-                    target_folder: job.change.target_folder.clone(),
+                    target_folder: job.execution_folder.clone(),
+                    project_folder: (metadata.definition.kind != InstanceKind::Instance
+                        && !instance::same_folder(
+                            &job.execution_folder,
+                            &job.change.target_folder,
+                        ))
+                    .then(|| job.change.target_folder.clone()),
                     session_id: identity["sessionId"].as_str().map(String::from),
                     session_file: identity["sessionFile"].as_str().map(PathBuf::from),
                     workspace_epoch: job.expected.workspace_epoch,
@@ -778,7 +893,7 @@ impl WorkspaceService {
                 crate::workspace_native::relocate(
                     &self.root,
                     &self.registry.home,
-                    json!({"sessionFile":file,"targetFolder":job.change.target_folder,"profile":metadata.definition.input.profile,"cwd":metadata.definition.input.project_path}),
+                    json!({"sessionFile":file,"targetFolder":job.execution_folder,"profile":metadata.definition.input.profile,"cwd":metadata.definition.input.project_path}),
                     commit,
                 )
             } else {
@@ -876,15 +991,15 @@ impl WorkspaceService {
             job.clone()
         };
         let actual = Self::canonical(payload["cwd"].as_str().ok_or("Native cwd is required")?)?;
-        if actual.to_lowercase().replace('\\', "/")
-            != job.change.target_folder.to_lowercase().replace('\\', "/")
-        {
+        if !instance::same_folder(&actual, &job.execution_folder) {
             return Err("Native workspace destination does not match request".into());
         }
         let lease = self.registry.commit_workspace_change(&WorkspaceCommit {
             request_id: request.into(),
             coordinator_id: id.into(),
             expected: job.expected.clone(),
+            project_folder: (!instance::same_folder(&actual, &job.change.target_folder))
+                .then(|| job.change.target_folder.clone()),
             target_folder: actual,
             session_id: payload["sessionId"].as_str().map(String::from),
             session_file: payload["sessionFile"].as_str().map(PathBuf::from),
@@ -1223,10 +1338,182 @@ mod tests {
         );
     }
     #[test]
+    fn coordinators_share_logical_project_but_keep_registered_dirty_worktrees_across_reload() {
+        let fixture = Fixture::new();
+        let project = repo(&fixture, "shared", &["src"]);
+        std::fs::write(project.join("uncommitted"), "user data").unwrap();
+        std::fs::write(project.join("src/.keep"), "staged").unwrap();
+        crate::code_diff::git_timed(&project, &["add", "src/.keep"], None, 30).unwrap();
+        std::fs::write(project.join("src/.keep"), "unstaged").unwrap();
+        let staged =
+            crate::code_diff::git_timed(&project, &["diff", "--cached", "--binary"], None, 30)
+                .unwrap();
+        let mut executions = Vec::new();
+        for kind in [InstanceKind::Manager, InstanceKind::Architect] {
+            let id = fixture.registry.coordinator_id(kind).unwrap();
+            let change = fixture
+                .workspace
+                .change_directory(id.clone(), canon(&project), 0)
+                .unwrap();
+            assert_eq!(
+                fixture.wait(&change.request_id).status,
+                WorkspaceStatus::Applied
+            );
+            let row = fixture.registry.workspace_metadata(&id).unwrap().definition;
+            assert_eq!(
+                row.project_folder.as_deref(),
+                Some(canon(&project).as_str())
+            );
+            assert_ne!(row.input.project_path, canon(&project));
+            assert_eq!(
+                crate::code_diff::git_timed(
+                    Path::new(&row.input.project_path),
+                    &["rev-parse", "--is-inside-work-tree"],
+                    None,
+                    30
+                )
+                .unwrap(),
+                b"true\n"
+            );
+            std::fs::write(
+                Path::new(&row.input.project_path).join("coordinator-edit"),
+                &id,
+            )
+            .unwrap();
+            let again = fixture
+                .workspace
+                .change_directory(id.clone(), canon(&project), 0)
+                .unwrap();
+            assert_eq!(
+                fixture.wait(&again.request_id).status,
+                WorkspaceStatus::Applied
+            );
+            assert_eq!(
+                std::fs::read_to_string(
+                    Path::new(&row.input.project_path).join("coordinator-edit")
+                )
+                .unwrap(),
+                id
+            );
+            let restored = Registry::load(
+                fixture.registry.config_root().join("instances.json"),
+                fixture.root.clone(),
+            )
+            .unwrap();
+            let saved = restored.workspace_metadata(&id).unwrap().definition;
+            assert_eq!(saved.project_folder, row.project_folder);
+            assert_eq!(
+                coordinator_directory(
+                    restored.config_root(),
+                    &id,
+                    saved.project_folder.as_deref().unwrap()
+                )
+                .unwrap(),
+                row.input.project_path
+            );
+            executions.push(row.input.project_path);
+        }
+        assert_ne!(executions[0], executions[1]);
+        assert_eq!(
+            std::fs::read_to_string(project.join("uncommitted")).unwrap(),
+            "user data"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("src/.keep")).unwrap(),
+            "unstaged"
+        );
+        assert_eq!(
+            crate::code_diff::git_timed(&project, &["diff", "--cached", "--binary"], None, 30)
+                .unwrap(),
+            staged
+        );
+        assert!(!project.join("coordinator-edit").exists());
+        let registered =
+            crate::code_diff::git_timed(&project, &["worktree", "list", "--porcelain"], None, 30)
+                .unwrap();
+        let registered = String::from_utf8(registered).unwrap();
+        for working in executions {
+            assert!(registered.contains(&working));
+        }
+    }
+    #[test]
+    fn broken_git_projects_fail_without_pending_and_non_git_can_be_selected_afterward() {
+        let fixture = Fixture::new();
+        let id = fixture
+            .registry
+            .coordinator_id(InstanceKind::Architect)
+            .unwrap();
+        let broken = fixture.root.join("broken");
+        std::fs::create_dir_all(broken.join(".git")).unwrap();
+        let failed = fixture
+            .workspace
+            .change_directory(id.clone(), canon(&broken), 0)
+            .unwrap();
+        let failed = fixture.wait(&failed.request_id);
+        assert_eq!(failed.status, WorkspaceStatus::Failed);
+        assert!(failed.error.unwrap().contains("Coordinator Git workspace"));
+        let success = fixture
+            .workspace
+            .change_directory(id.clone(), canon(&fixture.project), 0)
+            .unwrap();
+        assert_eq!(
+            fixture.wait(&success.request_id).status,
+            WorkspaceStatus::Applied
+        );
+        let row = fixture.registry.workspace_metadata(&id).unwrap().definition;
+        assert_eq!(row.input.project_path, canon(&fixture.project));
+        assert!(row.project_folder.is_none());
+    }
+    #[test]
+    fn committed_subfolders_are_preserved_and_uncommitted_subfolders_fail_safely() {
+        let fixture = Fixture::new();
+        let project = repo(&fixture, "subfolders", &["src"]);
+        let working = coordinator_directory(
+            fixture.registry.config_root(),
+            "manager",
+            &canon(&project.join("src")),
+        )
+        .unwrap();
+        assert!(Path::new(&working).join(".keep").is_file());
+        assert_eq!(Path::new(&working).file_name().unwrap(), "src");
+        std::fs::create_dir(project.join("untracked")).unwrap();
+        std::fs::write(project.join("untracked/data"), "keep").unwrap();
+        assert!(coordinator_directory(
+            fixture.registry.config_root(),
+            "manager",
+            &canon(&project.join("untracked"))
+        )
+        .unwrap_err()
+        .contains("absent from the committed worktree"));
+        assert_eq!(
+            std::fs::read_to_string(project.join("untracked/data")).unwrap(),
+            "keep"
+        );
+    }
+    #[test]
+    fn unregistered_workspace_contents_are_never_adopted_or_removed() {
+        let fixture = Fixture::new();
+        let project = repo(&fixture, "obstructed", &[]);
+        let working =
+            coordinator_directory(fixture.registry.config_root(), "manager", &canon(&project))
+                .unwrap();
+        crate::code_diff::git_timed(&project, &["worktree", "remove", &working], None, 30).unwrap();
+        std::fs::create_dir_all(&working).unwrap();
+        std::fs::write(Path::new(&working).join("user-data"), "keep").unwrap();
+        assert!(
+            coordinator_directory(fixture.registry.config_root(), "manager", &canon(&project))
+                .unwrap_err()
+                .contains("not a registered worktree")
+        );
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&working).join("user-data")).unwrap(),
+            "keep"
+        );
+    }
+    #[test]
     fn architect_repo_transfer_uses_metadata_and_keeps_both_agents_stopped() {
         let fixture = Fixture::new();
-        let repo = fixture.root.join("source");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo = repo(&fixture, "source", &[]);
         let worker = fixture
             .registry
             .create(crate::instance::CreateInput {
@@ -1256,9 +1543,10 @@ mod tests {
             .unwrap();
         assert!(!architect.running);
         assert_eq!(
-            architect.definition.input.project_path,
-            WorkspaceService::canonical(&repo.to_string_lossy()).unwrap()
+            architect.definition.project_folder.as_deref(),
+            Some(canon(&repo).as_str())
         );
+        assert_ne!(architect.definition.input.project_path, canon(&repo));
     }
     #[test]
     fn manual_generation_and_non_worker_sources_are_rejected_before_admission() {
@@ -1286,10 +1574,30 @@ mod tests {
     }
     fn repo(fixture: &Fixture, name: &str, children: &[&str]) -> PathBuf {
         let repo = fixture.root.join(name);
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
         for child in children {
             std::fs::create_dir_all(repo.join(child)).unwrap();
+            std::fs::write(repo.join(child).join(".keep"), "").unwrap();
         }
+        crate::code_diff::git_timed(&repo, &["init", "--quiet"], None, 30).unwrap();
+        crate::code_diff::git_timed(&repo, &["add", "."], None, 30).unwrap();
+        crate::code_diff::git_timed(
+            &repo,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "Fixture",
+            ],
+            None,
+            30,
+        )
+        .unwrap();
         repo
     }
     fn canon(path: &Path) -> String {
@@ -1412,6 +1720,7 @@ mod tests {
                 coordinator_id: manager.clone(),
                 expected: lease.clone(),
                 target_folder: context.target,
+                project_folder: None,
                 session_id: None,
                 session_file: None,
                 workspace_epoch: lease.workspace_epoch,

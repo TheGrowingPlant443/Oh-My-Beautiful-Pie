@@ -24,7 +24,7 @@ async function listTabs(ticket, context) {
   return response.json();
 }
 
-const ACTIONS = new Set(['open', 'close', 'tabs', 'run', 'call']);
+const ACTIONS = new Set(['open', 'close', 'tabs', 'targets', 'run', 'call']);
 function isBrowserCall(parameters) {
   if (!parameters || typeof parameters !== 'object' || !ACTIONS.has(parameters.action)) return false;
   return parameters.name === undefined || (typeof parameters.name === 'string' && parameters.name !== '');
@@ -125,6 +125,13 @@ export function installTerminalBrowserBridge(pi, request) {
       const app = parameters.app;
       if (app && (app.path !== undefined || app.cdp_url !== undefined || app.relay === true || app.tern === true)) throw new Error(OWNERSHIP_ERROR);
       try {
+        if (parameters.action === 'targets') {
+          if (context?.signal?.aborted) throw context.signal.reason;
+          const value = (await findRows(context)).map(row => ({
+            target: row.url, title: row.title, url: row.url, shown: row.active, tab: row.name,
+          }));
+          return {content:[],details:{action:'targets',name,browser:'connected',value}};
+        }
         if (parameters.action === 'open') return await open(this, name, parameters, context);
         if (parameters.action === 'close') return await close(this, name, parameters, context);
         await prepare(this, name, parameters, context);
@@ -136,7 +143,7 @@ export function installTerminalBrowserBridge(pi, request) {
     };
     const documentation = definition.documentation;
     definition.invoke=callback;
-    definition.documentation = `${documentation}\nOMP Manager owns an isolated browser for this terminal. App Settings control Headless and presentation. Human and automation input may conflict; neither pauses the other. Do not pass external app/relay/CDP overrides. Every tab in this browser belongs to your session: tabs the user opens by hand (or that links open) are attached automatically as tab-1, tab-2, ... the next time you call browser.tabs() or browser.tab(name); use browser.tabs() to see their url and title. browser.open({name:'docs', app:{target:'<url or title substring>'}}) re-attaches an existing page under a name of your choice (omit url, which would navigate it). Closing a tab closes its page. Screenshots bring the attached tab to the front.`;
+    definition.documentation = `${documentation}\nOMP Manager owns an isolated browser for this terminal. App Settings control Headless and presentation. Human and automation input may conflict; neither pauses the other. Do not pass external app/relay/CDP overrides. In Manager, browser.targets({}) lists this session's existing Chrome pages as {target, title, url, shown, tab}; it never resolves Tern/relay or launches a browser. browser.tabs() attaches and lists the same pages as managed tabs, also without launching. Both return [] if this session has no browser. Every tab in this browser belongs to your session: tabs the user opens by hand (or that links open) are attached automatically as tab-1, tab-2, ... the next time you call browser.tabs() or use browser.tab(name). Use browser.tab(entry.tab) for an entry from targets, or browser.tab(entry.name) for one from tabs. browser.open({name:'docs', app:{target:entry.target}}) re-attaches an automatically named page under a name of your choice (omit url, which would navigate it); already named pages should be reused with browser.tab. Closing a tab closes its page. Screenshots bring the attached tab to the front.`;
     wrapped.set(definition,{descriptor,callback,documentation}); definitions.add(definition);
   }
   function incompatible() {

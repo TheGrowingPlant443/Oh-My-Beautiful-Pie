@@ -45,3 +45,10 @@ test("a helper whose target row is missing yields nothing and is never a candida
   assert.deepEqual(sameRepoAgents([a, orphan], orphan), []);
   assert.deepEqual(sameRepoAgents([a, orphan], a), []);
 });
+
+test("isolated coordinators match their logical project rather than their execution worktrees", () => {
+  const worker = row("worker");
+  const manager = row("manager", { projectPath: "C:/managed/manager", projectFolder: worker.projectPath });
+  const architect = row("architect", { projectPath: "C:/managed/architect", projectFolder: worker.projectPath });
+  assert.deepEqual(ids(sameRepoAgents([worker, manager, architect], manager)), ["architect", "worker"]);
+});

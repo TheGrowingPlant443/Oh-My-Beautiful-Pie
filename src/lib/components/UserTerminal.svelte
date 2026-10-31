@@ -5,6 +5,7 @@
   import "@xterm/xterm/css/xterm.css";
   import { api, type PtyChunk, type UserShellInfo } from "../api";
   import { reportError } from "../stores";
+  import { isReplayReply, registerBackendReplies } from "../terminal";
 
   let { instanceId, shell }: { instanceId: string; shell: UserShellInfo } = $props();
   let host = $state<HTMLDivElement>();
@@ -19,6 +20,7 @@
       cols: shell.cols, rows: shell.rows, fontSize: 13, scrollback: 8000, cursorBlink: true,
       fontFamily: '"Cascadia Mono", Consolas, monospace', theme: { background: "#0b1017", foreground: "#dfe6ef" },
     });
+    const disposeReplies = registerBackendReplies(term.parser);
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(element);
@@ -28,9 +30,8 @@
     const channel = new Channel<PtyChunk>();
     channel.onmessage = data => { if (!disposed) term.write(new Uint8Array(data)); };
     const input = term.onData(data => {
-      // Cursor reports are answered by the backend, and replayed history must not be answered a second time.
-      if (/^\x1b\[\??\d+;\d+R$/.test(data)) return;
-      if (replaying && /^\x1b(?:\[[?>=]?[0-9;]*[Rcnuy]|\])/.test(data)) return;
+      // Other protocol replies from replayed history still belong to the original attachment.
+      if (replaying && isReplayReply(data)) return;
       void api.writeUserTerminal(id, shellId, data).catch(error => { if (!shell.exited && !disposed) reportError("Send terminal input", error); });
     });
     api.attachUserTerminal(id, shellId, channel)
@@ -64,6 +65,7 @@
       cancelAnimationFrame(frame);
       observer.disconnect();
       input.dispose();
+      disposeReplies();
       term.dispose();
     };
   });

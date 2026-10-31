@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { terminalTabs, nextSelection, outputWrite, stripAnsi, shellKey, commandKey, HISTORY_KEY, DECISIONS_KEY, MONITOR_KEY } from './terminal.ts';
+import { terminalTabs, nextSelection, outputWrite, stripAnsi, shellKey, commandKey, HISTORY_KEY, DECISIONS_KEY, MONITOR_KEY, registerBackendReplies, isReplayReply } from './terminal.ts';
+import xterm from '@xterm/xterm';
 
 function command(id, tab, startedAt, description = null) {
   return { executionId: id, sessionId: 's', sourceSessionId: 's', toolCallId: id, agentId: 'main', kind: 'bash', description, preview: `run ${id}`, cwd: '.', startedAt, endedAt: null, status: 'running', exitCode: null, tab, historical: false, hasOutput: false };
@@ -78,4 +79,45 @@ test('Follow and fresh-pane selection never choose the monitor, and a selected m
   assert.equal(nextSelection(after, known, MONITOR_KEY, true), commandKey('a', 'c1'), 'Follow moves to a new command only');
   assert.equal(nextSelection(terminalTabs('a', []), new Set(), '', true), HISTORY_KEY);
   assert.equal(nextSelection(terminalTabs(null, []), new Set(), MONITOR_KEY, false), HISTORY_KEY, 'a stale monitor selection cannot apply on the global page');
+});
+
+test('backend-owned queries never emit xterm replies, but user input and other reports survive', async () => {
+  const term = new xterm.Terminal();
+  const disposeReplies = registerBackendReplies(term.parser);
+  const data = [];
+  term.onData(chunk => data.push(chunk));
+  const write = chunk => new Promise(resolve => term.write(chunk, resolve));
+  try {
+    for (const query of ['\x1b[c', '\x1b[0c', '\x1b[6n', '\x1b[?6n']) {
+      for (let split = 0; split <= query.length; split++) {
+        await write(query.slice(0, split));
+        await write(query.slice(split));
+      }
+    }
+    assert.deepEqual(data, [], 'live or replayed queries have only the backend responder');
+    term.input('\x1b[?1;2c');
+    term.input('\x1b[1;2R');
+    term.input('echo café\n');
+    assert.deepEqual(data, ['\x1b[?1;2c', '\x1b[1;2R', 'echo café\n'], 'input is not classified by its bytes');
+    data.length = 0;
+    await write('\x1b[5n');
+    await write('\x1b[>c');
+    assert.deepEqual(data, ['\x1b[0n', '\x1b[>0;276;0c'], 'other xterm capabilities retain their responder');
+    disposeReplies();
+    data.length = 0;
+    await write('\x1b[c');
+    assert.deepEqual(data, ['\x1b[?1;2c']);
+  } finally {
+    disposeReplies();
+    term.dispose();
+  }
+});
+
+test('initial replay filters only view-owned replies, never DA1 or cursor-shaped user input', () => {
+  for (const input of ['\x1b[?1;2c', '\x1b[1;2R', '\x1b[?1;2R', 'echo café\n']) {
+    assert.equal(isReplayReply(input), false);
+  }
+  for (const reply of ['\x1b[>0;276;0c', '\x1b[0n', '\x1b]10;rgb:0000/0000/0000\x1b\\']) {
+    assert.equal(isReplayReply(reply), true);
+  }
 });

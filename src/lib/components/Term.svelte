@@ -5,6 +5,7 @@
   import "@xterm/xterm/css/xterm.css";
   import { api } from "../api";
   import { ptyBus, reportError } from "../stores";
+  import { isReplayReply, registerBackendReplies } from "../terminal";
 
   interface Props {
     instanceId: string;
@@ -39,6 +40,7 @@
       cursorBlink: mode,
       theme: { background: "#0b1017", foreground: "#dfe6ef" },
     }));
+    const disposeReplies = registerBackendReplies(term.parser);
     terminal = term;
     const fit = new FitAddon();
     if (mode) term.loadAddon(fit);
@@ -53,11 +55,9 @@
       term.write(bytes);
     };
     const input = term.onData(data => {
-      // Cursor reports are answered by Rust even when no xterm view is mounted.
-      if (/^\x1b\[\??\d+;\d+R$/.test(data)) return;
       const protocolReply = /^\x1b(?:\[[?>=]?[0-9;]*[Rcnuy]|\])/.test(data);
       if (run === 0 || !ptyBus.isResponder(id, sink)) return;
-      if ((replaying && protocolReply) || (!mode && !protocolReply)) return;
+      if ((replaying && isReplayReply(data)) || (!mode && !protocolReply)) return;
       void api.writePty(id, data).catch(error => reportError("Send terminal input", error));
     });
     const unsubscribe = ptyBus.subscribe(id, sink, mode);
@@ -106,6 +106,7 @@
       observer.disconnect();
       unsubscribe();
       input.dispose();
+      disposeReplies();
       term.dispose();
       if (terminal === term) { terminal = undefined; relayout = undefined; }
     };

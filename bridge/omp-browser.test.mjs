@@ -52,5 +52,5 @@ test('a browser the user closed reopens for the same session without restoring o
 test('tabs the user opens by hand are attached to the agent session automatically and can be controlled', { skip: nativeSkip, timeout:180000 },
   () => runNativeScenario('browser-tabs-scenario.mjs','omp-browser-tabs-'));
 
-test('tabs opened by hand in a browser the human started with the Browser button are visible to the agent', { skip: nativeSkip, timeout:180000 },
+test('pinned SDK targets/tabs discover and control the Browser button browser without launching another', { skip: nativeSkip, timeout:180000 },
   () => runNativeScenario('browser-prelaunched-scenario.mjs','omp-browser-prelaunched-'));

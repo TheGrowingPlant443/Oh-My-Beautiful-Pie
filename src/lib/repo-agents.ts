@@ -26,13 +26,13 @@ export function sameRepoAgents(all: readonly Instance[], current: Instance): Ins
   const projectOf = (row: Instance): Instance | undefined => row.helper ? byId.get(row.helper.target) : row;
   const here = projectOf(current);
   if (!here) return [];
-  const key = repoKey(here.projectPath);
+  const key = repoKey(here.projectFolder ?? here.projectPath);
   return all
     .filter(row => {
       if (row.id === current.id || row.planTarget !== null) return false;
       if (row.status !== "running" && row.status !== "starting") return false;
       const project = projectOf(row);
-      return project !== undefined && repoKey(project.projectPath) === key;
+      return project !== undefined && repoKey(project.projectFolder ?? project.projectPath) === key;
     })
     .sort((a, b) => Number(a.helper !== null) - Number(b.helper !== null) || a.name.localeCompare(b.name));
 }

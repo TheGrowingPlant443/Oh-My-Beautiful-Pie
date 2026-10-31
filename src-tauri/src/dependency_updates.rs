@@ -859,7 +859,10 @@ impl DependencyUpdateService {
                 || &current != postmove
                 || current.session_id.is_none()
                 || !crate::instance::same_folder(
-                    &manager.project_path,
+                    manager
+                        .project_folder
+                        .as_deref()
+                        .unwrap_or(&manager.project_path),
                     &prepared.manager_working_directory,
                 )
             {
@@ -1704,6 +1707,7 @@ mod tests {
             id: id.into(),
             input: CreateInput::default(),
             session_path: None,
+            project_folder: None,
             kind,
             manager_id: None,
             plan_target: None,
@@ -1884,8 +1888,14 @@ mod tests {
                     &job.request_id,
                 )
                 .unwrap();
+            let execution = crate::workspace::coordinator_directory(
+                self.registry.config_root(),
+                &record.manager_id,
+                &job.target_folder,
+            )
+            .unwrap();
             self.workspace.ready(&record.manager_id, lease.generation, "fixture", &json!({
-                "requestId": job.request_id, "cwd": job.target_folder, "sessionId": lease.session_id,
+                "requestId": job.request_id, "cwd": execution, "sessionId": lease.session_id,
                 "sessionFile": null, "workspaceEpoch": lease.workspace_epoch + 1,
             })).unwrap();
             let postmove = self
@@ -2358,6 +2368,24 @@ mod tests {
     #[test]
     fn a_confirmed_revision_waits_for_workspace_commit_and_is_delivered_once_without_abort() {
         let fixture = Fixture::new();
+        crate::code_diff::git_timed(&fixture.project(), &["init", "--quiet"], None, 30).unwrap();
+        crate::code_diff::git_timed(&fixture.project(), &["add", "."], None, 30).unwrap();
+        crate::code_diff::git_timed(
+            &fixture.project(),
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "Fixture",
+            ],
+            None,
+            30,
+        )
+        .unwrap();
         fixture.architect();
         let service = fixture.service();
         let source = fixture.source();
@@ -2366,7 +2394,7 @@ mod tests {
         let revision = fixture.submit(&service, &request, "Upgrade inside", "# Steps\nmigrate");
         let (checking, checked_request, checked_revision) =
             (service.clone(), request.clone(), revision.clone());
-        let (_, manager) = fixture.manager(move |action| {
+        let (manager_instance, manager) = fixture.manager(move |action| {
             if action == "workspace_plan_prompt" {
                 assert_eq!(
                     checking
@@ -2430,6 +2458,15 @@ mod tests {
             .contains("pending"));
         manager.wait_for("workspace_change");
         fixture.complete_handoff(&service, &request, &revision);
+        let moved = fixture
+            .registry
+            .inspect(&manager_instance.id, Origin::Human)
+            .unwrap();
+        assert_eq!(
+            moved.project_folder.as_deref(),
+            Some(manager_instance.project_path.as_str())
+        );
+        assert_ne!(moved.project_path, manager_instance.project_path);
         let log = manager.controls.lock();
         let payload = &log
             .iter()

@@ -6,8 +6,8 @@
   import { api, type SetupDraft, type SetupAdmission, type PlanSessionAdmission, type Instance, type InsightProducer } from "./lib/api";
   import { connectInstances, instances, instancesById, previewsEnabled, toasts, dismissToast, reportError, managerInstance, architectInstance, appSettings, startInstance, errorText, refreshInstances } from "./lib/stores";
   import { initializeProjectHistory, visibleProjectHistory, computedFolders, rememberProjectFolder } from "./lib/stores";
-  import { coordinatorTemporaryFolders } from "./lib/stores";
-  import { architectEntryFolder } from "./lib/workspace";
+  import { coordinatorTemporaryFolders, workspaceChanges } from "./lib/stores";
+  import { qualityEntryFolder } from "./lib/workspace";
   import { isHiddenComputed } from "./lib/project-history";
   import { projectFolders } from "./lib/repo-agents";
   import Grid from "./lib/components/Grid.svelte";
@@ -211,7 +211,7 @@
   }
   // A global page, not an agent view: leaving it returns to The Architect's terminal.
   function openDependencyTree(): void {
-    analyzerInitialFolder = architectEntryFolder($architectInstance?.projectPath, temporaryFolders);
+    analyzerInitialFolder = $architectInstance ? qualityFolder($architectInstance) : undefined;
     planChange = null;
     void api.setBrowserView(null, null, null).catch(error => reportError("Hide browser", error));
     view = "dependency_tree";
@@ -229,17 +229,12 @@
     planChange = null;
     view = "graphify";
   }
-  // The repository an agent works on: its own folder; a helper's or plan agent's target project; for the
-  // Manager and Architect their committed folder, or the last remembered real folder when it is a temporary or computed shared folder.
+  // Resolve helper/plan targets before selecting a coordinator's logical project.
   function qualityFolder(source: Instance): string | undefined {
-    const targetId = source.helper?.target ?? source.planTarget;
-    if (targetId) return $instancesById.get(targetId)?.projectPath ?? source.helper?.repo;
-    if (source.kind === "manager" || source.kind === "architect") {
-      const live = projectFolders($instances);
-      const computed = $computedFolders.filter(folder => isHiddenComputed(folder, $computedFolders, live));
-      return architectEntryFolder(source.projectPath, [...temporaryFolders, ...computed]) ?? $visibleProjectHistory[0];
-    }
-    return source.projectPath;
+    const live = projectFolders($instances);
+    const computed = $computedFolders.filter(folder => isHiddenComputed(folder, $computedFolders, live));
+    return qualityEntryFolder(source, $instancesById, $workspaceChanges,
+      [...temporaryFolders, ...computed], $visibleProjectHistory[0]);
   }
   function openCodeQuality(sourceId: string, returnTo: { kind: "agent"; id: string } | { kind: "planChange" } = { kind: "agent", id: sourceId }): void {
     const source = $instancesById.get(sourceId);

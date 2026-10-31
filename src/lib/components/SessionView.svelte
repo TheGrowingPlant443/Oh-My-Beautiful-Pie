@@ -5,10 +5,8 @@
   import BrowserPane from "./BrowserPane.svelte";
   import OwnershipControls from "./OwnershipControls.svelte";
   import AgentDirectory from "./AgentDirectory.svelte";
-  import { workspaceChanges } from "../stores";
-  import { workspacePending } from "../workspace";
   import { restartInstance, startInstance, browserStatuses, errorText, reportError, appSettings, terminalOwners, terminalUi, updateTerminalUi, openUserTerminal, allInstances } from "../stores";
-  import { defaultTerminalUi } from "../terminal";
+  import { commandKey, defaultTerminalUi, nextSelection, terminalTabs } from "../terminal";
   import { sameRepoAgents } from "../repo-agents";
   import TerminalWorkspace from "./TerminalWorkspace.svelte";
   import { nativeHubDisabled } from "../native-agent-hub";
@@ -20,7 +18,6 @@
     /** Focus-only: show the existing Architect after the monitor's explanation was admitted. The parent guards the origin. */
     onFocusArchitect?: (producer: InsightProducer, current: () => boolean) => boolean | Promise<boolean>;
   } = $props();
-  const contextPending = $derived($workspaceChanges.some(change => change.coordinatorId === instance.id && workspacePending(change)));
   const TERMINAL_MIN = 160;
   const BROWSER_MIN = 520;
   const TERMINAL_PANE_MIN = 360;
@@ -71,17 +68,22 @@
     // The user shell exists only when asked for here: auto-open and the Dashboard page never create one.
     if ($appSettings.terminalCreateUser && !owner?.userShell) await openUserTerminal(instance.id, true);
   }
-  // A command that starts while this session is on screen shows the pane when the setting is on. Closing it by hand
-  // lasts until the next command starts; this never leaves the open session or creates a shell.
+  // Follow also reveals the command pane; neither path leaves this session or creates a shell.
   let seenCommands = new Set<string>();
   let autoWas = false;
   $effect(() => {
-    const autoOpen = showBrowser && $appSettings.terminalAutoOpen;
-    const ids = (owner && owner.generation === instance.generation ? owner.active : []).map(command => command.executionId);
-    const fresh = autoOpen && !autoWas ? ids : ids.filter(id => !seenCommands.has(id));
+    const autoOpen = showBrowser && ($appSettings.terminalAutoOpen || ui.follow);
+    const currentOwner = owner?.generation === instance.generation ? owner : undefined;
+    const ids = (currentOwner?.active ?? []).map(command => command.executionId);
+    const previous = autoOpen && !autoWas ? new Set<string>() : seenCommands;
+    const fresh = ids.some(id => !previous.has(id));
+    if (autoOpen && fresh) {
+      const tab = nextSelection(terminalTabs(instance.id, currentOwner ? [currentOwner] : []),
+        new Set([...previous].map(id => commandKey(instance.id, id))), ui.tab, ui.follow);
+      updateTerminalUi(instance.id, { pane: "terminal", tab });
+    }
     seenCommands = new Set(ids);
     autoWas = autoOpen;
-    if (autoOpen && fresh.length && ui.pane !== "terminal") updateTerminalUi(instance.id, { pane: "terminal" });
   });
   function clampRatio(value: number, width: number): number {
     if (width <= TERMINAL_MIN + rightMin + 6) return TERMINAL_MIN / Math.max(width, 1);
@@ -127,9 +129,9 @@
     <button disabled={busy || nativeHubDisabled(instance)} title={instance.bridgeReady && !instance.capabilities?.agentHub ? "Reopen this session with a compatible OMP version." : "Open this session's native Agent Hub"} onclick={() => onSubagents(instance.id)}>Subagents: {instance.subagents.length}</button>
     {#if showBrowser}<button disabled={busy || !live} title={live ? "Show this session's browser next to the terminal" : "Start this session first"} onclick={openBrowser}>Browser</button>{/if}
     {#if showBrowser}<button class:active={terminalOpen} aria-pressed={terminalOpen} title="Your own shell, the AI's command history and its live commands next to the terminal" onclick={toggleTerminal}>Terminal</button>{/if}
-    {#if instance.kind === "architect" && onDependencyTree}<button disabled={contextPending} title="Diagram of this project's dependencies" onclick={() => onDependencyTree(instance.id)}>Dependency tree</button>{/if}
-    {#if instance.kind === "architect" && onSystemOverview}<button disabled={contextPending} title="Function, file and system diagrams of this project, and its repository structure" onclick={() => onSystemOverview(instance.id)}>System overview</button>{/if}
-    {#if onCodeQuality}<button disabled={contextPending} title="Scan this project's code quality" onclick={() => onCodeQuality(instance.id)}>Code quality</button>{/if}
+    {#if instance.kind === "architect" && onDependencyTree}<button title="Choose a project and diagram its dependencies" onclick={() => onDependencyTree(instance.id)}>Dependency tree</button>{/if}
+    {#if instance.kind === "architect" && onSystemOverview}<button title="Choose a project and view its function, file and system diagrams" onclick={() => onSystemOverview(instance.id)}>System overview</button>{/if}
+    {#if onCodeQuality}<button title="Choose a project and scan its code quality" onclick={() => onCodeQuality(instance.id)}>Code quality</button>{/if}
     {#if showBrowser}<button title="Review and edit this project's changes" onclick={() => onCodeDiff(instance.id)}>Code diff</button>{/if}
     {#if instance.planKind}<button onclick={() => onPlanChange(instance.id)}>Plan</button>{/if}
     {#if instance.planPath}<button onclick={() => onPlan(instance.id)}>View Plan</button>{/if}

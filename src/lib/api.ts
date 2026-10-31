@@ -27,6 +27,8 @@ export interface Instance {
   id: string;
   name: string;
   projectPath: string;
+  /** Original project selected for an isolated coordinator worktree. */
+  projectFolder?: string | null;
   profile: string;
   agentFile: string | null;
   configs: string[];

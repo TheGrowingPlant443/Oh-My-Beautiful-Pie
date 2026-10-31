@@ -242,6 +242,8 @@ export default function managerBridge(pi) {
   const connection = bridgeConnection();
   if (!connection) return;
   const { token, instanceId, generation, role, port } = connection;
+  // A launch flag keeps native host/tool capture eager even after OMP caches this extension as deferrable.
+  pi.registerFlag('omp-manager-bridge', { type: 'boolean', default: false, description: 'Initialize the desktop host bridge before the native session starts' });
 
   let context;
   let socket;

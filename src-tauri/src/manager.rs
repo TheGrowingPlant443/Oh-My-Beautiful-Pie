@@ -477,16 +477,21 @@ impl ManagerHub {
         let folder = if let Some(helper) = &own.helper {
             registry
                 .workspace_metadata(&helper.target)
-                .map(|target| target.definition.input.project_path)
+                .map(|target| {
+                    target
+                        .definition
+                        .project_folder
+                        .unwrap_or(target.definition.input.project_path)
+                })
                 .unwrap_or_else(|_| helper.repo.clone())
         } else if let Some(target) = &own.plan_target {
-            registry
-                .workspace_metadata(target)?
-                .definition
-                .input
-                .project_path
+            let target = registry.workspace_metadata(target)?.definition;
+            target.project_folder.unwrap_or(target.input.project_path)
         } else {
-            own.input.project_path.clone()
+            own.project_folder
+                .as_ref()
+                .unwrap_or(&own.input.project_path)
+                .clone()
         };
         let computed = own.kind != InstanceKind::Instance
             && self
@@ -710,7 +715,10 @@ impl ManagerHub {
             None => own,
         };
         Ok((
-            subject.definition.input.project_path,
+            subject
+                .definition
+                .project_folder
+                .unwrap_or(subject.definition.input.project_path),
             subject.definition.id,
             subject.workspace_epoch,
         ))
@@ -2351,7 +2359,14 @@ impl ManagerHub {
         let (folder, subject, epoch) = Self::quality_repository(registry, actor)?;
         let result = service.agent_report(&folder, &request)?;
         let after = registry.workspace_metadata(&subject)?;
-        if after.workspace_epoch != epoch || after.definition.input.project_path != folder {
+        if after.workspace_epoch != epoch
+            || after
+                .definition
+                .project_folder
+                .as_deref()
+                .unwrap_or(&after.definition.input.project_path)
+                != folder
+        {
             return Err(
                 "workspace_changed: the working directory changed while reading; retry".into(),
             );
@@ -2593,6 +2608,59 @@ impl crate::agent_markdown::MarkdownBoundary for HubMarkdownBoundary {
 mod tests {
     use super::*;
     #[test]
+    fn coordinator_report_and_decision_context_use_the_original_project() {
+        let folder =
+            std::env::temp_dir().join(format!("omp-logical-project-{}", uuid::Uuid::new_v4()));
+        let project = folder.join("project");
+        let execution = folder.join("config/workspace/worktrees/manager");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&execution).unwrap();
+        let registry =
+            Registry::load(folder.join("config/instances.json"), folder.clone()).unwrap();
+        let manager = registry
+            .create_manager(CreateInput {
+                project_path: project.to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        let expected = registry.workspace_metadata(&manager.id).unwrap().lease;
+        registry
+            .begin_workspace_change(&manager.id, "move", &expected)
+            .unwrap();
+        registry
+            .commit_workspace_change(&crate::instance::WorkspaceCommit {
+                request_id: "move".into(),
+                coordinator_id: manager.id.clone(),
+                expected,
+                target_folder: execution.to_string_lossy().into_owned(),
+                project_folder: Some(project.to_string_lossy().into_owned()),
+                session_id: None,
+                session_file: None,
+                workspace_epoch: 1,
+                source: None,
+            })
+            .unwrap();
+        registry.finish_workspace_change(&manager.id, "move");
+        let actor = Actor {
+            id: manager.id.clone(),
+            generation: 0,
+            role: InstanceKind::Manager,
+            connection_id: String::new(),
+        };
+        assert_eq!(
+            ManagerHub::quality_repository(&registry, &actor).unwrap().0,
+            manager.project_path
+        );
+        let hub = ManagerHub::bind(folder.join("config/bridge.mjs")).unwrap();
+        let decision = hub.decision_repository(&registry, &manager.id).unwrap();
+        assert_eq!(
+            decision.folder.as_deref(),
+            Some(manager.project_path.as_str())
+        );
+        hub.shutdown();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+    #[test]
     fn human_decisions_cover_roles_preserve_repository_and_reject_stale_authority() {
         let folder = std::env::temp_dir().join(format!("omp-human-inbox-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(folder.join("repo-a")).unwrap();
@@ -2755,6 +2823,7 @@ mod tests {
             id: manager.id.clone(),
             input: CreateInput::default(),
             session_path: None,
+            project_folder: None,
             kind: InstanceKind::Manager,
             manager_id: None,
             plan_target: None,
@@ -2843,6 +2912,7 @@ mod tests {
                 id: manager.id.clone(),
                 input: CreateInput::default(),
                 session_path: None,
+                project_folder: None,
                 kind: InstanceKind::Manager,
                 manager_id: None,
                 plan_target: None,
@@ -2856,6 +2926,7 @@ mod tests {
                 id: worker.id.clone(),
                 input: CreateInput::default(),
                 session_path: None,
+                project_folder: None,
                 kind: InstanceKind::Instance,
                 manager_id: Some(manager.id.clone()),
                 plan_target: None,
@@ -2977,6 +3048,7 @@ mod tests {
                 id: manager.id.clone(),
                 input: CreateInput::default(),
                 session_path: None,
+                project_folder: None,
                 kind: InstanceKind::Manager,
                 manager_id: None,
                 plan_target: None,
@@ -3021,6 +3093,7 @@ mod tests {
                     id: worker.id.clone(),
                     input: CreateInput::default(),
                     session_path: None,
+                    project_folder: None,
                     kind: InstanceKind::Instance,
                     manager_id: None,
                     plan_target: None,
@@ -3118,6 +3191,7 @@ mod tests {
                 id: worker.id.clone(),
                 input: CreateInput::default(),
                 session_path: None,
+                project_folder: None,
                 kind: InstanceKind::Instance,
                 manager_id: None,
                 plan_target: None,
@@ -3219,6 +3293,7 @@ mod tests {
                     id: id.into(),
                     input: CreateInput::default(),
                     session_path: None,
+                    project_folder: None,
                     kind: InstanceKind::Instance,
                     manager_id: None,
                     plan_target: None,
@@ -3268,6 +3343,7 @@ mod tests {
                     id: worker.id.clone(),
                     input: CreateInput::default(),
                     session_path: None,
+                    project_folder: None,
                     kind: InstanceKind::Instance,
                     manager_id: None,
                     plan_target: None,
@@ -3354,6 +3430,7 @@ mod tests {
                     id: worker.id.clone(),
                     input: CreateInput::default(),
                     session_path: None,
+                    project_folder: None,
                     kind: InstanceKind::Instance,
                     manager_id: None,
                     plan_target: None,
@@ -3414,6 +3491,7 @@ mod tests {
             id: id.into(),
             input: CreateInput::default(),
             session_path: None,
+            project_folder: None,
             kind: InstanceKind::Instance,
             manager_id: None,
             plan_target,

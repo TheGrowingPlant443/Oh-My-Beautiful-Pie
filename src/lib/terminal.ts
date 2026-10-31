@@ -1,4 +1,20 @@
 import type { CommandOutput, CommandSummary, TerminalOwner } from "./api";
+import type { IParser } from "@xterm/xterm";
+
+// The PTY mirror owns these replies even before a view mounts; consume queries, never user input.
+export function registerBackendReplies(parser: IParser): () => void {
+  const handlers = [
+    parser.registerCsiHandler({ final: "c" }, params => params.length === 1 && params[0] === 0),
+    parser.registerCsiHandler({ final: "n" }, params => params.length === 1 && params[0] === 6),
+    parser.registerCsiHandler({ prefix: "?", final: "n" }, params => params.length === 1 && params[0] === 6),
+  ];
+  return () => handlers.forEach(handler => handler.dispose());
+}
+
+// DA1 and cursor reports cannot come from xterm: matching input bytes must still reach the shell.
+export function isReplayReply(data: string): boolean {
+  return data.startsWith("\u001b") && /^(?:\[(?:[>=][0-9;]*c|[?>=]?[0-9;]*[nuy])|\])/.test(data.slice(1));
+}
 
 // Per-view UI state keyed by instance id, or this key for the Dashboard's aggregate page.
 export const GLOBAL_UI_KEY = "*";

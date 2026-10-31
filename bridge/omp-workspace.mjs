@@ -482,7 +482,7 @@ export function installWorkspaceChanges(pi, options) {
       if (disposed) throw new Error('Workspace integration is shutting down');
       if (action === 'workspace_plan_prompt') return planPrompt(payload);
       if (action === 'cancel_workspace_change') return cancelChange(payload);
-      if (!init || !apply || !prompt) throw new Error(WORKSPACE_COMPATIBILITY_ERROR);
+      if (!compatible()) throw new Error(`${WORKSPACE_COMPATIBILITY_ERROR}; wait for session startup, then retry or reopen with the matching OMP version`);
       if (completed.has(payload.requestId)) return completed.get(payload.requestId);
       if (head?.requestId === payload.requestId) return { accepted: true, pending: true };
       if (head || active) throw new Error('Only the authorized FIFO head may be submitted');
