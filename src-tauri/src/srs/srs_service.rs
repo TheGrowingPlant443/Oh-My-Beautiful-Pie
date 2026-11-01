@@ -1,7 +1,9 @@
 //! Human scope admission, durable service state and explicit lifecycle transitions.
 use super::inventory::{InventoryExclusion, InventoryRoot};
 use super::store::{Mutation, Store};
-use super::types::{Counts, Diagnostic, Document, Exclusion, Job, Question, Root, Scope, Work};
+use super::types::{
+    Counts, Diagnostic, Document, Exclusion, Job, Purpose, Question, Root, Scope, Work,
+};
 use super::{documents, inventory, store, tools, JobState, Phase, Result};
 use crate::instance::Registry;
 use crate::knowledge::{KnowledgeScope, KnowledgeService, VaultRoot};
@@ -160,7 +162,7 @@ impl SrsService {
             }
         };
         Ok(
-            json!({"jobId":j.job_id,"folder":j.scope.folder,"repositoryRoot":j.scope.repository_root,"revision":j.revision,"state":j.state,"phase":j.phase,"vaultId":j.scope.vault_id,"vaultMode":j.scope.vault_mode,"vaultAvailable":same,"outputPath":format!("SRS/{}",j.job_id),"masterPath":format!("SRS/{}/SRS.md",j.job_id),"template":j.scope.template,"scopeHash":j.scope_hash,"sourceHash":j.source_hash,"attemptId":j.attempt_id,"stageId":j.stage.as_ref().map(|s|&s.stage_id),"stage":j.stage,"producer":j.producer,"counts":j.counts,"checkpoint":j.checkpoint,"error":j.error,"usage":{"tokens":null,"costUsd":null},"createdAt":j.created_at,"updatedAt":j.updated_at,"completion":j.completion,"resumeRequired":resume,"humanExclusions":j.human_exclusions,"architectModel":null}),
+            json!({"jobId":j.job_id,"purpose":j.scope.purpose,"folder":j.scope.folder,"repositoryRoot":j.scope.repository_root,"revision":j.revision,"state":j.state,"phase":j.phase,"vaultId":j.scope.vault_id,"vaultMode":j.scope.vault_mode,"vaultAvailable":same,"outputPath":format!("SRS/{}",j.job_id),"masterPath":format!("SRS/{}/SRS.md",j.job_id),"template":j.scope.template,"scopeHash":j.scope_hash,"sourceHash":j.source_hash,"attemptId":j.attempt_id,"stageId":j.stage.as_ref().map(|s|&s.stage_id),"stage":j.stage,"producer":j.producer,"counts":j.counts,"checkpoint":j.checkpoint,"error":j.error,"usage":{"tokens":null,"costUsd":null},"createdAt":j.created_at,"updatedAt":j.updated_at,"completion":j.completion,"resumeRequired":resume,"humanExclusions":j.human_exclusions,"architectModel":null}),
         )
     }
     pub fn get_srs_job(&self, job_id: &str) -> Result<Value> {
@@ -283,6 +285,7 @@ impl SrsService {
         &self,
         folder: &str,
         vault_id: &str,
+        purpose: Purpose,
         evidence_folders: Vec<String>,
         exclusions: Vec<String>,
     ) -> Result<Value> {
@@ -304,6 +307,7 @@ impl SrsService {
         let template =
             serde_json::to_value(documents::template_manifest()).map_err(|e| e.to_string())?;
         let scope = Scope {
+            purpose,
             folder: repository.display().to_string(),
             repository_root: repository.display().to_string(),
             vault_id: vault_id.into(),
@@ -315,7 +319,7 @@ impl SrsService {
         };
         let token = store::id();
         let expires = self.now() + TOKEN_TTL;
-        let result = json!({"token":token,"expiresAt":expires,"folder":scope.folder,"repositoryRoot":scope.repository_root,"vaultId":scope.vault_id,"vaultRoot":scope.vault_root,"vaultMode":scope.vault_mode,"roots":scope.roots,"exclusions":scope.exclusions,"template":scope.template,"warnings":["No total document/token/time/iteration limit. Provider charges may be very large. Local models still require time and compute.","Only the recorded evidence scope is covered; inaccessible production behavior is not proven.","Closing OMP Manager checkpoints and pauses; there is no background service."]});
+        let result = json!({"token":token,"expiresAt":expires,"purpose":scope.purpose,"folder":scope.folder,"repositoryRoot":scope.repository_root,"vaultId":scope.vault_id,"vaultRoot":scope.vault_root,"vaultMode":scope.vault_mode,"roots":scope.roots,"exclusions":scope.exclusions,"template":scope.template,"warnings":["No total document/token/time/iteration limit. Provider charges may be very large. Local models still require time and compute.","Only the recorded evidence scope is covered; inaccessible production behavior is not proven. Unknown external behavior requires stakeholder answers, not invented contracts.","Closing OMP Manager checkpoints and pauses; there is no background service."]});
         let mut pending = self.scopes.lock();
         pending.retain(|_, s| s.expires > self.now());
         pending.insert(token, PreparedScope { scope, expires });
@@ -483,13 +487,10 @@ impl SrsService {
         j.counts.excluded = summary.excluded + work_exclusions;
         let blocked = j.counts.blocked;
         j.inventory_complete = true;
-        j.state = if blocked > 0 {
-            JobState::WaitingForHuman
-        } else {
-            JobState::Running
-        };
+        // Blocked evidence is a completion obligation, not a reason to prevent the first survey.
+        j.state = JobState::Running;
         j.error = if blocked > 0 {
-            Some(Diagnostic{code:"needs_evidence".into(),message:"Unreadable or unsupported evidence needs a readable supply or explicit human exclusion. It is not proof of no behavior.".into()})
+            Some(Diagnostic{code:"needs_evidence".into(),message:"The Architect can survey readable evidence, but unreadable or unsupported evidence remains blocked until readable supply or explicit human exclusion. It is not proof of no behavior.".into()})
         } else {
             None
         };
@@ -552,6 +553,21 @@ impl SrsService {
                     revision: 0,
                 };
                 store::atomic(&self.store.path(id, "work", &wid)?, &w)?;
+            }
+        }
+        for contract in super::ledger::REQUIRED_CONTRACTS {
+            let wid = format!("contract-{}", store::hash(contract.as_bytes()));
+            if !self.store.path(id, "work", &wid)?.exists() {
+                let work = Work {
+                    id: wid.clone(),
+                    parent_id: None,
+                    phase: Phase::Specify,
+                    kind: "contractReview".into(),
+                    status: "pending".into(),
+                    rationale: (*contract).into(),
+                    revision: 0,
+                };
+                store::atomic(&self.store.path(id, "work", &wid)?, &work)?;
             }
         }
         Ok(())
@@ -701,7 +717,7 @@ impl SrsService {
             },
         );
         Ok(
-            json!({"token":token,"expiresAt":expires,"jobId":id,"mode":mode,"summary":j.checkpoint.as_ref().map(|c|&c.summary),"warnings":["Resume revalidates source, vault, template and conversation identity. Committed documents are not replayed."]}),
+            json!({"token":token,"expiresAt":expires,"jobId":id,"purpose":j.scope.purpose,"mode":mode,"summary":j.checkpoint.as_ref().map(|c|&c.summary),"warnings":["Resume revalidates source, vault, template and conversation identity. Committed documents are not replayed. The recorded purpose is unchanged."]}),
         )
     }
     pub fn resume_srs(self: &Arc<Self>, token: &str) -> Result<Value> {
@@ -861,4 +877,46 @@ fn safe_root(p: &Path) -> Result<()> {
         return Err("Choose a regular project/evidence folder, not a filesystem root".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod purpose_tests {
+    use super::*;
+
+    #[test]
+    fn reviewed_tokens_bind_purpose_and_legacy_jobs_keep_their_recorded_identity() {
+        let fix = super::super::tests::Fix::new("paused", "survey", "interrupted");
+        let legacy = fix.job();
+        assert_eq!(legacy.scope.purpose, Purpose::Migration);
+        let prepare = |purpose| {
+            fix.service
+                .prepare_srs_scope(
+                    &legacy.scope.folder,
+                    &legacy.scope.vault_id,
+                    purpose,
+                    vec![],
+                    vec![],
+                )
+                .unwrap()
+        };
+        let migration = prepare(Purpose::Migration);
+        let insights = prepare(Purpose::Insights);
+        assert_ne!(migration["token"], insights["token"]);
+        let scopes = fix.service.scopes.lock();
+        let a = &scopes[migration["token"].as_str().unwrap()].scope;
+        let b = &scopes[insights["token"].as_str().unwrap()].scope;
+        assert_eq!(a.purpose, Purpose::Migration);
+        assert_eq!(b.purpose, Purpose::Insights);
+        assert_ne!(
+            store::hash(&serde_json::to_vec(a).unwrap()),
+            store::hash(&serde_json::to_vec(b).unwrap())
+        );
+        let mut serialized = serde_json::to_value(a).unwrap();
+        serialized["purpose"] = json!("not-a-human-choice");
+        assert!(serde_json::from_value::<Scope>(serialized).is_err());
+        assert_eq!(
+            fix.service.store.job(&legacy.job_id).unwrap().scope_hash,
+            legacy.scope_hash
+        );
+    }
 }

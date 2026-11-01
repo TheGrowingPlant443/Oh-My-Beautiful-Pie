@@ -1,0 +1,9 @@
+[run]
+branch = True
+source = .
+omit = test_*.py
+relative_files = True
+data_file = .quality-coverage/.coverage
+
+[xml]
+output = .quality-coverage/python.xml

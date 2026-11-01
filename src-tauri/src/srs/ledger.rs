@@ -20,6 +20,7 @@ const WORK_KINDS: &[&str] = &[
     "scenario",
     "requirementReview",
     "templateSection",
+    "contractReview",
 ];
 const STATUSES: &[&str] = &["pending", "active", "blocked", "reviewed", "notApplicable"];
 const FIXED_DOCUMENTS: &[&str] = &[
@@ -42,6 +43,15 @@ const TEMPLATE_SECTIONS: &[&str] = &[
     "AI/ML",
     "Verification",
     "Appendixes",
+];
+pub(super) const REQUIRED_CONTRACTS: &[&str] = &[
+    "UI interactions and business rules",
+    "External systems and service dependencies",
+    "Operational, error and boundary behavior",
+    "Data meaning, validation and lifecycle",
+    "Security, authentication and authorization",
+    "Acceptance criteria and verification",
+    "Language and architecture independence",
 ];
 
 fn invalid(message: impl AsRef<str>) -> String {
@@ -937,6 +947,7 @@ pub fn validate_completion(store: &Store, job: &Job) -> Result<Vec<String>> {
     report_unfound(&mut reasons, &sections, TEMPLATE_SECTIONS, |title| {
         format!("Create and review templateSection work for {title}")
     });
+    check_contracts(store, job, &mut reasons)?;
     check_questions(store, job, &mut reasons)?;
     let fixed = check_documents(store, job, &mut reasons)?;
     report_unfound(&mut reasons, &fixed, FIXED_DOCUMENTS, |kind| {
@@ -1011,6 +1022,43 @@ fn check_work(store: &Store, job: &Job, work: &Work, reasons: &mut Vec<String>) 
     if work.status == "excluded" {
         check_excluded_work(store, job, work, reasons)?;
     }
+    Ok(())
+}
+
+fn check_contracts(store: &Store, job: &Job, reasons: &mut Vec<String>) -> Result<()> {
+    let mut found = [false; REQUIRED_CONTRACTS.len()];
+    store.for_each(&job.job_id, "work", |value| {
+        let work: Work = decode(value)?;
+        if work.kind != "contractReview" { return Ok(()); }
+        if let Some(index) = REQUIRED_CONTRACTS.iter().position(|title| Some(*title) == work.rationale.lines().next()) {
+            found[index] = true;
+        }
+        if work.status == "notApplicable" && work.rationale.lines().skip(1).flat_map(str::chars).filter(|c| c.is_alphanumeric()).take(8).count() < 8 {
+            reason(reasons, format!("Contract {} needs a concrete non-applicability rationale after its topic; missing evidence is a stakeholder question, not proof of non-applicability", work.id));
+        }
+        if work.status == "reviewed" {
+            let mut evidence = false;
+            store.related(&job.job_id, &work.id, "evidence", |_| { evidence = true; Ok(()) })?;
+            let mut specified = false;
+            store.related(&job.job_id, &work.id, "requirement", |id| {
+                let req: Requirement = store.get(&job.job_id, "requirements", id)?;
+                let doc: Document = store.get(&job.job_id, "documents", &req.document_id)?;
+                specified |= doc.state == "committed"
+                    && doc.specificity.as_deref() == Some("portable")
+                    && review_receipt_current(store, job, &doc.document_id, &work.id)?;
+                Ok(())
+            })?;
+            if !evidence || !specified {
+                reason(reasons, format!("Contract {} needs evidence and a committed portable requirement reviewed against this exact work revision; otherwise record an evidence-backed notApplicable or a stakeholder question", work.rationale));
+            }
+        } else if work.status == "excluded" {
+            reason(reasons, format!("Contract {} must be reviewed or evidence-backed notApplicable, not excluded", work.rationale));
+        }
+        Ok(())
+    })?;
+    report_unfound(reasons, &found, REQUIRED_CONTRACTS, |title| {
+        format!("Create and review contractReview work for {title}")
+    });
     Ok(())
 }
 
@@ -1477,6 +1525,16 @@ mod tests {
                 doc.state = "committed".into();
                 doc.bytes = 1;
                 doc.hash = Some(store::hash(b"x"));
+                doc.specificity = Some(
+                    if doc.r#type == "uiObservations" {
+                        "uiSpecific"
+                    } else if doc.r#type == "structureObservations" {
+                        "implementationSpecific"
+                    } else {
+                        "portable"
+                    }
+                    .into(),
+                );
                 doc.reviewed_revision = Some(self.job.work_revision);
                 let mut writes =
                     review_mutations(&self.store, &self.job, &doc.document_id, work_ids).unwrap();
@@ -1497,17 +1555,30 @@ mod tests {
                 .iter()
                 .map(|item| item["id"].as_str().unwrap().to_owned())
                 .collect();
-            let linked = if map_second {
+            let mut linked = if map_second {
                 ids.clone()
             } else {
                 vec![ids[0].clone()]
             };
+            let evidence = self.evidence("a.txt");
+            let contracts = self.apply(json!({"addWork":REQUIRED_CONTRACTS.iter().map(|topic|
+                json!({"phase":"specify","kind":"contractReview","status":"reviewed","rationale":topic,"evidenceIds":[evidence.id]})
+            ).collect::<Vec<_>>()}));
+            let contract_ids = contracts["work"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            linked.extend(contract_ids.iter().cloned());
             let docs: Vec<Value> = FIXED_DOCUMENTS
                 .iter()
                 .map(|kind| json!({"type":kind,"title":kind}))
                 .collect();
             self.apply(json!({"addDocuments":docs,"addRequirements":[{"area":"FUN","title":"Booking lifecycle","workIds":linked}]}));
-            self.publish_ledger_documents(&ids);
+            self.publish_ledger_documents(
+                &ids.iter().chain(&contract_ids).cloned().collect::<Vec<_>>(),
+            );
             for name in ["a.txt", "b.txt"] {
                 let item = self.evidence(name);
                 self.receipt(&item, 0, item.bytes);
@@ -1779,6 +1850,63 @@ mod tests {
         );
         f.publish_ledger_documents(&ids);
         assert!(validate_completion(&f.store, &f.job).unwrap().is_empty());
+    }
+
+    #[test]
+    fn contract_coverage_requires_current_portable_requirements_not_topic_checkmarks() {
+        let mut f = Fixture::new();
+        f.complete_ledger(true);
+        assert!(validate_completion(&f.store, &f.job).unwrap().is_empty());
+        let contracts = f.store.page(&f.job.job_id, "work", 0, 200).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["kind"] == "contractReview")
+            .cloned()
+            .collect::<Vec<_>>();
+        let contract: Work = decode(contracts[0].clone()).unwrap();
+        f.apply(json!({"updateWork":[{"id":contract.id,"status":"reviewed"}]}));
+        assert!(validate_completion(&f.store, &f.job)
+            .unwrap()
+            .iter()
+            .any(|r| r.contains("committed portable requirement")));
+        let mut req: Document = decode(
+            f.store.page(&f.job.job_id, "documents", 0, 200).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["type"] == "requirement")
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let writes =
+            review_mutations(&f.store, &f.job, &req.document_id, &[contract.id.clone()]).unwrap();
+        f.commit(writes);
+        req.specificity = Some("implementationSpecific".into());
+        f.commit(vec![
+            store::mutation("documents", &req.document_id, &req).unwrap()
+        ]);
+        assert!(validate_completion(&f.store, &f.job)
+            .unwrap()
+            .iter()
+            .any(|r| r.contains("committed portable requirement")));
+        req.specificity = Some("portable".into());
+        f.commit(vec![
+            store::mutation("documents", &req.document_id, &req).unwrap()
+        ]);
+        f.publish_ledger_documents(&[contract.id.clone()]);
+        assert!(validate_completion(&f.store, &f.job).unwrap().is_empty());
+        f.apply(json!({"updateWork":[{"id":contract.id,"status":"notApplicable"}]}));
+        assert!(validate_completion(&f.store, &f.job)
+            .unwrap()
+            .iter()
+            .any(|r| r.contains("concrete non-applicability rationale")));
+        f.apply(json!({"updateWork":[{"id":contract.id,"status":"notApplicable","rationale":"A topic which omits a required dependency contract\nThe isolated product has no such capability."}]}));
+        assert!(validate_completion(&f.store, &f.job)
+            .unwrap()
+            .iter()
+            .any(|r| r.contains("Create and review contractReview work")));
     }
 
     #[test]

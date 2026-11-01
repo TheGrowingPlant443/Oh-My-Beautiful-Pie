@@ -194,6 +194,7 @@ impl Drop for Remove {
 #[allow(clippy::too_many_arguments)]
 pub fn explain_with(
     program: &OsStr,
+    prefix: &[&OsStr],
     folder: &Path,
     profile: &str,
     configs: &[PathBuf],
@@ -207,6 +208,8 @@ pub fn explain_with(
     fs::write(&file, material).map_err(|e| e.to_string())?;
     let material_file = Remove(file);
     let mut cmd = Command::new(program);
+    cmd.args(prefix);
+    cmd.env_remove("PI_COMPILED");
     cmd.args([
         "-p",
         "--no-session",
@@ -260,14 +263,30 @@ pub fn explain(
     let row = registry.inspect(id, Origin::Human)?;
     let root = code_diff::repository_root(Path::new(&row.project_path))?;
     let material = material(&root, kind, base, target)?;
-    let program = crate::toolchain::omp_program();
+    let utility = crate::config::prepare_utility(
+        registry,
+        id,
+        Some(&row.model),
+        row.session_path.as_deref(),
+        crate::config::UtilityMode::Generate,
+    )?;
+    let settings_snapshot = utility
+        .settings_snapshot
+        .as_deref()
+        .ok_or("Utility generation requires a private settings snapshot")?;
     let folder = registry.config_root().join("git-explain");
     explain_with(
-        &program,
+        &utility.bun,
+        &[
+            utility.generator.as_os_str(),
+            utility.sdk_cli.as_os_str(),
+            OsStr::new("--settings-snapshot"),
+            settings_snapshot.as_os_str(),
+        ],
         &folder,
         &row.profile,
-        &row.configs,
-        &row.model,
+        &utility.configs,
+        utility.model.as_deref().unwrap_or(""),
         kind,
         &material,
         Duration::from_secs(MODEL_SECS),
@@ -402,6 +421,80 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn source_cli_prefix_keeps_fixed_model_effective_configs_and_tool_restrictions() {
+        let repo = Repo::new("source-cli");
+        let cli = repo.0.join("source-cli.sh");
+        let effective = repo.0.join("C.yml");
+        fs::write(&effective, "model:\n  default: provider/E\n").unwrap();
+        fs::write(
+            &cli,
+            "printf '%s\\n' \"$0\" \"$@\" > argv.txt\nprintf '\\n\\033[1mOne explanation.\\033[0m\\nsecond line\\n'\n",
+        )
+        .unwrap();
+        let folder = repo.0.join("work");
+        assert_eq!(
+            explain_with(
+                OsStr::new("/bin/sh"),
+                &[cli.as_os_str()],
+                &folder,
+                "selected-profile",
+                &[effective.clone()],
+                "provider/D",
+                "commit",
+                "private material",
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            "One explanation."
+        );
+        let argv = fs::read_to_string(folder.join("argv.txt")).unwrap();
+        let args: Vec<_> = argv.lines().collect();
+        assert_eq!(
+            args[0],
+            cli.to_str().unwrap(),
+            "the source CLI precedes flags"
+        );
+        for flag in [
+            "-p",
+            "--no-session",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules",
+            "--no-lsp",
+            "--no-title",
+            "--max-time=120",
+        ] {
+            assert!(args.contains(&flag), "{flag} missing from {args:?}");
+        }
+        for (flag, value) in [
+            ("--cwd", folder.to_str().unwrap()),
+            ("--profile", "selected-profile"),
+            ("--config", effective.to_str().unwrap()),
+            ("--model", "provider/D"),
+        ] {
+            let values: Vec<_> = args
+                .windows(2)
+                .filter(|pair| pair[0] == flag)
+                .map(|pair| pair[1])
+                .collect();
+            assert_eq!(
+                values,
+                vec![value],
+                "{flag} must have one authoritative value"
+            );
+        }
+        assert!(!argv.contains("B.yml") && !argv.contains("provider/E"));
+        let attachment = args.iter().find_map(|arg| arg.strip_prefix('@')).unwrap();
+        assert!(
+            !Path::new(attachment).exists(),
+            "private material is removed"
+        );
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+    }
+
     #[cfg(windows)]
     mod stub {
         use super::*;
@@ -417,6 +510,7 @@ mod tests {
         fn run(program: &Path, folder: &Path, limit: Duration) -> Result<String> {
             explain_with(
                 program.as_os_str(),
+                &[],
                 folder,
                 "",
                 &[PathBuf::from("C:/cfg/a.yml")],

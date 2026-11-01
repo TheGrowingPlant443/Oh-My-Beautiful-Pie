@@ -19,7 +19,7 @@
           sdk = import ./nix/omp-sdk { inherit pkgs; };
           sdkCommand = pkgs.writeShellScript "omp-manager-cli" ''
             unset PI_COMPILED
-            exec "''${BUN_BIN:-${pkgs.bun}/bin/bun}" ${sdk}/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js "$@"
+            exec "''${BUN_BIN:-${pkgs.bun}/bin/bun}" ${sdk}/node_modules/@oh-my-pi/pi-coding-agent/src/cli.ts "$@"
           '';
           # PHP needs both upstream entry points, not the generic single-grammar binding.
           phpGrammar = pkgs.python3Packages.buildPythonPackage {

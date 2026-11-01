@@ -29,7 +29,7 @@
   const declined = $derived(caps?.obsidian.declinedForProject === true);
   const suggested = $derived(scope.kind === "global" ? caps?.suggestedGlobalRoot ?? null : caps?.suggestedProjectRoot ?? null);
   const registered = $derived(installed ? caps?.obsidian.registeredVaults ?? [] : []);
-  /** Obsidian is missing and the human has neither declined nor installed it yet. */
+  /** Not detected does not prove there is no portable or unusually located installation. */
   const undecided = $derived(offerObsidianInstall && !!caps && caps.obsidian.state === "absent" && !declined);
 
   let destination = $state<string | null>(null);
@@ -83,6 +83,22 @@
     const found = await knowledge.probe(folder);
     note = found?.obsidian.state === "installed" ? "Obsidian was found." : "Obsidian was still not found.";
   }
+  async function locateObsidian(): Promise<void> {
+    const target = folder;
+    let mine = epoch;
+    try {
+      const picked = await pickFolderDialog({ directory: false, multiple: false, title: "Locate the installed Obsidian executable or AppImage" });
+      if (typeof picked !== "string" || !open || folder !== target) return;
+      mine = ++epoch; preparation = null; error = null; note = null; busy = true;
+      await knowledgeApi.configureObsidian(picked);
+      const found = await knowledge.probe(target);
+      if (mine !== epoch || !open || folder !== target) return;
+      if (!modeTouched) mode = obsidianInstalled(found) ? "obsidian" : "markdown";
+      note = found?.obsidian.message ?? (obsidianInstalled(found) ? "Obsidian was found." : "The executable was saved, but detection could not confirm it. Check the executable override and try again.");
+      if (destination) await prepare(destination);
+    } catch (failure) { if (mine === epoch) error = String(failure); }
+    finally { if (mine === epoch) busy = false; }
+  }
   async function decline(): Promise<void> {
     if (folder === null) return;
     try { knowledge.adopt(await knowledgeApi.recordObsidianDecline(folder)); modeTouched = true; mode = "markdown"; note = "Obsidian will not be offered again for this project. Notes are plain Markdown files."; } catch (failure) { error = String(failure); }
@@ -96,7 +112,7 @@
       <p class="dim">{scope.kind === "global" ? "One vault holds your agent setup Markdown for every project." : `One vault holds the documentation of ${scope.repositoryRoot ?? folder ?? "this project"}.`} It contains Markdown only; scripts, tools, settings and credentials never enter it.</p>
       {#if undecided}
         <div class="notice" role="status">
-          <p><strong>Obsidian was not found on this computer.</strong> It is optional: without it you read and write the same notes as plain Markdown in the built-in viewer.</p>
+          <p><strong>Obsidian's launcher was not detected.</strong> If it is already installed, locate its executable below. It is optional: the same notes remain available as plain Markdown in the built-in viewer.</p>
           <div class="actions">
             <button onclick={() => void install()}>Install Obsidian</button>
             <button onclick={() => void checkAgain()}>Check again</button>
@@ -107,6 +123,7 @@
       {:else if caps && caps.obsidian.state === "unreadable"}
         <p class="warn" role="status">Obsidian's install could not be read ({caps.obsidian.message ?? "unknown reason"}); this is not proof that it is missing. Plain Markdown mode works.</p>
       {/if}
+      {#if !installed}<button disabled={busy} onclick={() => void locateObsidian()}>Locate installed Obsidian…</button>{/if}
       {#if note}<p role="status">{note}</p>{/if}
 
       <div class="block">

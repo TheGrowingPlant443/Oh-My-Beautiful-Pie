@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OMBP · Start app</title><link rel="stylesheet" href="/ui.css"><script src="/ui.js" type="module"></script></head>
+<body>
+<header><div><h1>OMBP <span>Start app</span></h1><p>One container. Permissions you control outside the AI.</p></div><output id="status">Connecting…</output></header>
+<section class="launch" aria-label="Launch settings">
+<label>OMP Manager executable<input id="executable" placeholder="/home/you/.nix-profile/bin/omp-manager"></label>
+<label>Launch mode<select id="mode"><option value="container">Podman · isolated</option><option value="normal">Normal · unrestricted host access</option></select></label>
+<label>GPU<select id="gpu"><option value="none">None · software rendering</option><option value="amd">AMD · render devices + KFD</option><option value="nvidia">NVIDIA · CDI (not tested)</option></select></label>
+<div class="actions"><button id="start">Start OMBP</button><button id="stop" class="secondary">Stop</button></div>
+</section>
+<p id="boundary" class="notice">Container mode: OMBP and every OMP child run together. Only approved host resources are exposed. Network requests must pass the website gateway.</p>
+<p id="message" role="alert" aria-live="polite"></p>
+<main>
+<section class="column"><h2>Folder access</h2><p>Host folders appear at <code>/host/…</code>. Grant a vault directory for Obsidian files; this does not control the host Obsidian app.</p>
+<form id="folder-form"><label>Absolute host folder<input id="folder" placeholder="/home/you/Downloads" required></label><label class="check"><input id="write" type="checkbox">Allow changes and deletion</label><button>Add folder</button></form>
+<div class="presets"><button id="downloads" class="secondary">Downloads</button><button id="desktop-folder" class="secondary">Desktop folder</button></div><ul id="folders"></ul>
+<p class="fine">Read-only by default. Grants include subfolders. Host symlinks, hardlinked files, special files and launcher state are blocked. Broad grants can expose secrets.</p></section>
+<section class="column"><h2>Programs &amp; desktop</h2><p>Make an installed Nix program available inside the container, including its runtime dependencies.</p>
+<form id="program-form"><label>Installed executable<input id="program" placeholder="/home/you/.nix-profile/bin/program" required></label><button>Add program</button></form><ul id="programs"></ul>
+<label class="check"><input id="desktop" type="checkbox" checked>Show OMBP in an isolated desktop window</label><p class="fine">A nested Wayland compositor separates OMBP from host screen/input protocols. No host display socket, X11, session bus, portals, Podman socket or host program execution. This is not host-desktop automation.</p>
+<p class="fine">Programs already bundled with OMBP and interpreters remain runnable. This list controls host mounts, not arbitrary code execution. GPU and display changes require a new launch.</p>
+</section>
+<section class="column"><h2>Websites &amp; internet</h2><label class="check"><input id="internet" type="checkbox">Enable internet through whitelist</label>
+<form id="website-form"><label>Base URL<input id="website" type="url" placeholder="https://api.example.com" required></label><label class="check"><input id="host-credential" type="checkbox">Attach Authorization from host keyring</label><button>Allow website</button></form><ul id="websites"></ul>
+<p class="fine">Exact scheme, host and port; every subpath is allowed. Subdomains need separate entries. Private networks and direct connections are blocked. HTTPS is inspected using this launcher's local CA; clients must trust it. Certificate-pinned clients and WebSockets fail closed.</p>
+<p class="fine">Optional host-side Authorization injection keeps the stored header outside the container. Store it using <code>secret-tool store --label='OMBP API' application ombp-start origin https://api.example.com</code>, then enter the complete header value at its prompt (for example Bearer …). Trust that origin: its responses could echo the credential. Otherwise use the container's private keyring; the AI can read credentials there.</p></section>
+<section class="column"><h2>Denied attempts</h2><p>Gateway-observed website, folder and program attempts. Use + to grant access without restarting.</p><p id="history-error" class="fine" aria-live="polite"></p><section id="history" aria-live="off" aria-label="Denied attempts history"></section><p class="fine">Latest 500 distinct denied resources, with counts. Direct network syscalls and missing programs outside the gateways cannot be identified here. Revocation cannot undo data already read or code already loaded.</p></section>
+</main>
+<footer>Permissions apply live in container mode only. State and logs stay on the host. This launcher does not modify OMBP.</footer>
+</body></html>

@@ -249,11 +249,12 @@ export function readEvidence(root, relative, offset, inspect) {
 // ---- immutable publication -------------------------------------------------------------------------------------
 
 /**
- * Writes `bytes` as `<folder>/result.json` under the exclusive `result.lock`; a result is never overwritten.
+ * Publishes `bytes` under the exclusive `result.lock`; the trusted caller selects a result or terminal marker.
  * `recheck()` runs under the lock and throws when the request no longer accepts a result. The descriptor, temporary
  * file and lock are always released; the first failure is reported, so cleanup never hides the cause.
  */
-export function publishExclusively(folder, bytes, recheck) {
+export function publishExclusively(folder, bytes, recheck, filename = 'result.json') {
+  if (!['result.json', 'terminal.json'].includes(filename)) throw new Error('invalid publication filename');
   const lock = path.join(folder, 'result.lock');
   const temporary = path.join(folder, `result.${process.pid}.${randomUUID()}.tmp`);
   const fd = openSync(lock, 'wx');
@@ -265,7 +266,7 @@ export function publishExclusively(folder, bytes, recheck) {
   attempt(() => {
     recheck();
     writeFileSync(temporary, bytes, { flag: 'wx' });
-    renameSync(temporary, path.join(folder, 'result.json'));
+    renameSync(temporary, path.join(folder, filename));
   });
   attempt(() => {
     try { unlinkSync(temporary); }

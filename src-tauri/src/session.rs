@@ -488,23 +488,22 @@ impl TailReader {
 pub fn render_transcript_file(
     path: &Path,
     input: &crate::instance::CreateInput,
+    utility: &crate::config::UtilityConfiguration,
 ) -> Result<String, String> {
-    let program = crate::toolchain::omp_program();
-    let mut command = std::process::Command::new(program);
+    let mut command = std::process::Command::new(&utility.bun);
+    // Native render copies the transcript and uses empty tools plus in-memory auth, not inference.
     command
+        .arg(&utility.sdk_cli)
         .arg("render")
         .arg(path)
         .args(["-w", "120", "--plain"]);
     command
         .current_dir(&input.project_path)
-        .env("OMP_PROFILE", &input.profile);
-    let overlays: Vec<PathBuf> = std::env::var_os("PI_CONFIG_FILES")
-        .map(|s| std::env::split_paths(&s).collect())
-        .unwrap_or_default();
+        .env("OMP_PROFILE", &input.profile)
+        .env_remove("PI_COMPILED");
     command.env(
         "PI_CONFIG_FILES",
-        std::env::join_paths(overlays.iter().chain(input.configs.iter()))
-            .map_err(|e| e.to_string())?,
+        std::env::join_paths(&utility.configs).map_err(|e| e.to_string())?,
     );
     #[cfg(windows)]
     {

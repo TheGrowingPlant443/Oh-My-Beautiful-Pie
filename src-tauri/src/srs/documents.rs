@@ -12,8 +12,49 @@ use uuid::Uuid;
 
 pub const TEMPLATE_REVISION: &str = "3965e951fa5ea1c1dd1bbc7a66b7f35f7e85c006";
 pub const DOCUMENT_CHUNK_BYTES: usize = 64 * 1024;
-pub const UI_ONLY_LABEL: &str = "UI-only requirement";
-pub const IMPLEMENTATION_ONLY_LABEL: &str = "Implementation-only requirement";
+pub const UI_ONLY_LABEL: &str = "Visual observations only — not UI logic. UI interaction and business logic are required separately.";
+pub const IMPLEMENTATION_ONLY_LABEL: &str = "Existing architecture observations only — not requirements for the replacement language, stack or architecture.";
+const REQUIREMENT_SECTIONS: &[&str] = &[
+    "Statement",
+    "Rationale",
+    "Acceptance Criteria",
+    "Verification Method",
+    "More Information",
+];
+const INTERFACE_SECTIONS: &[&str] = &[
+    "Participants and Purpose",
+    "Inputs and Outputs",
+    "Protocol and Interaction",
+    "Authentication and Authorization",
+    "Failure and Recovery",
+    "Limits and Unknowns",
+    "Verification",
+];
+const FLOW_SECTIONS: &[&str] = &[
+    "Actors and Preconditions",
+    "Interaction and Business Rules",
+    "Outcomes and State Changes",
+    "Errors and Boundary Cases",
+    "Verification",
+];
+const DOMAIN_SECTIONS: &[&str] = &[
+    "Data and Meaning",
+    "Validation and Invariants",
+    "Lifecycle and Retention",
+    "Access and Ownership",
+    "Verification",
+];
+
+pub fn public_contracts() -> serde_json::Value {
+    serde_json::json!({
+        "requiredHeadings":{"master":master_sections(),"requirement":REQUIREMENT_SECTIONS,"interface":INTERFACE_SECTIONS,"flow":FLOW_SECTIONS,"domain":DOMAIN_SECTIONS},
+        "specificity":"All public requirements and contracts must be portable; only uiObservations and structureObservations are specificity exceptions.",
+        "observationNotices":{"uiObservations":UI_ONLY_LABEL,"structureObservations":IMPLEMENTATION_ONLY_LABEL},
+        "noticePlacement":"First nonblank content immediately after the Markdown title.",
+        "unknowns":"Missing or inaccessible evidence is not proof of non-applicability. Queue stakeholder questions; never invent external behavior or claim it was verified.",
+        "publicEvidence":"No code, source links, symbols or private citations. Evidence and human answer receipts stay in the private ledger."
+    })
+}
 
 pub static EMBEDDED_TEMPLATES: &[(&str, &str)] = &[
     (
@@ -667,6 +708,14 @@ fn validate_specificity(text: &str, context: &ValidationContext<'_>) -> Result<(
         "implementationSpecific" => Some(IMPLEMENTATION_ONLY_LABEL),
         _ => return Err("Unknown document specificity".into()),
     };
+    check_specificity_placement(context)?;
+    if context.document_type == "requirement" && context.specificity == "portable" {
+        check_portable_requirement(text)?;
+    }
+    check_specificity_label(text, required_label)
+}
+
+fn check_specificity_placement(context: &ValidationContext<'_>) -> Result<(), String> {
     if context.document_type == "uiObservations" && context.specificity != "uiSpecific"
         || context.document_type == "structureObservations"
             && context.specificity != "implementationSpecific"
@@ -675,17 +724,48 @@ fn validate_specificity(text: &str, context: &ValidationContext<'_>) -> Result<(
             "Observation notes must carry their UI-only or implementation-only specificity".into(),
         );
     }
-    if let Some(label) = required_label {
-        if !text
-            .lines()
-            .any(|line| line.trim().trim_matches('*') == label)
-        {
-            return Err(format!(
-                "Public note must display the mandatory label: {label}"
-            ));
+    if !matches!(
+        context.document_type,
+        "uiObservations" | "structureObservations"
+    ) && context.specificity != "portable"
+    {
+        return Err("Public requirements and contracts must be portable; implementation and visuals belong only in observation notes".into());
+    }
+    Ok(())
+}
+
+fn check_portable_requirement(text: &str) -> Result<(), String> {
+    let lower = text.to_ascii_lowercase();
+    if [
+        "shall be implemented in",
+        "must be implemented in",
+        "shall be written in",
+        "must be written in",
+        "the implementation shall",
+        "as implemented in",
+        "according to the source code",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+    {
+        return Err("Implementation prescriptions are not portable requirements; specify observable behavior and keep existing architecture in observations".into());
+    }
+    Ok(())
+}
+
+fn check_specificity_label(text: &str, required_label: Option<&str>) -> Result<(), String> {
+    let Some(label) = required_label else {
+        if text.contains(UI_ONLY_LABEL) || text.contains(IMPLEMENTATION_ONLY_LABEL) {
+            return Err("Portable note cannot claim a UI-only or implementation-only label".into());
         }
-    } else if text.contains(UI_ONLY_LABEL) || text.contains(IMPLEMENTATION_ONLY_LABEL) {
-        return Err("Portable note cannot claim a UI-only or implementation-only label".into());
+        return Ok(());
+    };
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next();
+    if !first.is_some_and(|line| heading(line).is_some_and(|(level, _)| level == 1))
+        || lines.next().map(|line| line.trim_matches('*')) != Some(label)
+    {
+        return Err(format!("Public observation note must start with its mandatory notice, immediately after its title: {label}"));
     }
     Ok(())
 }
@@ -711,18 +791,11 @@ fn check_type_sections(
                     "Requirement title must start with its backend-allocated stable REQ ID".into(),
                 );
             }
-            check_sections(
-                text,
-                &[
-                    "Statement",
-                    "Rationale",
-                    "Acceptance Criteria",
-                    "Verification Method",
-                    "More Information",
-                ],
-                report,
-            )
+            check_sections(text, REQUIREMENT_SECTIONS, report)
         }
+        "interface" => check_sections(text, INTERFACE_SECTIONS, report),
+        "flow" => check_sections(text, FLOW_SECTIONS, report),
+        "domain" => check_sections(text, DOMAIN_SECTIONS, report),
         _ => check_sections(text, &[], report),
     }
 }
@@ -982,26 +1055,79 @@ mod tests {
     }
 
     #[test]
-    fn specificity_labels_are_mandatory_and_visible() {
-        let mut context = context(
-            "User interface/Current UI observations.md",
-            "uiObservations",
-        );
-        context.specificity = "uiSpecific";
-        assert!(validate_document("# Current UI\nA dialog exists.", &context, |_| true).is_err());
+    fn specificity_notices_precede_observations_and_requirements_remain_portable() {
+        for (kind, path, specificity, notice) in [
+            (
+                "uiObservations",
+                "User interface/Current UI observations.md",
+                "uiSpecific",
+                UI_ONLY_LABEL,
+            ),
+            (
+                "structureObservations",
+                "Implementation context/Current structure observations.md",
+                "implementationSpecific",
+                IMPLEMENTATION_ONLY_LABEL,
+            ),
+        ] {
+            let mut ctx = context(path, kind);
+            ctx.specificity = specificity;
+            let valid = format!(
+                "# Observations\n\n**{notice}**\n\nThe existing view contains a status panel.\n"
+            );
+            assert!(validate_document(&valid, &ctx, |_| true).is_ok());
+            let buried = format!(
+                "# Observations\n\nThe existing view contains a status panel.\n\n{notice}\n"
+            );
+            assert!(validate_document(&buried, &ctx, |_| true).is_err());
+            ctx.specificity = "portable";
+            assert!(validate_document(&valid, &ctx, |_| true).is_err());
+        }
+        let mut ctx = context("Requirements/REQ-CORE-001.md", "requirement");
+        ctx.requirement_id = Some("REQ-CORE-001");
+        ctx.specificity = "implementationSpecific";
         assert!(validate_document(
-            "# Current UI\nUI-only requirement\nA dialog exists.",
-            &context,
-            |_| true
-        )
-        .is_ok());
-        context.specificity = "portable";
-        assert!(validate_document(
-            "# Current UI\nUI-only requirement\nA dialog exists.",
-            &context,
+            &format!("{IMPLEMENTATION_ONLY_LABEL}\n{}", requirement()),
+            &ctx,
             |_| true
         )
         .is_err());
+        ctx.specificity = "portable";
+        let prescription = requirement().replace(
+            "The system shall save an accepted note.",
+            "The system shall be implemented in the existing programming language.",
+        );
+        assert!(validate_document(&prescription, &ctx, |_| true).is_err());
+        let external_protocol = requirement().replace("The system shall save an accepted note.", "The system shall accept a note through the agreed transport protocol and confirm its saved identifier.");
+        assert!(validate_document(&external_protocol, &ctx, |_| true).is_ok());
+    }
+
+    #[test]
+    fn external_contracts_need_failures_authority_limits_and_verification() {
+        let path = format!("Interfaces/{ID}.md");
+        let ctx = context(&path, "interface");
+        let sections = [
+            ("Participants and Purpose", "The payment service confirms customer payments."),
+            ("Inputs and Outputs", "A payment request includes amount and currency; the reply identifies the accepted transaction."),
+            ("Protocol and Interaction", "A client submits one request and awaits a confirmation before marking an order paid."),
+            ("Authentication and Authorization", "Only authorized shop staff may request a refund."),
+            ("Failure and Recovery", "If confirmation is unavailable, the order remains unpaid and may be checked again without charging twice."),
+            ("Limits and Unknowns", "The provider's maximum payment size needs a stakeholder decision; it is not inferred from the client."),
+            ("Verification", "Test acceptance, rejection, duplicate submission and loss of confirmation against an agreed service contract."),
+        ];
+        let note = |skip: Option<usize>| {
+            let mut text = "# Payment service contract\n".to_string();
+            for (index, (title, body)) in sections.iter().enumerate() {
+                if skip != Some(index) {
+                    text.push_str(&format!("\n## {title}\n{body}\n"));
+                }
+            }
+            text
+        };
+        assert!(validate_document(&note(None), &ctx, |_| true).is_ok());
+        for index in 0..sections.len() {
+            assert!(validate_document(&note(Some(index)), &ctx, |_| true).is_err());
+        }
     }
 
     #[test]

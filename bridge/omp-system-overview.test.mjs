@@ -519,6 +519,12 @@ test('visualization tools register with strict schemas, resolve the producer fro
   } finally { cleanup(fixture); }
 });
 
+const assertVisualizationUnsent = async (promise, reason) => {
+  const receipt = await promise;
+  assert.equal(receipt.admitted, false);
+  assert.match(receipt.error.message, reason);
+};
+
 test('project_visualization_prompt admits one guarded native follow-up per request and never resends', async () => {
   const fixture = setup();
   try {
@@ -530,11 +536,11 @@ test('project_visualization_prompt admits one guarded native follow-up per reque
     });
     const ctx = { ok: true, agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
     const payload = { requestId: fixture.requestId, kind: 'systemOverview', message: 'Analyze the system.', source: 'human', generation: 7 };
-    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, duplicate: false });
+    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, admitted: true, duplicate: false });
     assert.equal(sent.length, 1);
     assert.match(sent[0], /^Analyze the system\.\n\n\[omp-visualization-request id=/);
     assert.equal(control.guard.states()[0].state, 'pending');
-    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, duplicate: true });
+    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, admitted: true, duplicate: true });
     assert.equal(sent.length, 1);
     // The turn that carries the prompt activates the guard through the native before_agent_start hook.
     handlers.get('before_agent_start')({ prompt: sent[0] }, ctx);
@@ -555,22 +561,22 @@ test('project_visualization_prompt rejects invalid, mismatched, wrong-producer a
     });
     const ctx = { ok: true, agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
     const good = { requestId: fixture.requestId, kind: 'systemOverview', message: 'Analyze.' };
-    await assert.rejects(control.promptVisualization(ctx, { ...good, kind: 'security' }), /invalid visualization prompt/);
-    await assert.rejects(control.promptVisualization(ctx, { ...good, kind: 'structureCurrent' }), /not a structureCurrent request/);
-    await assert.rejects(control.promptVisualization(ctx, { ...good, requestId: 'not-a-uuid' }), /invalid request id/);
-    await assert.rejects(control.promptVisualization(ctx, { ...good, message: '   ' }), /message must be/);
-    await assert.rejects(control.promptVisualization(ctx, { ...good, message: 'x'.repeat(64 * 1024 + 1) }), /message must be/);
-    await assert.rejects(control.promptVisualization({ ...ctx, ok: false }, good), /Architect identity unavailable/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, kind: 'security' }), /invalid visualization prompt/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, kind: 'structureCurrent' }), /not a structureCurrent request/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, requestId: 'not-a-uuid' }), /invalid request id/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, message: '   ' }), /message must be/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, message: 'x'.repeat(64 * 1024 + 1) }), /message must be/);
+    await assertVisualizationUnsent(control.promptVisualization({ ...ctx, ok: false }, good), /Architect identity unavailable/);
     assert.equal(sent.length, 0);
     refuse.value = true;
-    await assert.rejects(control.promptVisualization(ctx, good), /native refused/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, good), /native refused/);
     assert.equal(control.guard.states().length, 0, 'a refused prompt leaves no guard behind');
     refuse.value = false;
-    assert.deepEqual(await control.promptVisualization(ctx, good), { accepted: true, duplicate: false });
+    assert.deepEqual(await control.promptVisualization(ctx, good), { accepted: true, admitted: true, duplicate: false });
     writeFileSync(path.join(fixture.folder, 'terminal.json'), JSON.stringify({ status: 'error', message: 'ended' }));
-    await assert.rejects(control.promptVisualization(ctx, { ...good, requestId: fixture.requestId }), /already ended/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, requestId: fixture.requestId }), /already ended/);
     const bare = registerProjectInsightTools(pi, fixture.dir, () => actor);
-    await assert.rejects(bare.promptVisualization(ctx, good), /native_prompt_unavailable/);
+    await assertVisualizationUnsent(bare.promptVisualization(ctx, good), /native_prompt_unavailable/);
   } finally { cleanup(fixture); }
 });
 
@@ -873,11 +879,11 @@ test('project_visualization_prompt admits a helicopter request in the existing A
     const ctx = { ok: true, agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
     const payload = { requestId: fixture.requestId, kind: 'helicopter', message: 'Describe the business.', source: 'human', generation: 7 };
     // A System request id cannot be admitted as a helicopter prompt (and the reverse), so the kinds never share an admission.
-    await assert.rejects(control.promptVisualization(ctx, { ...payload, kind: 'systemOverview' }), /not a systemOverview request/);
-    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, duplicate: false });
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...payload, kind: 'systemOverview' }), /not a systemOverview request/);
+    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, admitted: true, duplicate: false });
     assert.equal(sent.length, 1);
     assert.match(sent[0], /^Describe the business\.\n\n\[omp-visualization-request id=/);
-    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, duplicate: true });
+    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, admitted: true, duplicate: true });
     assert.equal(sent.length, 1);
     handlers.get('before_agent_start')({ prompt: sent[0] }, ctx);
     assert.equal(control.guard.states()[0].kind, 'helicopter');
@@ -890,5 +896,93 @@ test('project_visualization_prompt admits a helicopter request in the existing A
     assert.equal(handlers.get('tool_call')({ toolName: 'submit_helicopter', input: { requestId: fixture.requestId } }, ctx), undefined);
     handlers.get('tool_result')({ toolName: 'submit_helicopter', input: { requestId: fixture.requestId }, isError: false }, ctx);
     assert.equal(control.guard.states()[0].state, 'submitted');
+  } finally { cleanup(fixture); }
+});
+
+test('concurrent visualization controls share the one native admission, including a delayed refusal', async () => {
+  for (const refused of [false, true]) {
+    const fixture = setup();
+    try {
+      const boundary = Promise.withResolvers();
+      let submits = 0;
+      const pi = { registerTool() {}, zod: new Proxy({}, { get: () => () => ({ optional() { return this; }, nullable() { return this; } }) }), on() {} };
+      const control = registerProjectInsightTools(pi, fixture.dir, () => actor, undefined, {
+        async submitPrompt(_message, callbacks) {
+          submits++;
+          await boundary.promise;
+          if (refused) throw new Error('native refused before admission');
+          callbacks.onPromptAdmitted();
+        },
+      });
+      const ctx = { agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
+      const payload = { requestId: fixture.requestId, kind: 'systemOverview', message: 'Analyze.' };
+      const first = control.promptVisualization(ctx, payload);
+      const second = control.promptVisualization(ctx, payload);
+      assert.equal(submits, 1);
+      boundary.resolve();
+      const receipts = await Promise.all([first, second]);
+      assert.equal(receipts[0].admitted, !refused);
+      assert.equal(receipts[1].admitted, !refused);
+      assert.equal(submits, 1, 'no retry is hidden in duplicate handling');
+      assert.equal(control.guard.states().length, refused ? 0 : 1);
+    } finally { cleanup(fixture); }
+  }
+});
+
+test('an accepted native failure becomes a durable request error without replacing an already saved result', async () => {
+  for (const completed of [false, true]) {
+    const fixture = setup();
+    try {
+      const running = Promise.withResolvers();
+      let attempts = 0;
+      const pi = { registerTool() {}, zod: new Proxy({}, { get: () => () => ({ optional() { return this; }, nullable() { return this; } }) }), on() {} };
+      const control = registerProjectInsightTools(pi, fixture.dir, () => actor, undefined, { submitPrompt(_message, callbacks) { attempts++; callbacks.onPromptAdmitted(); return attempts === 1 ? running.promise : new Promise(() => {}); } });
+      const ctx = { agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
+      const receipt = await control.promptVisualization(ctx, { requestId: fixture.requestId, kind: 'systemOverview', message: 'Analyze.' });
+      assert.equal(receipt.admitted, true);
+      if (completed) writeFileSync(path.join(fixture.folder, 'result.json'), 'saved-result-must-not-change');
+      running.reject(new Error('No credential is configured for the selected model'));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(attempts, 1);
+      if (completed) {
+        assert.equal(readFileSync(path.join(fixture.folder, 'result.json'), 'utf8'), 'saved-result-must-not-change');
+        assert.equal(existsSync(path.join(fixture.folder, 'terminal.json')), false);
+      } else {
+        const terminal = JSON.parse(readFileSync(path.join(fixture.folder, 'terminal.json'), 'utf8'));
+        assert.equal(terminal.code, 'native_prompt_failed');
+        assert.match(terminal.message, /No credential/);
+      }
+      assert.deepEqual(control.guard.states(), []);
+      if (!completed) {
+        const nextId = randomUUID(), nextFolder = path.join(fixture.root, 'project-insight', nextId);
+        mkdirSync(nextFolder);
+        writeFileSync(path.join(nextFolder, 'request.json'), JSON.stringify({ ...fixture.request, requestId: nextId, kind: 'helicopter' }));
+        writeFileSync(path.join(nextFolder, 'index-ref.json'), readFileSync(path.join(fixture.folder, 'index-ref.json')));
+        assert.equal((await control.promptVisualization(ctx, { requestId: nextId, kind: 'helicopter', message: 'Generate a business helicopter view instead.' })).admitted, true, 'a different analysis is admitted without restarting the native session');
+        assert.equal(attempts, 2);
+      }
+    } finally { cleanup(fixture); }
+  }
+});
+
+test('a cancelled queued visualization records incompleteness only at the native quiescent guard boundary', async () => {
+  const fixture = setup();
+  try {
+    const handlers = new Map(), timers = [];
+    let idle = false;
+    const pi = { registerTool() {}, zod: new Proxy({}, { get: () => () => ({ optional() { return this; }, nullable() { return this; } }) }),
+      on(name, handler) { if (!handlers.has(name)) handlers.set(name, []); handlers.get(name).push(handler); } };
+    const control = registerProjectInsightTools(pi, fixture.dir, () => actor, undefined, { submitPrompt(_message, callbacks) { callbacks.onPromptAdmitted(); return new Promise(() => {}); } });
+    const ctx = { agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId }, isIdle: () => idle, hasPendingMessages: () => false, setTimeout: callback => timers.push(callback) };
+    await control.promptVisualization(ctx, { requestId: fixture.requestId, kind: 'systemOverview', message: 'Analyze.' });
+    for (const handler of handlers.get('agent_end')) handler({ willContinue: false, messages: [] }, ctx);
+    for (const callback of timers.splice(0)) callback();
+    assert.equal(existsSync(path.join(fixture.folder, 'terminal.json')), false);
+    idle = true;
+    for (const callback of timers.splice(0)) callback();
+    const terminal = JSON.parse(readFileSync(path.join(fixture.folder, 'terminal.json'), 'utf8'));
+    assert.equal(terminal.code, 'analysis_incomplete');
+    assert.match(terminal.message, /cancelled without saving/);
+    assert.deepEqual(control.guard.states(), []);
   } finally { cleanup(fixture); }
 });

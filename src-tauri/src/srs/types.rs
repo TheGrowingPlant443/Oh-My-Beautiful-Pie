@@ -19,9 +19,19 @@ pub struct Exclusion {
     pub reason: String,
     pub source: String,
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Purpose {
+    #[default]
+    Migration,
+    Insights,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Scope {
+    /// Only saved scopes may omit purpose; new scope preparation requires an explicit choice.
+    #[serde(default)]
+    pub purpose: Purpose,
     pub folder: String,
     pub repository_root: String,
     pub vault_id: String,

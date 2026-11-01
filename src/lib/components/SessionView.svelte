@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, type BrowserInfo, type Instance, type InsightProducer } from "../api";
+  import { api, type BrowserInfo, type Instance, type InsightProducer, type SavedConfigs } from "../api";
   import { agentName, confirmDanger } from "../ui";
   import Term from "./Term.svelte";
   import BrowserPane from "./BrowserPane.svelte";
@@ -10,6 +10,7 @@
   import { sameRepoAgents } from "../repo-agents";
   import TerminalWorkspace from "./TerminalWorkspace.svelte";
   import { nativeHubDisabled } from "../native-agent-hub";
+  import { refreshInstances, refreshGlobalConfig, globalConfig } from "../stores";
   let { instance, instances, onSwitch, onClose, onPlan, onPlanChange, onSubagents, onCodeDiff, onDependencyTree, onSystemOverview, onCodeQuality, showBrowser = false, browserHidden = false, focusRequest = 0, onTerminalReady, onFocusArchitect }: {
     instance: Instance; instances: Instance[]; onSwitch: (id: string) => void;
     onClose: () => void; onPlan: (id: string) => void; onPlanChange: (id: string) => void; onSubagents: (id: string) => void;
@@ -22,6 +23,29 @@
   const BROWSER_MIN = 520;
   const TERMINAL_PANE_MIN = 360;
   let busy = $state(false);
+  let configBusy = $state(false);
+  let configError = $state("");
+  let setups = $state<SavedConfigs | null>(null);
+  let configRequest = 0;
+  const configInstanceId = $derived(instance.id);
+  $effect(() => {
+    const id = configInstanceId;
+    void $globalConfig;
+    const version = ++configRequest;
+    configError = "";
+    void api.listSavedConfigs().then(result => {
+      if (version === configRequest && instance.id === id) { setups = result; if (result.error) configError = result.error; }
+    }).catch(error => { if (version === configRequest) configError = errorText(error); });
+  });
+  async function switchConfig(path: string): Promise<void> {
+    const id = instance.id;
+    configBusy = true; configError = "";
+    try {
+      await api.switchSessionConfig(id, path || null);
+      await Promise.all([refreshInstances(), refreshGlobalConfig()]);
+    } catch (error) { if (instance.id === id) configError = errorText(error); }
+    finally { configBusy = false; }
+  }
   let ratio = $state(0.5);
   let dragging = $state(false);
   let workspace = $state<HTMLDivElement>();
@@ -122,7 +146,12 @@
       </select>
     {/if}
     <span class="pill">{live ? instance.activity : instance.status}</span>
-    <span class="dim">{instance.profile || "Default profile"}{instance.agentFile ? ` · ${agentName(instance.agentFile)}` : ""}</span><span class="spacer"></span>
+    <select aria-label="Session configuration setup" title="Stopped sessions use this selection at launch. Live switching does not restart or interrupt active work; busy or unsupported changes report an error." disabled={configBusy || instance.status === "starting" || (instance.status === "running" && !instance.bridgeReady)} value={instance.configSelection || ""} onchange={e => { const path = e.currentTarget.value; e.currentTarget.value = instance.configSelection || ""; void switchConfig(path); }}>
+      <option value="">Automatic · model assignment / global default</option>
+      {#if instance.configSelection && !setups?.snapshots.some(setup => setup.path === instance.configSelection)}<option value={instance.configSelection}>{instance.configSelection} · not in saved setups</option>{/if}
+      {#each setups?.snapshots ?? [] as setup (setup.path)}<option value={setup.path}>{setup.name || "Saved setup"} · {new Date(setup.modifiedMs).toLocaleString()}</option>{/each}
+    </select>
+    <span class="dim">Auth: {instance.profile || "default profile"}{instance.agentFile ? ` · ${agentName(instance.agentFile)}` : ""}</span><span class="spacer"></span>
     {#if currentBrowser && !paneBrowser}
       <span class="pill">{currentBrowser.state === "error" ? "Browser error" : currentBrowser.state === "opening" ? "Opening browser…" : currentBrowser.headless ? "Browser: headless" : "Browser: external"}</span>
     {/if}
@@ -138,6 +167,11 @@
     {#if !live}<button disabled={busy} onclick={() => run(() => startInstance(instance.id))}>Start / reopen</button>{/if}
     <button disabled={busy} onclick={() => run(() => restartInstance(instance.id))}>Restart</button>
   </header>
+  {#if configBusy}<p role="status">Applying setup without restarting the session…</p>{/if}
+  {#if instance.configState}<p class="dim">Resolved model: {instance.configState.model || "not reported"} · Setup: {instance.configState.configName || instance.configState.configPath || "native default"} · Source: {instance.configState.source}</p>{/if}
+  {#if instance.configState?.configFiles?.length}<details><summary>Ordered settings overlays</summary><ol>{#each instance.configState.configFiles as path}<li class="mono">{path}</li>{/each}</ol>{#if instance.configState.setupPaths?.length}<p>Contributing setup assets</p><ul>{#each instance.configState.setupPaths as path}<li class="mono">{path}</li>{/each}</ul>{/if}</details>{/if}
+  {#if instance.configState?.children?.length}<details><summary>Active child model/setup relationships ({instance.configState.children.length})</summary><p class="dim">Built-in native tasks retain parent startup skills, rules, context and MCP resources; incompatible child-only changes require changing the parent or using an independent managed session. Owned SRS workers use a separate restricted constructor setup. Reported setup identity does not imply independent asset loading.</p><ul>{#each instance.configState.children as child (child.id)}<li><strong>{child.id}</strong> · model: {child.model || "not reported"} · reported effective setup: {child.configName || child.configPath || "native default"} · {child.source}{#if child.mcpInheritedFrom} · MCP inherited from {child.mcpInheritedFrom}{/if}{#if child.error}<span class="err"> · {child.error}</span>{/if}</li>{/each}</ul></details>{/if}
+  {#if configError || instance.configState?.error}<p class="err" role="alert">{configError || instance.configState?.error}</p>{/if}
   <div class="identity mono">{#if !instance.helper && !instance.planTarget}<AgentDirectory {instance} />{:else}{instance.projectPath}{/if}{#if instance.task}<span> · {instance.task}</span>{/if}</div>
   {#if !instance.helper}<OwnershipControls {instance} onOpen={() => onSwitch(instance.id)} />{/if}
   {#if instance.lastError}<p class="err" role="alert">{instance.lastError}</p>{/if}

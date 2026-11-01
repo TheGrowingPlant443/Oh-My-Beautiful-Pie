@@ -314,7 +314,16 @@ impl PlanService {
             plan: registry.plan(target_id, Origin::Human).ok().flatten(),
             transcript: registry
                 .main_transcript(target_id, Origin::Human)
-                .and_then(|(path, input)| session::render_transcript_file(&path, &input))
+                .and_then(|(path, input)| {
+                    let utility = crate::config::prepare_utility(
+                        registry,
+                        target_id,
+                        None,
+                        Some(&path),
+                        crate::config::UtilityMode::Render,
+                    )?;
+                    session::render_transcript_file(&path, &input, &utility)
+                })
                 .map(|text| tail(&text, 30_000)),
             screen: registry
                 .screen(target_id, Origin::Human)

@@ -25,7 +25,7 @@ pub(super) fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .and_then(Value::as_str)
         .ok_or_else(|| err("invalid_request", format!("{key} is required")))
 }
-fn only<'a>(value: &'a Value, allowed: &[&str]) -> Result<&'a Map<String, Value>> {
+pub(super) fn only<'a>(value: &'a Value, allowed: &[&str]) -> Result<&'a Map<String, Value>> {
     let object = value
         .as_object()
         .ok_or_else(|| err("invalid_request", "A JSON object is required"))?;
@@ -140,11 +140,14 @@ impl SrsService {
             "srs_ask_map" | "srs_ask_receipt" | "srs_ask_retired" => {
                 self.ask_bridge(producer, action, p)
             }
+            "srs_delegate_open" | "srs_delegate_validate" | "srs_delegate_close" => {
+                self.delegate_bridge(producer, action, &p)
+            }
             _ => Err("invalid_action".into()),
         }
     }
 
-    fn current_stage<'a>(
+    pub(super) fn current_stage<'a>(
         job: &'a Job,
         producer: &DependencyProducer,
         p: &Value,
@@ -168,7 +171,7 @@ impl SrsService {
         Ok(stage)
     }
 
-    fn bound(
+    pub(super) fn bound(
         &self,
         producer: &DependencyProducer,
         p: &Value,
@@ -373,6 +376,18 @@ impl SrsService {
     fn run_tool(&self, producer: &DependencyProducer, action: &str, p: &Value) -> Result<Value> {
         let finishing = action == "srs_finish_stage";
         let (mut job, stage) = self.bound(producer, p, finishing)?;
+        let mut scoped;
+        let p = if p.get("delegation").is_some() {
+            self.authorize_delegated(&job, action, p)?;
+            scoped = p.clone();
+            scoped
+                .as_object_mut()
+                .ok_or_else(|| err("invalid_request", "A JSON object is required"))?
+                .remove("delegation");
+            &scoped
+        } else {
+            p
+        };
         match action {
             "srs_inspect" => reply(self.tool_inspect(&job, p)?),
             "srs_read_evidence" => reply(self.tool_read_evidence(&job, p)?),
@@ -448,6 +463,19 @@ impl SrsService {
             "inventory" => Self::inspect_inventory(&dir, &query),
             "work" | "documents" | "questions" => self.inspect_records(job, &query),
             "coverage" => self.inspect_coverage(job, &dir, &query),
+            "delegations" => {
+                let page =
+                    self.store
+                        .page(&job.job_id, "delegations", offset as usize, limit as usize)?;
+                Ok(page_value(
+                    section,
+                    job.revision,
+                    page["items"].as_array().cloned().unwrap_or_default(),
+                    page["total"].as_u64().unwrap_or(0),
+                    offset,
+                    page["nextOffset"].as_u64(),
+                ))
+            }
             "checkpoint" => Ok(Self::inspect_checkpoint(job, &query)),
             _ => Err(err("invalid_request", "Unknown inspect section")),
         }
@@ -469,7 +497,7 @@ impl SrsService {
             q.section,
             q.revision,
             vec![
-                json!({"jobId":job.job_id,"phase":job.phase,"scopeHash":job.scope_hash,"sourceHash":job.source_hash,"roots":roots,"exclusions":exclusions,"vaultMode":job.scope.vault_mode,"outputRoot":format!("SRS/{}",job.job_id),"template":job.scope.template,"counts":job.counts}),
+                json!({"jobId":job.job_id,"purpose":job.scope.purpose,"phase":job.phase,"scopeHash":job.scope_hash,"sourceHash":job.source_hash,"roots":roots,"exclusions":exclusions,"vaultMode":job.scope.vault_mode,"outputRoot":format!("SRS/{}",job.job_id),"template":job.scope.template,"counts":job.counts,"publicDocumentContracts":documents::public_contracts(),"requiredContractReviews":ledger::REQUIRED_CONTRACTS}),
             ],
             1,
             0,
@@ -1372,6 +1400,9 @@ impl SrsService {
             return Ok(
                 json!({"advanced":true,"state":job.state,"nextPhase":job.phase,"completed":job.state == JobState::Completed,"reasons":[],"replayed":true}),
             );
+        }
+        if self.has_live_delegations(job)? {
+            return Err(err("precondition_failed", "Wait for native children to end and review their durable findings before finishing the stage"));
         }
         let review = Self::parse_review(job, &stage, object)?;
         self.check_review_ids(job, &review)?;

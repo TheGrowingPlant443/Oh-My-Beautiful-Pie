@@ -237,3 +237,29 @@ test('saved-session relocation uses the installed native writer lease, preserves
     assert.match(stdout, /Native workspace relocation verified/);
   } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
+
+test('post-admission native exceptions are visible without resending or starting another turn', async () => {
+  for (const accepted of [false, true]) {
+    const f = await workspaceFixture();
+    const messages = [];
+    let attempts = 0;
+    try {
+      f.mode.session.prompt = async (_message, options) => {
+        attempts++;
+        if (accepted) options.onPromptAdmitted();
+        throw new Error('No credential is configured for this model');
+      };
+      f.mode.session.sendCustomMessage = async (message, options) => messages.push({ message, options });
+      await assert.rejects(f.workspace.submitPrompt('Analyze the admitted evidence.'), /No credential/);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(attempts, 1);
+      assert.equal(messages.length, accepted ? 1 : 0);
+      assert.equal(f.events.filter(event => event.kind === 'turn_error').length, accepted ? 1 : 0);
+      if (accepted) {
+        assert.match(messages[0].message.content, /No credential/);
+        assert.equal(messages[0].message.display, true);
+        assert.equal(messages[0].options.triggerTurn, false);
+      }
+    } finally { await f.workspace.dispose(); }
+  }
+});

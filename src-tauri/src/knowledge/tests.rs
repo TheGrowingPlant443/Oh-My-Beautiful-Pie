@@ -1,7 +1,9 @@
 //! Deterministic regression tests for the knowledge backend. Every fixture lives in a throwaway folder; no
 //! application is launched, no network is used and no personal vault/Cognee/Graphify store is read or written.
 use super::fsio::{self, sha256_hex, validate_relative};
-use super::integrations::{validate_cognee_url, Environment, ExeSetting};
+#[cfg(target_os = "linux")]
+use super::integrations::{discover_obsidian, platform_obsidian_candidates};
+use super::integrations::{obsidian_xdg_registry, validate_cognee_url, Environment, ExeSetting};
 use super::markdown;
 use super::{
     CogneeOpenState, CogneeUiState, GraphifyDirection, GraphifyIdKind, GraphifyQuery,
@@ -949,6 +951,11 @@ fn fake_obsidian(t: &Temp, registered: &Path) -> Environment {
     });
     write_notes(&t.join("obsidian"), &[("registry.json", &json!({"vaults": {"abc123": {"path": registered.to_string_lossy(), "ts": 1}, "gone": {"path": t.join("not-here").to_string_lossy()}}}).to_string())]);
     fs::write(&exe, b"not a real program").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     Environment {
         obsidian_exe: ExeSetting::Fixed(exe),
         obsidian_registry: Some(t.join("obsidian").join("registry.json")),
@@ -989,6 +996,151 @@ fn obsidian_is_discovered_passively_and_never_adopted() {
     assert!(absent
         .prepare_knowledge_vault(ScopeRequest::Global, None, "", VaultMode::Obsidian)
         .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn obsidian_path_and_nix_launchers_are_discovered_without_execution() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let t = Temp::new();
+    let home = t.join("home");
+    let launcher = home.join(".nix-profile/bin/obsidian");
+    let wrapped = t.join("store/obsidian-wrapper");
+    let marker = t.join("must-not-run");
+    write_notes(
+        wrapped.parent().unwrap(),
+        &[(
+            "obsidian-wrapper",
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )],
+    );
+    fs::set_permissions(&wrapped, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    symlink(&wrapped, &launcher).unwrap();
+    let search = std::env::join_paths([Path::new("relative"), Path::new("")]).unwrap();
+    let candidates = platform_obsidian_candidates(&home, Some(&search));
+    assert!(candidates.iter().all(|candidate| candidate.is_absolute()));
+    assert_eq!(
+        discover_obsidian(candidates).unwrap(),
+        Some(launcher.clone())
+    );
+
+    let path_launcher = t.join("custom bin/obsidian");
+    fs::create_dir_all(path_launcher.parent().unwrap()).unwrap();
+    symlink(&wrapped, &path_launcher).unwrap();
+    let search = std::env::join_paths([path_launcher.parent().unwrap()]).unwrap();
+    assert_eq!(
+        discover_obsidian(platform_obsidian_candidates(&home, Some(&search))).unwrap(),
+        Some(path_launcher),
+        "PATH wins over the desktop-launch fallback"
+    );
+    assert!(!marker.exists(), "discovery must never execute a launcher");
+    assert!(
+        !t.join("config").exists(),
+        "discovery must not save settings"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn obsidian_explicit_overrides_win_and_missing_differs_from_unusable() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Temp::new();
+    let personal = t.join("personal");
+    fs::create_dir_all(&personal).unwrap();
+    let env = fake_obsidian(&t, &personal);
+    let explicit = match &env.obsidian_exe {
+        ExeSetting::Fixed(path) => path.clone(),
+        _ => unreachable!(),
+    };
+    let service = service_with(&t, env);
+    let saved = t.join("saved-obsidian");
+    fs::copy(&explicit, &saved).unwrap();
+    let capability = service
+        .configure_obsidian_executable(Some(saved.to_str().unwrap()))
+        .unwrap();
+    assert_eq!(
+        capability.executable,
+        Some(explicit.to_string_lossy().into_owned())
+    );
+    fs::remove_file(&explicit).unwrap();
+    assert_eq!(service.probe_obsidian().state, ObsidianState::Absent);
+    fs::write(&explicit, b"not executable").unwrap();
+    fs::set_permissions(&explicit, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(service.probe_obsidian().state, ObsidianState::Unreadable);
+    assert!(service
+        .configure_obsidian_executable(Some(explicit.to_str().unwrap()))
+        .is_err());
+
+    // A saved override must not silently fall back to a different installed application.
+    let auto = KnowledgeService::with_environment(
+        t.join("config"),
+        t.join("home"),
+        Environment {
+            obsidian_exe: ExeSetting::Auto,
+            obsidian_registry: Some(t.join("missing-registry.json")),
+            ..Environment::isolated()
+        },
+    );
+    fs::remove_file(&saved).unwrap();
+    let fallback = t.join("home/.nix-profile/bin/obsidian");
+    fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+    fs::write(&fallback, b"not executed").unwrap();
+    fs::set_permissions(&fallback, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(auto.probe_obsidian().state, ObsidianState::Absent);
+    assert_eq!(
+        auto.configure_obsidian_executable(None).unwrap().state,
+        ObsidianState::Installed
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn obsidian_registry_aliases_are_canonical_and_registry_errors_remain_visible() {
+    use std::os::unix::fs::symlink;
+    let t = Temp::new();
+    let personal = t.join("personal");
+    let alias = t.join("vault-alias");
+    fs::create_dir_all(&personal).unwrap();
+    symlink(&personal, &alias).unwrap();
+    let env = fake_obsidian(&t, &alias);
+    let registry = env.obsidian_registry.clone().unwrap();
+    let original = fs::read(&registry).unwrap();
+    let service = service_with(&t, env);
+    assert_eq!(
+        service.probe_obsidian().registered_vaults,
+        vec![personal.to_string_lossy().into_owned()]
+    );
+    assert_eq!(fs::read(&registry).unwrap(), original);
+    fs::write(&registry, b"{invalid").unwrap();
+    let capability = service.probe_obsidian();
+    assert_eq!(capability.state, ObsidianState::Installed);
+    assert!(capability.registered_vaults.is_empty());
+    assert!(capability
+        .message
+        .unwrap()
+        .contains("vault registry could not be read"));
+    assert!(!t.join("config/knowledge").exists());
+}
+
+#[test]
+fn obsidian_xdg_registry_uses_only_absolute_config_roots() {
+    let t = Temp::new();
+    let home = t.join("home");
+    let config = t.join("custom config");
+    let selected = obsidian_xdg_registry(&home, Some(config.clone()));
+    assert_eq!(selected, config.join("obsidian/obsidian.json"));
+    let fallback = home.join(".config/obsidian/obsidian.json");
+    assert_eq!(obsidian_xdg_registry(&home, None), fallback);
+    assert_eq!(
+        obsidian_xdg_registry(&home, Some(PathBuf::from("relative"))),
+        fallback
+    );
+    assert!(!config.exists(), "locating a registry must not create it");
+    assert!(
+        !home.exists(),
+        "locating a registry must not create a profile"
+    );
 }
 
 #[test]

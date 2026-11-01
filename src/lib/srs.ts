@@ -3,15 +3,18 @@ import { listen } from "@tauri-apps/api/event";
 import { writable, type Readable } from "svelte/store";
 import type { VaultMode } from "./knowledge";
 
+export type SrsPurpose = "migration" | "insights";
+export const srsPurposeLabel = (purpose: SrsPurpose): string => purpose === "insights" ? "Exhaustive insights" : "Migration / system reconstruction";
 export type SrsPhase = "survey" | "specify" | "gapReview" | "verify";
 export type SrsState = "inventory" | "running" | "waitingForHuman" | "paused" | "interrupted" | "uncertain" | "reviewing" | "completed" | "cancelled";
 export type ResumeMode = "sameConversation" | "currentConversationFromCheckpoints";
 export type SrsSection = "stages" | "work" | "questions" | "documents" | "coverage" | "activity" | "receipts";
 export interface SrsJob {
+  purpose: SrsPurpose;
   jobId: string; folder: string; repositoryRoot: string; revision: number; state: SrsState; phase: SrsPhase | null;
   vaultId: string; vaultMode: VaultMode; vaultAvailable: boolean; outputPath: string; masterPath: string;
   template: { revision: string }; scopeHash: string; sourceHash: string | null; attemptId: string | null; stageId: string | null;
-  stage: { stageId: string; number: number; phase: SrsPhase; state: "pending" | "queued" | "active" | "committed" } | null;
+  stage: { stageId: string; number: number; phase: SrsPhase; state: "pending" | "claimed" | "queued" | "active" | "committed" | "interrupted"; admitted: boolean } | null;
   producer: { instanceId: string; generation: number; sessionId: string } | null;
   counts: { areas: number; evidenceFiles: number; work: number; workOpen: number; documents: number; requirements: number; questions: number; questionsOpen: number; blocked: number; excluded: number };
   checkpoint: { revision: number; at: number; summary: string } | null; error: { code: string; message: string } | null;
@@ -20,12 +23,13 @@ export interface SrsJob {
   resumeRequired: "none" | ResumeMode; humanExclusions: number; architectModel: string | null;
 }
 export interface ScopePreparation {
+  purpose: SrsPurpose;
   token: string; expiresAt: number; folder: string; repositoryRoot: string; vaultId: string; vaultMode: VaultMode; vaultRoot: string;
   roots: { path: string; kind: "repository" | "evidence"; rationale: string }[];
   exclusions: { path: string; reason: string; source: "app" | "human" }[];
   template: { revision: string; files: { name: string; sha256: string }[] }; warnings: string[];
 }
-export interface ResumePreparation { token: string; expiresAt: number; jobId: string; mode: ResumeMode; summary: string; warnings: string[] }
+export interface ResumePreparation { token: string; expiresAt: number; jobId: string; purpose: SrsPurpose; mode: ResumeMode; summary: string; warnings: string[] }
 export interface SrsPage<T> { jobId: string; revision: number; section: SrsSection; total: number; offset: number; items: T[]; nextOffset: number | null }
 export interface SrsJobPage { items: SrsJob[]; total: number; offset: number; nextOffset: number | null }
 export interface SrsQuestion { questionId: string; prompt: string; options: { label: string; description?: string }[]; multi: boolean; required: boolean; state: "open" | "asked" | "answered" | "excluded"; answerReceiptId: string | null; live: boolean; workIds: string[] }
@@ -35,7 +39,7 @@ export interface SrsWork { id: string; parentId: string | null; phase: SrsPhase;
 export interface SrsDocuments { vaultId: string; vaultMode: VaultMode; path: string; completed: boolean; draft: boolean }
 
 export const srsApi = {
-  prepareScope: (folder: string, vaultId: string, evidenceFolders: string[], exclusions: string[]) => invoke<ScopePreparation>("prepare_srs_scope", { folder, vaultId, evidenceFolders, exclusions }),
+  prepareScope: (folder: string, vaultId: string, purpose: SrsPurpose, evidenceFolders: string[], exclusions: string[]) => invoke<ScopePreparation>("prepare_srs_scope", { folder, vaultId, purpose, evidenceFolders, exclusions }),
   start: (scopeToken: string) => invoke<SrsJob>("start_srs", { scopeToken }),
   get: (jobId: string) => invoke<SrsJob>("get_srs_job", { jobId }),
   list: (folder: string, offset: number, limit: number) => invoke<SrsJobPage>("list_srs_jobs", { folder, offset, limit }),
@@ -61,6 +65,12 @@ const SRS_STATE_LABELS: Partial<Record<SrsState, string>> = {
 export function srsStateLabel(job: SrsJob): string {
   if (completedSrs(job)) return "SRS complete for the recorded evidence scope";
   if (job.state === "completed") return "Completion manifest unavailable — recheck";
+  if (job.state === "running" || job.state === "reviewing") {
+    if (!job.stage) return "Queued — waiting for the Architect's safe boundary";
+    if (job.stage.state === "committed") return "Stage saved — waiting for the next Architect step";
+    if (job.stage.state === "interrupted") return "Stage interrupted — inspect before resuming";
+    if (!job.stage.admitted) return "Awaiting native Architect admission";
+  }
   return SRS_STATE_LABELS[job.state] ?? job.state;
 }
 export const srsPhaseLabel = (phase: SrsPhase | null): string => phase ? ({ survey: "Survey", specify: "Specify requirements", gapReview: "Gap review", verify: "Verification" })[phase] : "Inventory";

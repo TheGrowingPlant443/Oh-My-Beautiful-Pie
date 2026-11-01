@@ -7,6 +7,7 @@ import { importTs } from "./test-loader.mjs";
 const { createSrsStore, completedSrs, srsDocumentLabel, srsModelLabel, srsStateLabel } = await importTs("srs");
 
 const job = (revision = 1, extra = {}) => ({
+  purpose: "migration",
   jobId: "job-1", folder: "C:/project", repositoryRoot: "C:/project", revision, state: "running", phase: "survey",
   vaultId: "vault-1", vaultMode: "markdown", vaultAvailable: true, outputPath: "SRS/job-1", masterPath: "SRS/job-1/SRS.md",
   template: { revision: "3965e951fa5ea1c1dd1bbc7a66b7f35f7e85c006" }, scopeHash: "scope-1", sourceHash: "source-1",
@@ -135,6 +136,18 @@ test("labels distinguish draft, Markdown mode and native manifest completion wit
   assert.equal(srsStateLabel(complete()), "SRS complete for the recorded evidence scope");
   assert.match(srsModelLabel(null), /locality\/cost unknown/);
   assert.match(srsModelLabel("local-sounding-name"), /not inferred/);
+});
+
+test("queued or unadmitted jobs never claim active Architect work", () => {
+  for (const state of ["running", "reviewing"]) {
+    assert.equal(srsStateLabel(job(1, { state, stage: null })), "Queued — waiting for the Architect's safe boundary");
+    for (const stageState of ["pending", "claimed", "queued"]) {
+      assert.equal(srsStateLabel(job(1, { state, stage: { state: stageState, admitted: false } })), "Awaiting native Architect admission");
+    }
+    assert.equal(srsStateLabel(job(1, { state, stage: { state: "committed", admitted: true } })), "Stage saved — waiting for the next Architect step");
+  }
+  assert.equal(srsStateLabel(job(1, { stage: { state: "active", admitted: true } })), "Running");
+  assert.equal(srsStateLabel(job(1, { state: "paused", stage: null })), "Paused");
 });
 
 test("vendored templates retain upstream pinned blob hashes and every recorded SHA256", async () => {

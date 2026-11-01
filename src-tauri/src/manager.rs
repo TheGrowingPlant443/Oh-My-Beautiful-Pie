@@ -732,6 +732,12 @@ impl ManagerHub {
     ) -> Result<Value> {
         self.control(id, lease, action, payload, Origin::Human)
     }
+    pub(crate) fn config_control(&self, id: &str, payload: Value) -> Result<Value> {
+        let lease = self
+            .registry()?
+            .lease(id, Origin::Human, /* mutation */ true)?;
+        self.control(id, &lease, "config_switch", payload, Origin::Human)
+    }
     pub(crate) fn send_workspace_plan_prompt(
         &self,
         manager_id: &str,
@@ -1408,6 +1414,7 @@ impl ManagerHub {
         }
         match kind {
             "ready" | "session_changed" => self.event_ready(&registry, actor, payload)?,
+            "config_state" => registry.apply_config_state(&actor.id, actor.generation, payload)?,
             "needs_decision" => self.register_decision(actor, payload)?,
             "decision_resolved" => self.event_decision_resolved(&registry, actor, kind, payload)?,
             "agent_started" => {}
@@ -1825,24 +1832,38 @@ impl ManagerHub {
         kind: &str,
         message: &str,
     ) -> Result<Value> {
-        let registry = self.registry()?;
-        let lease = registry.lease(id, Origin::Human, /* mutation */ true)?;
+        let unsent = |message: String| {
+            Ok(
+                json!({"admitted":false,"error":{"code":message.split(':').next().unwrap_or("architect_unavailable"),"message":message}}),
+            )
+        };
+        let registry = match self.registry() {
+            Ok(registry) => registry,
+            Err(error) => return unsent(error),
+        };
+        let lease = match registry.lease(id, Origin::Human, /* mutation */ true) {
+            Ok(lease) => lease,
+            Err(error) => return unsent(error),
+        };
         if lease.generation != generation {
-            return Err("stale_generation".into());
+            return unsent(
+                "stale_generation: The Architect was replaced; nothing was sent.".into(),
+            );
         }
         if self
             .srs
             .get()
             .and_then(Weak::upgrade)
-            .is_some_and(|s| s.has_active_generation(id))
+            .is_some_and(|service| service.has_active_generation(id))
         {
-            return Err(
-                "srs_active: Pause SRS and continue before generating another overview analysis."
-                    .into(),
-            );
+            return unsent("srs_active: Pause the active SRS stage and continue before generating another overview analysis.".into());
         }
-        if registry.inspect(id, Origin::Human)?.kind != InstanceKind::Architect {
-            return Err("The Architect is no longer available".into());
+        match registry.inspect(id, Origin::Human) {
+            Ok(row) if row.kind == InstanceKind::Architect => {}
+            Ok(_) => {
+                return unsent("architect_unavailable: The Architect is no longer available".into())
+            }
+            Err(error) => return unsent(error),
         }
         self.control(
             id,
@@ -1851,6 +1872,14 @@ impl ManagerHub {
             json!({"requestId": request_id, "kind": kind, "message": message}),
             Origin::Human,
         )
+        .or_else(|error| {
+            if ["bridge_not_ready", "stale_generation", "not_controlled"].contains(&error.as_str())
+            {
+                unsent(error)
+            } else {
+                Err(error)
+            }
+        })
     }
     /// Deliver the app-created frozen-snapshot explanation prompt through the human-only `monitor_explanation_prompt` control.
     /// One lease binds the generation check and the frame. An SRS job on this Architect is reported structurally, never paused here.
@@ -2109,7 +2138,16 @@ impl ManagerHub {
             .unwrap_or(20_000)
             .clamp(1_000, 60_000) as usize;
         let (path, input) = registry.main_transcript(target, Origin::Human)?;
-        Ok(json!({"text": plan::tail(&session::render_transcript_file(&path, &input)?, tail)}))
+        let utility = crate::config::prepare_utility(
+            registry,
+            target,
+            None,
+            Some(&path),
+            crate::config::UtilityMode::Render,
+        )?;
+        Ok(
+            json!({"text": plan::tail(&session::render_transcript_file(&path, &input, &utility)?, tail)}),
+        )
     }
     fn plan_write_plan(
         &self,
@@ -2214,6 +2252,9 @@ impl ManagerHub {
                 | "srs_stage_admitted"
                 | "srs_stage_validate"
                 | "srs_stage_yielded"
+                | "srs_delegate_open"
+                | "srs_delegate_validate"
+                | "srs_delegate_close"
         ) {
             return self.execute_srs(actor, action, p);
         }
@@ -2472,7 +2513,14 @@ impl ManagerHub {
                 } else {
                     registry.main_transcript(id, origin)?
                 };
-                Ok(json!({"text":session::render_transcript_file(&path,&input)?}))
+                let utility = crate::config::prepare_utility(
+                    registry,
+                    id,
+                    None,
+                    Some(&path),
+                    crate::config::UtilityMode::Render,
+                )?;
+                Ok(json!({"text":session::render_transcript_file(&path,&input,&utility)?}))
             }
             "keys" => {
                 registry.keys(
@@ -3240,6 +3288,20 @@ mod tests {
             matches!(refused, Err(MonitorPromptError::NotSent { .. })),
             "{refused:?}"
         );
+        let visualization = hub
+            .prompt_visualization(
+                &worker.id,
+                0,
+                "11111111-1111-4111-8111-111111111111",
+                "systemOverview",
+                "Analyze.",
+            )
+            .unwrap();
+        assert_eq!(visualization["admitted"], false);
+        assert!(visualization["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Architect"));
         let missing = DependencyProducer {
             instance_id: "missing".into(),
             ..producer

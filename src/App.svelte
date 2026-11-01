@@ -91,7 +91,6 @@
     return () => window.removeEventListener("focus", onFocus);
   });
   let configOpen = $state(false);
-  let configMode = $state<"save" | "import">("save");
   let setupDraft = $state<SetupDraft>({ scope: null, kinds: [], items: [], step: 0, instanceId: null, projectInstanceId: null });
   let setupContextId = $state<string | null>(null);
   let setupAdmission = $state<SetupAdmission | null>(null);
@@ -285,7 +284,7 @@
       else focus(id);
     });
   }
-  function openConfig(mode: "save" | "import"): void { configMode = mode; configOpen = true; }
+  function openConfig(): void { configOpen = true; }
   async function provisionCoordinators(): Promise<boolean> {
     try {
       await initializeProjectHistory();
@@ -516,8 +515,7 @@
     {#if !fullscreen}
       <button disabled={initializing} aria-pressed={$previewsEnabled} onclick={() => previewsEnabled.update(value => !value)}>Previews {$previewsEnabled ? "On" : "Off"}</button>
     {/if}
-    {#if fullscreen}<button disabled={initializing} onclick={() => openConfig("save")}>Save as global config</button>{/if}
-    <button disabled={initializing} onclick={() => openConfig("import")}>Import config</button>
+    <button disabled={initializing} onclick={openConfig}>Manage config</button>
     <button disabled={initializing} class:active={view === "agent_setup"} onclick={() => requestNavigation(openAgentSetup)}>Agent setup</button>
     <button disabled={initializing} class:active={view === "terminals"} class:attention={attention} title={attention ? "An agent is waiting for your decision" : "Every agent's history, human decisions and live commands"} aria-label={attention ? `Terminals - ${$humanDecisions.items.length} pending ${$humanDecisions.items.length === 1 ? "decision" : "decisions"}` : undefined} onclick={() => requestNavigation(openTerminalsFromButton)}>Terminals{#if $humanDecisions.items.length}<span class="pill">{$humanDecisions.items.length}</span>{/if}</button>
     {#each $systemOverview.tickets.filter(ticket => ticket.lateResult && ticket.state === "completed").slice(0, 1) as ticket (ticket.key)}
@@ -574,9 +572,9 @@
   </main>
 </div>
 <NewInstanceDialog open={dialogOpen} purpose={dialogPurpose} onclose={() => dialogOpen = false} oncreated={created} />
-<GlobalConfigDialog open={configOpen} mode={configMode} initialSourceId={focused?.id || $managerInstance?.id || null} onclose={() => configOpen = false} />
+<GlobalConfigDialog open={configOpen} initialSourceId={focused?.id || $managerInstance?.id || null} onclose={() => configOpen = false} />
 <SettingsDialog open={settingsOpen} onclose={() => settingsOpen = false} />
-<SrsStartDialog open={srsStartFolder !== null} folder={srsStartFolder ?? ""} architectModel={$architectInstance?.model ?? null}
+<SrsStartDialog open={srsStartFolder !== null} folder={srsStartFolder ?? ""} architectModel={$architectInstance?.configState?.model ?? $architectInstance?.model ?? null}
   onClose={() => srsStartFolder = null} onExisting={folder => openSrsPage(folder)}
   onStarted={() => { srsStartFolder = null; }} onOpenArchitect={() => requestNavigation(openArchitect)} />
 {#if panel && panelOwner}

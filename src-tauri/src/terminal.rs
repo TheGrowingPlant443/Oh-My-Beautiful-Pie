@@ -1024,7 +1024,9 @@ impl TerminalService {
             if let Some(shell) = shells.get(id) {
                 return Ok(shell.info());
             }
-            let mut pty = Pty::spawn_shell(cwd)?;
+            let pty = Pty::spawn_shell(cwd)?;
+            #[cfg(windows)]
+            let mut pty = pty;
             #[cfg(windows)]
             let containment = match pty
                 .process_id()

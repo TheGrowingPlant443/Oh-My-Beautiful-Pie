@@ -201,30 +201,36 @@ test('registered Manager tool uses installed SDK validator before any transport 
   assert.equal(result.status,0,result.stderr || result.error?.message || result.stdout);
 });
 
-test('cached interactive startup retains native workspace, UI and Eval command capture', {
-  skip: !sdk || !process.env.OMP_BIN ? 'Set OMP_SDK_DIR and OMP_BIN for the packaged CLI' : process.platform === 'win32' ? 'Bun.Terminal requires Unix' : false,
-  timeout: 110000,
-}, async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'omp-bridge-startup-'));
-  try {
-    const agent = path.join(root, 'agent');
-    await mkdir(agent);
-    await writeFile(path.join(agent, 'models.yml'), 'providers:\n  startup-offline:\n    api: openai-completions\n    baseUrl: http://127.0.0.1:9/v1\n    apiKey: fixture-key\n    models:\n      - id: fixture\n');
-    await writeFile(path.join(agent, 'config.yml'), 'modelRoles:\n  default: startup-offline/fixture\n');
-    const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', [
-      fileURLToPath(new URL('./fixtures/bridge-startup-scenario.mjs', import.meta.url)),
-    ], {
-      env: { ...process.env, BRIDGE_STARTUP_ROOT: root, HOME: root, USERPROFILE: root,
-        PI_CODING_AGENT_DIR: agent, PI_CONFIG_DIR: '.omp', PI_CONFIG_FILES: '', OMP_PROFILE: 'default',
-        XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
-        XDG_STATE_HOME: path.join(root, 'state'), XDG_CACHE_HOME: path.join(root, 'cache'),
-        PI_NATIVES_DIR: process.env.PI_NATIVES_DIR || path.join(os.homedir(), '.omp', 'natives'),
-        OMP_MANAGER_BRIDGE_ENDPOINT: '127.0.0.1:9', OMP_MANAGER_BRIDGE_TOKEN: 'fixture',
-        OMP_MANAGER_BRIDGE_INSTANCE_ID: 'fixture', OMP_MANAGER_BRIDGE_GENERATION: '1',
-        OMP_MANAGER_BRIDGE_ROLE: 'instance', OMP_MANAGER_BROWSER_REQUIRED: '1',
-        OMP_MANAGER_TERMINAL_DIR: path.join(root, 'ledger'), OMP_MANAGER_SDK_DIR: sdk },
-      timeout: 100000, maxBuffer: 2 * 1024 * 1024,
-    });
-    assert.match(stdout, /Cached native bridge startup verified/);
-  } finally { await rm(root, { recursive: true, force: true }); }
-});
+for (const [name, managerNotice] of [
+  ['cached interactive startup retains native workspace, UI and Eval command capture', false],
+  ['reopening a saved Manager conversation does not append another startup announcement', true],
+]) {
+  test(name, {
+    skip: !sdk || !process.env.OMP_BIN ? 'Set OMP_SDK_DIR and OMP_BIN for the packaged CLI' : process.platform === 'win32' ? 'Bun.Terminal requires Unix' : false,
+    timeout: 110000,
+  }, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'omp-bridge-startup-'));
+    try {
+      const agent = path.join(root, 'agent');
+      await mkdir(agent);
+      await writeFile(path.join(agent, 'models.yml'), 'providers:\n  startup-offline:\n    api: openai-completions\n    baseUrl: http://127.0.0.1:9/v1\n    apiKey: fixture-key\n    models:\n      - id: fixture\n');
+      await writeFile(path.join(agent, 'config.yml'), 'modelRoles:\n  default: startup-offline/fixture\nstartup:\n  setupWizard: false\n');
+      const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', [
+        fileURLToPath(new URL('./fixtures/bridge-startup-scenario.mjs', import.meta.url)),
+      ], {
+        env: { ...process.env, BRIDGE_STARTUP_ROOT: root, HOME: root, USERPROFILE: root,
+          PI_CODING_AGENT_DIR: agent, PI_CONFIG_DIR: '.omp', PI_CONFIG_FILES: '', OMP_PROFILE: 'default',
+          XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
+          XDG_STATE_HOME: path.join(root, 'state'), XDG_CACHE_HOME: path.join(root, 'cache'),
+          PI_NATIVES_DIR: process.env.PI_NATIVES_DIR || path.join(os.homedir(), '.omp', 'natives'),
+          OMP_MANAGER_BRIDGE_ENDPOINT: '127.0.0.1:9', OMP_MANAGER_BRIDGE_TOKEN: 'fixture',
+          OMP_MANAGER_BRIDGE_INSTANCE_ID: 'fixture', OMP_MANAGER_BRIDGE_GENERATION: '1',
+          OMP_MANAGER_BRIDGE_ROLE: managerNotice ? 'manager' : 'instance', OMP_MANAGER_BROWSER_REQUIRED: '1',
+          BRIDGE_MANAGER_NOTICE: managerNotice ? '1' : '0',
+          OMP_MANAGER_TERMINAL_DIR: path.join(root, 'ledger'), OMP_MANAGER_SDK_DIR: sdk },
+        timeout: 100000, maxBuffer: 2 * 1024 * 1024,
+      });
+      assert.match(stdout, managerNotice ? /Manager startup notice survives reopening without duplication/ : /Cached native bridge startup verified/);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+}

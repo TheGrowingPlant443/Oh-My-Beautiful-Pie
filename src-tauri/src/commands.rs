@@ -1300,7 +1300,18 @@ pub async fn render_transcript(
     let (path, input) = state
         .registry
         .transcript_path(&id, &subagent_id, Origin::Human)?;
-    blocking(move || session::render_transcript_file(&path, &input)).await
+    let registry = state.registry.clone();
+    blocking(move || {
+        let utility = crate::config::prepare_utility(
+            &registry,
+            &id,
+            None,
+            Some(&path),
+            crate::config::UtilityMode::Render,
+        )?;
+        session::render_transcript_file(&path, &input, &utility)
+    })
+    .await
 }
 #[tauri::command]
 pub fn get_global_config(state: State<'_, AppState>) -> crate::config::GlobalConfigInfo {
@@ -1308,10 +1319,12 @@ pub fn get_global_config(state: State<'_, AppState>) -> crate::config::GlobalCon
 }
 #[tauri::command]
 pub async fn preview_global_config(
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     source_id: Option<String>,
     import_path: Option<String>,
 ) -> Result<crate::config::ConfigPreview> {
+    require_main_window(&window)?;
     if source_id.is_some() && import_path.is_some() {
         return Err("Select a source instance or import file, not both".into());
     }
@@ -1320,7 +1333,18 @@ pub async fn preview_global_config(
         serde_json::json!({"action":"import","path":path,"cwd":registry.home,"profile":"default"})
     } else if let Some(id) = source_id {
         let source = registry.inspect(&id, Origin::Human)?;
-        serde_json::json!({"action":"export","cwd":source.project_path,"profile":source.profile,"configFiles":source.configs})
+        if let Some(config) = source.config_state {
+            if config.error.is_some() {
+                return Err("Resolve the native configuration error before exporting this session, or select a named snapshot directly".into());
+            }
+            serde_json::json!({"action":"export","cwd":source.project_path,"profile":source.profile,
+                "configFiles":config.config_files,"setupPaths":config.setup_paths})
+        } else {
+            serde_json::json!({"action":"export","cwd":source.project_path,"profile":source.profile,
+                "configFiles":source.configs,"configRoot":registry.config_root(),
+                "configDefault":source.config_default,"configSelection":source.config_selection,
+                "model":source.model,"sessionPath":source.session_path,"reconstructSelection":true})
+        }
     } else {
         serde_json::json!({"action":"export","cwd":registry.home,"profile":"default"})
     };
@@ -1329,13 +1353,18 @@ pub async fn preview_global_config(
 #[tauri::command]
 pub async fn save_global_config(
     state: State<'_, AppState>,
-    yaml: String,
+    window: tauri::WebviewWindow,
+    preview: crate::config::ConfigPreview,
+    name: String,
+    activate: bool,
+    approve_execution: bool,
 ) -> Result<serde_json::Value> {
+    require_main_window(&window)?;
     let registry = state.registry.clone();
     blocking(move || {
         let clean = crate::config::preview(registry.config_root(), &registry.home,
-            serde_json::json!({"action":"import","yaml":yaml,"cwd":registry.home,"profile":"default"}))?;
-        let path = registry.global_config.publish(&clean.yaml)?;
+            serde_json::json!({"action":"import","yaml":preview.yaml,"assets":preview.assets,"name":name,"cwd":registry.home,"profile":"default"}))?;
+        let path = registry.global_config.publish_setup(&clean, &name, activate, approve_execution)?;
         Ok(serde_json::json!({"path":path}))
     }).await
 }
@@ -1346,6 +1375,7 @@ pub struct SavedConfigs {
     pub snapshots: Vec<crate::config::SavedConfig>,
     pub native_global: Option<std::path::PathBuf>,
     pub error: Option<String>,
+    pub assignments: Vec<crate::config::ModelConfigAssignment>,
 }
 #[tauri::command]
 pub async fn list_saved_configs(state: State<'_, AppState>) -> Result<SavedConfigs> {
@@ -1367,19 +1397,89 @@ pub async fn list_saved_configs(state: State<'_, AppState>) -> Result<SavedConfi
             snapshots: registry.global_config.list(),
             native_global,
             error,
+            assignments: registry.global_config.assignments()?,
         })
     })
     .await
 }
 #[tauri::command]
 pub async fn activate_global_config(
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     path: String,
 ) -> Result<serde_json::Value> {
+    require_main_window(&window)?;
     let registry = state.registry.clone();
     blocking(move || {
         let path = registry.global_config.activate(Path::new(&path))?;
         Ok(serde_json::json!({"path":path}))
+    })
+    .await
+}
+#[tauri::command]
+pub async fn export_config(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    path: String,
+    destination: String,
+) -> Result<()> {
+    require_main_window(&window)?;
+    let registry = state.registry.clone();
+    blocking(move || {
+        registry
+            .global_config
+            .export_setup(Path::new(&path), Path::new(&destination))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn save_model_config_assignments(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    assignments: Vec<crate::config::ModelConfigAssignment>,
+) -> Result<()> {
+    require_main_window(&window)?;
+    let registry = state.registry.clone();
+    blocking(move || registry.global_config.save_assignments(assignments)).await
+}
+
+#[tauri::command]
+pub async fn list_config_models(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    source_id: Option<String>,
+) -> Result<serde_json::Value> {
+    require_main_window(&window)?;
+    let registry = state.registry.clone();
+    let request = if let Some(id) = source_id {
+        let source = registry.inspect(&id, Origin::Human)?;
+        let configs = source
+            .config_state
+            .map(|config| config.config_files)
+            .unwrap_or(source.configs);
+        serde_json::json!({"action":"models","cwd":source.project_path,"profile":source.profile,"configFiles":configs})
+    } else {
+        serde_json::json!({"action":"models","cwd":registry.home,"profile":"default"})
+    };
+    blocking(move || crate::config::native_request(registry.config_root(), &registry.home, request))
+        .await
+}
+
+#[tauri::command]
+pub async fn switch_session_config(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    id: String,
+    path: Option<std::path::PathBuf>,
+) -> Result<()> {
+    require_main_window(&window)?;
+    let registry = state.registry.clone();
+    blocking(move || {
+        let result = registry.switch_session_config(&id, path);
+        publish(&app, &registry);
+        result
     })
     .await
 }
@@ -2458,12 +2558,14 @@ pub async fn prepare_srs_scope(
     state: State<'_, AppState>,
     folder: String,
     vault_id: String,
+    purpose: crate::srs::Purpose,
     evidence_folders: Vec<String>,
     exclusions: Vec<String>,
 ) -> Result<serde_json::Value> {
     require_main_window(&window)?;
     let s = state.srs.clone();
-    blocking(move || s.prepare_srs_scope(&folder, &vault_id, evidence_folders, exclusions)).await
+    blocking(move || s.prepare_srs_scope(&folder, &vault_id, purpose, evidence_folders, exclusions))
+        .await
 }
 #[tauri::command]
 

@@ -32,6 +32,9 @@ export interface Instance {
   profile: string;
   agentFile: string | null;
   configs: string[];
+  configSelection?: string | null;
+  configDefault?: string | null;
+  useGlobalConfig?: boolean | null;
   model: string;
   status: InstanceStatus;
   activity: string;
@@ -53,6 +56,7 @@ export interface Instance {
   planTarget: string | null;
   helper: { target: string; purpose: "diff" | "git"; repo: string } | null;
   bridgeReady: boolean;
+  configState?: ConfigState | null;
   capabilities?: { agentHub: boolean; nativeDecisions?: boolean; nativeDecisionsError?: string | null };
   pendingDecisionCount: number;
   humanRequest: { id: string; reason: string; decisionId: string | null } | null;
@@ -101,11 +105,17 @@ export interface CreateInstanceInput {
   model: string;
   resumeSessionId: string | null;
   useGlobalConfig?: boolean;
+  configSelection?: string | null;
   agentFile?: string | null;
 }
 export type PtyChunk = ArrayBuffer;
 export interface GlobalConfigInfo { path: string | null; error: string | null; }
-export interface ConfigPreview { yaml: string; modelRoles: Record<string, string | null>; omitted: string[]; }
+export interface ConfigAsset { path: string; content: string; mode?: number | null; file?: { sourcePath: string; size: number; sha256: string } | null; }
+export interface ConfigPreview { yaml: string; modelRoles: Record<string, string | null>; omitted: string[]; name: string; assets: ConfigAsset[]; requiresExecutionReview: boolean; }
+export interface ModelConfigAssignment { model: string; configPath: string; }
+export interface ConfigState { model: string | null; configPath: string | null; configName: string | null; source: "session" | "model" | "default" | "native"; error?: string | null; children?: ConfigChildState[]; configFiles?: string[]; setupPaths?: string[]; }
+export interface ConfigChildState { id: string; model: string | null; configPath: string | null; configName: string | null; source: string; error?: string | null; mcpInheritedFrom?: string | null; }
+export interface ConfigModels { models: { selector: string; name: string; available: boolean | null }[]; profile: string; error?: string | null; }
 export type SetupScope = "global" | "manager" | "architect" | "local_ai" | "repository";
 export type SetupKind = "agents" | "rules" | "skill" | "tool" | "workflow" | "plugin" | "profile";
 export type ScriptLanguage = "python" | "bash" | "typescript";
@@ -117,8 +127,8 @@ export interface HelperAdmission { helper: Instance; promptSent: boolean | null;
 export interface ClassifyAdmission { architect: Instance | null; promptSent: boolean | null; requested: number; error: string | null; }
 export interface SetupPaths { globalOmpFolder: string; globalAgentFolder: string; managerFolder: string; architectFolder: string; localAiFolder: string; }
 export interface SetupAdmission { instance: Instance; promptSent: boolean | null; error: string | null; }
-export interface SavedConfig { path: string; modifiedMs: number; }
-export interface SavedConfigs { current: string | null; snapshots: SavedConfig[]; nativeGlobal: string | null; error: string | null; }
+export interface SavedConfig { path: string; modifiedMs: number; name: string; }
+export interface SavedConfigs { current: string | null; snapshots: SavedConfig[]; nativeGlobal: string | null; error: string | null; assignments: ModelConfigAssignment[]; }
 export interface AgentFile { name: string; scope: "global" | "manager" | "architect"; path: string; }
 export interface AgentFiles { files: AgentFile[]; error: string | null; }
 export interface OmpProfile { name: string; hasLogin: boolean; }
@@ -448,9 +458,13 @@ export const api = {
   renderTranscript: (id: string, subagentId: string) => invoke<string>("render_transcript", { id, subagentId }),
   getGlobalConfig: () => invoke<GlobalConfigInfo>("get_global_config"),
   previewGlobalConfig: (sourceId: string | null, importPath: string | null) => invoke<ConfigPreview>("preview_global_config", { sourceId, importPath }),
-  saveGlobalConfig: (yaml: string) => invoke<{ path: string }>("save_global_config", { yaml }),
+  saveGlobalConfig: (preview: ConfigPreview, name: string, activate: boolean, approveExecution: boolean) => invoke<{ path: string }>("save_global_config", { preview, name, activate, approveExecution }),
   listSavedConfigs: () => invoke<SavedConfigs>("list_saved_configs"),
   activateGlobalConfig: (path: string) => invoke<{ path: string }>("activate_global_config", { path }),
+  exportConfig: (path: string, destination: string) => invoke<void>("export_config", { path, destination }),
+  listConfigModels: (sourceId: string | null) => invoke<ConfigModels>("list_config_models", { sourceId }),
+  saveModelConfigAssignments: (assignments: ModelConfigAssignment[]) => invoke<void>("save_model_config_assignments", { assignments }),
+  switchSessionConfig: (id: string, path: string | null) => invoke<void>("switch_session_config", { id, path }),
   listAgentFiles: (kind: Instance["kind"]) => invoke<AgentFiles>("list_agent_files", { kind }),
   listOmpProfiles: () => invoke<OmpProfiles>("list_omp_profiles"),
   getSetupPaths: () => invoke<SetupPaths>("get_setup_paths"),

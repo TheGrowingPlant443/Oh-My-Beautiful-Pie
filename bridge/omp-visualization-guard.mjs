@@ -7,6 +7,8 @@ export const TOOLS = Object.freeze({
 });
 export const MARKER = 'omp-visualization-request';
 export const MAX_PROMPT_BYTES = 64 * 1024;
+// Native @file reads happen before extension guards; protected evidence text must stay literal.
+export const literalAnalysisPrompt = message => message.replaceAll('@', String.raw`\u0040`);
 export const MONITOR_MARKER = 'omp-host-monitor';
 export const MONITOR_GUARD_ERROR = 'native_monitor_guard_unavailable: Reopen the Architect with a compatible OMP version.';
 export const MONITOR_BLOCK = 'This turn explains one frozen host-monitor snapshot. Only the exact monitor_snapshot_read request/snapshot and native ask are available; commands, file reads, file changes, refreshes, other generation and delegation are refused.';
@@ -15,9 +17,8 @@ const READ_TOOLS = new Set([TOOLS.evidence, TOOLS.inspect, TOOLS.target]);
 const SUBMITTERS = Object.freeze({ systemOverview: TOOLS.systemSubmit, helicopter: TOOLS.helicopterSubmit,
   structureCurrent: TOOLS.structureSubmit, structureProposed: TOOLS.structureSubmit });
 const submitterFor = kind => Object.hasOwn(SUBMITTERS, kind) ? SUBMITTERS[kind] : null;
-const SRS_READ = ['srs_inspect', 'srs_read_evidence', 'srs_checkpoint', 'srs_finish_stage', 'ask'];
-export const SRS_ALLOWLISTS = Object.freeze(Object.fromEntries(['survey', 'specify', 'gapReview', 'verify'].map(phase =>
-  [phase, Object.freeze(phase === 'survey' ? [...SRS_READ] : [...SRS_READ, 'srs_write_document_chunk', 'srs_commit_document'])])));
+const SRS_TOOLS = Object.freeze(['srs_inspect', 'srs_read_evidence', 'srs_checkpoint', 'srs_finish_stage', 'srs_delegate', 'ask', 'srs_write_document_chunk', 'srs_commit_document']);
+export const SRS_ALLOWLISTS = Object.freeze(Object.fromEntries(['survey', 'specify', 'gapReview', 'verify'].map(phase => [phase, SRS_TOOLS])));
 const registered = new WeakMap();
 function messageText(message) {
   if (typeof message?.content === 'string') return message.content;
@@ -132,7 +133,7 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
       if (mine(ctx).some(guard => guard.mode === 'monitor')) throw new Error('analysis_in_progress: Wait for the host-monitor explanation to settle.');
       const guard = { mode: 'visualization', requestId, kind, nonce: nonce(), sessionId, state: 'pending' };
       guards.set(guard.nonce, guard);
-      return { duplicate: false, text: `${message}\n\n[${MARKER} id=${requestId} nonce=${guard.nonce}]` };
+      return { duplicate: false, text: `${literalAnalysisPrompt(message)}\n\n[${MARKER} id=${requestId} nonce=${guard.nonce}]` };
     },
     admitSrs(ctx, payload) {
       if (!main(ctx) || !session(ctx)) throw new Error('native session unavailable');
@@ -146,7 +147,7 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
       const { message, ...stage } = payload;
       const guard = { ...stage, mode: 'srs', sessionId: session(ctx), state: 'pending' };
       guards.set(guard.nonce, guard);
-      return { duplicate: false, text: `${message}\n\n[omp-srs-stage job=${guard.jobId} attempt=${guard.attemptId} stage=${guard.stageId} nonce=${guard.nonce}]` };
+      return { duplicate: false, text: `${literalAnalysisPrompt(message)}\n\n[omp-srs-stage job=${guard.jobId} attempt=${guard.attemptId} stage=${guard.stageId} nonce=${guard.nonce}]` };
     },
     /** A frozen host-monitor explanation: only its exact reader and native Ask run; there is no submitter. */
     admitMonitor(ctx, { requestId, snapshotId, message }) {
@@ -164,7 +165,7 @@ export function createVisualizationGuard({ nonce = () => randomBytes(16).toStrin
       if (mine(ctx).length) throw new Error('analysis_in_progress: Wait for the current analysis to settle.');
       const guard = { mode: 'monitor', requestId, snapshotId, nonce: nonce(), sessionId, state: 'pending' };
       guards.set(guard.nonce, guard);
-      return { duplicate: false, text: `${message}\n\n[${MONITOR_MARKER} request=${requestId} snapshot=${snapshotId} nonce=${guard.nonce}]` };
+      return { duplicate: false, text: `${literalAnalysisPrompt(message)}\n\n[${MONITOR_MARKER} request=${requestId} snapshot=${snapshotId} nonce=${guard.nonce}]` };
     },
     monitor(ctx) { return publicMonitor(mine(ctx).find(guard => guard.mode === 'monitor')); },
     activeMonitor(ctx) { return publicMonitor(mine(ctx).find(guard => guard.mode === 'monitor' && guard.state === 'active')); },

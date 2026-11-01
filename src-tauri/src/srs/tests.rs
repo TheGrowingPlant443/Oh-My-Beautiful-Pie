@@ -1,6 +1,8 @@
 //! Service-level behavior with an injected clock, scratch storage and no Architect, provider or network.
 use super::types::{Document, Job, Question, Stage, Work};
-use super::{documents, inventory, store, Answer, Clock, JobState, Phase, Result, SrsService};
+use super::{
+    documents, inventory, store, Answer, Clock, JobState, Phase, Purpose, Result, SrsService,
+};
 use crate::knowledge::{KnowledgeService, ScopeRequest, VaultMode};
 use crate::manager::DependencyProducer;
 use serde_json::{json, Value};
@@ -579,10 +581,21 @@ fn scope_preparation_records_roots_app_and_human_exclusions_and_is_single_use() 
         .prepare_srs_scope(
             fix.repo.to_string_lossy().as_ref(),
             &fix.vault_id,
+            Purpose::Insights,
             vec![],
             vec!["vendor".into()],
         )
         .unwrap();
+    assert_eq!(prepared["purpose"], "insights");
+    assert_eq!(
+        fix.job().scope.purpose,
+        Purpose::Migration,
+        "legacy saved jobs default to migration"
+    );
+    assert_eq!(
+        fix.service.get_srs_job(&fix.job_id).unwrap()["purpose"],
+        "migration"
+    );
     assert_eq!(prepared["roots"][0]["kind"], "repository");
     let exclusions = prepared["exclusions"].as_array().unwrap();
     assert!(exclusions
@@ -596,6 +609,7 @@ fn scope_preparation_records_roots_app_and_human_exclusions_and_is_single_use() 
         .prepare_srs_scope(
             fix.repo.to_string_lossy().as_ref(),
             &fix.vault_id,
+            Purpose::Migration,
             vec![],
             vec![fix.repo.to_string_lossy().into_owned()]
         )
@@ -605,6 +619,7 @@ fn scope_preparation_records_roots_app_and_human_exclusions_and_is_single_use() 
         .prepare_srs_scope(
             fix.repo.to_string_lossy().as_ref(),
             &fix.vault_id,
+            Purpose::Migration,
             vec![fix.repo.join("src").to_string_lossy().into_owned()],
             vec![]
         )
@@ -614,6 +629,7 @@ fn scope_preparation_records_roots_app_and_human_exclusions_and_is_single_use() 
             .prepare_srs_scope(
                 fix.repo.to_string_lossy().as_ref(),
                 &store::id(),
+                Purpose::Migration,
                 vec![],
                 vec![]
             )
@@ -874,6 +890,20 @@ fn a_complete_srs_is_reached_only_through_the_real_tool_api_and_publishes_clean_
         {"id": book_work, "status": "reviewed", "requirementIds": [requirements[0].0], "evidenceIds": [behaviour]},
         {"id": cancel_work, "status": "reviewed", "requirementIds": [requirements[1].0, requirements[2].0], "evidenceIds": [behaviour]}
     ]})).unwrap();
+    let contract_work = ok(&fix, "srs_inspect", json!({"section":"work","limit":200}))["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["kind"] == "contractReview")
+        .cloned()
+        .collect::<Vec<_>>();
+    let contract_ids = contract_work
+        .iter()
+        .map(|w| w["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    fix.checkpoint(json!({"updateWork":contract_work.iter().map(|w|
+        json!({"id":w["id"],"status":"reviewed","evidenceIds":[behaviour],"requirementIds":[requirements[0].0]})
+    ).collect::<Vec<_>>()})).unwrap();
     let cite = json!([{"evidenceId": behaviour}, {"evidenceId": booking}]);
     let master_path = path(0);
     let links: Vec<(String, String)> = requirements
@@ -902,7 +932,7 @@ fn a_complete_srs_is_reached_only_through_the_real_tool_api_and_publishes_clean_
             &fix,
             doc_ref,
             &text,
-            json!({"type": "requirement", "requirementId": id, "specificity": "portable", "reviewedWorkIds": [if index == 0 { &book_work } else { &cancel_work }], "citations": cite}),
+            json!({"type": "requirement", "requirementId": id, "specificity": "portable", "reviewedWorkIds": std::iter::once(if index == 0 { &book_work } else { &cancel_work }).chain(contract_ids.iter()).collect::<Vec<_>>(), "citations": cite}),
         );
     }
     publish(&fix, &doc(1), "# Glossary\n\n- Appointment: a reserved time slot for one visitor.\n- Refund: money returned after a cancellation.\n", json!({"type": "glossary", "specificity": "portable", "reviewedWorkIds": [book_work]}));
@@ -913,8 +943,8 @@ fn a_complete_srs_is_reached_only_through_the_real_tool_api_and_publishes_clean_
         &open_questions,
         json!({"type": "questions", "specificity": "portable", "reviewedWorkIds": [cancel_work]}),
     );
-    publish(&fix, &doc(3), "# Current UI observations\n\n**UI-only requirement**\n\nCurrent UI only — redesignable.\n\nThe legacy screens show a list of free time slots and a cancel button beside each booking. Keyboard access to every action is essential behaviour; the widgets and layout are incidental.\n", json!({"type": "uiObservations", "specificity": "uiSpecific", "reviewedWorkIds": [book_work]}));
-    publish(&fix, &doc(4), "# Current structure observations\n\n**Implementation-only requirement**\n\nImplementation-specific — not a modernization requirement.\n\nThe legacy system separates booking rules from refund rules; a new design may organise this differently.\n", json!({"type": "structureObservations", "specificity": "implementationSpecific", "reviewedWorkIds": [cancel_work]}));
+    publish(&fix, &doc(3), &format!("# Current UI observations\n\n**{}**\n\nThe legacy screens show a list of free time slots and a cancel button beside each booking. Keyboard access to every action is essential behaviour; the widgets and layout are incidental.\n", documents::UI_ONLY_LABEL), json!({"type": "uiObservations", "specificity": "uiSpecific", "reviewedWorkIds": [book_work]}));
+    publish(&fix, &doc(4), &format!("# Current structure observations\n\n**{}**\n\nThe legacy system separates booking rules from refund rules; a new design may organise this differently.\n", documents::IMPLEMENTATION_ONLY_LABEL), json!({"type": "structureObservations", "specificity": "implementationSpecific", "reviewedWorkIds": [cancel_work]}));
     let trace_rows: String = requirements
         .iter()
         .map(|(id, p, _)| format!("| {} | Test |\n", link(id, &path(5), p)))
@@ -1154,7 +1184,12 @@ fn interrupted_inventory_reconciles_existing_work_links_and_all_counters_before_
         .unwrap();
     fix.service.build_inventory(&fix.job_id).unwrap();
     let reconciled = fix.job();
-    assert_eq!(reconciled.state, JobState::WaitingForHuman);
+    assert_eq!(
+        reconciled.state,
+        JobState::Running,
+        "blocked attachments must not prevent the initial Architect survey"
+    );
+    assert_eq!(reconciled.error.as_ref().unwrap().code, "needs_evidence");
     assert_eq!(
         reconciled.counts.blocked, 1,
         "existing blocked work is counted on replay"
@@ -1193,10 +1228,11 @@ fn interrupted_inventory_reconciles_existing_work_links_and_all_counters_before_
         Ok(())
     })
     .unwrap();
+    fix.service.pause_srs(&fix.job_id).unwrap();
     fix.service
         .dispose_srs_item(
             &fix.job_id,
-            reconciled.revision,
+            fix.job().revision,
             &evidence_id,
             "excludeFromScope",
             "Unreadable attachment excluded by the stakeholder",
@@ -1212,13 +1248,14 @@ fn interrupted_inventory_reconciles_existing_work_links_and_all_counters_before_
         .filter(|w| w["kind"] == "sourceArea" && w["status"] == "pending")
         .map(|w| json!({"id":w["id"],"status":"reviewed"}))
         .collect();
+    let reviewed_source = source.len() as u64;
     fix.checkpoint(json!({"updateWork":source}))
         .expect("reviewing reconstructed pending work never underflows counters");
     assert_eq!(fix.job().counts.blocked, 0);
     assert_eq!(
         fix.job().counts.work_open,
-        10,
-        "only template sections remain open"
+        open - reconciled.counts.blocked - reviewed_source,
+        "exclusions and reviewed source work reduce the reconciled open-work count"
     );
 }
 
@@ -1460,4 +1497,258 @@ fn tool_document_review_becomes_stale_lazily_and_commit_replay_cannot_refresh_it
         true,
         "explicitly reviewed new publication records the current work revision"
     );
+}
+
+#[test]
+fn native_children_write_durable_scoped_findings_without_root_authority() {
+    let fix = Fix::new("inventory", "survey", "active");
+    std::fs::write(
+        fix.repo.join("other.txt"),
+        "Private unrelated capability.\n",
+    )
+    .unwrap();
+    fix.service.build_inventory(&fix.job_id).unwrap();
+    let evidence = ok(
+        &fix,
+        "srs_inspect",
+        json!({"section":"inventory","limit":200}),
+    )["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let admitted = evidence.iter().find(|e| e["path"] == "src/a.txt").unwrap()["id"].clone();
+    let unrelated = evidence.iter().find(|e| e["path"] == "other.txt").unwrap()["id"].clone();
+    let allocated = fix.checkpoint(json!({
+        "addWork":[{"phase":"survey","kind":"sourceArea","status":"active","rationale":"Delegated booking findings"},{"phase":"survey","kind":"sourceArea","rationale":"Other findings"}],
+        "addDocuments":[{"type":"glossary","title":"Booking terminology"},{"type":"questions","title":"Stakeholder questions"}]
+    })).unwrap()["allocated"].clone();
+    let work = allocated["work"][0]["id"].clone();
+    let doc = allocated["documents"][0].clone();
+    let bridge = |action: &str, extra: Value| {
+        let mut p =
+            json!({"jobId":fix.job_id,"attemptId":"attempt","stageId":"stage","nonce":"nonce"});
+        for (key, value) in extra.as_object().unwrap() {
+            p[key] = value.clone();
+        }
+        fix.service.handle_bridge(&fix.producer, action, p)
+    };
+    let assignment = bridge("srs_delegate_open", json!({
+        "childId":"native-child-1","assignment":"Read booking evidence and persist terms and findings.",
+        "workIds":[work],"evidenceIds":[admitted],"documentIds":[doc["documentId"]]
+    })).unwrap();
+    assert_eq!(assignment["purpose"], "migration");
+    let actor = json!({"assignmentId":assignment["assignmentId"],"childId":"native-child-1"});
+    let child = |action: &str, mut extra: Value| {
+        extra["delegation"] = actor.clone();
+        fix.call(action, extra)
+    };
+    assert_eq!(
+        bridge("srs_delegate_validate", json!({"delegation":actor})).unwrap()["authorized"],
+        true
+    );
+    assert!(bridge(
+        "srs_delegate_open",
+        json!({"childId":"overlapping-child","assignment":"Overlap",
+        "workIds":[work],"evidenceIds":[],"documentIds":[]})
+    )
+    .is_err());
+    assert!(child(
+        "srs_read_evidence",
+        json!({"evidenceId":admitted,"offset":0})
+    )
+    .is_ok());
+    assert!(child(
+        "srs_read_evidence",
+        json!({"evidenceId":unrelated,"offset":0})
+    )
+    .is_err());
+    assert!(child("srs_inspect", json!({"section":"inventory"})).is_err());
+    assert!(child("srs_inspect", json!({"section":"request"})).is_err());
+    assert!(child("srs_inspect", json!({"section":"questions"})).is_err());
+    assert!(child(
+        "srs_inspect",
+        json!({"section":"work","id":allocated["work"][1]["id"]})
+    )
+    .is_err());
+    assert!(child("srs_checkpoint", json!({"expectedRevision":fix.job().revision,"updates":{"addQuestions":[{"prompt":"Impersonate a human?"}]}})).is_err());
+    assert!(child("srs_checkpoint", json!({"expectedRevision":fix.job().revision,"updates":{"updateWork":[{"id":work,"evidenceIds":[unrelated]}]}})).is_err());
+    assert!(child("srs_checkpoint", json!({"expectedRevision":fix.job().revision,"updates":{"updateWork":[{"id":work,"status":"reviewed","rationale":"A visitor reserves an available appointment and receives a confirmation.","evidenceIds":[admitted]}]}})).is_ok());
+    let body = "# Booking terminology\n\nAppointment: an available time reserved by a visitor.\n";
+    assert!(child("srs_write_document_chunk", json!({"documentId":doc["documentId"],"revisionId":doc["revisionId"],"offset":0,"text":body,"expectedPrefixHash":store::hash(b"")})).is_ok());
+    assert!(child("srs_commit_document", json!({"documentId":doc["documentId"],"revisionId":doc["revisionId"],"expectedHash":store::hash(body.as_bytes()),"metadata":{"type":"glossary","specificity":"portable","reviewedWorkIds":[work],"citations":[{"evidenceId":admitted}]}})).is_ok());
+    assert!(child("srs_finish_stage", json!({"expectedRevision":fix.job().revision,"review":{"phase":"survey","summary":"Child cannot finish root stage"}})).is_err());
+    assert!(fix.call("srs_finish_stage", json!({"expectedRevision":fix.job().revision,"review":{"phase":"survey","summary":"Root must wait"}})).unwrap_err().contains("native children"));
+    let checkpoint = child("srs_inspect", json!({"section":"checkpoint"})).unwrap();
+    assert_eq!(checkpoint["revision"], fix.job().revision);
+    assert_eq!(bridge("srs_delegate_close", json!({"delegation":actor,"outcome":"completed","summary":"Findings and terminology saved."})).unwrap()["persisted"], true);
+    assert!(child(
+        "srs_read_evidence",
+        json!({"evidenceId":admitted,"offset":0})
+    )
+    .is_err());
+    let saved: Document = fix
+        .service
+        .store
+        .get(
+            &fix.job_id,
+            "documents",
+            doc["documentId"].as_str().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(saved.state, "committed");
+    let audit = fix
+        .service
+        .store
+        .page(&fix.job_id, "delegation-actions", 0, 200)
+        .unwrap();
+    assert!(audit["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["action"] == "srs_commit_document" && a["childId"] == "native-child-1"));
+    assert_eq!(
+        ok(&fix, "srs_inspect", json!({"section":"delegations"}))["items"][0]["state"],
+        "completed"
+    );
+}
+
+#[test]
+fn native_child_authority_does_not_survive_pause_or_a_new_attempt() {
+    let mut fix = Fix::new("running", "survey", "active");
+    let work = fix
+        .checkpoint(
+            json!({"addWork":[{"phase":"survey","kind":"sourceArea","rationale":"Findings"}]}),
+        )
+        .unwrap()["allocated"]["work"][0]["id"]
+        .clone();
+    let p = json!({"jobId":fix.job_id,"attemptId":"attempt","stageId":"stage","nonce":"nonce","childId":"native-child","assignment":"Inspect assigned work","workIds":[work],"evidenceIds":[],"documentIds":[]});
+    let assignment = fix
+        .service
+        .handle_bridge(&fix.producer, "srs_delegate_open", p)
+        .unwrap();
+    let actor = json!({"assignmentId":assignment["assignmentId"],"childId":"native-child"});
+    let payload = json!({"action":"srs_inspect","jobId":fix.job_id,"attemptId":"attempt","stageId":"stage","delegation":actor,"section":"checkpoint"});
+    assert!(fix.service.handle_tool(&fix.producer, &payload).is_ok());
+    fix.service.pause_srs(&fix.job_id).unwrap();
+    assert!(fix.service.handle_tool(&fix.producer, &payload).is_err());
+    let close = json!({"jobId":fix.job_id,"attemptId":"attempt","stageId":"stage","nonce":"nonce","delegation":actor,"outcome":"cancelled","summary":"Native child stopped after pause."});
+    assert_eq!(
+        fix.service
+            .handle_bridge(&fix.producer, "srs_delegate_close", close.clone())
+            .unwrap()["persisted"],
+        true
+    );
+    assert_eq!(fix.job().state, JobState::Paused);
+    let revision = fix.job().revision;
+    assert_eq!(
+        fix.service
+            .handle_bridge(&fix.producer, "srs_delegate_close", close)
+            .unwrap()["replayed"],
+        true
+    );
+    assert_eq!(
+        fix.job().revision,
+        revision,
+        "close acknowledgement replay must not mutate the job"
+    );
+    fix.restart();
+    let mut job = fix.job();
+    job.state = JobState::Running;
+    job.attempt_id = Some("new-attempt".into());
+    job.stage.as_mut().unwrap().attempt_id = "new-attempt".into();
+    job.stage.as_mut().unwrap().state = "active".into();
+    fix.service
+        .save(&mut job, vec![], "Explicit new attempt")
+        .unwrap();
+    let mut new_payload = payload;
+    new_payload["attemptId"] = json!("new-attempt");
+    assert!(fix
+        .service
+        .handle_tool(&fix.producer, &new_payload)
+        .is_err());
+}
+
+#[test]
+fn cancelled_jobs_accept_only_their_existing_childs_terminal_acknowledgement() {
+    let fix = Fix::new("running", "survey", "active");
+    let work = fix
+        .checkpoint(
+            json!({"addWork":[{"phase":"survey","kind":"sourceArea","rationale":"Findings"}]}),
+        )
+        .unwrap()["allocated"]["work"][0]["id"]
+        .clone();
+    let base = json!({"jobId":fix.job_id,"attemptId":"attempt","stageId":"stage","nonce":"nonce"});
+    let mut open = base.clone();
+    open["childId"] = json!("native-child");
+    open["assignment"] = json!("Inspect assigned work");
+    open["workIds"] = json!([work]);
+    open["evidenceIds"] = json!([]);
+    open["documentIds"] = json!([]);
+    let assignment = fix
+        .service
+        .handle_bridge(&fix.producer, "srs_delegate_open", open.clone())
+        .unwrap();
+    fix.service.cancel_srs(&fix.job_id).unwrap();
+    let mut close = base;
+    close["delegation"] =
+        json!({"assignmentId":assignment["assignmentId"],"childId":"native-child"});
+    close["outcome"] = json!("cancelled");
+    assert_eq!(
+        fix.service
+            .handle_bridge(&fix.producer, "srs_delegate_close", close)
+            .unwrap()["persisted"],
+        true
+    );
+    assert_eq!(fix.job().state, JobState::Cancelled);
+    assert!(fix
+        .service
+        .handle_bridge(&fix.producer, "srs_delegate_open", open)
+        .is_err());
+}
+
+#[test]
+fn survey_persists_portable_domain_flow_and_interface_findings_before_synthesis() {
+    let fix = Fix::new("running", "survey", "active");
+    let allocated = fix.checkpoint(json!({
+        "addWork":[{"phase":"survey","kind":"sourceArea","status":"active","rationale":"Appointment evidence findings"}],
+        "addDocuments":[{"type":"domain","title":"Appointment data"},{"type":"flow","title":"Booking interaction"},{"type":"interface","title":"Confirmation service"}]
+    })).unwrap()["allocated"].clone();
+    let work = allocated["work"][0]["id"].clone();
+    let notes = [
+        ("domain", "# Appointment data\n\n## Data and Meaning\nAn appointment associates one visitor with one available time.\n\n## Validation and Invariants\nA time can belong to only one current booking.\n\n## Lifecycle and Retention\nCancellation releases the time and retains the visitor's cancellation result.\n\n## Access and Ownership\nA visitor sees their own booking details.\n\n## Verification\nReserve a time, inspect its owner, cancel it and check that the time becomes available.\n"),
+        ("flow", "# Booking interaction\n\n## Actors and Preconditions\nA visitor has selected an available time.\n\n## Interaction and Business Rules\nThe visitor submits the selection and the system checks availability before confirming.\n\n## Outcomes and State Changes\nConfirmation creates one booking and makes the time unavailable.\n\n## Errors and Boundary Cases\nA concurrent reservation is refused without creating a second booking; missing times are rejected.\n\n## Verification\nSubmit valid, empty and concurrent selections and compare the bookings and user-visible results.\n"),
+        ("interface", "# Confirmation service\n\n## Participants and Purpose\nThe booking system asks the notification service to confirm a reservation to the visitor.\n\n## Inputs and Outputs\nThe request contains the recipient and booking identifier; the result states accepted or refused.\n\n## Protocol and Interaction\nSubmit a confirmation after saving the booking and await the service acknowledgement.\n\n## Authentication and Authorization\nOnly the booking system's authorized sender may request delivery.\n\n## Failure and Recovery\nA refused notification leaves the booking intact and exposes the delivery failure for staff review.\n\n## Limits and Unknowns\nThe service accepts one notification per request; provider throughput is not established by this finding and requires stakeholder clarification before completion.\n\n## Verification\nCheck accepted and refused delivery and confirm neither creates an additional booking.\n"),
+    ];
+    for (index, (kind, text)) in notes.iter().enumerate() {
+        publish(
+            &fix,
+            &allocated["documents"][index],
+            text,
+            json!({"type":kind,"specificity":"portable","reviewedWorkIds":[work]}),
+        );
+        let document: Document = fix
+            .service
+            .store
+            .get(
+                &fix.job_id,
+                "documents",
+                allocated["documents"][index]["documentId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(document.state, "committed");
+        assert!(document.hash.is_some());
+        assert_eq!(
+            fix.job().phase,
+            Phase::Survey,
+            "writing findings must not synthesize or advance the phase"
+        );
+    }
+    assert_eq!(
+        fix.job().counts.requirements,
+        0,
+        "survey findings do not need premature requirement allocation"
+    );
+    assert!(fix.job().completion.is_none());
 }

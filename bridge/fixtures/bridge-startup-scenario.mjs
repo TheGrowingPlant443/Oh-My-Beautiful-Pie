@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import managerBridge from '../omp-manager.mjs';
 
 export default function bridgeStartup(pi) {
+  const noticeMode = process.env.BRIDGE_MANAGER_NOTICE === '1';
   let session;
   const sessions = new Set();
   const prototype = pi.pi.AgentSession.prototype;
@@ -18,6 +19,7 @@ export default function bridgeStartup(pi) {
     // Native init unwinds after session_start; checking from inside its handler deadlocks that boundary.
     setTimeout(async () => {
       try {
+        const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
         const workspace = pi.pi.InteractiveMode.prototype[Symbol.for('omp-manager.workspace-host')];
         const observer = pi.pi.BashTool.prototype[Symbol.for('omp-manager.terminal-observer')];
         const capabilities = workspace.nativeUiCapabilities();
@@ -29,17 +31,23 @@ export default function bridgeStartup(pi) {
           pi.getAllTools();
           session = [...sessions].find(candidate => candidate.sessionId === ctx.sessionManager.getSessionId());
           assert.ok(session);
-          const result = await session.getToolByName('eval').execute('startup-eval', {
-            language: 'js', code: 'print("bridge startup command")', timeout: 10,
-          });
-          assert.equal(result.isError === true, false);
-          const row = observer.history().rows.find(row => row.toolCallId === 'startup-eval');
-          assert.ok(row, 'real Eval execution must reach command history');
-          assert.equal(row.status, 'completed');
-          assert.equal(row.kind, 'js');
+          if (noticeMode) {
+            const notices = ctx.sessionManager.getBranch().filter(entry => entry.type === 'custom_message' && entry.customType === 'omp-manager.ready');
+            assert.equal(notices.length, 1, 'a saved Manager conversation must retain one startup notice');
+            await ctx.sessionManager.ensureOnDisk();
+          } else {
+            const result = await session.getToolByName('eval').execute('startup-eval', {
+              language: 'js', code: 'print("bridge startup command")', timeout: 10,
+            });
+            assert.equal(result.isError === true, false);
+            const row = observer.history().rows.find(row => row.toolCallId === 'startup-eval');
+            assert.ok(row, 'real Eval execution must reach command history');
+            assert.equal(row.status, 'completed');
+            assert.equal(row.kind, 'js');
+          }
           await session.dispose();
         }
-        await writeFile(process.env.BRIDGE_STARTUP_RESULT, JSON.stringify({ eager, capabilities }));
+        await writeFile(process.env.BRIDGE_STARTUP_RESULT, JSON.stringify({ eager, capabilities, sessionFile }));
         process.exit(0);
       } catch (error) {
         await session?.dispose().catch(() => {});
@@ -52,12 +60,16 @@ export default function bridgeStartup(pi) {
 
 if (import.meta.main) {
   const root = process.env.BRIDGE_STARTUP_ROOT;
+  const noticeMode = process.env.BRIDGE_MANAGER_NOTICE === '1';
+  let sessionFile = null;
   // First load records OMP's verdict; the unchanged module is deferred on the next launch unless the flag is present.
-  for (const [index, flag, eager] of [[0, true, true], [1, false, false], [2, true, true]]) {
+  for (const [index, flag, eager] of (noticeMode ? [[0, true, true], [1, true, true]] : [[0, true, true], [1, false, false], [2, true, true]])) {
     const result = path.join(root, `startup-${index}.json`);
     let output = '';
     const child = Bun.spawn([process.env.OMP_BIN, '--no-extensions', '--extension', fileURLToPath(import.meta.url),
-      ...(flag ? ['--omp-manager-bridge'] : []), '--no-session', '--no-skills', '--no-rules', '--no-lsp', '--no-title', '--auto-approve', '--cwd', root], {
+      ...(flag ? ['--omp-manager-bridge'] : []), ...(noticeMode ? [] : ['--no-session']),
+      ...(sessionFile ? ['--resume', sessionFile] : []),
+      '--no-skills', '--no-rules', '--no-lsp', '--no-title', '--auto-approve', '--cwd', root], {
       env: { ...process.env, BRIDGE_EXPECT_EAGER: eager ? '1' : '0', BRIDGE_STARTUP_RESULT: result },
       terminal: { cols: 100, rows: 30, data(_terminal, bytes) { output = (output + Buffer.from(bytes).toString()).slice(-16384); } },
     });
@@ -67,7 +79,11 @@ if (import.meta.main) {
       const observation = JSON.parse(await readFile(result, 'utf8').catch(() => '{}'));
       assert.equal(status, 0, observation.error ?? output);
       assert.equal(observation.eager, eager);
+      if (noticeMode) {
+        assert.ok(observation.sessionFile, 'Manager announcement must persist its conversation');
+        sessionFile = observation.sessionFile;
+      }
     } finally { clearTimeout(timer); child.terminal.close(); }
   }
-  console.log('Cached native bridge startup verified');
+  console.log(noticeMode ? 'Manager startup notice survives reopening without duplication' : 'Cached native bridge startup verified');
 }

@@ -546,6 +546,27 @@ impl ProjectInsightService {
                     None => Err("manager bridge not initialized".into()),
                 };
                 match outcome {
+                    Ok(receipt) if receipt["admitted"] == false => StoredAdmission {
+                        request_id: id.clone(),
+                        prompt_sent: Some(false),
+                        error: Some(
+                            receipt["error"]["message"]
+                                .as_str()
+                                .unwrap_or("The Architect refused the prompt before admission.")
+                                .into(),
+                        ),
+                    },
+                    Ok(receipt)
+                        if entry.request.kind.is_visualization() && receipt["admitted"] != true =>
+                    {
+                        StoredAdmission {
+                            request_id: id.clone(),
+                            prompt_sent: None,
+                            error: Some(format!(
+                                "Unrecognised Architect admission receipt. {UNKNOWN_ADMISSION}"
+                            )),
+                        }
+                    }
                     Ok(_) => StoredAdmission {
                         request_id: id.clone(),
                         prompt_sent: Some(true),

@@ -8,6 +8,7 @@ import { installWorkspaceChanges } from './omp-workspace.mjs';
 import { registerCodeQualityTool } from './omp-code-quality.mjs';
 import { installNativeDecisions } from './omp-native-ui.mjs';
 import { installSrsBridge } from './omp-srs.mjs';
+import { installConfigPolicy } from './omp-config-policy.mjs';
 
 const MAX_FRAME = 64 * 1024 * 1024;
 const ACTIONS = ['list','create','start','stop','restart','remove','send','interrupt','screen','transcript','plan','subagents','respond','keys','subscribe','request_human'];
@@ -130,7 +131,7 @@ export async function confirmedPlanHandoff(request, ctx, payload, signal) {
 // including The Manager and unowned workers. Manager-originated control still needs an owned instance.
 // Killing a terminal command also interrupts the agent, so it is never available to a model or a Manager.
 export function controlAllowed({ role, owner, action, source }) {
-  if (['agent_hub','terminal_kill','dependency_result','workspace_change','cancel_workspace_change','workspace_plan_prompt','project_visualization_prompt','structure_sources','structure_source_read','structure_source_select_last','srs_stage_prompt','srs_stage_status','srs_pause','monitor_explanation_prompt','setup_markdown_hold','setup_markdown_release'].includes(action)) return source === 'human';
+  if (['agent_hub','terminal_kill','config_switch','dependency_result','workspace_change','cancel_workspace_change','workspace_plan_prompt','project_visualization_prompt','structure_sources','structure_source_read','structure_source_select_last','srs_stage_prompt','srs_stage_status','srs_pause','monitor_explanation_prompt','setup_markdown_hold','setup_markdown_release'].includes(action)) return source === 'human';
   if (source === 'human') return action === 'prompt' || action === 'abort' || action === 'reply_ui';
   return role === 'instance' && !!owner;
 }
@@ -267,7 +268,7 @@ export default function managerBridge(pi) {
     return { sessionId: context?.sessionManager.getSessionId(), sessionFile: sessionFile ?? null,
       cwd: context?.sessionManager.getCwd(), materialized: !!sessionFile && existsSync(sessionFile),
       workspaceEpoch: workspace.identity().workspaceEpoch,
-      supported: true, capabilities: workspace.nativeUiCapabilities(), terminal: terminal?.snapshot() ?? null, pendingDecisions: [...pending.values()].map(item => item.request) };
+      supported: true, capabilities: workspace.nativeUiCapabilities(), configState: configPolicy.snapshot(), terminal: terminal?.snapshot() ?? null, pendingDecisions: [...pending.values()].map(item => item.request) };
   }
   function write(frame) {
     if (!socket || socket.destroyed || !authenticated) throw new Error('manager bridge disconnected');
@@ -299,6 +300,16 @@ export default function managerBridge(pi) {
     identity: () => ({ instanceId, generation, ...workspace.identity() }),
     opportunity: () => workspace.opportunity(),
     srs: () => srs?.ask,
+  });
+  const configPolicy = installConfigPolicy(pi, {
+    emit,
+    isQuiescent: (options = {}) => {
+      const state = workspace.quiescence();
+      // A native pre-model hook is paused while its enclosing prompt remains active.
+      return options.modelBoundary
+        ? state.reasons.every(reason => reason === 'streaming' || reason === 'prompt_flow_unsettled')
+        : state.quiescent;
+    },
   });
   const workspace = installWorkspaceChanges(pi, {
     request, emit, role, nativeUi,
@@ -408,6 +419,8 @@ export default function managerBridge(pi) {
         return workspace.releaseMarkdown(payload.transactionId);
       case 'prompt':
         return promptSession(payload);
+      case 'config_switch':
+        return configPolicy.control(payload);
       case 'terminal_kill':
         if (!terminal || typeof payload.executionId !== 'string') throw new Error('terminal integration unavailable');
         return terminal.kill(payload.executionId);
@@ -506,7 +519,7 @@ export default function managerBridge(pi) {
       },
     });
   }
-  pi.on('session_start', (_event, ctx) => {
+  pi.on('session_start', async (_event, ctx) => {
     if (process.env.OMP_MANAGER_LOCAL_AI_SETUP_DIR) {
       const guard = globalThis[Symbol.for('omp-manager.local-ai-guard-ready')];
       const local = process.env.OMP_MANAGER_LOCAL_AI_SETUP_MODE === 'local';
@@ -518,15 +531,19 @@ export default function managerBridge(pi) {
       guard.checkSession(ctx);
     }
     if (!adoptContext(ctx)) return;
+    await configPolicy.attachContext(ctx);
     connect();
     if (!timer) timer = ctx.setInterval(connect, 1000);
     if (role === 'manager' && !startupShown) {
       startupShown = true;
-      pi.sendMessage({ customType: 'omp-manager.ready', content: 'The Manager is ready. I can control sessions I create or you hand over, review their work, and handle their decisions. I will ask you when human intervention is needed.', display: true, attribution: 'agent' });
+      if (!ctx.sessionManager.getBranch().some(entry => entry.type === 'custom_message' && entry.customType === 'omp-manager.ready')) {
+        pi.sendMessage({ customType: 'omp-manager.ready', content: 'The Manager is ready. I can control sessions I create or you hand over, review their work, and handle their decisions. I will ask you when human intervention is needed.', display: true, attribution: 'agent' });
+      }
     }
   });
-  pi.on('session_switch', (_event, ctx) => {
+  pi.on('session_switch', async (_event, ctx) => {
     if (!adoptContext(ctx)) return;
+    await configPolicy.attachContext(ctx);
     completionVersion++;
     lastStopTurn = undefined;
     resolveTerminalRequests();
@@ -590,6 +607,7 @@ export default function managerBridge(pi) {
     disposeBrowser();
     nativeUi.dispose();
     srs?.dispose();
+    await configPolicy.dispose();
     socket?.destroy();
   });
 }

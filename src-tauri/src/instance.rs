@@ -68,6 +68,10 @@ pub struct CreateInput {
     #[serde(default)]
     pub use_global_config: Option<bool>,
     #[serde(default)]
+    pub config_selection: Option<PathBuf>,
+    #[serde(default)]
+    pub config_default: Option<PathBuf>,
+    #[serde(default)]
     pub agent_file: Option<PathBuf>,
 }
 
@@ -106,6 +110,37 @@ pub struct NativeUiCapabilities {
     pub native_decisions_error: Option<String>,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigState {
+    pub model: Option<String>,
+    pub config_path: Option<PathBuf>,
+    pub config_name: Option<String>,
+    pub source: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub children: Vec<ConfigChildState>,
+    #[serde(default)]
+    pub config_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub setup_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigChildState {
+    pub id: String,
+    pub model: Option<String>,
+    pub config_path: Option<PathBuf>,
+    pub config_name: Option<String>,
+    pub source: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub mcp_inherited_from: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Instance {
@@ -116,6 +151,9 @@ pub struct Instance {
     pub profile: String,
     pub agent_file: Option<PathBuf>,
     pub configs: Vec<PathBuf>,
+    pub config_selection: Option<PathBuf>,
+    pub config_default: Option<PathBuf>,
+    pub use_global_config: Option<bool>,
     pub model: String,
     pub status: String,
     pub activity: String,
@@ -140,6 +178,7 @@ pub struct Instance {
     pub helper: Option<HelperLink>,
     pub bridge_ready: bool,
     pub capabilities: NativeUiCapabilities,
+    pub config_state: Option<ConfigState>,
     pub pending_decision_count: usize,
     pub human_request: Option<HumanRequest>,
 }
@@ -214,6 +253,7 @@ struct Record {
     materialized: bool,
     bridge_ready: bool,
     capabilities: NativeUiCapabilities,
+    config_state: Option<ConfigState>,
     pending_decision_count: usize,
     human_request: Option<HumanRequest>,
     ownership_epoch: u64,
@@ -275,6 +315,7 @@ impl Record {
             materialized,
             bridge_ready: false,
             capabilities: NativeUiCapabilities::default(),
+            config_state: None,
             pending_decision_count: 0,
             human_request: None,
             ownership_epoch: 0,
@@ -414,7 +455,14 @@ impl Record {
             profile: input.profile.clone(),
             agent_file: input.agent_file.clone(),
             configs: input.configs.clone(),
-            model: input.model.clone(),
+            config_selection: input.config_selection.clone(),
+            config_default: input.config_default.clone(),
+            use_global_config: input.use_global_config,
+            model: self
+                .config_state
+                .as_ref()
+                .and_then(|state| state.model.clone())
+                .unwrap_or_else(|| input.model.clone()),
             status: runtime.status.into(),
             activity: runtime.activity.into(),
             task: state.task.clone(),
@@ -439,6 +487,10 @@ impl Record {
             plan_target: self.definition.plan_target.clone(),
             helper: self.definition.helper.clone(),
             bridge_ready: self.bridge_ready,
+            config_state: self
+                .bridge_ready
+                .then(|| self.config_state.clone())
+                .flatten(),
             capabilities: if self.bridge_ready {
                 self.capabilities.clone()
             } else {
@@ -770,6 +822,82 @@ fn coordinator_temporary_paths(root: &Path) -> [PathBuf; 2] {
         temporary_root.join("manager"),
         temporary_root.join("architect"),
     ]
+}
+
+fn load_definitions(file: &Path) -> Result<Vec<Definition>, String> {
+    let bytes = match fs::read(file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut value: Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", file.display()))?;
+    let snapshots = file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("global-configs");
+    if let Some(instances) = value.get_mut("instances").and_then(Value::as_array_mut) {
+        migrate_config_defaults(instances);
+        migrate_config_selections(instances, &snapshots);
+    }
+    let saved: Saved =
+        serde_json::from_value(value).map_err(|e| format!("{}: {e}", file.display()))?;
+    if saved.version != 1 {
+        return Err("unsupported instance registry version".into());
+    }
+    Ok(saved.instances)
+}
+
+fn migrate_config_defaults(instances: &mut [Value]) {
+    let mut inherited_defaults = Vec::new();
+    for (index, instance) in instances.iter_mut().enumerate() {
+        if !instance.is_object() || instance.get("configDefault").is_some() {
+            continue;
+        }
+        if let Some(target) = instance["planTarget"]
+            .as_str()
+            .or_else(|| instance["helper"]["target"].as_str())
+        {
+            inherited_defaults.push((index, target.to_owned()));
+        }
+        // Legacy overlays have no proven automatic-default provenance; preserve them as explicit.
+        instance["configDefault"] = Value::Null;
+    }
+    if inherited_defaults.is_empty() {
+        return;
+    }
+    let defaults: std::collections::HashMap<_, _> = instances
+        .iter()
+        .filter_map(|instance| {
+            Some((
+                instance["id"].as_str()?.to_owned(),
+                instance["configDefault"].as_str().map(str::to_owned),
+            ))
+        })
+        .collect();
+    for (index, target) in inherited_defaults {
+        if let Some(default) = defaults.get(&target) {
+            instances[index]["configDefault"] = json!(default);
+        }
+    }
+}
+
+fn migrate_config_selections(instances: &mut [Value], snapshots: &Path) {
+    for instance in instances {
+        if !instance.is_object() || instance.get("configSelection").is_some() {
+            continue;
+        }
+        let default = instance["configDefault"].as_str();
+        let selected = instance["configs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|path| Path::new(path).starts_with(snapshots) && Some(*path) != default)
+            .last()
+            .map(str::to_owned);
+        instance["configSelection"] = json!(selected);
+    }
 }
 
 impl Registry {
@@ -1130,18 +1258,7 @@ impl Registry {
         self.set_manager_owner(id, None)
     }
     pub fn load(file: PathBuf, home: PathBuf) -> Result<Self, String> {
-        let definitions = match fs::read(&file) {
-            Ok(bytes) => {
-                let saved: Saved = serde_json::from_slice(&bytes)
-                    .map_err(|e| format!("{}: {e}", file.display()))?;
-                if saved.version != 1 {
-                    return Err("unsupported instance registry version".into());
-                }
-                saved.instances
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
-            Err(e) => return Err(e.to_string()),
-        };
+        let definitions = load_definitions(&file)?;
         Ok(Self {
             global_config: GlobalConfigStore::load(
                 file.parent()
@@ -1383,6 +1500,8 @@ impl Registry {
                 project_path: folder.to_string_lossy().into(),
                 profile: target.profile,
                 configs: target.configs,
+                config_selection: target.config_selection,
+                config_default: target.config_default,
                 model: target.model,
                 use_global_config: Some(false),
                 ..Default::default()
@@ -1421,6 +1540,8 @@ impl Registry {
                 project_path: folder.to_string_lossy().into(),
                 profile: target.profile,
                 configs: target.configs,
+                config_selection: target.config_selection,
+                config_default: target.config_default,
                 model: target.model,
                 use_global_config: Some(false),
                 ..Default::default()
@@ -1507,11 +1628,40 @@ impl Registry {
             let verified = crate::setup::verify_agent_file(self, &path, kind)?;
             input.agent_file = Some(verified);
         }
+        if let Some(path) = &input.config_selection {
+            self.global_config.metadata(path)?;
+        }
+        if let Some(path) = &input.config_default {
+            self.global_config.metadata(path)?;
+        }
         Ok(cwd)
     }
-    fn resolve_configs(&self, input: &mut CreateInput, cwd: &Path) -> Result<(), String> {
+    fn infer_config_selection(&self, input: &mut CreateInput, cwd: &Path) -> Result<(), String> {
+        for path in &input.configs {
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            };
+            if path.starts_with(self.config_root().join("global-configs")) {
+                self.global_config.metadata(&path)?;
+                input.config_selection = Some(path);
+            }
+        }
+        Ok(())
+    }
+    fn resolve_configs(
+        &self,
+        input: &mut CreateInput,
+        cwd: &Path,
+        infer_selection: bool,
+    ) -> Result<(), String> {
+        if infer_selection && input.config_selection.is_none() {
+            self.infer_config_selection(input, cwd)?;
+        }
         if input.use_global_config.unwrap_or(input.profile.is_empty()) {
             if let Some(path) = self.global_config.current_path()? {
+                input.config_default = Some(path.clone());
                 if !input.configs.contains(&path) {
                     input.configs.insert(0, path);
                 }
@@ -1552,7 +1702,7 @@ impl Registry {
         helper: Option<HelperLink>,
     ) -> Result<Instance, String> {
         let cwd = self.prepare_input(&mut input, kind)?;
-        self.resolve_configs(&mut input, &cwd)?;
+        self.resolve_configs(&mut input, &cwd, plan_target.is_none() && helper.is_none())?;
         let path = self.resume_session_path(&input, &cwd)?;
         let definition = Definition {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1667,6 +1817,12 @@ impl Registry {
         }
         records[i].native_session_id = payload["sessionId"].as_str().map(String::from);
         records[i].materialized = payload["materialized"].as_bool().unwrap_or(false);
+        if let Some(state) = payload.get("configState").filter(|state| !state.is_null()) {
+            records[i].config_state = Some(
+                serde_json::from_value(state.clone())
+                    .map_err(|e| format!("Invalid native config identity: {e}"))?,
+            );
+        }
         records[i].bridge_ready = payload["supported"].as_bool().unwrap_or(true);
         records[i].capabilities.agent_hub = payload["capabilities"]["agentHub"]
             .as_bool()
@@ -1679,6 +1835,75 @@ impl Registry {
             .as_str()
             .map(str::to_owned);
         records[i].workspace_epoch = epoch;
+        Ok(())
+    }
+    pub fn apply_config_state(
+        &self,
+        id: &str,
+        generation: u64,
+        payload: &Value,
+    ) -> Result<(), String> {
+        let state: ConfigState = serde_json::from_value(payload.clone())
+            .map_err(|e| format!("Invalid native config state: {e}"))?;
+        let mut records = self.records.lock().map_err(|e| e.to_string())?;
+        let i = index(&records, id)?;
+        if records[i].generation != generation {
+            return Err("stale_generation".into());
+        }
+        records[i].config_state = Some(state);
+        Ok(())
+    }
+    /// Persist intent separately from credentials and the native conversation.
+    pub fn switch_session_config(&self, id: &str, path: Option<PathBuf>) -> Result<(), String> {
+        let _lifecycle = self.lifecycle.lock();
+        if let Some(path) = &path {
+            let metadata = self.global_config.metadata(path)?;
+            if metadata.requires_execution_review && !metadata.executable_review {
+                return Err(
+                    "Review and approve executable setup assets in Manage config first".into(),
+                );
+            }
+        }
+        let mut records = self.records.lock().map_err(|e| e.to_string())?;
+        let i = index(&records, id)?;
+        authorize(&records, i, Origin::Human, true)?;
+        let old = std::mem::replace(
+            &mut records[i].definition.input.config_selection,
+            path.clone(),
+        );
+        if let Err(error) = self.save(&records) {
+            records[i].definition.input.config_selection = old;
+            return Err(error);
+        }
+        let running = records[i]
+            .process
+            .as_mut()
+            .is_some_and(|process| matches!(process.poll(), Ok(None)));
+        let ready = records[i].bridge_ready;
+        drop(records);
+        if running {
+            let switched = if ready {
+                self.hub
+                    .get()
+                    .ok_or_else(|| "manager bridge not initialized".to_owned())
+                    .and_then(|hub| hub.config_control(id, json!({"path": path})))
+                    .and_then(|state| match state["error"].as_str() {
+                        Some(error) => Err(error.to_owned()),
+                        None => Ok(()),
+                    })
+            } else {
+                Err("Wait for the native session bridge before switching configuration".into())
+            };
+            if let Err(error) = switched {
+                let mut records = self.records.lock().map_err(|e| e.to_string())?;
+                let i = index(&records, id)?;
+                records[i].definition.input.config_selection = old;
+                self.save(&records).map_err(|rollback| {
+                    format!("{error}; could not restore saved selection: {rollback}")
+                })?;
+                return Err(error);
+            }
+        }
         Ok(())
     }
     pub fn set_bridge_ready(&self, id: &str, generation: u64, ready: bool) {
@@ -2922,6 +3147,267 @@ mod tests {
         assert_eq!(row.status, "stopped");
         fs::remove_dir_all(folder).unwrap();
     }
+    #[test]
+    fn explicit_only_snapshot_is_not_frozen_as_an_automatic_default() {
+        let (folder, registry) = fixture();
+        let chosen = registry
+            .global_config
+            .publish("temperature: 0.7\n")
+            .unwrap();
+        let row = registry
+            .create(CreateInput {
+                configs: vec![chosen.clone()],
+                use_global_config: Some(false),
+                ..input(&folder)
+            })
+            .unwrap();
+        assert_eq!(row.config_selection, Some(chosen));
+        assert!(row.config_default.is_none());
+        registry.switch_session_config(&row.id, None).unwrap();
+        let restored = Registry::load(folder.join("instances.json"), folder.clone())
+            .unwrap()
+            .inspect(&row.id, Origin::Human)
+            .unwrap();
+        assert!(restored.config_selection.is_none());
+        assert!(restored.config_default.is_none());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn explicitly_picked_snapshot_becomes_session_intent_not_an_ignored_overlay() {
+        let (folder, registry) = fixture();
+        let chosen = registry
+            .global_config
+            .publish("plan:\n  enabled: true\n")
+            .unwrap();
+        let default = registry
+            .global_config
+            .publish("plan:\n  enabled: false\n")
+            .unwrap();
+        let row = registry
+            .create(CreateInput {
+                configs: vec![chosen.clone()],
+                ..input(&folder)
+            })
+            .unwrap();
+        assert_eq!(row.config_selection, Some(chosen.clone()));
+        assert_eq!(row.configs, vec![default, chosen]);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn legacy_overlay_intent_migrates_once_and_explicit_automatic_survives_restart() {
+        let (folder, registry) = fixture();
+        let default = registry
+            .global_config
+            .publish("temperature: 0.2\n")
+            .unwrap();
+        let explicit = registry
+            .global_config
+            .publish("temperature: 0.7\n")
+            .unwrap();
+        registry.global_config.activate(&default).unwrap();
+        let row = registry
+            .create(CreateInput {
+                configs: vec![explicit.clone()],
+                ..input(&folder)
+            })
+            .unwrap();
+        let file = folder.join("instances.json");
+        let mut legacy: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        legacy["instances"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("configSelection");
+        legacy["instances"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("configDefault");
+        fs::write(&file, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let migrated = Registry::load(file.clone(), folder.clone()).unwrap();
+        assert_eq!(
+            migrated
+                .inspect(&row.id, Origin::Human)
+                .unwrap()
+                .config_selection,
+            Some(explicit)
+        );
+        migrated.switch_session_config(&row.id, None).unwrap();
+        let automatic = Registry::load(file, folder.clone())
+            .unwrap()
+            .inspect(&row.id, Origin::Human)
+            .unwrap();
+        assert!(automatic.config_selection.is_none());
+        assert_eq!(
+            automatic.configs.len(),
+            2,
+            "clearing intent need not destroy the saved ordered overlay history"
+        );
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_legacy_single_snapshot_keeps_explicit_intent_until_cleared() {
+        let (folder, registry) = fixture();
+        let snapshot = registry
+            .global_config
+            .publish("temperature: 0.7\n")
+            .unwrap();
+        let row = registry
+            .create(CreateInput {
+                configs: vec![snapshot.clone()],
+                use_global_config: Some(true),
+                ..input(&folder)
+            })
+            .unwrap();
+        let file = folder.join("instances.json");
+        let mut legacy: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        let fields = legacy["instances"][0].as_object_mut().unwrap();
+        fields.remove("configSelection");
+        fields.remove("configDefault");
+        fs::write(&file, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let migrated = Registry::load(file.clone(), folder.clone()).unwrap();
+        let preserved = migrated.inspect(&row.id, Origin::Human).unwrap();
+        assert_eq!(preserved.config_selection, Some(snapshot));
+        assert!(preserved.config_default.is_none());
+        migrated.switch_session_config(&row.id, None).unwrap();
+        let cleared = Registry::load(file, folder.clone())
+            .unwrap()
+            .inspect(&row.id, Origin::Human)
+            .unwrap();
+        assert!(cleared.config_selection.is_none());
+        assert!(cleared.config_default.is_none());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn session_setup_selection_persists_without_replacing_auth_or_conversation() {
+        let (folder, registry) = fixture();
+        let row = registry
+            .create(CreateInput {
+                profile: "friend-login".into(),
+                ..input(&folder)
+            })
+            .unwrap();
+        let setup = registry
+            .global_config
+            .publish("modelRoles:\n  default: example\n")
+            .unwrap();
+        let session_file = folder.join("conversation.jsonl");
+        fs::write(
+            &session_file,
+            "{\"type\":\"session\",\"id\":\"existing\"}\n",
+        )
+        .unwrap();
+        registry.apply_identity(&row.id, 0, &json!({
+            "sessionId":"existing","sessionFile":session_file,"cwd":folder,"materialized":true
+        })).unwrap();
+        registry
+            .switch_session_config(&row.id, Some(setup.clone()))
+            .unwrap();
+        let loaded = Registry::load(folder.join("instances.json"), folder.clone()).unwrap();
+        let selected = loaded.inspect(&row.id, Origin::Human).unwrap();
+        assert_eq!(selected.config_selection, Some(setup));
+        assert_eq!(selected.profile, "friend-login");
+        assert_eq!(selected.session_path, Some(session_file.clone()));
+        assert!(
+            selected.config_state.is_none(),
+            "saved intent is not evidence of an active model"
+        );
+        loaded.switch_session_config(&row.id, None).unwrap();
+        assert!(
+            Registry::load(folder.join("instances.json"), folder.clone())
+                .unwrap()
+                .inspect(&row.id, Origin::Human)
+                .unwrap()
+                .config_selection
+                .is_none()
+        );
+        assert!(session_file.is_file());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn native_config_identity_is_generation_fenced_and_not_connected_when_stopped() {
+        let (folder, registry) = fixture();
+        let row = registry.create(input(&folder)).unwrap();
+        let state = json!({"model":"native/exact-model","configPath":null,"configName":null,"source":"native",
+            "children":[{"id":"native-child","model":"native/child-model","configPath":null,"configName":null,"source":"native"}]});
+        assert!(registry.apply_config_state(&row.id, 1, &state).is_err());
+        assert!(registry
+            .inspect(&row.id, Origin::Human)
+            .unwrap()
+            .config_state
+            .is_none());
+        registry.apply_config_state(&row.id, 0, &state).unwrap();
+        assert!(registry
+            .inspect(&row.id, Origin::Human)
+            .unwrap()
+            .config_state
+            .is_none());
+        registry.set_bridge_ready(&row.id, 0, true);
+        let active = registry.inspect(&row.id, Origin::Human).unwrap();
+        let config = active.config_state.unwrap();
+        assert_eq!(config.model.as_deref(), Some("native/exact-model"));
+        assert_eq!(config.children[0].id, "native-child");
+        assert_eq!(
+            config.children[0].model.as_deref(),
+            Some("native/child-model")
+        );
+        registry.set_bridge_ready(&row.id, 0, false);
+        assert!(registry
+            .inspect(&row.id, Origin::Human)
+            .unwrap()
+            .config_state
+            .is_none());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn internal_sessions_preserve_explicit_intent_without_promoting_automatic_snapshots() {
+        let (folder, registry) = fixture();
+        let default = registry
+            .global_config
+            .publish("temperature: 0.2\n")
+            .unwrap();
+        let target = registry.create(input(&folder)).unwrap();
+        let planner = registry.create_planner(&target.id).unwrap();
+        let helper = registry
+            .create_helper(
+                &target.id,
+                HelperPurpose::Diff,
+                folder.to_string_lossy().into(),
+            )
+            .unwrap();
+        assert_eq!(planner.configs, vec![default.clone()]);
+        assert_eq!(helper.configs, vec![default.clone()]);
+        assert_eq!(planner.config_default, Some(default.clone()));
+        assert_eq!(helper.config_default, Some(default.clone()));
+        assert!(planner.config_selection.is_none());
+        assert!(helper.config_selection.is_none());
+        let explicit = registry
+            .global_config
+            .publish("temperature: 0.7\n")
+            .unwrap();
+        let explicit_target = registry
+            .create(CreateInput {
+                config_selection: Some(explicit.clone()),
+                ..input(&folder)
+            })
+            .unwrap();
+        let selected = registry.create_planner(&explicit_target.id).unwrap();
+        let selected_helper = registry
+            .create_helper(
+                &explicit_target.id,
+                HelperPurpose::Git,
+                folder.to_string_lossy().into(),
+            )
+            .unwrap();
+        assert_eq!(selected.config_selection, Some(explicit.clone()));
+        assert_eq!(selected_helper.config_selection, Some(explicit));
+        fs::remove_dir_all(folder).unwrap();
+    }
+
     #[test]
     fn new_rows_freeze_defaults_without_changing_existing_sessions() {
         let (folder, registry) = fixture();

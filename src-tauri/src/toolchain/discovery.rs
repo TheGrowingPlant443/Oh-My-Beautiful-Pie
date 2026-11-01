@@ -9,7 +9,7 @@ use std::ffi::OsString;
 /// An override variable wins when set and non-empty; otherwise the program found on this machine, otherwise the
 /// bare name, so a missing program fails with the OS's own "not found" and the callers' existing messages.
 #[must_use]
-pub fn program(override_variable: &str, name: &str) -> OsString {
+fn program(override_variable: &str, name: &str) -> OsString {
     if let Some(explicit) = std::env::var_os(override_variable).filter(|value| !value.is_empty()) {
         return explicit;
     }

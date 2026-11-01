@@ -213,36 +213,118 @@ fn executable_version(_path: &Path) -> Option<String> {
     None
 }
 
-fn platform_obsidian_candidates(home: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let var = |name: &str| {
-        std::env::var_os(name)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
-    if cfg!(windows) {
-        if let Some(base) = var("LOCALAPPDATA") {
-            found.push(base.join("Programs").join("Obsidian").join("Obsidian.exe"));
-        }
-        for name in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
-            if let Some(base) = var(name) {
-                found.push(base.join("Obsidian").join("Obsidian.exe"));
-            }
-        }
-        found.push(PathBuf::from("C:/Program Files/Obsidian/Obsidian.exe"));
-    } else if cfg!(target_os = "macos") {
-        found.push(PathBuf::from(
-            "/Applications/Obsidian.app/Contents/MacOS/Obsidian",
-        ));
-        found.push(home.join("Applications/Obsidian.app/Contents/MacOS/Obsidian"));
+pub(super) fn platform_obsidian_candidates(
+    home: &Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let executable = if cfg!(windows) {
+        "Obsidian.exe"
     } else {
-        found.push(PathBuf::from("/usr/bin/obsidian"));
-        found.push(PathBuf::from("/usr/local/bin/obsidian"));
-        found.push(PathBuf::from("/opt/Obsidian/obsidian"));
+        "obsidian"
+    };
+    let mut found: Vec<PathBuf> = search_path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(executable))
+        .collect();
+    if cfg!(windows) {
+        push_windows_obsidian_candidates(&mut found);
+    } else if cfg!(target_os = "macos") {
+        push_macos_obsidian_candidates(&mut found, home);
+    } else {
+        push_linux_obsidian_candidates(&mut found, home);
     }
     let mut seen = BTreeSet::new();
     found.retain(|p| seen.insert(fsio::norm(p)));
     found
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn push_windows_obsidian_candidates(found: &mut Vec<PathBuf>) {
+    if let Some(base) = non_empty_env_path("LOCALAPPDATA") {
+        found.push(base.join("Programs").join("Obsidian").join("Obsidian.exe"));
+    }
+    for name in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(base) = non_empty_env_path(name) {
+            found.push(base.join("Obsidian").join("Obsidian.exe"));
+        }
+    }
+    found.push(PathBuf::from("C:/Program Files/Obsidian/Obsidian.exe"));
+}
+
+fn push_macos_obsidian_candidates(found: &mut Vec<PathBuf>, home: &Path) {
+    found.push(PathBuf::from(
+        "/Applications/Obsidian.app/Contents/MacOS/Obsidian",
+    ));
+    found.push(home.join("Applications/Obsidian.app/Contents/MacOS/Obsidian"));
+    found.push(home.join(".local/bin/obsidian"));
+    found.push(home.join(".nix-profile/bin/obsidian"));
+}
+
+fn push_linux_obsidian_candidates(found: &mut Vec<PathBuf>, home: &Path) {
+    for relative in [
+        ".local/bin/obsidian",
+        ".nix-profile/bin/obsidian",
+        ".local/state/nix/profile/bin/obsidian",
+    ] {
+        found.push(home.join(relative));
+    }
+    for directory in [
+        "/nix/var/nix/profiles/default/bin",
+        "/run/current-system/sw/bin",
+    ] {
+        found.push(Path::new(directory).join("obsidian"));
+    }
+    found.push(PathBuf::from("/usr/bin/obsidian"));
+    found.push(PathBuf::from("/usr/local/bin/obsidian"));
+    found.push(PathBuf::from("/opt/Obsidian/obsidian"));
+}
+
+pub(super) fn obsidian_xdg_registry(home: &Path, config_home: Option<PathBuf>) -> PathBuf {
+    config_home
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+        .join("obsidian/obsidian.json")
+}
+
+/// Follow installation symlinks for validation, but retain the launcher path: wrappers may depend on argv[0].
+pub(super) fn discover_obsidian(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let mut problem = None;
+    for candidate in candidates {
+        if !candidate.is_absolute() {
+            problem = Some("The Obsidian executable path must be absolute".to_string());
+            continue;
+        }
+        match fs::metadata(&candidate) {
+            Ok(meta) => {
+                #[cfg(unix)]
+                let executable = {
+                    use std::os::unix::fs::PermissionsExt;
+                    meta.permissions().mode() & 0o111 != 0
+                };
+                #[cfg(not(unix))]
+                let executable = true;
+                if meta.is_file() && executable {
+                    return Ok(Some(candidate));
+                }
+                problem = Some(format!("{} is not an executable file", candidate.display()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => problem = Some(format!("{}: {error}", candidate.display())),
+        }
+    }
+    match problem {
+        Some(problem) => Err(problem),
+        None => Ok(None),
+    }
 }
 
 enum Registry {
@@ -472,25 +554,14 @@ impl KnowledgeService {
         let candidates: Vec<PathBuf> = match &self.env.obsidian_exe {
             ExeSetting::Disabled => Vec::new(),
             ExeSetting::Fixed(path) => vec![path.clone()],
-            ExeSetting::Auto => {
-                let mut list: Vec<PathBuf> = configured.map(PathBuf::from).into_iter().collect();
-                list.extend(platform_obsidian_candidates(&self.home));
-                list
-            }
+            ExeSetting::Auto => match configured {
+                Some(path) => vec![PathBuf::from(path)],
+                None => {
+                    platform_obsidian_candidates(&self.home, std::env::var_os("PATH").as_deref())
+                }
+            },
         };
-        let mut problem = None;
-        for candidate in candidates {
-            match fs::metadata(&candidate) {
-                Ok(meta) if meta.is_file() => return Ok(Some(candidate)),
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => problem = Some(format!("{}: {e}", candidate.display())),
-            }
-        }
-        match problem {
-            Some(problem) => Err(problem),
-            None => Ok(None),
-        }
+        discover_obsidian(candidates)
     }
 
     fn obsidian_registry_file(&self) -> Option<PathBuf> {
@@ -510,7 +581,7 @@ impl KnowledgeService {
                     .join("Library/Application Support/obsidian/obsidian.json"),
             )
         } else {
-            Some(self.home.join(".config/obsidian/obsidian.json"))
+            Some(obsidian_xdg_registry(&self.home, var("XDG_CONFIG_HOME")))
         }
     }
 
@@ -531,21 +602,29 @@ impl KnowledgeService {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             return Registry::Unreadable("obsidian.json is not valid JSON".into());
         };
-        let mut vaults = Vec::new();
-        if let Some(map) = value.get("vaults").and_then(|v| v.as_object()) {
-            for (id, entry) in map.iter().take(MAX_REGISTERED_VAULTS) {
-                if let Some(path) = entry
-                    .get("path")
-                    .and_then(|p| p.as_str())
-                    .filter(|p| !p.is_empty())
-                {
-                    vaults.push((id.clone(), PathBuf::from(path)));
-                }
-            }
-        }
-        Registry::Vaults(vaults)
+        Registry::Vaults(registered_vaults(&value))
     }
+}
 
+/// Registered vault entries with an absolute path that canonicalizes to an existing directory.
+fn registered_vaults(value: &serde_json::Value) -> Vec<(String, PathBuf)> {
+    let Some(map) = value.get("vaults").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    map.iter()
+        .take(MAX_REGISTERED_VAULTS)
+        .filter_map(|(id, entry)| {
+            let path = entry
+                .get("path")
+                .and_then(|p| p.as_str())
+                .filter(|p| Path::new(p).is_absolute())?;
+            let path = crate::setup::canonical(Path::new(path)).ok()?;
+            path.is_dir().then(|| (id.clone(), path))
+        })
+        .collect()
+}
+
+impl KnowledgeService {
     fn lookup_registration(&self, root: &Path) -> Lookup {
         match self.read_obsidian_registry() {
             Registry::Vaults(vaults) => {
@@ -570,25 +649,35 @@ impl KnowledgeService {
     pub(crate) fn probe_obsidian_for(&self, declined_for_project: bool) -> ObsidianCapability {
         let configured = self.state.lock().integrations.obsidian.executable.clone();
         let registered = || match self.read_obsidian_registry() {
-            Registry::Vaults(vaults) => vaults
-                .into_iter()
-                .map(|(_, p)| p)
-                .filter(|p| p.is_dir())
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            _ => Vec::new(),
+            Registry::Vaults(vaults) => (
+                vaults
+                    .into_iter()
+                    .map(|(_, path)| path.to_string_lossy().into_owned())
+                    .collect(),
+                None,
+            ),
+            Registry::Unreadable(problem) => (
+                Vec::new(),
+                Some(format!(
+                    "Obsidian is installed, but its vault registry could not be read: {problem}"
+                )),
+            ),
+            Registry::Absent => (Vec::new(), None),
         };
         match self.obsidian_executable(configured.as_deref()) {
             Ok(Some(path)) => {
+                let (registered_vaults, registry_problem) = registered();
                 let version = executable_version(&path);
-                let message = version
-                    .is_none()
-                    .then(|| "Obsidian is installed; its version could not be read".to_string());
+                let message = registry_problem.or_else(|| {
+                    version
+                        .is_none()
+                        .then(|| "Obsidian is installed; its version could not be read".to_string())
+                });
                 ObsidianCapability {
                     state: ObsidianState::Installed,
                     version,
                     executable: Some(path.to_string_lossy().into_owned()),
-                    registered_vaults: registered(),
+                    registered_vaults,
                     message,
                     declined_for_project,
                 }
@@ -772,11 +861,11 @@ impl KnowledgeService {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.to_lowercase().contains("obsidian"));
-                if !candidate.is_absolute() || !candidate.is_file() || !named {
-                    return Err(
-                        "Choose the Obsidian executable (an absolute path to Obsidian.exe)".into(),
-                    );
+                if !candidate.is_absolute() || !named {
+                    return Err("Choose the Obsidian executable (an absolute path)".into());
                 }
+                discover_obsidian([candidate.to_path_buf()])?
+                    .ok_or_else(|| "The chosen Obsidian executable was not found".to_string())?;
                 Some(path.to_string())
             }
         };
