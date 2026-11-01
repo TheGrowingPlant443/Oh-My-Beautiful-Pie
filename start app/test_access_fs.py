@@ -86,7 +86,8 @@ class AccessFSTests(unittest.TestCase):
         self.store_patch = patch.object(access_fs, "STORE", str(self.store))
         self.store_patch.start()
         self.addCleanup(self.store_patch.stop)
-        self.fs = access_fs.AccessFS(self.policy, [str(self.base)], closure)
+        self.fs = access_fs.AccessFS(self.policy, {"runtime": {
+            "roots": [str(self.base)], "primary_roots": [str(self.base)], "programs": []}}, closure)
         self.addCleanup(self.fs.destroy, "/")
 
     @staticmethod
@@ -222,7 +223,7 @@ class AccessFSTests(unittest.TestCase):
                                 raise TimeoutError("Validation was not resumed")
                         return super()._entry(candidate, *args, **kwargs)
 
-                fs = PausedValidationFS(self.policy, [], lambda _: [])
+                fs = PausedValidationFS(self.policy, {}, lambda _: [])
                 fs._lock = ObservedRLock("rename", attempted)
                 self.addCleanup(fs.destroy, "/")
                 handle = fs.open(path, os.O_RDWR)
@@ -284,7 +285,7 @@ class AccessFSTests(unittest.TestCase):
                                 raise TimeoutError("Registration was not resumed")
                             return super()._register(candidate, fd, fi)
 
-                    fs = PausedRegistrationFS(self.policy, [], lambda _: [])
+                    fs = PausedRegistrationFS(self.policy, {}, lambda _: [])
                     fs._lock = ObservedRLock("opening-rename", attempted)
                     self.addCleanup(fs.destroy, "/")
                     handles, failures = [], []
@@ -355,7 +356,7 @@ class AccessFSTests(unittest.TestCase):
                             raise TimeoutError("Pinned parent was not resumed")
                     yield value
 
-        fs = PausedParentFS(self.policy, [], lambda _: [])
+        fs = PausedParentFS(self.policy, {}, lambda _: [])
         fs._lock = ObservedRLock("parent-rename", attempted)
         self.addCleanup(fs.destroy, "/")
         handle = fs.open(path, os.O_RDWR)
@@ -521,6 +522,52 @@ class AccessFSTests(unittest.TestCase):
         self.assertTrue(any(kind == "program" and target == str(self.hidden / "bin" / "other")
                             for kind, target, _ in self.policy.denied))
 
+    def test_cached_roots_revoke_symlink_targets_for_existing_handles(self):
+        self.policy.data["programs"] = [str(self.program)]
+        (self.base / "selected-library").symlink_to(self.dependency / "library")
+        path = "/store/" + self.base.name + "/selected-library"
+        handle = self.fs.open(path, os.O_RDONLY)
+        try:
+            self.assertEqual(self.fs.read(path, 32, 0, handle), b"library")
+            approved = self.policy.snapshot()
+            self.policy.data["programs"] = []
+            self.assertDenied(self.fs.read, path, 32, 0, handle)
+            # An older concurrent snapshot must not authorize a later operation.
+            self.fs._roots(approved)
+            self.assertDenied(self.fs.read, path, 32, 0, handle)
+            self.assertDenied(self.fs.getattr, path)
+            self.policy.data["programs"] = [str(self.program)]
+            self.assertEqual(self.fs.read(path, 32, 0, handle), b"library")
+        finally:
+            self.fs.release(path, handle)
+
+    def test_removing_required_bundle_blocks_its_store_root_and_restores_live(self):
+        path = "/store/" + self.base.name + "/runtime"
+        handle = self.fs.open(path, os.O_RDONLY)
+        self.fs._resolve_closure = lambda _: [
+            str(self.package), str(self.dependency), str(self.base)]
+        self.policy.data["programs"] = [str(self.program)]
+        self.policy.data["disabled_requirements"] = ["runtime"]
+        try:
+            self.assertDenied(self.read, path)
+            self.assertDenied(self.fs.read, path, 32, 0, handle)
+            self.assertNotIn(self.base.name, self.fs.readdir("/store", None))
+            self.assertTrue(self.read("/store/" + self.package.name + "/bin/tool").startswith(b"#!/bin/sh"))
+            self.policy.data["disabled_requirements"] = []
+            self.assertEqual(self.fs.read(path, 32, 0, handle), b"base")
+        finally:
+            self.fs.release(path, handle)
+
+    def test_cleared_history_can_record_the_same_denial_again(self):
+        path = self.host(self.secret / "credential")
+        self.assertDenied(self.read, path)
+        self.assertDenied(self.read, path)
+        self.assertEqual(len(self.policy.denied), 1)
+        self.policy.denied.clear()
+        self.policy.history_generation = 1
+        self.assertDenied(self.read, path)
+        self.assertEqual(len(self.policy.denied), 1)
+
     def test_store_symlinks_are_rewritten_and_must_stay_in_closure(self):
         self.policy.data["programs"] = [str(self.program)]
         link = self.package / "library-link"
@@ -557,6 +604,23 @@ class AccessFSTests(unittest.TestCase):
         self.assertDenied(self.read, "/store/" + self.package.name + "/bin/tool")
         self.assertTrue(any(kind == "program" and target == str(self.program)
                             for kind, target, _ in self.policy.denied))
+
+    def test_failed_closure_is_retried_without_a_policy_change(self):
+        self.policy.data["programs"] = [str(self.program)]
+        resolver = self.fs._resolve_closure
+        self.fs._resolve_closure = lambda _: [str(self.package), str(self.secret)]
+        path = "/store/" + self.package.name + "/bin/tool"
+        self.assertDenied(self.read, path)
+        self.fs._resolve_closure = resolver
+        self.assertTrue(self.read(path).startswith(b"#!/bin/sh"))
+
+    def test_store_root_membership_does_not_match_a_prefix(self):
+        other = self.store / (self.base.name + "-other")
+        other.mkdir()
+        (other / "runtime").write_bytes(b"unapproved")
+        with self.assertRaises(OSError) as error:
+            self.read("/store/" + other.name + "/runtime")
+        self.assertEqual(error.exception.errno, errno.EACCES)
 
     def test_store_symlink_loop_and_special_files_are_denied(self):
         (self.base / "loop").symlink_to("loop")

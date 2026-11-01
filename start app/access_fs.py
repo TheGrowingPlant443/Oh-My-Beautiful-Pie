@@ -24,7 +24,8 @@ _HOST_VIEW = "/host"
 _DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _PATH = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
 _SYSTEM = ("/proc", "/sys", "/dev", "/run", "/nix")
-_PROBES = {".DS_Store", ".directory", ".hidden", "desktop.ini", "autorun.inf"}
+# Lookups of files that never exist, not user actions; Python's startup probes beside its executable included.
+_PROBES = {".DS_Store", ".directory", ".hidden", "desktop.ini", "autorun.inf", "pyvenv.cfg"}
 
 
 def _within(path, root):
@@ -34,6 +35,11 @@ def _within(path, root):
 def _absolute(path):
     return (isinstance(path, str) and path.startswith("/") and "\0" not in path
             and path == posixpath.normpath(path) and not path.startswith("//"))
+
+
+def _store_root(path):
+    if path.startswith(STORE + "/"):
+        return STORE + "/" + path[len(STORE) + 1:].split("/", 1)[0]
 
 
 @dataclass(frozen=True)
@@ -60,13 +66,18 @@ class AccessFS(Operations):
 
     def __init__(self, policy, base_store_roots, closure_resolver):
         self.policy = policy
-        self._base_roots = frozenset(self._root(root) for root in base_store_roots)
+        self._requirements = base_store_roots
+        self._base_roots = {key: frozenset(self._root(root) for root in item["roots"])
+                            for key, item in base_store_roots.items()}
         self._resolve_closure = closure_resolver
         self._closures = {}
+        self._roots_key = None
+        self._approved_roots = frozenset()
         self._handles = {}
         self._next_handle = 1
         self._lock = threading.RLock()
         self._denials = OrderedDict()
+        self._history_generation = getattr(policy, "history_generation", 0)
 
     @staticmethod
     def _root(path):
@@ -75,10 +86,14 @@ class AccessFS(Operations):
         return path
 
     def _deny(self, kind, target, reason):
-        if posixpath.basename(target) in _PROBES:
+        if posixpath.basename(target) in _PROBES or target.endswith("._pth"):
             return
         key = kind, target, reason
         with self._lock:
+            generation = getattr(self.policy, "history_generation", 0)
+            if generation != self._history_generation:
+                self._denials.clear()
+                self._history_generation = generation
             if key in self._denials:
                 return
             self._denials[key] = None
@@ -96,26 +111,57 @@ class AccessFS(Operations):
                 if isinstance(item, dict) and _absolute(item.get("path"))
                 and not self._blocked(item["path"])]
 
+    def _blocked_roots(self, snapshot):
+        return {self._root(root) for key in snapshot.get("disabled_requirements", ())
+                for root in self._requirements.get(key, {}).get("primary_roots", ())}
+
     def _programs(self, snapshot):
+        blocked = self._blocked_roots(snapshot)
+        disabled = snapshot.get("disabled_requirements", ())
+        programs = {}
+        for key, item in self._requirements.items():
+            if key not in disabled:
+                for path in item["programs"]:
+                    if not any(_within(path, root) for root in blocked):
+                        programs.setdefault(posixpath.basename(path), path)
         paths = [path for path in snapshot.get("programs", ())
-                 if _absolute(path) and _within(path, STORE)
-                 and path != STORE]
+                 if _absolute(path) and _within(path, STORE) and path != STORE
+                 and not any(_within(path, root) for root in blocked)]
         counts = Counter(posixpath.basename(path) for path in set(paths))
-        return {posixpath.basename(path): path for path in paths
-                if counts[posixpath.basename(path)] == 1}
+        for path in paths:
+            name = posixpath.basename(path)
+            if counts[name] == 1:
+                programs[name] = path
+            else:
+                programs.pop(name, None)
+        return programs
 
     def _roots(self, snapshot):
-        roots = set(self._base_roots)
-        for program in set(self._programs(snapshot).values()):
-            try:
-                with self._lock:
+        key = (tuple(snapshot.get("programs", ())),
+               tuple(snapshot.get("disabled_requirements", ())))
+        with self._lock:
+            if key == self._roots_key:
+                return self._approved_roots
+            disabled = snapshot.get("disabled_requirements", ())
+            roots = set()
+            for requirement, paths in self._base_roots.items():
+                if requirement not in disabled:
+                    roots.update(paths)
+            complete = True
+            for program in set(snapshot.get("programs", ())) & set(self._programs(snapshot).values()):
+                try:
                     if program not in self._closures:
                         self._closures[program] = frozenset(
                             self._root(root) for root in self._resolve_closure(program))
                     roots.update(self._closures[program])
-            except (OSError, ValueError, RuntimeError):
-                self._deny("program", program, "Cannot resolve approved Nix closure")
-        return roots
+                except (OSError, ValueError, RuntimeError):
+                    complete = False
+                    self._deny("program", program, "Cannot resolve approved Nix closure")
+            roots = frozenset(roots - self._blocked_roots(snapshot))
+            # Failed closures stay retryable; only complete policy results are cached.
+            if complete:
+                self._roots_key, self._approved_roots = key, roots
+            return roots
 
     def _entry(self, path, write=False, snapshot=None, file=False):
         if not _absolute(path):
@@ -157,7 +203,7 @@ class AccessFS(Operations):
         raise FuseOSError(errno.EACCES)
 
     def _store_entry(self, target, write, snapshot):
-        if not any(_within(target, root) for root in self._roots(snapshot)):
+        if _store_root(target) not in self._roots(snapshot):
             if "/bin/" in target and self._unapproved_executable(target):
                 self._deny("program", target, "Nix executable is not approved")
             raise FuseOSError(errno.EACCES)
@@ -166,7 +212,7 @@ class AccessFS(Operations):
         return _Entry("store", target)
 
     def _unapproved_executable(self, target):
-        root = STORE + "/" + target[len(STORE) + 1:].split("/")[0]
+        root = _store_root(target)
         try:
             target = self._store_resolve(target, {root})
             parent = self._directory(posixpath.dirname(target))
@@ -285,7 +331,7 @@ class AccessFS(Operations):
     def _store_resolve(self, target, roots, follow_final=True):
         links = 0
         while True:
-            if not any(_within(target, root) for root in roots):
+            if _store_root(target) not in roots:
                 raise FuseOSError(errno.EACCES)
             parts = target[len(STORE) + 1:].split("/")
             fd = self._directory(STORE)
@@ -430,8 +476,10 @@ class AccessFS(Operations):
             self._next_handle += 1
             if fi is not None:
                 fi.fh = handle
-                fi.direct_io = int(_within(path, _HOST_VIEW))
-                fi.keep_cache = 0
+                host = _within(path, _HOST_VIEW)
+                fi.direct_io = int(host)
+                # Store files are immutable; every open is still authorized, only their page cache survives.
+                fi.keep_cache = int(not host)
             self._handles[handle] = _Handle(fd, path)
         return handle if fi is None else 0
 

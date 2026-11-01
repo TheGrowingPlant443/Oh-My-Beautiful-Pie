@@ -1,8 +1,10 @@
 """Local fixtures only: production never offers a private-address bypass."""
 
 import asyncio
+import base64
 import contextlib
 from datetime import datetime, timedelta, timezone
+import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,12 +25,16 @@ class Policy:
     def __init__(self, websites=(), internet=True):
         self.values = {"websites": list(websites), "internet": internet}
         self.denials = []
+        self.remembered = []
 
     def snapshot(self):
         return dict(self.values)
 
     def deny(self, *entry):
         self.denials.append(entry)
+
+    def remember_website(self, origin):
+        self.remembered.append(origin)
 
 
 def flow(url, host=None, tls=False):
@@ -45,11 +51,59 @@ class OriginTests(unittest.TestCase):
         self.assertEqual(network.origin("https://EXAMPLE.com:443/"), "https://example.com")
         self.assertEqual(network.origin("http://[2606:4700:4700::1111]:8080"),
                          "http://[2606:4700:4700::1111]:8080")
-        guard = network._Guard(Policy(["https://example.com"]))
-        self.assertIsNone(guard._allowed("https://example.com"))
-        for target in ("http://example.com", "https://example.com:444",
-                       "https://sub.example.com", "https://example.com.evil.test"):
+        policy = Policy(["https://www.example.com"])
+        guard = network._Guard(policy)
+        for target in ("https://www.example.com", "https://example.com", "https://api.example.com",
+                       "http://example.com", "http://clients2.example.com"):
+            self.assertIsNone(guard._allowed(target))
+        for target in ("https://example.com:444", "http://api.example.com:8080",
+                       "https://example.com.evil.test", "https://notexample.com"):
             self.assertIsNotNone(guard._allowed(target))
+        policy.values["exact_hosts"] = ["https://www.example.com"]
+        self.assertIsNone(guard._allowed("https://www.example.com"))
+        self.assertIsNotNone(guard._allowed("https://api.example.com"))
+
+    def test_auto_approve_matches_hosts_containing_text_only_while_enabled(self):
+        policy = Policy([])
+        policy.values["auto_approve"] = {"enabled": True, "sites": ["chatgpt", "anthropic.com"]}
+        guard = network._Guard(policy)
+        for target in ("https://chatgpt.com", "https://ab.chatgpt.com", "http://api.anthropic.com",
+                       "https://anthropic.community.com"):
+            self.assertIsNone(guard._allowed(target))
+        policy.values["auto_approve"]["sites"].append("google.com")
+        self.assertIsNone(guard._allowed("https://update.googleapis.com"))
+        for target in ("https://openai.com", "https://anthropic.com.mirror.test", "https://www.google.de"):
+            self.assertIsNotNone(guard._allowed(target))
+        self.assertEqual(policy.remembered, ["https://chatgpt.com", "https://ab.chatgpt.com", "http://api.anthropic.com",
+                                             "https://anthropic.community.com", "https://update.googleapis.com"])
+        policy.values["auto_approve"]["enabled"] = False
+        self.assertIsNotNone(guard._allowed("https://api.anthropic.com"))
+        self.assertFalse(network.covers("https://10.0.0.1", "https://x.10.0.0.1"))
+
+    def test_auto_approved_origin_is_listed_once_as_allowed_website(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy = PersistentPolicy(directory)
+            guard = network._Guard(policy)
+            before = policy.snapshot()["websites"]
+            for _ in range(2):
+                self.assertIsNone(guard._allowed("https://ab.chatgpt.com"))
+            self.assertEqual(PersistentPolicy(directory).snapshot()["websites"],
+                             sorted(before + ["https://ab.chatgpt.com"]))
+            # Auto-approve switched off between the guard's check and remembering: nothing is granted.
+            value = policy.snapshot()
+            value["auto_approve"]["enabled"] = False
+            policy.replace(value)
+            policy.remember_website("https://cd.chatgpt.com")
+            self.assertNotIn("https://cd.chatgpt.com", PersistentPolicy(directory).snapshot()["websites"])
+
+    def test_allow_all_network_bypasses_whitelist_only_while_internet_is_on(self):
+        policy = Policy([])
+        guard = network._Guard(policy)
+        self.assertIsNotNone(guard._allowed("https://anything.test"))
+        policy.values["allow_all_network"] = True
+        self.assertIsNone(guard._allowed("https://anything.test"))
+        policy.values["internet"] = False
+        self.assertIsNotNone(guard._allowed("https://anything.test"))
 
     def test_reject_non_origins(self):
         for value in ("file:///etc/passwd", "https://user:secret@example.com",
@@ -122,10 +176,82 @@ class OriginTests(unittest.TestCase):
         guard.tls_start_client(tls)
         self.assertIsNone(tls.ssl_conn)
         guard.bad_tls.clear()
-        upgrade = flow("https://example.test/", tls=True)
-        upgrade.request.headers["Upgrade"] = "websocket"
-        guard._check_request(upgrade)
-        self.assertEqual(upgrade.response.status_code, 403)
+        from mitmproxy import http
+        websocket = flow("https://example.test/", tls=True)
+        websocket.request.headers["Upgrade"] = "websocket"
+        guard._check_request(websocket)
+        self.assertIsNone(websocket.response)
+        websocket.response = http.Response.make(101, b"", {"Upgrade": "websocket"})
+        guard.responseheaders(websocket)
+        self.assertEqual(websocket.response.status_code, 101)
+        h2c = flow("https://example.test/", tls=True)
+        h2c.request.headers["Upgrade"] = "h2c"
+        guard._check_request(h2c)
+        self.assertEqual(h2c.response.status_code, 403)
+        unasked = flow("https://example.test/", tls=True)
+        unasked.response = http.Response.make(101, b"", {"Upgrade": "websocket"})
+        guard.responseheaders(unasked)
+        self.assertEqual(unasked.response.status_code, 403)
+
+
+class DependencyTests(unittest.TestCase):
+    def test_served_resources_exclude_navigation_links(self):
+        html = ('<link rel="stylesheet" href="https://assets.test/a.css"><script src="//cdn.test/s.js"></script>'
+                '<img srcset="https://img.test/1x.png 1x, https://img2.test/2x.png 2x">'
+                '<a href="https://elsewhere.test/">x</a><style>@import "https://fonts.test/f.css";</style>'
+                '<img src="/local.png">')
+        self.assertEqual(network.resource_origins(html, "text/html", "https://site.test/page"),
+                         {"https://assets.test", "https://cdn.test", "https://img.test",
+                          "https://img2.test", "https://fonts.test"})
+        self.assertEqual(network.resource_origins("a{background:url('https://bg.test/x.png')}", "text/css",
+                                                  "https://assets.test/a.css"), {"https://bg.test"})
+
+    def test_base_href_resolves_relative_resources(self):
+        html = '<base href="https://assets.test/static/"><script src="app.js"></script><link rel="stylesheet" href="s.css">'
+        self.assertEqual(network.resource_origins(html, "text/html", "https://site.test/page"), {"https://assets.test"})
+
+    def test_compressed_expansion_is_bounded_and_not_learned(self):
+        import gzip
+        import zlib
+        policy = Policy(["https://site.test"])
+        guard = network._Guard(policy)
+        bomb = gzip.compress(b'<script src="https://cdn.test/s.js"></script>' + b" " * (network._LEARN_LIMIT + 1))
+        self.assertLess(len(bomb), network._LEARN_LIMIT)
+        guard._learn("https://site.test", "https://site.test/", "text/html", "gzip", bomb)
+        self.assertEqual(guard.references.get("https://site.test", set()), set())
+        raw = zlib.compressobj(wbits=-15)
+        deflated = raw.compress(b'<img src="https://img.test/a.png">') + raw.flush()
+        guard._learn("https://site.test", "https://site.test/", "text/html", "deflate", deflated)
+        self.assertEqual(guard.references["https://site.test"], {"https://img.test"})
+        guard._learn("https://site.test", "https://site.test/", "text/html", "br", b"\x00")
+        self.assertEqual(guard.references["https://site.test"], {"https://img.test"})
+
+    def test_served_mode_allows_only_learned_origins_of_opted_in_site(self):
+        import gzip
+        policy = Policy(["https://site.test"])
+        policy.values.update(dependencies={}, all_dependencies=[])
+        guard = network._Guard(policy)
+        body = gzip.compress(b'<script src="https://cdn.test/s.js"></script><a href="https://evil.test/">x</a>')
+        guard._learn("https://site.test", "https://site.test/", "text/html", "gzip", body)
+        self.assertIsNotNone(guard._allowed("https://cdn.test"))
+        policy.values["all_dependencies"] = ["https://site.test"]
+        self.assertIsNone(guard._allowed("https://cdn.test"))
+        self.assertIsNotNone(guard._allowed("https://evil.test"))
+
+    def test_header_mode_and_denials_group_under_requesting_site(self):
+        policy = Policy(["https://site.test"])
+        guard = network._Guard(policy)
+        request = flow("http://cdn.test/s.js")
+        request.request.headers["Referer"] = "https://site.test/page"
+        guard._check_request(request)
+        self.assertEqual(request.response.status_code, 403)
+        self.assertEqual(policy.denials[-1], ("website", "http://cdn.test", "Origin is not allowed", "https://site.test"))
+        policy.values["header_dependencies"] = ["https://site.test"]
+        allowed = flow("http://cdn.test/s.js")
+        allowed.request.headers["Referer"] = "https://site.test/page"
+        guard._check_request(allowed)
+        self.assertIsNone(allowed.response)
+        self.assertIsNotNone(guard._allowed("http://cdn.test"))
 
 
 class CredentialTests(unittest.IsolatedAsyncioTestCase):
@@ -312,6 +438,9 @@ class GatewayIntegrationTests(unittest.TestCase):
             protocol_version = "HTTP/1.1"
 
             def do_GET(self):
+                if self.path == "/ws":
+                    self.echo_websocket()
+                    return
                 if self.path == "/download":
                     self.connection.settimeout(5)
                     try:
@@ -343,6 +472,23 @@ class GatewayIntegrationTests(unittest.TestCase):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def echo_websocket(self):
+                accept = base64.b64encode(hashlib.sha1(
+                    self.headers["Sec-WebSocket-Key"].encode() + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+                self.send_response(101)
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", accept.decode())
+                self.end_headers()
+                self.wfile.flush()
+                self.close_connection = True
+                with contextlib.suppress(OSError):
+                    while (head := self.rfile.read(2)) and head[0] & 0x0F != 8:
+                        mask = self.rfile.read(4)
+                        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(self.rfile.read(head[1] & 0x7F)))
+                        self.wfile.write(bytes([0x81, len(payload)]) + payload)
+                        self.wfile.flush()
 
             def do_PUT(self):
                 seen.append((self.path, self.headers.get("Authorization"), self.headers.get("Host")))
@@ -421,6 +567,30 @@ class GatewayIntegrationTests(unittest.TestCase):
         response.close()
         sock.close()
         return result
+
+    def test_websocket_forwards_without_retaining_messages_and_stops_on_revocation(self):
+        authority = f"fixture.test:{self.httpd.server_port}"
+        self.policy.values["websites"] = [f"http://{authority}"]
+        sock = self.open_socket()
+        sock.sendall((f"GET http://{authority}/ws HTTP/1.1\r\nHost: {authority}\r\nUpgrade: websocket\r\n"
+                      "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                      "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            head += sock.recv(1)
+        self.assertIn(b" 101 ", head.split(b"\r\n")[0])
+        for message in (b"one", b"two", b"three"):
+            sock.sendall(bytes([0x81, 0x80 | len(message)]) + b"\0\0\0\0" + message)
+            self.assertEqual(sock.recv(2 + len(message)), bytes([0x81, len(message)]) + message)
+        flows = [flow for flow, _ in self.gateway._master.addons.get("_guard").active.values()]
+        self.assertEqual([len(flow.websocket.messages) for flow in flows], [0])
+        self.revoke("websites")
+        with contextlib.suppress(OSError):
+            sock.sendall(bytes([0x81, 0x80 | 5]) + b"\0\0\0\0" + b"after")
+        received = b""
+        while chunk := sock.recv(64):
+            received += chunk
+        self.assertNotIn(b"after", received, "WebSocket kept forwarding after revocation")
 
     def connect_status(self, authority):
         with socket.socket(socket.AF_UNIX) as sock:
@@ -661,8 +831,8 @@ class GatewayIntegrationTests(unittest.TestCase):
         self.policy.values["websites"] = [site]
         self.assertEqual(self.request(path="/sub/path")[0], 200)
         self.assertEqual(self.request(path="/redirect")[0], 302)
-        self.assertEqual(self.connect_status("blocked.test:443"), 403)
-        self.assertEqual(self.policy.denials[-1][1], "https://blocked.test")
+        # Unapproved HTTPS is denied per request after TLS (to see its requesting site); CONNECT never reaches upstream.
+        self.assertEqual(self.connect_status("blocked.test:443"), 200)
         self.assertEqual(self.request(host="blocked.test")[0], 403)
         self.policy.values["internet"] = False
         self.assertEqual(self.request()[0], 403)

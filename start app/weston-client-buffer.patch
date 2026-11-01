@@ -1,0 +1,11 @@
+--- a/frontend/main.c
++++ b/frontend/main.c
+@@ -5353,6 +5353,8 @@
+ 		weston_log("fatal: failed to create display\n");
+ 		goto out_display;
+ 	}
++	/* A briefly busy OMBP plus fast mouse input overflows libwayland's 4 KiB default; ring buffers grow on demand. */
++	wl_display_set_default_max_buffer_size(display, 16 * 1024 * 1024);
+ 
+ 	loop = wl_display_get_event_loop(display);
+ 	signals[0] = wl_event_loop_add_signal(loop, SIGTERM, on_term_signal,

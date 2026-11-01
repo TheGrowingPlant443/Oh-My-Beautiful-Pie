@@ -16,6 +16,9 @@ class ControlTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.policy = Policy(Path(self.temp.name) / "state")
         self.runtime = Runtime(self.policy)
+        offline = self.policy.snapshot()
+        offline["internet"] = False
+        self.policy.replace(offline)
         self.addCleanup(self.runtime.stop)
         self.server = Server(self.policy, self.runtime)
         self.valid_policy = self.policy.snapshot()
@@ -72,6 +75,21 @@ class ControlTests(unittest.TestCase):
             status, body = self.request("GET", path)
             self.assertEqual(status, 404)
             self.assertNotIn(b"https://example.com", body)
+
+    def test_catalog_folders_and_history_clear_require_same_origin_authentication(self):
+        self.policy.deny("website", "https://denied.example", "not allowed")
+        for headers in ({}, {"Authorization": f"Bearer {self.server.token}", "Origin": "https://evil.example"}):
+            self.assertEqual(self.request("GET", "/api/catalog", headers=headers)[0], 403)
+            self.assertEqual(self.request("GET", "/api/folders?q=x", headers=headers)[0], 403)
+            self.assertEqual(self.request("POST", "/api/history/clear", "{}", headers)[0], 403)
+        self.assertEqual(self.policy.events()[0]["target"], "https://denied.example")
+        headers = {"Authorization": f"Bearer {self.server.token}"}
+        self.assertEqual(self.request("GET", "/api/catalog", headers=headers)[0], 200)
+        self.assertEqual(self.request("GET", "/api/folders?q=a%2Fb", headers=headers), (200, b"[]"))
+        before = self.policy.snapshot()
+        self.assertEqual(self.request("POST", "/api/history/clear", "{}", headers)[0], 200)
+        self.assertEqual(Policy(self.policy.directory).events(), [])
+        self.assertEqual(self.policy.snapshot(), before)
 
 
 if __name__ == "__main__":
