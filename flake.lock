@@ -223,11 +223,11 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1793634722,
-        "narHash": "sha256-PANModdqikpy/vrcZm7L+zRN2YvpjOq83KGJj7hnA0E=",
+        "lastModified": 1793637811,
+        "narHash": "sha256-quYSuk8U+vUGWw0Lf5q2j69eL7wdsSaEBZMFiXAnDCE=",
         "owner": "TheGrowingPlant443",
         "repo": "oh-my-striped-pi",
-        "rev": "8d6ef081de79601a65024271f185199fb9e04d5a",
+        "rev": "72a7980f63e77560c647e62436ecdfc25687e524",
         "type": "github"
       },
       "original": {
