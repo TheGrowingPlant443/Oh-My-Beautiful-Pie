@@ -614,6 +614,18 @@ class AccessFSTests(unittest.TestCase):
         self.fs._resolve_closure = resolver
         self.assertTrue(self.read(path).startswith(b"#!/bin/sh"))
 
+    def test_missing_store_metadata_is_not_found_but_existing_unapproved_files_stay_denied(self):
+        path = "/store/package.json"
+        for operation in (self.fs.getattr, self.read):
+            with self.assertRaises(OSError) as error:
+                operation(path)
+            self.assertEqual(error.exception.errno, errno.ENOENT)
+        (self.store / "package.json").write_text('{"type":"module"}')
+        for operation in (self.fs.getattr, self.read):
+            with self.assertRaises(OSError) as error:
+                operation(path)
+            self.assertEqual(error.exception.errno, errno.EACCES)
+
     def test_store_root_membership_does_not_match_a_prefix(self):
         other = self.store / (self.base.name + "-other")
         other.mkdir()

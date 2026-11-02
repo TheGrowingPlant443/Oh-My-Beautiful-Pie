@@ -69,6 +69,8 @@
           gnutar gzip bzip2 xz zstd unzip zip curl wget jq ripgrep fd rsync tree gnumake bc strace lsof
           # zenity: OMBP's file/folder pickers fall back to it without a desktop portal.
           ncurses libnotify dialog
+          marksman emmet-language-server typescript-language-server typescript
+          vscode-langservers-extracted nil nixd jdt-language-server
         ];
         pathsToLink = [ "/bin" ];
       };

@@ -205,7 +205,13 @@ class AccessFS(Operations):
         raise FuseOSError(errno.EACCES)
 
     def _store_entry(self, target, write, snapshot):
-        if _store_root(target) not in self._roots(snapshot):
+        root = _store_root(target)
+        if root not in self._roots(snapshot):
+            # Node searches parent directories for optional package metadata; absence is not a denied grant.
+            try:
+                os.lstat(root)
+            except FileNotFoundError:
+                raise FuseOSError(errno.ENOENT) from None
             if "/bin/" in target and self._unapproved_executable(target):
                 self._deny("program", target, "Nix executable is not approved")
             raise FuseOSError(errno.EACCES)
