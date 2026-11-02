@@ -65,12 +65,13 @@ def bundles(executable, gpu, resolve_closure):
             entries.append(("bundled-" + package, "OMBP bundled " + package, path))
     python = os.environ.get("START_APP_PYTHON", sys.executable)
     dbus = os.environ.get("START_APP_DBUS")
-    # Bin directories expose python/python3 and dbus-daemon under /allowed-programs, not only the entrypoints.
+    shell = os.environ.get("START_APP_SHELL")
+    # Bin directories expose python/python3, dbus-daemon and sh/bash under /allowed-programs, not only the entrypoints.
     entries.extend((
         ("sandbox-python", "Sandbox Python", str(Path(python).parent)),
         ("sandbox-dbus", "Private D-Bus", dbus and str(Path(dbus).parent)),
         ("sandbox-keyring", "Private keyring", os.environ.get("START_APP_KEYRING")),
-        ("sandbox-shell", "Sandbox shell", os.environ.get("START_APP_SHELL")),
+        ("sandbox-shell", "Sandbox shell (sh, bash)", shell and str(Path(shell).parent)),
         ("sandbox-coreutils", "Sandbox core utilities", os.environ.get("START_APP_COREUTILS")),
         ("sandbox-fonts", "Sandbox fonts", os.environ.get("START_APP_FONTCONFIG")),
         ("sandbox-tools", "Basic tools (gdbus, ps/pgrep/pkill, grep, sed, find, curl, jq, rg…)",

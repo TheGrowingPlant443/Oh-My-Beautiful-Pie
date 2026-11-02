@@ -47,13 +47,28 @@
           ln -s "$out/libexec/ombp-browser" "$out/bin/$name"
         done
       '';
+      # rfd's Zenity fallback drops the directory; start unspecified sandbox pickers at the host gateway.
+      dialog = pkgs.writeShellScriptBin "zenity" ''
+        file_selection=false
+        for arg in "$@"; do
+          case "$arg" in
+            --file-selection) file_selection=true ;;
+            --filename|--filename=*) exec ${pkgs.zenity}/bin/zenity "$@" ;;
+          esac
+        done
+        if "$file_selection"; then
+          exec ${pkgs.zenity}/bin/zenity --filename=/host/ "$@"
+        fi
+        exec ${pkgs.zenity}/bin/zenity "$@"
+      '';
       # Everyday CLI tools for the AI inside the sandbox; files and network still pass the gateways.
       tools = pkgs.buildEnv {
         name = "ombp-sandbox-tools";
         paths = with pkgs; [
           glib.bin procps psmisc util-linux findutils gnugrep gnused gawk diffutils patch file which less
           gnutar gzip bzip2 xz zstd unzip zip curl wget jq ripgrep fd rsync tree gnumake bc strace lsof
-          ncurses libnotify
+          # zenity: OMBP's file/folder pickers fall back to it without a desktop portal.
+          ncurses libnotify dialog
         ];
         pathsToLink = [ "/bin" ];
       };
