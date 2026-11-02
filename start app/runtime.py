@@ -288,6 +288,7 @@ class Runtime:
                "SSL_CERT_FILE": TRUST_CA, "NODE_EXTRA_CA_CERTS": TRUST_CA,
                "REQUESTS_CA_BUNDLE": TRUST_CA, "CURL_CA_BUNDLE": TRUST_CA,
                "OMP_BIN": "/launcher/omp", "OMBP_AGENT": agent,
+               "OMBP_GIT_DISCOVERY_HOME": "/host" + str(Path.home()),
                "START_APP_KEYRING": keyring, "SHELL": shell, "FONTCONFIG_FILE": fonts,
                "GDK_BACKEND": "wayland", "NIXOS_OZONE_WL": "1"}
         browsers = base["tool-chrome"]["programs"]

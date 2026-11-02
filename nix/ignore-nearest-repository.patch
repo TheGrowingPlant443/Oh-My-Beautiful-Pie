@@ -1,0 +1,35 @@
+--- a/src/dir.rs
++++ b/src/dir.rs
+@@ -215,10 +215,30 @@
+                 return (self.clone(), None);
+             }
+         };
+-        // List of parents, from child to root.
++        // OMBP: discover the nearest repository before loading inherited rules.
++        // A sandbox supplies its mirrored host home; ordinary launches use HOME.
++        let ceiling = ["OMBP_GIT_DISCOVERY_HOME", "HOME", "USERPROFILE"]
++            .into_iter()
++            .filter_map(std::env::var_os)
++            .map(PathBuf::from)
++            .filter(|home| home.is_absolute() && absolute_base.starts_with(home))
++            .max_by_key(|home| home.components().count())
++            .unwrap_or_else(|| absolute_base.as_ref().clone());
+         let mut parents = vec![];
+         let mut path = &**absolute_base;
+-        while let Some(parent) = path.parent() {
++        loop {
++            let marker = path.join(".git");
++            match fs::symlink_metadata(&marker) {
++                Ok(_) => break, // Directories and worktree files both mark repositories.
++                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
++                Err(err) => {
++                    return (self.clone(), Some(Error::Io(err).with_path(marker)));
++                }
++            }
++            if path == ceiling {
++                break;
++            }
++            let Some(parent) = path.parent() else { break };
+             parents.push(parent);
+             path = parent;
+         }

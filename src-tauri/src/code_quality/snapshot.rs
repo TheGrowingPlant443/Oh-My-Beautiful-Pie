@@ -717,6 +717,84 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "requires the Nix-patched ignore dependency; run with the vendored Nix environment"]
+    fn snapshots_stop_ancestor_rules_at_the_nearest_repository_or_home() {
+        if let Some(home) = std::env::var_os("OMBP_TEST_DISCOVERY_HOME") {
+            let home = PathBuf::from(home);
+            let files = |folder: &Path| {
+                list_source_files(folder, &[], None, 100, &RunControl::silent())
+                    .unwrap()
+                    .paths
+            };
+            let repo = home.join("repo");
+            let listed = files(&repo);
+            assert!(listed.contains(&repo.join("keep.txt")));
+            assert!(!listed.contains(&repo.join("local.txt")));
+            let sub = repo.join("sub");
+            let listed = files(&sub);
+            assert!(listed.contains(&sub.join("inherited.txt")));
+            assert!(!listed.contains(&sub.join("nested.txt")));
+            assert!(!listed.contains(&sub.join("excluded.txt")));
+            let loose = home.join("loose/sub");
+            let listed = files(&loose);
+            assert!(listed.contains(&loose.join("keep.txt")));
+            assert!(!listed.contains(&loose.join("ignored.txt")));
+            let worktree = home.join("worktree");
+            assert!(files(&worktree).contains(&worktree.join("keep.txt")));
+            return;
+        }
+        let t = Temp::new();
+        let home = t.0.join("home");
+        let repo = home.join("repo");
+        fs::create_dir_all(repo.join(".git/info")).unwrap();
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        fs::create_dir_all(home.join("loose/sub")).unwrap();
+        fs::create_dir_all(home.join("worktree")).unwrap();
+        fs::create_dir_all(home.join("metadata")).unwrap();
+        fs::write(t.0.join(".ignore"), "keep.txt\n").unwrap();
+        fs::write(home.join(".ignore"), "repo/keep.txt\nworktree/keep.txt\n").unwrap();
+        fs::write(home.join(".gitignore"), "loose/sub/ignored.txt\n").unwrap();
+        fs::write(repo.join(".gitignore"), "local.txt\nsub/inherited.txt\n").unwrap();
+        fs::write(repo.join(".git/info/exclude"), "sub/excluded.txt\n").unwrap();
+        fs::write(repo.join("sub/.gitignore"), "!inherited.txt\nnested.txt\n").unwrap();
+        fs::write(
+            home.join("worktree/.git"),
+            format!("gitdir: {}\n", home.join("metadata").display()),
+        )
+        .unwrap();
+        for name in [
+            "repo/keep.txt",
+            "repo/local.txt",
+            "repo/sub/inherited.txt",
+            "repo/sub/nested.txt",
+            "repo/sub/excluded.txt",
+            "loose/sub/keep.txt",
+            "loose/sub/ignored.txt",
+            "worktree/keep.txt",
+        ] {
+            fs::write(home.join(name), "source").unwrap();
+        }
+        // Isolate the home boundary from parallel tests without mutating this process's environment.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "code_quality::snapshot::tests::snapshots_stop_ancestor_rules_at_the_nearest_repository_or_home",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OMBP_TEST_DISCOVERY_HOME", &home)
+            .env("OMBP_GIT_DISCOVERY_HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
     fn snapshot_honors_ignores_untracked_unicode_and_is_deterministic() {
         let t = Temp::new();
         let source = t.0.join("source æ folder");
