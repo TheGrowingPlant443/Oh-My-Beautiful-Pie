@@ -9,6 +9,7 @@ import {
 } from './omp-project-insight.mjs';
 import { formatVisualizationResult, technicalMarker } from './omp-system-results.mjs';
 import { readTargetStructure, systemOverviewInspect } from './omp-source-snapshot.mjs';
+import { markdownLike } from './omp-structure-sources.mjs';
 
 const actor = { instanceId: 'architect-fixture', generation: 7, launchId: 'launch-fixture', sessionId: 'session-fixture' };
 const sha = value => createHash('sha256').update(value).digest('hex');
@@ -439,6 +440,8 @@ test('a proposed structure requires the admitted source identity and valid, coll
     rejects(() => saveRepositoryStructure(fixture.dir, proposed(fixture), actor), /baseRequestId must be/);
     rejects(() => saveRepositoryStructure(fixture.dir, { ...good, sourceHash: sha('other') }, actor), /sourceHash must be/);
     rejects(() => saveRepositoryStructure(fixture.dir, { ...good, sourceId: null }, actor), /sourceId must be/);
+    rejects(() => saveRepositoryStructure(fixture.dir, { ...good, supersedesRequestId: null }, actor), /supersedesRequestId must be/);
+    rejects(() => saveRepositoryStructure(fixture.dir, { ...good, sourceId: 'other', sourceHash: sha('other'), entries: [] }, actor), /sourceId must be "source-1"/);
     saveRepositoryStructure(fixture.dir, good, actor);
     const saved = resultOf(fixture);
     assert.equal(saved.kind, 'structureProposed');
@@ -516,6 +519,12 @@ test('visualization tools register with strict schemas, resolve the producer fro
   } finally { cleanup(fixture); }
 });
 
+const assertVisualizationUnsent = async (promise, reason) => {
+  const receipt = await promise;
+  assert.equal(receipt.admitted, false);
+  assert.match(receipt.error.message, reason);
+};
+
 test('project_visualization_prompt admits one guarded native follow-up per request and never resends', async () => {
   const fixture = setup();
   try {
@@ -527,11 +536,11 @@ test('project_visualization_prompt admits one guarded native follow-up per reque
     });
     const ctx = { ok: true, agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
     const payload = { requestId: fixture.requestId, kind: 'systemOverview', message: 'Analyze the system.', source: 'human', generation: 7 };
-    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, duplicate: false });
+    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, admitted: true, duplicate: false });
     assert.equal(sent.length, 1);
     assert.match(sent[0], /^Analyze the system\.\n\n\[omp-visualization-request id=/);
     assert.equal(control.guard.states()[0].state, 'pending');
-    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, duplicate: true });
+    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, admitted: true, duplicate: true });
     assert.equal(sent.length, 1);
     // The turn that carries the prompt activates the guard through the native before_agent_start hook.
     handlers.get('before_agent_start')({ prompt: sent[0] }, ctx);
@@ -552,22 +561,22 @@ test('project_visualization_prompt rejects invalid, mismatched, wrong-producer a
     });
     const ctx = { ok: true, agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
     const good = { requestId: fixture.requestId, kind: 'systemOverview', message: 'Analyze.' };
-    await assert.rejects(control.promptVisualization(ctx, { ...good, kind: 'security' }), /invalid visualization prompt/);
-    await assert.rejects(control.promptVisualization(ctx, { ...good, kind: 'structureCurrent' }), /not a structureCurrent request/);
-    await assert.rejects(control.promptVisualization(ctx, { ...good, requestId: 'not-a-uuid' }), /invalid request id/);
-    await assert.rejects(control.promptVisualization(ctx, { ...good, message: '   ' }), /message must be/);
-    await assert.rejects(control.promptVisualization(ctx, { ...good, message: 'x'.repeat(64 * 1024 + 1) }), /message must be/);
-    await assert.rejects(control.promptVisualization({ ...ctx, ok: false }, good), /Architect identity unavailable/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, kind: 'security' }), /invalid visualization prompt/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, kind: 'structureCurrent' }), /not a structureCurrent request/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, requestId: 'not-a-uuid' }), /invalid request id/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, message: '   ' }), /message must be/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, message: 'x'.repeat(64 * 1024 + 1) }), /message must be/);
+    await assertVisualizationUnsent(control.promptVisualization({ ...ctx, ok: false }, good), /Architect identity unavailable/);
     assert.equal(sent.length, 0);
     refuse.value = true;
-    await assert.rejects(control.promptVisualization(ctx, good), /native refused/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, good), /native refused/);
     assert.equal(control.guard.states().length, 0, 'a refused prompt leaves no guard behind');
     refuse.value = false;
-    assert.deepEqual(await control.promptVisualization(ctx, good), { accepted: true, duplicate: false });
+    assert.deepEqual(await control.promptVisualization(ctx, good), { accepted: true, admitted: true, duplicate: false });
     writeFileSync(path.join(fixture.folder, 'terminal.json'), JSON.stringify({ status: 'error', message: 'ended' }));
-    await assert.rejects(control.promptVisualization(ctx, { ...good, requestId: fixture.requestId }), /already ended/);
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...good, requestId: fixture.requestId }), /already ended/);
     const bare = registerProjectInsightTools(pi, fixture.dir, () => actor);
-    await assert.rejects(bare.promptVisualization(ctx, good), /native_prompt_unavailable/);
+    await assertVisualizationUnsent(bare.promptVisualization(ctx, good), /native_prompt_unavailable/);
   } finally { cleanup(fixture); }
 });
 
@@ -641,6 +650,11 @@ test('helicopter rules: evidence, journeys, containment, capabilities, enums and
     bad(payload => { payload.nodes[1].parentId = 'ghost'; }, /unknown parent/);
     bad(payload => { payload.nodes[2].parentId = 'booking'; }, /cannot contain itself/);
     bad(payload => { payload.nodes[2].parentId = 'inner'; payload.nodes.push({ id: 'inner', kind: 'businessGroup', label: 'Inner', parentId: 'booking', description: '', evidenceIds: [] }); }, /containment cycle/);
+    bad(payload => {
+      payload.nodes[2].parentId = 'inner';
+      payload.nodes.push({ id: 'inner', kind: 'businessGroup', label: 'Inner', parentId: 'booking', description: '', evidenceIds: [] });
+      payload.nodes[6].parentId = 'ghost';
+    }, /node "pay" has unknown parent "ghost"/);
     bad(payload => { payload.edges[0].targetId = 'ghost'; }, /dangling target/);
     bad(payload => { payload.edges[0].targetId = 'booking'; }, /containment is never a flow/);
     bad(payload => { payload.edges[0].sourceId = 'booking'; }, /containment is never a flow/);
@@ -693,14 +707,48 @@ test('helicopter business text stays plain language: code, paths, identifiers, U
 });
 
 test('technicalMarker agrees with the backend on what counts as code or a path', () => {
-  for (const ok of ['Pay and/or refund', '24/7 support', 'Customer (or clinic) cancels', 'Cancel the visit(s)', 'Version 4.5 is announced.', 'e.g. a late cancellation', "Wait for the clinic's reply, then continue."]) {
+  for (const ok of ['Pay and/or refund', '24/7 support', 'Customer (or clinic) cancels', 'Cancel the visit(s)', 'Version 4.5 is announced.', 'e.g. a late cancellation', "Wait for the clinic's reply, then continue.", '[24/7]', '"and/or,"', 'rate/4.5', '_optional', 'optional_']) {
     assert.equal(technicalMarker(ok), null, ok);
   }
   for (const [bad, kind] of [
     ['C:\\data\\orders.csv', 'a file path'], ['open ./config/app', 'a file path'], ['src/booking', 'a file path'], ['see notes/readme.md', 'a file path'],
     ['handlers/order.ts is used', 'a file path'], ['start main.py', 'a source file name'], ['uses a => b', 'code syntax'], ['Order::new', 'code syntax'],
     ['order_total', 'a code identifier'], ['call `run`', 'inline code'],
+    ['[src/booking],', 'a file path'], ['"MAIN.PY!"', 'a source file name'], ['notes/data.a1', 'a file path'],
+    ['résumé_total', 'a code identifier'], ['order_total => result', 'code syntax'], ['src/app.ts and `run`', 'inline code'],
   ]) assert.equal(technicalMarker(bad), kind, bad);
+  assert.equal(technicalMarker('Business' + '.'.repeat(32768) + 'text'), null);
+  assert.equal(technicalMarker('.'.repeat(32768) + 'src/app.ts' + '!'.repeat(32768)), 'a file path');
+});
+
+test('fenced structure discovery keeps delimiter lengths, comments and native tree markers', () => {
+  for (const value of [
+    '   ~~~~text\nsrc/a/ # core\nREADME.md\n   ~~~~~` \t\n',
+    '```\n  |-- src\n```',
+    '~~~\n|  branch\n~~~',
+    '~~~\n|\n  branch\n~~~',
+    '````\n```\nsrc/\nlib/\n',
+    '```\n```\nsrc/\nlib/\n',
+    '```\ntext\n```\n~~~\nREADME.md\nconfig.toml\n~~~',
+    '\r```\nsrc/\nlib/\n```',
+    '```\n./\n../\n```',
+    '```\na//b // comment\n/a/b/ — comment\n```',
+  ]) assert.equal(markdownLike(value), true, value);
+  for (const value of [
+    '    ```\nsrc/\nlib/\n    ```',
+    '```\nsrc/\n```',
+    '```',
+    '```js\nconst a = 1;\nfoo(a);\n```',
+    '```text\nfolder.abcdefghi\none/\n```',
+    '```text\nREADME.md note\none/\n```',
+    '~~~\nnotes\n~~~\nsrc/\nlib/\n',
+  ]) assert.equal(markdownLike(value), false, value);
+});
+
+test('structure discovery scans long whitespace and rejects incomplete path lines without truncating them', () => {
+  assert.equal(markdownLike('```\n' + ' \n'.repeat(32768)), false);
+  assert.equal(markdownLike('```\n' + 'a/'.repeat(16384) + '!\nsecond/\n```'), false);
+  assert.equal(markdownLike('`'.repeat(32768) + '\nsrc/\nlib/\n```'), true);
 });
 
 test('submit_helicopter is a registered strict tool bound to the producer and its own kind, and announces the saved view', async () => {
@@ -748,6 +796,77 @@ test('replay formatting is exhaustive per kind: an unknown kind fails closed ins
   assert.match(withHelicopter, /Helicopter view[\s\S]*Purpose: P[\s\S]*Limitations:\n {2}- Only configuration was readable\./);
 });
 
+test('system replay keeps section boundaries, label resolution and the 80-row limit', () => {
+  const result = {
+    snapshotId: 'snapshot', limitations: [],
+    nodes: Array.from({ length: 81 }, (_, index) => ({ id: `node-${index}`, kind: 'service', label: `Service ${index}`, parentId: index === 0 ? 'node-80' : null })),
+    edges: Array.from({ length: 81 }, (_, index) => ({ sourceId: `node-${index}`, targetId: 'node-80', relation: 'reads', certainty: ['declared', 'inferred', 'unknown'][index % 3], label: index === 0 ? '' : `lookup ${index}` })),
+    coverage: Array.from({ length: 81 }, (_, index) => ({ area: `Area ${index}`, status: 'unresolved', notes: index === 0 ? '' : 'outside scope' })),
+  };
+  const replay = formatVisualizationResult({ kind: 'systemOverview', folder: '/repo' }, result);
+  const [header, elements, relationships, coverage, limitations] = replay.split('\n\n');
+  assert.match(header, /Source snapshot: snapshot$/);
+  for (const section of [elements, relationships, coverage]) {
+    assert.equal(section.split('\n').filter(line => line.startsWith('  - ')).length, 80);
+    assert.ok(section.endsWith('  ... 1 more in the saved result'));
+  }
+  assert.match(elements, /\n  - \[service\] Service 0 \(in Service 80\)\n/);
+  assert.match(elements, /\n  - \[service\] Service 79\n/);
+  assert.doesNotMatch(elements, /\n  - \[service\] Service 80/);
+  assert.match(relationships, /\n  - Service 0 -reads-> Service 80 \[declared\]\n/);
+  assert.match(relationships, /\n  - Service 1 -reads-> Service 80 \[inferred\]: lookup 1\n/);
+  assert.match(relationships, /\n  - Service 2 -reads-> Service 80 \[unknown\]: lookup 2\n/);
+  assert.doesNotMatch(relationships, /\n  - Service 80 -reads/);
+  assert.match(coverage, /\n  - Area 0: unresolved\n  - Area 1: unresolved - outside scope\n/);
+  assert.doesNotMatch(coverage, /\n  - Area 80:/);
+  assert.match(limitations, /^Limitations:\n  - /);
+});
+
+test('helicopter replay uses business kinds and bounds capability rows without losing descriptions', () => {
+  const result = helicopter({ requestId: 'request', snapshotId: 'snapshot' });
+  result.capabilities = Array.from({ length: 81 }, (_, index) => ({ label: `Capability ${index}`, description: index === 0 ? '' : 'Available' }));
+  const replay = formatVisualizationResult({ kind: 'helicopter', folder: '/repo' }, result);
+  assert.match(replay, /\n\nPurpose: Lets customers/);
+  assert.match(replay, /\n  - \[who\] Customer\n/);
+  assert.match(replay, /\n  - \[starts when\] Customer asks for an appointment \(in Booking an appointment\)\n/);
+  assert.match(replay, /\n  - \[outside party\] Payment provider\n\nFlow/);
+  assert.match(replay, /\n\nBusiness capabilities \(81\):\n  - Capability 0\n  - Capability 1: Available\n/);
+  assert.match(replay, /\n  - Capability 79: Available\n  \.\.\. 1 more in the saved result\n\nCoverage/);
+  assert.doesNotMatch(replay, /\n  - Capability 80:/);
+});
+
+test('structure replay keeps path precedence, proposal directions, conflicts and section limits', () => {
+  const result = proposed({ requestId: 'request', snapshotId: 'snapshot' });
+  result.entries = Array.from({ length: 81 }, (_, index) => ({ label: `Group ${index}`, path: index === 0 ? 'src/core' : null, pattern: index < 2 ? '*.toml' : null, purpose: `Purpose ${index}` }));
+  result.conventions = Array.from({ length: 81 }, (_, index) => ({ scope: `Scope ${index}`, current: `Current ${index}`, proposed: index === 0 ? null : `Proposed ${index}` }));
+  result.mappings = [
+    { operation: 'create', fromPaths: [], toPaths: ['new'] },
+    { operation: 'remove', fromPaths: ['old'], toPaths: [] },
+    ...Array.from({ length: 79 }, (_, index) => ({ operation: 'move', fromPaths: [`old-${index}`], toPaths: [`new-${index}`] })),
+  ];
+  result.conflicts = Array.from({ length: 81 }, (_, index) => `Conflict ${index}`);
+  const replay = formatVisualizationResult({ kind: 'structureProposed', folder: '/repo' }, result);
+  const [header, groups, conventions, mappings, conflicts] = replay.split('\n\n');
+  assert.ok(header.includes(`Target document: source-1 (sha256 ${sha(TARGET)})`));
+  for (const section of [groups, conventions, mappings]) {
+    assert.equal(section.split('\n').filter(line => line.startsWith('  - ')).length, 80);
+    assert.ok(section.endsWith('  ... 1 more in the saved result'));
+  }
+  assert.match(groups, /\n  - Group 0 \(src\/core\): Purpose 0\n  - Group 1 \(\*\.toml\): Purpose 1\n/);
+  assert.match(groups, /\n  - Group 79: Purpose 79\n/);
+  assert.doesNotMatch(groups, /\n  - Group 80/);
+  assert.match(conventions, /\n  - Scope 0: Current 0\n  - Scope 1: Current 1 -> Proposed 1\n/);
+  assert.doesNotMatch(conventions, /\n  - Scope 80:/);
+  assert.match(mappings, /\n  - create: \(none\) -> new\n  - remove: old -> \(none\)\n/);
+  assert.match(mappings, /\n  - move: old-77 -> new-77\n/);
+  assert.doesNotMatch(mappings, /old-78/);
+  assert.match(conflicts, /^Target document conflicts:\n  - Conflict 0\n/);
+  assert.ok(conflicts.endsWith('  - Conflict 80'));
+  const current = formatVisualizationResult({ kind: 'structureCurrent', folder: '/repo' }, structure({ requestId: 'request', snapshotId: 'snapshot' }));
+  assert.match(current, /\n  - Infrastructure files \(\*\.yml\): Deployment config\n\nConventions/);
+  assert.doesNotMatch(current, /Target document:|Mappings \(|Target document conflicts:/);
+});
+
 test('project_visualization_prompt admits a helicopter request in the existing Architect session; its guard allows only its own submitter', async () => {
   const fixture = setup('helicopter');
   try {
@@ -760,11 +879,11 @@ test('project_visualization_prompt admits a helicopter request in the existing A
     const ctx = { ok: true, agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
     const payload = { requestId: fixture.requestId, kind: 'helicopter', message: 'Describe the business.', source: 'human', generation: 7 };
     // A System request id cannot be admitted as a helicopter prompt (and the reverse), so the kinds never share an admission.
-    await assert.rejects(control.promptVisualization(ctx, { ...payload, kind: 'systemOverview' }), /not a systemOverview request/);
-    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, duplicate: false });
+    await assertVisualizationUnsent(control.promptVisualization(ctx, { ...payload, kind: 'systemOverview' }), /not a systemOverview request/);
+    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, admitted: true, duplicate: false });
     assert.equal(sent.length, 1);
     assert.match(sent[0], /^Describe the business\.\n\n\[omp-visualization-request id=/);
-    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, duplicate: true });
+    assert.deepEqual(await control.promptVisualization(ctx, payload), { accepted: true, admitted: true, duplicate: true });
     assert.equal(sent.length, 1);
     handlers.get('before_agent_start')({ prompt: sent[0] }, ctx);
     assert.equal(control.guard.states()[0].kind, 'helicopter');
@@ -777,5 +896,93 @@ test('project_visualization_prompt admits a helicopter request in the existing A
     assert.equal(handlers.get('tool_call')({ toolName: 'submit_helicopter', input: { requestId: fixture.requestId } }, ctx), undefined);
     handlers.get('tool_result')({ toolName: 'submit_helicopter', input: { requestId: fixture.requestId }, isError: false }, ctx);
     assert.equal(control.guard.states()[0].state, 'submitted');
+  } finally { cleanup(fixture); }
+});
+
+test('concurrent visualization controls share the one native admission, including a delayed refusal', async () => {
+  for (const refused of [false, true]) {
+    const fixture = setup();
+    try {
+      const boundary = Promise.withResolvers();
+      let submits = 0;
+      const pi = { registerTool() {}, zod: new Proxy({}, { get: () => () => ({ optional() { return this; }, nullable() { return this; } }) }), on() {} };
+      const control = registerProjectInsightTools(pi, fixture.dir, () => actor, undefined, {
+        async submitPrompt(_message, callbacks) {
+          submits++;
+          await boundary.promise;
+          if (refused) throw new Error('native refused before admission');
+          callbacks.onPromptAdmitted();
+        },
+      });
+      const ctx = { agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
+      const payload = { requestId: fixture.requestId, kind: 'systemOverview', message: 'Analyze.' };
+      const first = control.promptVisualization(ctx, payload);
+      const second = control.promptVisualization(ctx, payload);
+      assert.equal(submits, 1);
+      boundary.resolve();
+      const receipts = await Promise.all([first, second]);
+      assert.equal(receipts[0].admitted, !refused);
+      assert.equal(receipts[1].admitted, !refused);
+      assert.equal(submits, 1, 'no retry is hidden in duplicate handling');
+      assert.equal(control.guard.states().length, refused ? 0 : 1);
+    } finally { cleanup(fixture); }
+  }
+});
+
+test('an accepted native failure becomes a durable request error without replacing an already saved result', async () => {
+  for (const completed of [false, true]) {
+    const fixture = setup();
+    try {
+      const running = Promise.withResolvers();
+      let attempts = 0;
+      const pi = { registerTool() {}, zod: new Proxy({}, { get: () => () => ({ optional() { return this; }, nullable() { return this; } }) }), on() {} };
+      const control = registerProjectInsightTools(pi, fixture.dir, () => actor, undefined, { submitPrompt(_message, callbacks) { attempts++; callbacks.onPromptAdmitted(); return attempts === 1 ? running.promise : new Promise(() => {}); } });
+      const ctx = { agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId } };
+      const receipt = await control.promptVisualization(ctx, { requestId: fixture.requestId, kind: 'systemOverview', message: 'Analyze.' });
+      assert.equal(receipt.admitted, true);
+      if (completed) writeFileSync(path.join(fixture.folder, 'result.json'), 'saved-result-must-not-change');
+      running.reject(new Error('No credential is configured for the selected model'));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(attempts, 1);
+      if (completed) {
+        assert.equal(readFileSync(path.join(fixture.folder, 'result.json'), 'utf8'), 'saved-result-must-not-change');
+        assert.equal(existsSync(path.join(fixture.folder, 'terminal.json')), false);
+      } else {
+        const terminal = JSON.parse(readFileSync(path.join(fixture.folder, 'terminal.json'), 'utf8'));
+        assert.equal(terminal.code, 'native_prompt_failed');
+        assert.match(terminal.message, /No credential/);
+      }
+      assert.deepEqual(control.guard.states(), []);
+      if (!completed) {
+        const nextId = randomUUID(), nextFolder = path.join(fixture.root, 'project-insight', nextId);
+        mkdirSync(nextFolder);
+        writeFileSync(path.join(nextFolder, 'request.json'), JSON.stringify({ ...fixture.request, requestId: nextId, kind: 'helicopter' }));
+        writeFileSync(path.join(nextFolder, 'index-ref.json'), readFileSync(path.join(fixture.folder, 'index-ref.json')));
+        assert.equal((await control.promptVisualization(ctx, { requestId: nextId, kind: 'helicopter', message: 'Generate a business helicopter view instead.' })).admitted, true, 'a different analysis is admitted without restarting the native session');
+        assert.equal(attempts, 2);
+      }
+    } finally { cleanup(fixture); }
+  }
+});
+
+test('a cancelled queued visualization records incompleteness only at the native quiescent guard boundary', async () => {
+  const fixture = setup();
+  try {
+    const handlers = new Map(), timers = [];
+    let idle = false;
+    const pi = { registerTool() {}, zod: new Proxy({}, { get: () => () => ({ optional() { return this; }, nullable() { return this; } }) }),
+      on(name, handler) { if (!handlers.has(name)) handlers.set(name, []); handlers.get(name).push(handler); } };
+    const control = registerProjectInsightTools(pi, fixture.dir, () => actor, undefined, { submitPrompt(_message, callbacks) { callbacks.onPromptAdmitted(); return new Promise(() => {}); } });
+    const ctx = { agent: { kind: 'main' }, sessionManager: { getSessionId: () => actor.sessionId }, isIdle: () => idle, hasPendingMessages: () => false, setTimeout: callback => timers.push(callback) };
+    await control.promptVisualization(ctx, { requestId: fixture.requestId, kind: 'systemOverview', message: 'Analyze.' });
+    for (const handler of handlers.get('agent_end')) handler({ willContinue: false, messages: [] }, ctx);
+    for (const callback of timers.splice(0)) callback();
+    assert.equal(existsSync(path.join(fixture.folder, 'terminal.json')), false);
+    idle = true;
+    for (const callback of timers.splice(0)) callback();
+    const terminal = JSON.parse(readFileSync(path.join(fixture.folder, 'terminal.json'), 'utf8'));
+    assert.equal(terminal.code, 'analysis_incomplete');
+    assert.match(terminal.message, /cancelled without saving/);
+    assert.deepEqual(control.guard.states(), []);
   } finally { cleanup(fixture); }
 });

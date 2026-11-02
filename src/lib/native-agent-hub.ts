@@ -19,7 +19,7 @@ export function describeNativeHubError(error: unknown): { code: string | null; m
     if (start < 0) continue;
     const before = text[start - 1];
     const after = text[start + code.length];
-    if ((before === undefined || !/[A-Za-z0-9_]/.test(before)) && (after === undefined || !/[A-Za-z0-9_]/.test(after))) return { code, message };
+    if ((before === undefined || !/\w/.test(before)) && (after === undefined || !/\w/.test(after))) return { code, message };
   }
   return { code: null, message: text };
 }
@@ -42,7 +42,7 @@ export async function awaitNativeAgentHub(options: {
   const deadline = now() + 30_000;
   while (options.current()) {
     const instance = options.instance();
-    if (!instance || instance.generation !== generation) return;
+    if (instance?.generation !== generation) return;
     if (instance.status === "stopped" || instance.status === "error") throw new Error("The session did not become ready. Open its terminal to inspect the startup error.");
     if (instance.bridgeReady && instance.capabilities?.agentHub !== true) throw new Error(NATIVE_HUB_UNAVAILABLE);
     if (instance.bridgeReady && options.terminalReady(generation) && instance.capabilities?.agentHub === true) {

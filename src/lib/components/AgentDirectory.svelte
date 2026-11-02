@@ -8,17 +8,18 @@
   const changes = $derived($workspaceChanges.filter(change => change.coordinatorId === instance.id));
   const active = $derived(changes.filter(workspacePending));
   const latest = $derived(changes.at(-1));
+  const project = $derived(instance.projectFolder ?? instance.projectPath);
   async function choose(): Promise<void> {
     busy = true;
     try {
-      const folder = await pickFolder(instance.projectPath);
+      const folder = await pickFolder(project);
       if (folder && await changeAgentDirectory(instance.id, folder, instance.generation)) rememberProjectFolder(folder, true);
     } catch (error) { reportError("Change working directory", error); }
     finally { busy = false; }
   }
 </script>
 <span class="directory" class:compact>
-  <button class="mono" aria-label="Change working directory" title={`Change working directory: ${instance.projectPath}`} disabled={busy} onclick={choose}>{compact ? basename(instance.projectPath) : instance.projectPath}</button>
+  <button class="mono" aria-label="Change working directory" title={`Change project: ${project}${instance.projectFolder ? `; isolated working directory: ${instance.projectPath}` : ""}`} disabled={busy} onclick={choose}>{compact ? basename(project) : project}</button>
   {#each active as change (change.requestId)}
     <small role="status">{change.status === "pending" ? "Pending" : "Applying"} → {change.targetFolder}</small>
   {/each}

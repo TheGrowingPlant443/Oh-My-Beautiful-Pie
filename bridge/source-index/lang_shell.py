@@ -65,7 +65,8 @@ PS_WRAPPERS = {
     "logical_expression", "pipeline_chain", "pipeline", "parenthesized_expression",
 }
 PS_SCOPE_PREFIX = re.compile(r"^(global|script|local|private):", re.IGNORECASE)
-PS_PATHLIKE = re.compile(r"[\\/]|\.(psm1|psd1|ps1|dll)$", re.IGNORECASE)
+PS_MODULE_EXTENSION = re.compile(r"\.(?:psm1|psd1|ps1|dll)$", re.IGNORECASE)
+PS_SCRIPT_ROOT = "$psscriptroot"
 
 
 def _cap(text, binding=None):
@@ -116,6 +117,10 @@ class _Base:
             self.cond += 1
             self.cond_nodes.add(node.id)
 
+    def import_site(self, node, binding, spec, conditional):
+        self.ctx.add_site("imports", _cap(self.ctx.text(node), binding), node, conditional=conditional,
+                          dynamic=spec is None, binding=binding)
+
     def leave(self, node):
         if node.id in self.cond_nodes:
             self.cond_nodes.discard(node.id)
@@ -157,56 +162,60 @@ class _Bash(_Base):
         args = [c for i, c in enumerate(node.children) if node.field_name_for_child(i) == "argument"]
         first = name_node.named_children[0] if name_node.named_children else None
         name = self.literal_word(first) if first is not None else None
-        end = args[0].start_byte if args else node.end_byte
         raw = ctx.source[name_node.start_byte:name_node.end_byte].decode("utf-8", "replace")
         cond = self.cond > 0
         if name in ("source", "."):
             spec = self.literal_word(args[0]) if args else None
             binding = _import_binding("source", spec, loader=name, cwdRelative=bool(spec) and not spec.startswith("/"))
-            ctx.add_site("imports", _cap(ctx.text(node), binding), node, conditional=cond, dynamic=spec is None, binding=binding)
+            self.import_site(node, binding, spec, cond)
             return
+        binding, dynamic = self.command_binding(name)
+        ctx.add_site("calls", _cap(raw, binding), node, conditional=cond, dynamic=dynamic, binding=binding)
+
+    @staticmethod
+    def command_binding(name):
         binding = {"kind": "identifier", "name": name, "receiver": None, "receiverKind": None, "command": True}
-        dynamic = False
         if name is None:
             binding.update(kind="dynamic", dynamic=True)
-            dynamic = True
-        else:
-            if name in BASH_BUILTINS:
-                binding["builtin"] = True
-            if "/" in name:
-                binding["pathLike"] = True
-            if name in BASH_DYNAMIC:
-                binding["dynamic"] = True
-                dynamic = True
-        ctx.add_site("calls", _cap(raw, binding), node, conditional=cond, dynamic=dynamic, binding=binding)
+            return binding, True
+        if name in BASH_BUILTINS:
+            binding["builtin"] = True
+        if "/" in name:
+            binding["pathLike"] = True
+        dynamic = name in BASH_DYNAMIC
+        if dynamic:
+            binding["dynamic"] = True
+        return binding, dynamic
 
     def enter(self, node):
         if not node.is_named:
-            return True
-        ctx = self.ctx
+            return
         t = node.type
         self.enter_cond(node, BASH_CONDITIONAL)
         if t == "list":
-            after = False
-            for c in node.children:
-                if not c.is_named:
-                    if c.type in ("&&", "||"):
-                        after = True
-                elif after:
-                    self.cond_children.add(c.id)
-        if t == "function_definition":
-            name_node = node.child_by_field_name("name")
-            name = ctx.text(name_node)
-            sym = ctx.add_symbol("function", name, node, bindings={"body": True, "global": True})
-            # Shell functions live in one global namespace once defined: reassignable, never name-promoted.
-            ctx.declare(name, "function", node.start_byte, len(ctx.source), symbol_id=sym["id"], mutable=True,
-                        position=name_node.start_byte, owner=self.module_id)
-            self.push(node, sym, name, "function")
-            return True
-        if t == "command":
+            self.mark_after_logical(node)
+        elif t == "function_definition":
+            self.define_function(node)
+        elif t == "command":
             self.command(node)
-            return True
-        return True
+
+    def mark_after_logical(self, node):
+        after = False
+        for c in node.children:
+            if not c.is_named:
+                after = after or c.type in ("&&", "||")
+            elif after:
+                self.cond_children.add(c.id)
+
+    def define_function(self, node):
+        ctx = self.ctx
+        name_node = node.child_by_field_name("name")
+        name = ctx.text(name_node)
+        sym = ctx.add_symbol("function", name, node, bindings={"body": True, "global": True})
+        # Shell functions live in one global namespace once defined: reassignable, never name-promoted.
+        ctx.declare(name, "function", node.start_byte, len(ctx.source), symbol_id=sym["id"], mutable=True,
+                    position=name_node.start_byte, owner=self.module_id)
+        self.push(node, sym, name, "function")
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +251,7 @@ class _Ps(_Base):
     def classify_path(self, text, interpolating):
         """(specifier|None, relativeTo) for a literal-ish path token."""
         low = text.lower()
-        if low.startswith("$psscriptroot") and len(text) > 13 and text[13] in "\\/":
+        if low.startswith(PS_SCRIPT_ROOT) and len(text) > 13 and text[13] in "\\/":
             return text[14:], "dir"
         if interpolating and ("$" in text or "`" in text):
             return None, None
@@ -250,28 +259,33 @@ class _Ps(_Base):
 
     def expr_literal(self, node):
         """Literal value of an argument node (generic token / string / wrapped string), else (None,None)."""
-        ctx = self.ctx
         n = node
         while n is not None and n.type in ("array_literal_expression", "unary_expression") and n.named_child_count == 1:
             n = n.named_children[0]
         if n is None:
             return None, None
         if n.type in ("generic_token", "command_name", "path_command_name", "simple_name"):
-            text = ctx.text(n)
-            if n.type == "path_command_name" and any(d.type == "variable" for d in n.named_children) and not text.lower().startswith("$psscriptroot"):
-                return None, None
-            return self.classify_path(text, True)
+            return self.token_literal(n)
         if n.type == "string_literal":
-            val, single = self.string_literal(n)
-            if val is None:
-                text = ctx.text(n)
-                inner = text[1:-1] if len(text) >= 2 else text
-                if inner.lower().startswith("$psscriptroot"):
-                    return self.classify_path(inner, True)
-                return None, None
-            return self.classify_path(val, not single)
+            return self.string_arg_literal(n)
         if n.type == "command_name_expr":
             return self.expr_literal(n.named_children[0]) if n.named_children else (None, None)
+        return None, None
+
+    def token_literal(self, n):
+        text = self.ctx.text(n)
+        if n.type == "path_command_name" and any(d.type == "variable" for d in n.named_children) and not text.lower().startswith(PS_SCRIPT_ROOT):
+            return None, None
+        return self.classify_path(text, True)
+
+    def string_arg_literal(self, n):
+        val, single = self.string_literal(n)
+        if val is not None:
+            return self.classify_path(val, not single)
+        text = self.ctx.text(n)
+        inner = text[1:-1] if len(text) >= 2 else text
+        if inner.lower().startswith(PS_SCRIPT_ROOT):
+            return self.classify_path(inner, True)
         return None, None
 
     def collect_args(self, elements):
@@ -292,12 +306,12 @@ class _Ps(_Base):
     # -- commands -----------------------------------------------------------------
     def command(self, node):
         ctx = self.ctx
-        op_node = next((c for c in node.children if c.type == "command_invokation_operator"), None)
-        op = ctx.text(op_node) if op_node is not None else None
         nm = node.child_by_field_name("command_name")
-        elements = node.child_by_field_name("command_elements")
         if nm is None:
             return
+        op_node = next((c for c in node.children if c.type == "command_invokation_operator"), None)
+        op = ctx.text(op_node) if op_node is not None else None
+        elements = node.child_by_field_name("command_elements")
         args = self.collect_args(elements)
         cond = self.cond > 0
         raw_end = elements.start_byte if elements is not None else node.end_byte
@@ -305,55 +319,67 @@ class _Ps(_Base):
         if op == ".":
             spec, rel = self.expr_literal(nm)
             binding = _import_binding("source", spec, loader="dot-source", relativeTo=rel, pathLike=True)
-            ctx.add_site("imports", _cap(ctx.text(node), binding), node, conditional=cond, dynamic=spec is None, binding=binding)
+            self.import_site(node, binding, spec, cond)
             return
         if nm.type == "command_name_expr":
-            lit, rel = self.expr_literal(nm)
-            binding = {"kind": "identifier", "name": lit, "receiver": None, "receiverKind": None, "command": True, "callOperator": op or None}
-            dynamic = lit is None
-            if dynamic:
-                binding.update(kind="dynamic", dynamic=True)
-            else:
-                binding["pathLike"] = True
-                if rel:
-                    binding["relativeTo"] = rel
-            ctx.add_site("calls", _cap(raw, binding), node, conditional=cond, dynamic=dynamic, binding=binding)
+            self.expression_call(node, nm, op, raw, cond)
             return
         name = ctx.text(nm)
         low = name.lower()
         if low in PS_KEYWORDS:
             return
         if low == "using":
-            kw = args[0] if args else None
-            kwtext = ctx.text(kw["node"]).lower() if kw is not None else ""
-            target = args[1] if len(args) > 1 else None
-            spec = None
-            if target is not None:
-                spec, _ = self.expr_literal(target["node"]) if kwtext == "module" else (self.ctx.text(target["node"]), None)
-                if kwtext != "module" and any(d.type == "variable" for d in self.descendants(target["node"])):
-                    spec = None
-            binding = _import_binding("using", spec, typeKind=kwtext or None, namespace=(kwtext == "namespace"), loader="using")
-            ctx.add_site("imports", _cap(ctx.text(node), binding), node, conditional=cond, dynamic=spec is None, binding=binding)
-            return
-        if low in ("import-module", "ipmo"):
-            target = next((a for a in args if (a["param"] or "").lower() in ("-name", "-path", "-literalpath", "-fullyqualifiedname")), None)
-            if target is None:
-                target = next((a for a in args if a["param"] is None), None)
-            spec, rel = (None, None)
-            if target is not None:
-                spec, rel = self.expr_literal(target["node"])
-            binding = _import_binding("import", spec, loader="Import-Module", relativeTo=rel,
-                                      pathLike=bool(spec and PS_PATHLIKE.search(spec)))
-            ctx.add_site("imports", _cap(ctx.text(node), binding), node, conditional=cond, dynamic=spec is None, binding=binding)
-            return
+            self.using_import(node, args, cond)
+        elif low in ("import-module", "ipmo"):
+            self.module_import(node, args, cond)
+        else:
+            self.named_call(node, name, low, op, raw, cond)
+
+    def expression_call(self, node, nm, op, raw, cond):
+        lit, rel = self.expr_literal(nm)
+        binding = {"kind": "identifier", "name": lit, "receiver": None, "receiverKind": None, "command": True, "callOperator": op or None}
+        dynamic = lit is None
+        if dynamic:
+            binding.update(kind="dynamic", dynamic=True)
+        else:
+            binding["pathLike"] = True
+            if rel:
+                binding["relativeTo"] = rel
+        self.ctx.add_site("calls", _cap(raw, binding), node, conditional=cond, dynamic=dynamic, binding=binding)
+
+    def using_import(self, node, args, cond):
+        kw = args[0] if args else None
+        kwtext = self.ctx.text(kw["node"]).lower() if kw is not None else ""
+        target = args[1] if len(args) > 1 else None
+        spec = self.using_spec(target["node"], kwtext) if target is not None else None
+        binding = _import_binding("using", spec, typeKind=kwtext or None, namespace=(kwtext == "namespace"), loader="using")
+        self.import_site(node, binding, spec, cond)
+
+    def using_spec(self, target, kwtext):
+        if kwtext == "module":
+            return self.expr_literal(target)[0]
+        if any(d.type == "variable" for d in self.descendants(target)):
+            return None
+        return self.ctx.text(target)
+
+    def module_import(self, node, args, cond):
+        target = next((a for a in args if (a["param"] or "").lower() in ("-name", "-path", "-literalpath", "-fullyqualifiedname")), None)
+        if target is None:
+            target = next((a for a in args if a["param"] is None), None)
+        spec, rel = self.expr_literal(target["node"]) if target is not None else (None, None)
+        binding = _import_binding("import", spec, loader="Import-Module", relativeTo=rel,
+                                  pathLike=bool(spec and ("/" in spec or "\\" in spec or PS_MODULE_EXTENSION.search(spec))))
+        self.import_site(node, binding, spec, cond)
+
+    def named_call(self, node, name, low, op, raw, cond):
         binding = {"kind": "identifier", "name": name, "receiver": None, "receiverKind": None, "command": True,
                    "caseInsensitive": True, "callOperator": op or None}
         dynamic = low in PS_DYNAMIC
         if dynamic:
             binding["dynamic"] = True
-        if PS_PATHLIKE.search(name) and ("\\" in name or "/" in name):
+        if "\\" in name or "/" in name:
             binding["pathLike"] = True
-        ctx.add_site("calls", _cap(raw, binding), node, conditional=cond, dynamic=dynamic, binding=binding)
+        self.ctx.add_site("calls", _cap(raw, binding), node, conditional=cond, dynamic=dynamic, binding=binding)
 
     def invocation(self, node):
         ctx = self.ctx
@@ -364,27 +390,31 @@ class _Ps(_Base):
         end = args.start_byte if args is not None else node.end_byte
         raw = ctx.source[node.start_byte:end].decode("utf-8", "replace").rstrip()
         binding: dict = {"name": None, "receiver": None, "receiverKind": None}
-        dynamic = False
-        if member is None or obj is None or obj is member:
+        dynamic = member is None or obj is None or obj is member
+        if dynamic:
             binding.update(kind="dynamic", dynamic=True)
-            dynamic = True
+        elif obj.type == "type_literal":
+            self.static_call_binding(binding, ctx.text(member), ctx.text(obj))
+            binding["caseInsensitive"] = True
         else:
-            mname = ctx.text(member)
             otext = ctx.text(obj)
-            if obj.type == "type_literal":
-                tname = otext.strip()[1:-1] if otext.startswith("[") and otext.endswith("]") else otext
-                binding.update(kind="new" if mname.lower() == "new" else "path", receiver=None if mname.lower() == "new" else tname,
-                               receiverKind=None if mname.lower() == "new" else "path",
-                               name=tname.rsplit(".", 1)[-1] if mname.lower() == "new" else mname)
-                if mname.lower() == "new" and "." in tname:
-                    binding["receiver"] = tname.rsplit(".", 1)[0]
-                    binding["receiverKind"] = "path"
-                binding["static"] = True
-            else:
-                rk = "this" if otext.lower() == "$this" else ("identifier" if obj.type == "variable" else "expression")
-                binding.update(kind="member", name=mname, receiver=_cap(otext, binding), receiverKind=rk)
+            rk = "identifier" if obj.type == "variable" else "expression"
+            if otext.lower() == "$this":
+                rk = "this"
+            binding.update(kind="member", name=ctx.text(member), receiver=_cap(otext, binding), receiverKind=rk)
             binding["caseInsensitive"] = True
         ctx.add_site("calls", _cap(raw, binding), node, conditional=self.cond > 0, dynamic=dynamic, binding=binding)
+
+    @staticmethod
+    def static_call_binding(binding, mname, otext):
+        tname = otext.strip()[1:-1] if otext.startswith("[") and otext.endswith("]") else otext
+        if mname.lower() != "new":
+            binding.update(kind="path", receiver=tname, receiverKind="path", name=mname)
+        else:
+            recv = tname.rsplit(".", 1)[0] if "." in tname else None
+            binding.update(kind="new", receiver=recv, receiverKind="path" if recv else None,
+                           name=tname.rsplit(".", 1)[-1])
+        binding["static"] = True
 
     # -- declarations ------------------------------------------------------------------
     def declare_var(self, name, node, *, sym=None, owner=..., scope=None, mutable=True):
@@ -414,10 +444,9 @@ class _Ps(_Base):
         return n
 
     def assigned_name_of_scriptblock(self, node):
-        n = node
         p = node.parent
         while p is not None and p.type in PS_WRAPPERS:
-            n, p = p, p.parent
+            p = p.parent
         if p is not None and p.type == "assignment_expression" and p.child_by_field_name("value") is not None:
             val = p.child_by_field_name("value")
             if val.start_byte <= node.start_byte and node.end_byte <= val.end_byte:
@@ -429,94 +458,112 @@ class _Ps(_Base):
     # -- traversal ---------------------------------------------------------------------
     def enter(self, node):
         if not node.is_named:
-            return True
-        ctx = self.ctx
-        t = node.type
+            return
         self.enter_cond(node, PS_CONDITIONAL)
-        if t == "function_statement":
-            fn = next((c for c in node.named_children if c.type == "function_name"), None)
-            full = ctx.text(fn) if fn is not None else ""
-            m = PS_SCOPE_PREFIX.match(full)
-            name = full[m.end():] if m else full
-            bindings = {"body": True, "caseInsensitive": True}
-            if m:
-                bindings["scope"] = m.group(1).lower()
-            sym = ctx.add_symbol("function", name, node, bindings=bindings)
-            start, end = self.scope_range()
-            ctx.declare(name, "function", node.start_byte, end, symbol_id=sym["id"], mutable=True, position=node.start_byte)
-            self.push(node, sym, name, "function")
-            return True
-        if t == "class_statement":
-            names = [c for c in node.named_children if c.type == "simple_name"]
-            name = ctx.text(names[0]) if names else ""
-            bases = [ctx.text(n) for n in names[1:]]
-            bindings = {"caseInsensitive": True}
-            outer = ctx.owner
-            if bases:
-                bindings["extends"] = bases
-            sym = ctx.add_symbol("class", name, node, bindings=bindings)
-            ctx.declare(name, "class", *self.scope_range(), symbol_id=sym["id"], mutable=False, position=node.start_byte)
-            self.push(node, sym, name, "class")
-            for n in names[1:]:
-                text = ctx.text(n)
-                ctx.add_site("references", text, n, caller=outer,
-                             binding={"kind": "identifier", "name": text, "receiver": None, "receiverKind": None, "role": "extends"})
-            return True
-        if t == "enum_statement":
-            names = [c for c in node.named_children if c.type == "simple_name"]
-            name = ctx.text(names[0]) if names else ""
-            sym = ctx.add_symbol("enum", name, node, bindings={})
-            ctx.declare(name, "enum", *self.scope_range(), symbol_id=sym["id"], mutable=False, position=node.start_byte)
-            self.push(node, sym, name, "enum")
-            return True
-        if t == "class_method_definition":
-            direct = [c for c in node.named_children if c.type == "simple_name"]
-            name = ctx.text(direct[0]) if direct else ""
-            attrs = [ctx.text(c).lower() for c in node.named_children if c.type == "class_attribute"]
-            has_ret = any(c.type == "type_literal" for c in node.named_children)
-            owner_name = ctx.current_scope.name if ctx.current_scope is not None else None
-            kind = "constructor" if (not has_ret and owner_name is not None and name.lower() == owner_name.lower()) else "method"
-            sym = ctx.add_symbol(kind, name, node, bindings={"static": "static" in attrs, "hidden": "hidden" in attrs, "caseInsensitive": True})
-            self.push(node, sym, name, kind)
-            return True
-        if t == "script_block_expression":
-            var = self.assigned_name_of_scriptblock(node)
-            outer = ctx.owner
-            outer_range = self.scope_range()
-            sym = ctx.add_symbol("lambda", "<scriptblock>", node, bindings={})
-            self.push(node, sym, None, "lambda")
-            if var is not None:
-                sym["bindings"]["assignedTo"] = ctx.text(var)
-                self.declare_var(ctx.text(var), var, sym=sym, owner=outer, scope=outer_range)
-            return True
-        if t in ("script_parameter", "class_method_parameter"):
-            for c in node.children:
-                if c.type == "variable":
-                    self.declare_param(c)
-            return True
-        if t == "assignment_expression":
-            left = next((c for c in node.named_children if c.type == "left_assignment_expression"), None)
-            value = node.child_by_field_name("value")
-            var = self.first_variable(left) if left is not None else None
-            if var is not None and not (value is not None and "script_block_expression" in {d.type for d in self.descendants(value)} and
-                                       self.assigned_name_of_scriptblock([d for d in self.descendants(value) if d.type == "script_block_expression"][0]) is not None):
-                self.declare_var(ctx.text(var), var)
-            return True
-        if t == "foreach_statement":
-            var = next((c for c in node.named_children if c.type == "variable"), None)
-            if var is not None:
-                self.declare_var(ctx.text(var), var, scope=(node.start_byte, node.end_byte))
-            return True
-        if t == "command":
-            self.command(node)
-            return True
-        if t == "invokation_expression":
-            self.invocation(node)
-            return True
-        return True
+        handler = self.ENTER_HANDLERS.get(node.type)
+        if handler is not None:
+            handler(self, node)
+
+    def enter_function(self, node):
+        ctx = self.ctx
+        fn = next((c for c in node.named_children if c.type == "function_name"), None)
+        full = ctx.text(fn) if fn is not None else ""
+        m = PS_SCOPE_PREFIX.match(full)
+        name = full[m.end():] if m else full
+        bindings = {"body": True, "caseInsensitive": True}
+        if m:
+            bindings["scope"] = m.group(1).lower()
+        sym = ctx.add_symbol("function", name, node, bindings=bindings)
+        _, end = self.scope_range()
+        ctx.declare(name, "function", node.start_byte, end, symbol_id=sym["id"], mutable=True, position=node.start_byte)
+        self.push(node, sym, name, "function")
+
+    def enter_class(self, node):
+        ctx = self.ctx
+        names = [c for c in node.named_children if c.type == "simple_name"]
+        name = ctx.text(names[0]) if names else ""
+        bases = [ctx.text(n) for n in names[1:]]
+        bindings = {"caseInsensitive": True}
+        outer = ctx.owner
+        if bases:
+            bindings["extends"] = bases
+        sym = ctx.add_symbol("class", name, node, bindings=bindings)
+        ctx.declare(name, "class", *self.scope_range(), symbol_id=sym["id"], mutable=False, position=node.start_byte)
+        self.push(node, sym, name, "class")
+        for n in names[1:]:
+            text = ctx.text(n)
+            ctx.add_site("references", text, n, caller=outer,
+                         binding={"kind": "identifier", "name": text, "receiver": None, "receiverKind": None, "role": "extends"})
+
+    def enter_enum(self, node):
+        ctx = self.ctx
+        names = [c for c in node.named_children if c.type == "simple_name"]
+        name = ctx.text(names[0]) if names else ""
+        sym = ctx.add_symbol("enum", name, node, bindings={})
+        ctx.declare(name, "enum", *self.scope_range(), symbol_id=sym["id"], mutable=False, position=node.start_byte)
+        self.push(node, sym, name, "enum")
+
+    def enter_method(self, node):
+        ctx = self.ctx
+        direct = [c for c in node.named_children if c.type == "simple_name"]
+        name = ctx.text(direct[0]) if direct else ""
+        attrs = [ctx.text(c).lower() for c in node.named_children if c.type == "class_attribute"]
+        has_ret = any(c.type == "type_literal" for c in node.named_children)
+        owner_name = ctx.current_scope.name if ctx.current_scope is not None else None
+        kind = "constructor" if (not has_ret and owner_name is not None and name.lower() == owner_name.lower()) else "method"
+        sym = ctx.add_symbol(kind, name, node, bindings={"static": "static" in attrs, "hidden": "hidden" in attrs, "caseInsensitive": True})
+        self.push(node, sym, name, kind)
+
+    def enter_scriptblock(self, node):
+        ctx = self.ctx
+        var = self.assigned_name_of_scriptblock(node)
+        outer = ctx.owner
+        outer_range = self.scope_range()
+        sym = ctx.add_symbol("lambda", "<scriptblock>", node, bindings={})
+        self.push(node, sym, None, "lambda")
+        if var is not None:
+            sym["bindings"]["assignedTo"] = ctx.text(var)
+            self.declare_var(ctx.text(var), var, sym=sym, owner=outer, scope=outer_range)
+
+    def enter_parameters(self, node):
+        for c in node.children:
+            if c.type == "variable":
+                self.declare_param(c)
+
+    def enter_assignment(self, node):
+        left = next((c for c in node.named_children if c.type == "left_assignment_expression"), None)
+        var = self.first_variable(left) if left is not None else None
+        if var is not None and not self.binds_scriptblock(node.child_by_field_name("value")):
+            self.declare_var(self.ctx.text(var), var)
+
+    def binds_scriptblock(self, value):
+        """True when a script block inside ``value`` is itself named by this assignment."""
+        if value is None:
+            return False
+        blocks = [d for d in self.descendants(value) if d.type == "script_block_expression"]
+        return bool(blocks) and self.assigned_name_of_scriptblock(blocks[0]) is not None
+
+    def enter_foreach(self, node):
+        var = next((c for c in node.named_children if c.type == "variable"), None)
+        if var is not None:
+            self.declare_var(self.ctx.text(var), var, scope=(node.start_byte, node.end_byte))
+
+    ENTER_HANDLERS = {
+        "function_statement": enter_function,
+        "class_statement": enter_class,
+        "enum_statement": enter_enum,
+        "class_method_definition": enter_method,
+        "script_block_expression": enter_scriptblock,
+        "script_parameter": enter_parameters,
+        "class_method_parameter": enter_parameters,
+        "assignment_expression": enter_assignment,
+        "foreach_statement": enter_foreach,
+        "command": command,
+        "invokation_expression": invocation,
+    }
 
 
-def extract(language: str, source: bytes, ctx: "common.Context") -> dict:
+def extract(language: str, _source: bytes, ctx: "common.Context") -> dict:
     tree = ctx.parse()
     root = tree.root_node
     module = ctx.module_symbol(root)

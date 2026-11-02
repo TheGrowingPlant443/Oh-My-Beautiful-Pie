@@ -2,6 +2,7 @@
 //! environment, full paths, user names or script previews: only what the Windows process snapshot and socket tables
 //! expose by themselves.
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const DEFAULT_PAGE: usize = 100;
 pub const MAX_PAGE: usize = 250;
@@ -47,15 +48,28 @@ pub struct SectionState {
 }
 
 impl SectionState {
+    #[must_use]
     pub fn ok() -> Self {
-        Self { status: SectionStatus::Ok, error: None }
+        Self {
+            status: SectionStatus::Ok,
+            error: None,
+        }
     }
-    pub fn partial(error: impl Into<String>) -> Self {
-        Self { status: SectionStatus::Partial, error: Some(error.into()) }
+    #[must_use]
+    pub fn partial(error: String) -> Self {
+        Self {
+            status: SectionStatus::Partial,
+            error: Some(error),
+        }
     }
-    pub fn unavailable(error: impl Into<String>) -> Self {
-        Self { status: SectionStatus::Unavailable, error: Some(error.into()) }
+    #[must_use]
+    pub fn unavailable(error: String) -> Self {
+        Self {
+            status: SectionStatus::Unavailable,
+            error: Some(error),
+        }
     }
+    #[must_use]
     pub fn is_unavailable(&self) -> bool {
         self.status == SectionStatus::Unavailable
     }
@@ -229,7 +243,7 @@ pub struct HostMonitorPage {
     pub total: usize,
     pub offset: usize,
     pub next_offset: Option<usize>,
-    pub items: Vec<serde_json::Value>,
+    pub items: Vec<Value>,
 }
 
 /// `null` counts are unavailable; a partial section makes its count a lower bound (see `sections`).

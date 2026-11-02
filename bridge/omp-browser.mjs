@@ -24,6 +24,12 @@ async function listTabs(ticket, context) {
   return response.json();
 }
 
+const ACTIONS = new Set(['open', 'close', 'tabs', 'targets', 'run', 'call']);
+function isBrowserCall(parameters) {
+  if (!parameters || typeof parameters !== 'object' || !ACTIONS.has(parameters.action)) return false;
+  return parameters.name === undefined || (typeof parameters.name === 'string' && parameters.name !== '');
+}
+
 export function installTerminalBrowserBridge(pi, request) {
   const prototype = pi.pi?.EvalTool?.prototype;
   const original = prototype && Object.getOwnPropertyDescriptor(prototype, 'execute');
@@ -41,69 +47,94 @@ export function installTerminalBrowserBridge(pi, request) {
     if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redact(entry)]));
     return value;
   }
+  function remember(cdpUrl) {
+    urls.add(cdpUrl);
+    urls.add(new URL(cdpUrl).hostname.split('.')[0]);
+  }
   function wrap(definition) {
     if (wrapped.has(definition)) return;
     const descriptor = Object.getOwnPropertyDescriptor(definition, 'invoke');
     if (!descriptor?.writable || typeof descriptor.value !== 'function') throw new Error(COMPATIBILITY_ERROR);
     const invoke = descriptor.value;
+    const open = async (self, name, parameters, context) => {
+      if (context?.signal?.aborted) throw context.signal.reason;
+      const target = parameters.app?.target;
+      const ticket = await request('browser_prepare', { name, ...(target === undefined ? {} : { target }) });
+      if (!ticket || typeof ticket.cdpUrl !== 'string' || !Number.isSafeInteger(ticket.epoch) || !Number.isSafeInteger(ticket.tabEpoch)) throw new Error(COMPATIBILITY_ERROR);
+      remember(ticket.cdpUrl);
+      const old = tickets.get(name);
+      if (old && (old.epoch !== ticket.epoch || old.tabEpoch !== ticket.tabEpoch)) await invoke.call(self, {action:'close',name,kill:false}, context);
+      const ownedParameters = { ...parameters };
+      delete ownedParameters.headed;
+      // The capability exposes exactly one page and every page URL has a scheme, so ':' always selects it;
+      // a target makes OMP bring that tab to the front before screenshots instead of failing on a hidden one.
+      const result = await invoke.call(self, { ...ownedParameters, app:{cdp_url:ticket.cdpUrl,target:':'} }, context);
+      tickets.set(name,ticket);
+      return redact(result);
+    };
+    const close = async (self, name, parameters, context) => {
+      const result = await invoke.call(self, {...parameters,kill:false}, context);
+      await request(parameters.all ? 'browser_close_all' : 'browser_close_tab', parameters.all ? {} : {name});
+      if (parameters.all) tickets.clear(); else tickets.delete(name);
+      return redact(result);
+    };
+    const findRows = async context => {
+      for (const ticket of tickets.values()) {
+        const rows = await listTabs(ticket, context);
+        if (rows) return rows;
+      }
+      // No ticket yet (e.g. the human opened the browser with the Browser button) or all closed: ask the app.
+      const rows = await request('browser_tabs', {});
+      if (!Array.isArray(rows)) throw new Error(COMPATIBILITY_ERROR);
+      return rows;
+    };
+    const attachNewTabs = async (self, context) => {
+      for (const row of await findRows(context)) {
+        const known = tickets.get(row.name);
+        if (known?.epoch === row.epoch && known.tabEpoch === row.tabEpoch) continue;
+        remember(row.cdpUrl);
+        if (known) await invoke.call(self, {action:'close',name:row.name,kill:false}, context);
+        await invoke.call(self, {action:'open',name:row.name,persist:true,app:{cdp_url:row.cdpUrl,target:':'}}, context);
+        tickets.set(row.name,{cdpUrl:row.cdpUrl,epoch:row.epoch,tabEpoch:row.tabEpoch});
+      }
+    };
+    const dropClosedTabs = async (self, context) => {
+      for (const [tabName, ticket] of tickets) {
+        try { await validateTab(ticket, context); }
+        catch (error) {
+          if (!String(error.message ?? error).includes(CLOSED_ERROR)) throw error;
+          await invoke.call(self, {action:'close',name:tabName,kill:false}, context);
+          tickets.delete(tabName);
+        }
+      }
+    };
+    const prepare = async (self, name, parameters, context) => {
+      if (parameters.action === 'tabs') {
+        await dropClosedTabs(self, context);
+        await attachNewTabs(self, context);
+        return;
+      }
+      if (!tickets.has(name)) await attachNewTabs(self, context);
+      const ticket = tickets.get(name);
+      if (!ticket) throw new Error(CLOSED_ERROR);
+      await validateTab(ticket, context);
+    };
     const callback = async function(parameters, context) {
-      if (!parameters || typeof parameters !== 'object' || !['open','close','tabs','run','call'].includes(parameters.action) || (parameters.name !== undefined && (typeof parameters.name !== 'string' || !parameters.name))) return invoke.call(this, parameters, context);
+      if (!isBrowserCall(parameters)) return invoke.call(this, parameters, context);
       const name = parameters.name ?? 'main';
       const app = parameters.app;
       if (app && (app.path !== undefined || app.cdp_url !== undefined || app.relay === true || app.tern === true)) throw new Error(OWNERSHIP_ERROR);
       try {
-        if (parameters.action === 'open') {
+        if (parameters.action === 'targets') {
           if (context?.signal?.aborted) throw context.signal.reason;
-          const ticket = await request('browser_prepare', { name, ...(app?.target === undefined ? {} : { target: app.target }) });
-          if (!ticket || typeof ticket.cdpUrl !== 'string' || !Number.isSafeInteger(ticket.epoch) || !Number.isSafeInteger(ticket.tabEpoch)) throw new Error(COMPATIBILITY_ERROR);
-          urls.add(ticket.cdpUrl);
-          urls.add(new URL(ticket.cdpUrl).hostname.split('.')[0]);
-          const old = tickets.get(name);
-          if (old && (old.epoch !== ticket.epoch || old.tabEpoch !== ticket.tabEpoch)) await invoke.call(this, {action:'close',name,kill:false}, context);
-          const {headed: _headed, ...ownedParameters} = parameters;
-          // The capability exposes exactly one page and every page URL has a scheme, so ':' always selects it;
-          // a target makes OMP bring that tab to the front before screenshots instead of failing on a hidden one.
-          const result = await invoke.call(this, { ...ownedParameters, app:{cdp_url:ticket.cdpUrl,target:':'} }, context);
-          tickets.set(name,ticket);
-          return redact(result);
+          const value = (await findRows(context)).map(row => ({
+            target: row.url, title: row.title, url: row.url, shown: row.active, tab: row.name,
+          }));
+          return {content:[],details:{action:'targets',name,browser:'connected',value}};
         }
-        if (parameters.action === 'close') {
-          const result = await invoke.call(this, {...parameters,kill:false}, context);
-          await request(parameters.all ? 'browser_close_all' : 'browser_close_tab', parameters.all ? {} : {name});
-          if (parameters.all) tickets.clear(); else tickets.delete(name);
-          return redact(result);
-        }
-        const attachNewTabs = async () => {
-          let rows = null;
-          for (const ticket of tickets.values()) if ((rows = await listTabs(ticket, context))) break;
-          if (!rows) {
-            // No ticket yet (e.g. the human opened the browser with the Browser button) or all closed: ask the app.
-            rows = await request('browser_tabs', {});
-            if (!Array.isArray(rows)) throw new Error(COMPATIBILITY_ERROR);
-          }
-          for (const row of rows ?? []) {
-            const known = tickets.get(row.name);
-            if (known?.epoch === row.epoch && known.tabEpoch === row.tabEpoch) continue;
-            urls.add(row.cdpUrl); urls.add(new URL(row.cdpUrl).hostname.split('.')[0]);
-            if (known) await invoke.call(this, {action:'close',name:row.name,kill:false}, context);
-            await invoke.call(this, {action:'open',name:row.name,persist:true,app:{cdp_url:row.cdpUrl,target:':'}}, context);
-            tickets.set(row.name,{cdpUrl:row.cdpUrl,epoch:row.epoch,tabEpoch:row.tabEpoch});
-          }
-        };
-        if (parameters.action === 'tabs') {
-          for (const [tabName,ticket] of tickets) {
-            try { await validateTab(ticket, context); }
-            catch(error) {
-              if (!String(error.message??error).includes(CLOSED_ERROR)) throw error;
-              await invoke.call(this,{action:'close',name:tabName,kill:false},context);tickets.delete(tabName);
-            }
-          }
-          await attachNewTabs();
-        } else {
-          if(!tickets.has(name))await attachNewTabs();
-          const ticket=tickets.get(name);if(!ticket)throw new Error(CLOSED_ERROR);
-          await validateTab(ticket, context);
-        }
+        if (parameters.action === 'open') return await open(this, name, parameters, context);
+        if (parameters.action === 'close') return await close(this, name, parameters, context);
+        await prepare(this, name, parameters, context);
         return redact(await invoke.call(this,parameters,context));
       } catch(error) {
         if (error instanceof Error) { error.message=redact(error.message); if(error.stack)error.stack=redact(error.stack); }
@@ -112,7 +143,7 @@ export function installTerminalBrowserBridge(pi, request) {
     };
     const documentation = definition.documentation;
     definition.invoke=callback;
-    definition.documentation = `${documentation}\nOMP Manager owns an isolated browser for this terminal. App Settings control Headless and presentation. Human and automation input may conflict; neither pauses the other. Do not pass external app/relay/CDP overrides. Every tab in this browser belongs to your session: tabs the user opens by hand (or that links open) are attached automatically as tab-1, tab-2, ... the next time you call browser.tabs() or browser.tab(name); use browser.tabs() to see their url and title. browser.open({name:'docs', app:{target:'<url or title substring>'}}) re-attaches an existing page under a name of your choice (omit url, which would navigate it). Closing a tab closes its page. Screenshots bring the attached tab to the front.`;
+    definition.documentation = `${documentation}\nOMP Manager owns an isolated browser for this terminal. App Settings control Headless and presentation. Human and automation input may conflict; neither pauses the other. Do not pass external app/relay/CDP overrides. In Manager, browser.targets({}) lists this session's existing Chrome pages as {target, title, url, shown, tab}; it never resolves Tern/relay or launches a browser. browser.tabs() attaches and lists the same pages as managed tabs, also without launching. Both return [] if this session has no browser. Every tab in this browser belongs to your session: tabs the user opens by hand (or that links open) are attached automatically as tab-1, tab-2, ... the next time you call browser.tabs() or use browser.tab(name). Use browser.tab(entry.tab) for an entry from targets, or browser.tab(entry.name) for one from tabs. browser.open({name:'docs', app:{target:entry.target}}) re-attaches an automatically named page under a name of your choice (omit url, which would navigate it); already named pages should be reused with browser.tab. Closing a tab closes its page. Screenshots bring the attached tab to the front.`;
     wrapped.set(definition,{descriptor,callback,documentation}); definitions.add(definition);
   }
   function incompatible() {

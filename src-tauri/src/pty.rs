@@ -1,13 +1,18 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use serde::Serialize;
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tauri::ipc::{Channel, InvokeResponseBody};
+use vt100::{Callbacks, Parser, Screen};
 
+use crate::config::ConfigDirectory;
+use crate::host_monitor::ProcessIdentity;
 use crate::instance::{Definition, InstanceKind};
 use crate::manager::BridgeLaunch;
 
@@ -17,18 +22,23 @@ const REPLAY_LIMIT: usize = 256 * 1024;
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 
 #[derive(Default)]
-struct CursorReplies {
+struct TerminalReplies {
     bytes: Vec<u8>,
 }
-impl vt100::Callbacks for CursorReplies {
+impl Callbacks for TerminalReplies {
     fn unhandled_csi(
         &mut self,
-        screen: &mut vt100::Screen,
+        screen: &mut Screen,
         i1: Option<u8>,
         i2: Option<u8>,
         params: &[&[u16]],
         action: char,
     ) {
+        if action == 'c' && i1.is_none() && i2.is_none() && params == [&[0u16][..]] {
+            // Match xterm's VT100 with Advanced Video response; do not advertise unsupported extensions.
+            self.bytes.extend_from_slice(b"\x1b[?1;2c");
+            return;
+        }
         if action != 'n'
             || i2.is_some()
             || !matches!(i1, None | Some(b'?'))
@@ -45,18 +55,18 @@ impl vt100::Callbacks for CursorReplies {
 struct Output {
     bytes: VecDeque<u8>,
     channel: Option<Channel<InvokeResponseBody>>,
-    parser: vt100::Parser<CursorReplies>,
+    parser: Parser<TerminalReplies>,
 }
 impl Output {
     fn new() -> Self {
         Self {
             bytes: VecDeque::new(),
             channel: None,
-            parser: vt100::Parser::new_with_callbacks(
+            parser: Parser::new_with_callbacks(
                 DEFAULT_ROWS,
                 DEFAULT_COLS,
                 0,
-                CursorReplies::default(),
+                TerminalReplies::default(),
             ),
         }
     }
@@ -76,6 +86,17 @@ pub struct TerminalScreen {
     pub cursor_col: u16,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreparedConfiguration {
+    config_files: Vec<PathBuf>,
+    model: Option<String>,
+    local: bool,
+    slot_manifest: Value,
+    #[serde(default)]
+    thinking_level: Option<String>,
+}
+
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Writer,
@@ -85,29 +106,74 @@ pub struct Pty {
     pub rows: u16,
     exit: Option<u32>,
     /// PID plus creation time captured while the PTY owns the child handle; read-only attribution for the host monitor.
-    root: Option<crate::host_monitor::ProcessIdentity>,
+    root: Option<ProcessIdentity>,
+    _config_directory: Option<ConfigDirectory>,
 }
 
 impl Pty {
     pub fn spawn(definition: &Definition, bridge: &BridgeLaunch) -> Result<Self, String> {
+        let app_root = bridge
+            .extension_path
+            .parent()
+            .ok_or("invalid bridge directory")?;
+        let sdk = bridge.sdk_dir.as_ref().ok_or("Native configuration setups require the matching OMP SDK. Configure OMP_SDK_DIR before starting this session.")?;
+        let cli = sdk.join("src/cli.ts");
+        if !cli.is_file() {
+            return Err(
+                "OMP compatibility: the installed SDK has no exported native source CLI".into(),
+            );
+        }
+        let directory = ConfigDirectory::create(app_root)?;
         let input = &definition.input;
-        let app_root = bridge.extension_path.parent().ok_or("invalid bridge directory")?;
+        let prepared: PreparedConfiguration = serde_json::from_value(crate::config::native_request(
+            app_root, &bridge.home_dir, serde_json::json!({
+                "action":"prepare_session","directory":directory.0,"configRoot":app_root,
+                "cwd":input.project_path,"profile":input.profile,"configFiles":input.configs,
+                "configDefault":input.config_default,"configSelection":input.config_selection,
+                "model":input.model,"sessionPath":definition.session_path.as_ref().filter(|path| path.is_file()),
+                "helper":definition.helper.is_some()
+            }),
+        )?).map_err(|error| format!("Invalid native configuration preparation: {error}"))?;
+        let local_enabled = prepared.local && Self::has_local_assets(definition, bridge);
+        // Source entry and extension SDK imports must share one native settings/capability registry.
+        let mut cmd = CommandBuilder::new(crate::toolchain::bun_program());
+        cmd.arg(cli);
+        cmd.env_remove("PI_COMPILED");
+        cmd.env_remove("OMSP_COMPILED");
+        cmd.cwd(&definition.input.project_path);
+        Self::add_session_args(&mut cmd, definition, &prepared)?;
+        Self::add_extensions(&mut cmd, definition, bridge, app_root, local_enabled)?;
+        Self::add_bridge_env(&mut cmd, definition, bridge)?;
+        cmd.env(
+            "OMP_MANAGER_CONFIG_SLOT_MANIFEST",
+            serde_json::to_string(&prepared.slot_manifest).map_err(|error| error.to_string())?,
+        );
+        let mut process = Self::start(cmd)?;
+        process._config_directory = Some(directory);
+        Ok(process)
+    }
+    fn has_local_assets(definition: &Definition, bridge: &BridgeLaunch) -> bool {
         // Read-only helpers keep their restricted tool surface, regardless of their model.
-        let has_local_assets = definition.helper.is_none()
-            && ["AGENTS.md", "RULES.md", "SKILLS.md", "agent-instructions", "rules", "skills", "tools", "extensions"]
-                .iter().any(|name| bridge.local_ai_setup_dir.join(name).exists());
-        let local = if has_local_assets {
-            crate::config::native_request(app_root, &bridge.home_dir, serde_json::json!({
-                "action": "local_setup", "cwd": input.project_path, "profile": input.profile,
-                "configFiles": input.configs, "model": input.model,
-                "sessionPath": definition.session_path.as_ref().filter(|p| p.is_file())
-            }))?
-        } else { serde_json::json!({"local": false}) };
-        let local_enabled = local["local"] == true;
-
-        let program = crate::toolchain::omp_program();
-        let mut cmd = CommandBuilder::new(program);
-        cmd.cwd(&input.project_path);
+        definition.helper.is_none()
+            && [
+                "AGENTS.md",
+                "RULES.md",
+                "SKILLS.md",
+                "agent-instructions",
+                "rules",
+                "skills",
+                "tools",
+                "extensions",
+            ]
+            .iter()
+            .any(|name| bridge.local_ai_setup_dir.join(name).exists())
+    }
+    fn add_session_args(
+        cmd: &mut CommandBuilder,
+        definition: &Definition,
+        prepared: &PreparedConfiguration,
+    ) -> Result<(), String> {
+        let input = &definition.input;
         cmd.args(["--cwd", &input.project_path]);
         cmd.args([
             "--profile",
@@ -117,18 +183,15 @@ impl Pty {
                 &input.profile
             },
         ]);
-        for config in &input.configs {
+        for config in &prepared.config_files {
             cmd.arg("--config");
             cmd.arg(config);
         }
-        if local_enabled {
-            let selector = local["selector"].as_str().ok_or("Local AI setup model resolution is unavailable")?;
-            cmd.args(["--model", selector]);
-            if let Some(thinking) = local["thinkingLevel"].as_str() {
-                cmd.args(["--thinking", thinking]);
-            }
-        } else if !input.model.is_empty() {
-            cmd.args(["--model", &input.model]);
+        if let Some(model) = &prepared.model {
+            cmd.args(["--model", model]);
+        }
+        if let Some(thinking) = &prepared.thinking_level {
+            cmd.args(["--thinking", thinking]);
         }
         // OMP creates sessions lazily: a path reported before the first message has no file to resume.
         if let Some(path) = definition.session_path.as_ref().filter(|p| p.is_file()) {
@@ -140,47 +203,111 @@ impl Pty {
             cmd.arg(path);
         }
         // A helper agent (Code diff / Git tree) has no built-in tools at all; its tools are the bridge's repo_inspect and code_quality_report.
-        let helper = definition.helper.as_ref();
-        if helper.is_some() {
+        if definition.helper.is_some() {
             cmd.arg("--no-tools");
         }
+        Ok(())
+    }
+    fn add_extensions(
+        cmd: &mut CommandBuilder,
+        definition: &Definition,
+        bridge: &BridgeLaunch,
+        app_root: &Path,
+        local_enabled: bool,
+    ) -> Result<(), String> {
         cmd.env("OMP_MANAGER_LOCAL_AI_SETUP_DIR", &bridge.local_ai_setup_dir);
-        cmd.env("OMP_MANAGER_LOCAL_AI_SETUP_MODE", if local_enabled { "local" } else { "ordinary" });
+        cmd.env(
+            "OMP_MANAGER_LOCAL_AI_SETUP_MODE",
+            if local_enabled { "local" } else { "ordinary" },
+        );
         cmd.arg("--extension");
         cmd.arg(app_root.join("local-ai-guard.ts"));
         if local_enabled {
             cmd.arg("--extension");
             cmd.arg(&bridge.local_ai_setup_dir);
-            for package in crate::setup::scoped_plugin_paths(&bridge.local_ai_setup_dir, "Local AI models")? {
-                cmd.arg("--extension");
-                cmd.arg(package);
-            }
+            Self::add_scoped_packages(cmd, &bridge.local_ai_setup_dir, "Local AI models")?;
         }
         cmd.arg("--extension");
         cmd.arg(&bridge.extension_path);
+        cmd.arg("--omp-manager-bridge");
         cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_DIR");
         cmd.env_remove("OMP_MANAGER_PRIVATE_SETUP_ROLE");
         let private_setup = match definition.kind {
-            InstanceKind::Manager => Some((&bridge.manager_setup_dir, "manager")),
-            InstanceKind::Architect => Some((&bridge.architect_setup_dir, "architect")),
+            InstanceKind::Manager => Some((&bridge.manager_setup_dir, "manager", "Manager")),
+            InstanceKind::Architect => {
+                Some((&bridge.architect_setup_dir, "architect", "Architect"))
+            }
             _ => None,
         };
-        if let Some((root, role)) = private_setup {
+        let Some((root, role, label)) = private_setup else {
+            return Ok(());
+        };
+        cmd.arg("--extension");
+        cmd.arg(root);
+        cmd.env("OMP_MANAGER_PRIVATE_SETUP_DIR", root);
+        cmd.env("OMP_MANAGER_PRIVATE_SETUP_ROLE", role);
+        // Private packages remain confined to their coordinator's directory.
+        Self::add_scoped_packages(cmd, root, label)
+    }
+    fn add_scoped_packages(
+        cmd: &mut CommandBuilder,
+        root: &Path,
+        label: &str,
+    ) -> Result<(), String> {
+        for package in crate::setup::scoped_plugin_paths(root, label)? {
             cmd.arg("--extension");
-            cmd.arg(root);
-            cmd.env("OMP_MANAGER_PRIVATE_SETUP_DIR", root);
-            cmd.env("OMP_MANAGER_PRIVATE_SETUP_ROLE", role);
-            // Private packages remain confined to their coordinator's directory.
-            let label = if definition.kind == InstanceKind::Manager { "Manager" } else { "Architect" };
-            for package in crate::setup::scoped_plugin_paths(root, label)? {
-                cmd.arg("--extension");
-                cmd.arg(package);
-            }
+            cmd.arg(package);
         }
+        Ok(())
+    }
+    fn add_bridge_env(
+        cmd: &mut CommandBuilder,
+        definition: &Definition,
+        bridge: &BridgeLaunch,
+    ) -> Result<(), String> {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("WT_SESSION", &definition.id);
         cmd.env("TERM_SESSION_ID", &definition.id);
+        if let Some(root) = bridge.extension_path.parent() {
+            cmd.env("OMP_MANAGER_CONFIG_ROOT", root);
+        }
+        cmd.env(
+            "OMP_MANAGER_CONFIG_FILES",
+            serde_json::to_string(&definition.input.configs)
+                .map_err(|error| format!("Configuration paths cannot be encoded: {error}"))?,
+        );
+        cmd.env(
+            "OMP_MANAGER_CONFIG_DEFAULT",
+            definition
+                .input
+                .config_default
+                .as_deref()
+                .unwrap_or_else(|| Path::new("")),
+        );
+        cmd.env(
+            "OMP_MANAGER_CONFIG_SELECTION",
+            definition
+                .input
+                .config_selection
+                .as_deref()
+                .unwrap_or_else(|| Path::new("")),
+        );
+        cmd.env(
+            "OMP_MANAGER_CONFIG_USE_DEFAULT",
+            if definition
+                .input
+                .use_global_config
+                .unwrap_or(definition.input.profile.is_empty())
+            {
+                "1"
+            } else {
+                "0"
+            },
+        );
+        if let Some(sdk) = &bridge.sdk_dir {
+            cmd.env("OMP_MANAGER_SDK_DIR", sdk);
+        }
         cmd.env("OMP_MANAGER_BRIDGE_ENDPOINT", &bridge.endpoint);
         cmd.env("OMP_MANAGER_BRIDGE_TOKEN", &bridge.token);
         cmd.env("OMP_MANAGER_BRIDGE_INSTANCE_ID", &bridge.instance_id);
@@ -199,7 +326,7 @@ impl Pty {
         if definition.kind == InstanceKind::Architect {
             cmd.env("OMP_MANAGER_ARCHITECT_DIR", &bridge.architect_dir);
         }
-        if let Some(link) = helper {
+        if let Some(link) = definition.helper.as_ref() {
             cmd.env("OMP_MANAGER_HELPER_REPO", &link.repo);
         } else {
             cmd.env("OMP_MANAGER_BROWSER_REQUIRED", "1");
@@ -215,7 +342,10 @@ impl Pty {
         cmd.env("PI_BROWSER_RELAY", "0");
         cmd.env("PI_BROWSER_TERN", "0");
         cmd.env("PI_BROWSER_CMUX", "0");
-        Self::start(cmd)
+        cmd.env("OMSP_BROWSER_RELAY", "0");
+        cmd.env("OMSP_BROWSER_TERN", "0");
+        cmd.env("OMSP_BROWSER_CMUX", "0");
+        Ok(())
     }
     /// The user's own shell: no OMP arguments, no bridge credentials, nothing from the manager environment.
     pub fn spawn_shell(cwd: &str) -> Result<Self, String> {
@@ -231,7 +361,7 @@ impl Pty {
         Self::start(cmd)
     }
     fn start(cmd: CommandBuilder) -> Result<Self, String> {
-        let pair = native_pty_system()
+        let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
                 rows: DEFAULT_ROWS,
                 cols: DEFAULT_COLS,
@@ -242,7 +372,9 @@ impl Pty {
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-        let root = child.process_id().and_then(crate::host_monitor::capture_identity);
+        let root = child
+            .process_id()
+            .and_then(crate::host_monitor::capture_identity);
         let writer: Writer = Arc::new(Mutex::new(
             pair.master.take_writer().map_err(|e| e.to_string())?,
         ));
@@ -262,13 +394,14 @@ impl Pty {
             rows: DEFAULT_ROWS,
             exit: None,
             root,
+            _config_directory: None,
         })
     }
     pub fn process_id(&self) -> Option<u32> {
         self.child.process_id()
     }
     /// Creation identity of the launched root, captured at launch; `None` when it could not be read.
-    pub fn root_identity(&self) -> Option<crate::host_monitor::ProcessIdentity> {
+    pub fn root_identity(&self) -> Option<ProcessIdentity> {
         self.root
     }
     /// Immediate termination for a shell the user closed; OMP uses `stop` for a graceful Ctrl-C first.
@@ -290,6 +423,7 @@ impl Pty {
         }
         Ok(())
     }
+    #[must_use]
     pub fn last_output(&self) -> u64 {
         self.shared.last_output.load(Ordering::Relaxed)
     }
@@ -300,6 +434,9 @@ impl Pty {
                 .try_wait()
                 .map_err(|e| e.to_string())?
                 .map(|s| s.exit_code());
+        }
+        if self.exit.is_some() {
+            self._config_directory = None;
         }
         Ok(self.exit)
     }
@@ -379,6 +516,7 @@ impl Pty {
         let session = self.kill_process_group();
         self.child.kill().map_err(|e| e.to_string())?;
         self.exit = Some(self.child.wait().map_err(|e| e.to_string())?.exit_code());
+        self._config_directory = None;
         session
     }
 }
@@ -440,8 +578,32 @@ fn drain(mut reader: Box<dyn Read + Send>, shared: Arc<Shared>, writer: Writer) 
 mod tests {
     use super::*;
     #[test]
+    fn prepared_configuration_capsule_is_private_and_removed_on_drop() {
+        let root =
+            std::env::temp_dir().join(format!("omp-config-capsule-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path;
+        {
+            let directory = ConfigDirectory::create(&root).unwrap();
+            path = directory.0.clone();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+            std::fs::write(path.join("config.yml"), "{}\n").unwrap();
+        }
+        assert!(!path.exists());
+        assert!(root.exists(), "cleanup is limited to the owned capsule");
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn screen_and_cursor_queries_survive_split_input() {
-        let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, CursorReplies::default());
+        let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, TerminalReplies::default());
         parser.process("café".as_bytes());
         parser.process(b"\x1b[");
         parser.process(b"6n");
@@ -454,44 +616,131 @@ mod tests {
         assert_eq!(parser.screen().size(), (40, 100));
     }
 
+    #[test]
+    fn primary_device_attributes_are_answered_once_across_every_chunk_boundary() {
+        for query in [b"\x1b[c".as_slice(), b"\x1b[0c"] {
+            for split in 0..=query.len() {
+                let mut output = Output::new();
+                output.parser.process(&query[..split]);
+                output.parser.process(&query[split..]);
+                assert_eq!(output.parser.callbacks().bytes, b"\x1b[?1;2c");
+                output.parser.callbacks_mut().bytes.clear();
+                output
+                    .parser
+                    .process(b"text\x1b[>c\x1b[?c\x1b[1c\x1b[0;0c\x1b[0:1c");
+                assert!(output.parser.callbacks().bytes.is_empty());
+                assert_eq!(output.parser.screen().contents(), "text");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fish_starts_and_accepts_input_without_an_attached_terminal() {
+        let Some(fish) = crate::toolchain::find_program("fish") else {
+            eprintln!("skipped: fish is not installed");
+            return;
+        };
+        let mut cmd = CommandBuilder::new(fish);
+        cmd.args(["--no-config", "--interactive"]);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        // The prompt marker is emitted only after fish completes its startup terminal queries.
+        cmd.args([
+            "--init-command",
+            "function fish_prompt; printf 'FISH_READY> '; end",
+        ]);
+        let mut shell = Pty::start(cmd).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = shell.screen().unwrap().text;
+            assert!(!text.contains("Primary Device Attribute"), "{text}");
+            if text.contains("FISH_READY>") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fish startup stalled: {text:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shell.write("printf '\\n%s\\n' INPUT_PRESERVED\n").unwrap();
+        loop {
+            let text = shell.screen().unwrap().text;
+            assert!(!text.contains("Primary Device Attribute"), "{text}");
+            if text.lines().any(|line| line == "INPUT_PRESERVED") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fish lost shell input: {text:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shell.kill().unwrap();
+    }
+
     /// Everything the shell started that stayed in its process group ends with it (the Windows job's Unix counterpart).
     #[cfg(unix)]
     #[test]
     fn killing_a_shell_ends_the_background_processes_it_started() {
         let folder = std::env::temp_dir();
         let mut shell = Pty::spawn_shell(folder.to_str().unwrap()).unwrap();
-        shell.write("sh -c 'sleep 600 & echo CHILD_PID=$!; wait'\n").unwrap();
+        shell
+            .write("sh -c 'sleep 600 & echo CHILD_PID=$!; wait'\n")
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         let child: libc::pid_t = loop {
             let text = shell.screen().unwrap().text;
-            let found = text.lines().filter_map(|line| line.rsplit_once("CHILD_PID=").map(|(_, pid)| pid)).find_map(|pid| pid.trim().parse().ok());
+            let found = text
+                .lines()
+                .filter_map(|line| line.rsplit_once("CHILD_PID=").map(|(_, pid)| pid))
+                .find_map(|pid| pid.trim().parse().ok());
             if let Some(pid) = found {
                 break pid;
             }
-            assert!(Instant::now() < deadline, "the shell never printed the child pid: {text:?}");
+            assert!(
+                Instant::now() < deadline,
+                "the shell never printed the child pid: {text:?}"
+            );
             std::thread::sleep(Duration::from_millis(50));
         };
-        // SAFETY: signal 0 only probes for existence.
-        assert_eq!(unsafe { libc::kill(child, 0) }, 0, "the background process is alive before the kill");
+        assert_eq!(
+            // SAFETY: signal 0 probes the numeric child PID without sending a signal or accessing Rust memory.
+            unsafe { libc::kill(child, 0) },
+            0,
+            "the background process is alive before the kill"
+        );
         shell.kill().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         // The orphaned sleep is reparented and reaped by init/subreaper; wait for it to disappear.
+        // SAFETY: signal 0 accepts a numeric PID and only probes existence; it does not access Rust memory.
         while unsafe { libc::kill(child, 0) } == 0 && !is_zombie(child) {
-            assert!(Instant::now() < deadline, "the background process survived the shell's kill");
+            assert!(
+                Instant::now() < deadline,
+                "the background process survived the shell's kill"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
 
     #[cfg(target_os = "linux")]
     fn is_zombie(pid: libc::pid_t) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z')))
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+        })
     }
 
     #[cfg(target_os = "macos")]
     fn is_zombie(pid: libc::pid_t) -> bool {
+        // SAFETY: proc_pidinfo receives a full writable proc_bsdinfo; it is read only after a complete result.
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
-        let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
         read == size && unsafe { info.assume_init() }.pbi_status == 5
     }
 }

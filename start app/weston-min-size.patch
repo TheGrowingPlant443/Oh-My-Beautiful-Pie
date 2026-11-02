@@ -1,0 +1,23 @@
+--- a/libweston/desktop/xdg-shell.c
++++ b/libweston/desktop/xdg-shell.c
+@@ -1130,19 +1130,7 @@
+ 		return;
+ 	}
+ 
+-	if (toplevel->next.state.fullscreen &&
+-	    (toplevel->next.size.width < geometry.width ||
+-	     toplevel->next.size.height < geometry.height)) {
+-		if (client_resource)
+-			wl_resource_post_error(client_resource,
+-					       XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE,
+-					       "xdg_surface geometry (%" PRIi32 " x %" PRIi32 ") "
+-					       "is larger than the configured fullscreen state (%" PRIi32 " x %" PRIi32 ")",
+-					       geometry.width, geometry.height,
+-					       toplevel->next.size.width,
+-					       toplevel->next.size.height);
+-		return;
+-	}
++	/* Kiosk clips oversized fullscreen clients; GTK minimum sizes may exceed a narrow output. */
+ 
+ 	toplevel->current.state = toplevel->next.state;
+ 	toplevel->current.min_size = toplevel->next.min_size;

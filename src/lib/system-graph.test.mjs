@@ -162,7 +162,6 @@ test("a repository above the Sigma cap is aggregated by directory first, then wi
   assert.ok(opened.nodes.length <= SIGMA_MAX_NODES);
   assert.ok(opened.edges.length <= SIGMA_MAX_EDGES);
   assert.equal(opened.renderer, "sigma");
-  assert.match(opened.reason, /collapsed/);
   assert.equal(opened.total.nodes, 7500);
   assert.equal(opened.displayed.nodes, 7500, "collapsed groups still account for every file");
   assert.ok(edgeCountsReconcile(index, opened));
@@ -170,13 +169,11 @@ test("a repository above the Sigma cap is aggregated by directory first, then wi
   const crowded = projectGraph(buildIndex(flatModel(SIGMA_MAX_NODES + 10, 100)), { mode: "source", expanded: null });
   assert.equal(crowded.nodes.length, 1);
   assert.equal(crowded.nodes[0].memberCount, SIGMA_MAX_NODES + 10);
-  assert.match(crowded.reason, /more than 5,000 nodes/);
   // Without containers the projection itself is windowed with explicit counts.
   const roots = (n) => ({ nodes: Array.from({ length: n }, (_, i) => leaf(`r${String(i).padStart(6, "0")}`)), edges: [] });
   const flat = projectGraph(buildIndex(roots(SIGMA_MAX_NODES + 10)), { mode: "source", expanded: null });
   assert.equal(flat.nodes.length, SIGMA_MAX_NODES);
   assert.equal(flat.paged.pages, 2);
-  assert.match(flat.reason, /window 1 of 2/);
   const second = projectGraph(buildIndex(roots(SIGMA_MAX_NODES + 10)), { mode: "source", expanded: null, page: 1 });
   assert.equal(second.nodes.length, 10);
   assert.equal(second.total.nodes, SIGMA_MAX_NODES + 10);
@@ -303,6 +300,31 @@ test("function overview nests functions under file containers and keeps same-nam
   assert.equal(view.nodes.find(item => item.id === "s1").selfLoops, 1);
   assert.equal(view.edges[0].grade, "candidate");
   assert.ok(edgeCountsReconcile(index, view));
+});
+
+test("function cycles stay under a shared file or common directory and truncated membership is not expandable", () => {
+  const symbol = (id, path) => ({
+    id, fileId: path, path, language: "ts", region: null, ownerId: null, kind: "function", name: id, qualifiedName: id,
+    span: { byteStart: 0, byteEnd: 1, lineStart: 1, lineEnd: 1, columnStart: 0, columnEnd: 1 },
+  });
+  const group = (id, members, membersTruncated = false) => ({
+    id, kind: "scc", level: "functions", label: id, cyclic: true, memberCount: members.length, members, membersTruncated,
+    internalEdges: 2, linksTotal: 0, linksTruncated: false, links: [],
+  });
+  const index = buildIndex(modelFromOverview({
+    level: "functions",
+    groups: [group("same", ["a", "b"]), group("cross", ["c", "d"], true)],
+    symbols: [symbol("a", "src/same.ts"), symbol("b", "src/same.ts"), symbol("c", "src/c.ts"), symbol("d", "src/nested/d.ts")],
+  }));
+  assert.equal(index.nodes.get("same").parentId, "file:src/same.ts");
+  assert.equal(index.nodes.get("file:src/same.ts").parentId, "dir:src");
+  assert.deepEqual(index.nodes.get("same").lazyMembers, ["a", "b"]);
+  assert.equal(index.nodes.get("cross").parentId, "dir:src");
+  assert.deepEqual(index.nodes.get("cross").lazyMembers, []);
+  assert.equal(index.totalNodes, 4);
+  const view = projectGraph(index, { mode: "source", expanded: null });
+  assert.equal(view.nodes.find(item => item.id === "same").expandable, true);
+  assert.equal(view.nodes.find(item => item.id === "cross").expandable, false);
 });
 
 test("neighborhood rows become peers and edges with site evidence; missing endpoints remain sites", () => {

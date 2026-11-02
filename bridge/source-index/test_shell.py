@@ -204,6 +204,16 @@ class PowerShellRecipe(unittest.TestCase):
         # imports are not also calls
         self.assertFalse([s for s in res["sites"] if s["relation"] == "calls" and s["raw"].lower().startswith(("import-module", "using"))])
 
+    def test_module_pathlike_slashes_and_extension_boundary(self):
+        res, _ = self.go(
+            "Import-Module 'dir/Module'\nImport-Module 'dir\\Module'\n"
+            "Import-Module 'Module.PSM1'\nImport-Module 'Module.psm1.backup'\n"
+        )
+        self.assertEqual(
+            {s["binding"]["specifier"]: s["binding"]["pathLike"] for s in by(res["sites"], relation="imports")},
+            {"dir/Module": True, "dir\\Module": True, "Module.PSM1": True, "Module.psm1.backup": False},
+        )
+
     def test_conditional_keywords_unicode_case(self):
         res, data = self.go(
             "if ($a) {\n  Invoke-A\n} else {\n  Invoke-B\n}\nInvoke-C\nfunction Café {}\nfunction cafe {}\nfunction CAFÉ {}\n"

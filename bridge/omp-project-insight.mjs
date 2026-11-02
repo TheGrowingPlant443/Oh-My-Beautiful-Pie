@@ -1,14 +1,15 @@
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
 import {
-  ID, KINDS, MAX_LIST_ENTRIES, MAX_READ_BYTES, MAX_REQUEST_BYTES, MAX_RESULT_BYTES, VISUALIZATION_KINDS, assertOpen, clean, containsSecret, evidenceExcluded, insightRoot, inside, lineValid, list, listEvidence, normalizeRelative,
-  nullableText, object, openRequest, producerFields, publishResult, readBoundedJson, readEvidence, requestFolder, stat, text, textList, validRelativePath,
+  ID, KINDS, MAX_REQUEST_BYTES, MAX_RESULT_BYTES, VISUALIZATION_KINDS, assertOpen, clean, containsSecret, inside, lineValid, list, listEvidence, normalizeRelative,
+  nullableText, object, openRequest, producerFields, publishExclusively, publishResult, readBoundedJson, readEvidence, requestFolder, stat, text, textList, validRelativePath,
 } from './omp-insight-base.mjs';
 import { readTargetStructure, snapshotReference, systemOverviewInspect, visualizationEvidence } from './omp-source-snapshot.mjs';
 import { CERTAINTIES, COVERAGE_STATUSES, HELICOPTER_CERTAINTIES, HELICOPTER_NODE_KINDS, MAPPING_OPERATIONS, SYSTEM_NODE_KINDS, SYSTEM_RELATIONS, formatVisualizationResult, saveHelicopter, saveRepositoryStructure, saveSystemOverview } from './omp-system-results.mjs';
 import { MAX_PROMPT_BYTES, TOOLS, createVisualizationGuard, registerVisualizationGuard } from './omp-visualization-guard.mjs';
 
-export { KINDS, MAX_LIST_ENTRIES, MAX_READ_BYTES, containsSecret, evidenceExcluded, insightRoot, validRelativePath };
+export { MAX_LIST_ENTRIES, MAX_READ_BYTES, evidenceExcluded, insightRoot } from './omp-insight-base.mjs';
+export { KINDS, containsSecret, validRelativePath };
 
 // Architect-only project-insight tools: a read-only, request-bound repository evidence reader and the producer-bound
 // result submissions (dependencyDiscovery, requirements, systemOverview, helicopter, structureCurrent, structureProposed). `dir` is
@@ -33,7 +34,10 @@ const ENVIRONMENTS = ['host', 'wsl', 'container'];
 function insideProject(folder, relative) {
   let real;
   try { real = realpathSync(path.join(folder, relative)); }
-  catch (error) { if (['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error.code)) return true; throw error; }
+  catch (error) {
+    if (['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error.code)) return true;
+    throw error;
+  }
   return inside(realpathSync(folder), real);
 }
 
@@ -125,19 +129,23 @@ export { saveHelicopter, saveRepositoryStructure, saveSystemOverview };
 
 const bullets = items => items.map(item => `  - ${item}`);
 
+function discoveryLine(item) {
+  const where = item.citations.map(citation => (citation.line ? `${citation.path}:${citation.line}` : citation.path)).join(', ');
+  const relationship = item.relationship ? `, ${item.relationship}` : '';
+  const notes = item.notes ? `: ${item.notes}` : '';
+  return `  - ${item.name} [${item.ecosystem ?? 'unknown ecosystem'}] declared ${item.declaredVersion ?? 'unknown'}${relationship} (${where})${notes}`;
+}
+
 export function formatInsightResult(request, result) {
   if (VISUALIZATION_KINDS.includes(request.kind)) return formatVisualizationResult(request, result);
   if (request.kind !== 'dependencyDiscovery' && request.kind !== 'requirements') throw new Error(`no console replay for request kind "${String(request.kind).slice(0, 80)}"`);
-  const header = request.kind === 'dependencyDiscovery'
+  const discovery = request.kind === 'dependencyDiscovery';
+  const header = discovery
     ? `Dependency discovery (Architect findings from repository files; nothing was installed or changed)\nProject: ${request.folder}`
     : `Project requirements findings (Architect findings, unverified; the app's own detections are separate)\nProject: ${request.folder}`;
   const out = [header, ''];
-  if (request.kind === 'dependencyDiscovery') {
-    out.push(`Dependencies (${result.items.length}):`);
-    for (const item of result.items) {
-      const where = item.citations.map(citation => (citation.line ? `${citation.path}:${citation.line}` : citation.path)).join(', ');
-      out.push(`  - ${item.name} [${item.ecosystem ?? 'unknown ecosystem'}] declared ${item.declaredVersion ?? 'unknown'}${item.relationship ? `, ${item.relationship}` : ''} (${where})${item.notes ? `: ${item.notes}` : ''}`);
-    }
+  if (discovery) {
+    out.push(`Dependencies (${result.items.length}):`, ...result.items.map(discoveryLine));
   } else {
     out.push(`Requirements (${result.items.length}):`);
     for (const item of result.items) out.push(`  - ${item.name} [${item.category}, ${item.need}, ${item.environment}]: ${item.explanation}`);
@@ -169,6 +177,7 @@ export function loadInsightResultText(dir, kind, requestId) {
  */
 export function registerProjectInsightTools(pi, dir, producerFor, resultConsole, options = {}) {
   for (const kind of KINDS) resultConsole?.registerKind(kind, (consoleDir, requestId) => loadInsightResultText(consoleDir, kind, requestId));
+  const promptAdmissions = new Map();
   const announce = (ctx, kind, requestId) => {
     try { resultConsole?.enqueue(ctx, { kind, requestId, text: loadInsightResultText(dir, kind, requestId) }); } catch { /* the saved dialog still shows it */ }
   };
@@ -234,6 +243,31 @@ export function registerProjectInsightTools(pi, dir, producerFor, resultConsole,
 
   // ---- system overview / repository structure tools and the analysis-only prompt control ----------------------
   const guard = registerVisualizationGuard(pi, createVisualizationGuard());
+  function failPrompt(requestId, message, code = 'native_prompt_failed') {
+    const admitted = promptAdmissions.get(requestId);
+    if (!admitted) return;
+    const { folder } = openRequest(dir, requestId, admitted.actor, admitted.kind);
+    try {
+      if (stat(path.join(folder, 'result.json')) || stat(path.join(folder, 'terminal.json'))) return;
+      const terminal = { status: 'error', code, message: Buffer.from(String(message)).subarray(0, 16380).toString('utf8'), resultHash: null, at: Date.now() };
+      publishExclusively(folder, JSON.stringify(terminal), () => assertOpen(folder), 'terminal.json');
+    } finally { guard.discard(requestId); promptAdmissions.delete(requestId); }
+  }
+  function reportFailedPrompt(requestId, message, code) {
+    try { failPrompt(requestId, message, code); }
+    catch (error) { process.stderr.write(`Cannot persist Architect prompt failure: ${String(error?.message ?? error)}\n`); }
+  }
+  pi.on?.('agent_end', (event, ctx) => {
+    if (ctx?.agent?.kind !== 'main' || event?.willContinue === true) return;
+    const last = [...(event.messages ?? [])].reverse().find(message => message.role === 'assistant');
+    for (const state of guard.states()) if (state.requestId && promptAdmissions.has(state.requestId)) {
+      const settled = () => {
+        if (guard.has(state.requestId)) { ctx.setTimeout(settled, 50); return; }
+        reportFailedPrompt(state.requestId, last?.errorMessage ?? 'The Architect ended or its queued prompt was cancelled without saving the requested visualization. Inspect its conversation and explicitly generate a new request.', last?.stopReason === 'error' ? 'provider_error' : 'analysis_incomplete');
+      };
+      ctx.setTimeout(settled, 0);
+    }
+  });
   const ok = body => ({ content: [{ type: 'text', text: body }] });
   pi.registerTool({
     name: TOOL_SYSTEM_INSPECT,
@@ -338,27 +372,39 @@ export function registerProjectInsightTools(pi, dir, producerFor, resultConsole,
    * once the native session has admitted it. A repeated request id is a duplicate and is never sent again.
    */
   async function promptVisualization(ctx, payload) {
-    if (typeof options.submitPrompt !== 'function') throw new Error('native_prompt_unavailable: Reopen this session with a compatible OMP version.');
-    if (!object(payload) || typeof payload.requestId !== 'string' || !VISUALIZATION_KINDS.includes(payload.kind) || typeof payload.message !== 'string') throw new Error('invalid visualization prompt request');
-    if (!payload.message.trim() || !clean(payload.message) || Buffer.byteLength(payload.message) > MAX_PROMPT_BYTES) throw new Error(`message must be 1..${MAX_PROMPT_BYTES} bytes of text`);
-    const actor = producerFor(ctx);
-    const { folder, request } = openRequest(dir, payload.requestId, actor, payload.kind);
-    assertOpen(folder);
-    snapshotReference(dir, folder, request);
-    const admission = guard.admit(ctx, { requestId: payload.requestId, kind: payload.kind, message: payload.message });
-    if (admission.duplicate) return { accepted: true, duplicate: true };
-    const admitted = Promise.withResolvers();
-    let accepted = false;
+    let accepted = false, guarded = false;
     try {
-      const running = options.submitPrompt(admission.text, { onPromptAdmitted() { accepted = true; admitted.resolve(); } });
-      Promise.resolve(running).then(() => { if (!accepted) admitted.reject(new Error('The native session did not admit the visualization prompt')); }, error => { if (!accepted) admitted.reject(error); });
+      if (typeof options.submitPrompt !== 'function') throw new Error('native_prompt_unavailable: Reopen this session with a compatible OMP version.');
+      if (!object(payload) || typeof payload.requestId !== 'string' || !VISUALIZATION_KINDS.includes(payload.kind) || typeof payload.message !== 'string') throw new Error('invalid visualization prompt request');
+      if (!payload.message.trim() || !clean(payload.message) || Buffer.byteLength(payload.message) > MAX_PROMPT_BYTES) throw new Error(`message must be 1..${MAX_PROMPT_BYTES} bytes of text`);
+      const actor = producerFor(ctx);
+      const { folder, request } = openRequest(dir, payload.requestId, actor, payload.kind);
+      assertOpen(folder);
+      snapshotReference(dir, folder, request);
+      const admission = guard.admit(ctx, { requestId: payload.requestId, kind: payload.kind, message: payload.message });
+      if (admission.duplicate) {
+        const receipt = promptAdmissions.get(payload.requestId);
+        if (!receipt) { accepted = true; throw new Error('native_prompt_admission_unknown: Inspect the Architect conversation before sending anything else.'); }
+        return { ...await receipt.promise, duplicate: true };
+      }
+      guarded = true;
+      const admitted = Promise.withResolvers();
+      promptAdmissions.set(payload.requestId, { ...admitted, actor, kind: payload.kind });
+      admitted.promise.catch(() => {});
+      const running = options.submitPrompt(admission.text, { onPromptAdmitted() { accepted = true; admitted.resolve({ accepted: true, admitted: true, duplicate: false }); } });
+      Promise.resolve(running).then(() => { if (!accepted) admitted.reject(new Error('native_prompt_not_admitted: The native session did not admit the visualization prompt')); }, error => {
+        if (!accepted) admitted.reject(error);
+        else reportFailedPrompt(payload.requestId, `The admitted native prompt failed: ${String(error?.message ?? error)}. It was not resent.`, 'native_prompt_failed');
+      });
       await admitted.promise;
+      return { accepted: true, admitted: true, duplicate: false };
     } catch (error) {
-      // A refused prompt never ran: drop its guard so a later explicit retry is a fresh admission.
-      if (!accepted) guard.discard(payload.requestId);
-      throw error;
+      if (accepted) throw error;
+      if (guarded) guard.discard(payload.requestId);
+      if (guarded) { promptAdmissions.get(payload.requestId)?.reject(error); promptAdmissions.delete(payload.requestId); }
+      const message = String(error?.message ?? error);
+      return { admitted: false, error: { code: message.split(':')[0].replaceAll(' ', '_'), message } };
     }
-    return { accepted: true, duplicate: false };
   }
   return { promptVisualization, guard };
 }

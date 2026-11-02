@@ -2,20 +2,39 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { nativeAnswer, controlAllowed, planPayload, confirmedPlanHandoff, managerParameters, managerPayload, registerManagerTool } from './omp-manager.mjs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { execFile, spawnSync } from 'node:child_process';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import { promisify } from 'node:util';
 
-test('approval answers must be actual native labels, not truthy values', () => {
+test('select answers must be actual native labels, not truthy values', () => {
   const request = { method: 'select', options: ['Approve', 'Deny'] };
   assert.equal(nativeAnswer(request, 'Deny'), 'Deny');
   assert.equal(nativeAnswer(request, 'Approve'), 'Approve');
   assert.throws(() => nativeAnswer(request, true));
   assert.throws(() => nativeAnswer(request, 'approve'));
   assert.equal(nativeAnswer(request, { cancelled: true }), undefined);
-  assert.equal(nativeAnswer({ method: 'confirm' }, { cancelled: true }), false);
-  assert.equal(nativeAnswer({ method: 'approve' }, { cancelled: true }), false);
-  assert.equal(nativeAnswer({ method: 'approve' }, true), true);
-  assert.throws(() => nativeAnswer({ method: 'approve' }, 'Approve'), /boolean/);
+});
+test('remote approvals grant only this call while confirmations remain boolean', () => {
+  const approval = { method: 'approve' };
+  assert.equal(nativeAnswer(approval, true), 'once');
+  assert.equal(nativeAnswer(approval, false), 'deny');
+  assert.equal(nativeAnswer(approval, { cancelled: true }), 'deny');
+  for (const response of ['Approve', 'once', 'session', { grant: 'target', always: true }]) {
+    assert.throws(() => nativeAnswer(approval, response), /boolean/);
+  }
+  const confirmation = { method: 'confirm' };
+  assert.equal(nativeAnswer(confirmation, true), true);
+  assert.equal(nativeAnswer(confirmation, false), false);
+  assert.equal(nativeAnswer(confirmation, { cancelled: true }), false);
+  assert.throws(() => nativeAnswer(confirmation, 'deny'), /boolean/);
+});
+
+test('cancelled native text and Ask answers stay undefined rather than becoming negative confirmations', () => {
+  for (const method of ['input', 'editor', 'askDialog']) {
+    assert.equal(nativeAnswer({ method }, { cancelled: true }), undefined);
+  }
 });
 test('rich answers retain native question identity and enforce selection rules', () => {
   const request = { method: 'askDialog', questions: [{ id: 'design', question: 'Design?', options: [{label:'Simple'},{label:'Complex'}] }] };
@@ -32,6 +51,7 @@ test('disabled options and opaque native overlays cannot be auto-approved', () =
   assert.throws(() => nativeAnswer({method:'terminal'}, 'Approve and execute'), /native_terminal_decision/);
   assert.throws(() => nativeAnswer({method:'custom'}, true), /native_terminal_decision/);
   assert.throws(() => nativeAnswer({ method: 'custom' }, { cancelled: true }), /native_terminal_decision/);
+  assert.throws(() => nativeAnswer({ method: 'terminal' }, { cancelled: true }), /native_terminal_decision/);
 });
 test('app-originated abort and prompt reach any session; manager-originated control still needs an owned instance', () => {
   assert.equal(controlAllowed({ source: 'human', action: 'abort', role: 'manager', owner: null }), true);
@@ -180,3 +200,37 @@ test('registered Manager tool uses installed SDK validator before any transport 
   });
   assert.equal(result.status,0,result.stderr || result.error?.message || result.stdout);
 });
+
+for (const [name, managerNotice] of [
+  ['cached interactive startup retains native workspace, UI and Eval command capture', false],
+  ['reopening a saved Manager conversation does not append another startup announcement', true],
+]) {
+  test(name, {
+    skip: !sdk || !process.env.OMP_BIN ? 'Set OMP_SDK_DIR and OMP_BIN for the packaged CLI' : process.platform === 'win32' ? 'Bun.Terminal requires Unix' : false,
+    timeout: 110000,
+  }, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'omp-bridge-startup-'));
+    try {
+      const agent = path.join(root, 'agent');
+      await mkdir(agent);
+      await writeFile(path.join(agent, 'models.yml'), 'providers:\n  startup-offline:\n    api: openai-completions\n    baseUrl: http://127.0.0.1:9/v1\n    apiKey: fixture-key\n    models:\n      - id: fixture\n');
+      await writeFile(path.join(agent, 'config.yml'), 'modelRoles:\n  default: startup-offline/fixture\nstartup:\n  setupWizard: false\n');
+      const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', [
+        fileURLToPath(new URL('./fixtures/bridge-startup-scenario.mjs', import.meta.url)),
+      ], {
+        env: { ...process.env, BRIDGE_STARTUP_ROOT: root, HOME: root, USERPROFILE: root,
+          PI_CODING_AGENT_DIR: agent, PI_CONFIG_DIR: '.omp', PI_CONFIG_FILES: '', OMP_PROFILE: 'default',
+          XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'),
+          XDG_STATE_HOME: path.join(root, 'state'), XDG_CACHE_HOME: path.join(root, 'cache'),
+          PI_NATIVES_DIR: process.env.PI_NATIVES_DIR || path.join(os.homedir(), '.omp', 'natives'),
+          OMP_MANAGER_BRIDGE_ENDPOINT: '127.0.0.1:9', OMP_MANAGER_BRIDGE_TOKEN: 'fixture',
+          OMP_MANAGER_BRIDGE_INSTANCE_ID: 'fixture', OMP_MANAGER_BRIDGE_GENERATION: '1',
+          OMP_MANAGER_BRIDGE_ROLE: managerNotice ? 'manager' : 'instance', OMP_MANAGER_BROWSER_REQUIRED: '1',
+          BRIDGE_MANAGER_NOTICE: managerNotice ? '1' : '0',
+          OMP_MANAGER_TERMINAL_DIR: path.join(root, 'ledger'), OMP_MANAGER_SDK_DIR: sdk },
+        timeout: 100000, maxBuffer: 2 * 1024 * 1024,
+      });
+      assert.match(stdout, managerNotice ? /Manager startup notice survives reopening without duplication/ : /Cached native bridge startup verified/);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+}

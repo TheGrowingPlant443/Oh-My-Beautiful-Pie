@@ -115,7 +115,7 @@ class PhpRecipe(unittest.TestCase):
         self.assertEqual(sites["strlen"]["binding"]["kind"], "identifier")
         self.assertEqual(sites["strlen"]["resolution"], "unresolved")
         self.assertEqual(sites["$v"]["resolution"], "dynamic")
-        self.assertEqual(sites["$o?->go"]["binding"]["optional"], True)
+        self.assertTrue(sites["$o?->go"]["binding"]["optional"])
         self.assertEqual(sites["$x->$name"]["resolution"], "dynamic")
         self.assertEqual(sites["$cls::make"]["resolution"], "dynamic")
         self.assertEqual(sites["new $cls"]["resolution"], "dynamic")
@@ -132,6 +132,26 @@ class PhpRecipe(unittest.TestCase):
         self.assertIn(("$a", "parameter"), [(d["name"], d["kind"]) for d in closure["bindings"]["declarations"]])
         for s in res["sites"]:
             self.assertIsNone(s["targetId"])
+
+    def test_relative_and_dynamic_constructors_keep_argument_calls_and_spans(self):
+        res, data = run(
+            "<?php class K extends Base { function make($class) {\nif ($flag) {\n"
+            "new self(first()); new parent(); new static(); new $class(last());\n} } }\n"
+        )
+        calls = by(res["sites"], relation="calls")
+        self.assertEqual([s["raw"] for s in calls], ["new self", "first", "new parent", "new static", "new $class", "last"])
+        constructors = [s for s in calls if s["binding"]["kind"] in ("new", "dynamic")]
+        self.assertEqual(
+            [(s["binding"]["name"], s["binding"]["receiverKind"], s["resolution"]) for s in constructors],
+            [("self", "self", "unresolved"), ("parent", "super", "unresolved"), ("static", "self", "unresolved"), (None, None, "dynamic")],
+        )
+        self.assertTrue(constructors[-1]["binding"]["new"])
+        self.assertEqual(
+            [data[s["span"]["byteStart"]:s["span"]["byteEnd"]].decode() for s in constructors],
+            ["new self(first())", "new parent()", "new static()", "new $class(last())"],
+        )
+        method = by(res["symbols"], name="make")[0]
+        self.assertTrue(all(s["callerId"] == method["id"] and s["conditional"] for s in calls))
 
     def test_anonymous_class_unicode_case_conditional(self):
         res, data = run(

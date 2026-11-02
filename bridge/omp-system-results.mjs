@@ -154,7 +154,31 @@ const HELICOPTER_KEYS = ['requestId', 'schemaVersion', 'snapshotId', 'purpose', 
 const MAX_CAPABILITY_NODES = 500;
 const SOURCE_EXTENSIONS = new Set(['rs', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'java', 'kt', 'go', 'cs', 'cpp', 'c', 'h', 'hpp', 'rb', 'php', 'swift', 'svelte', 'vue', 'json', 'yml', 'yaml', 'toml', 'xml', 'sql', 'sh', 'ps1', 'gradle', 'ini', 'env', 'lock', 'properties']);
 const PATH_ROOTS = ['src/', 'lib/', 'app/', 'docs/', 'test/', 'tests/', 'packages/', 'node_modules/'];
-const EDGE_PUNCTUATION = /^[.,;:!?()[\]"']+|[.,;:!?()[\]"']+$/g;
+const EDGE_PUNCTUATION = ".,;:!?()[]\"'";
+
+function trimEdgePunctuation(value) {
+  let start = 0;
+  let end = value.length;
+  while (start < end && EDGE_PUNCTUATION.includes(value[start])) start++;
+  while (end > start && EDGE_PUNCTUATION.includes(value[end - 1])) end--;
+  return value.slice(start, end);
+}
+
+function fileMarker(token) {
+  if (/^[A-Za-z]:[\\/]/.test(token)) return 'a file path';
+  if (!token.includes('/') && !token.includes('\\')) {
+    const dot = token.lastIndexOf('.');
+    if (dot > 0 && SOURCE_EXTENSIONS.has(token.slice(dot + 1).toLowerCase())) return 'a source file name';
+    return null;
+  }
+  const rooted = /^[/\\]/.test(token) || token.startsWith('./') || token.startsWith('../') || token.startsWith('~/') || PATH_ROOTS.some(root => token.startsWith(root));
+  if (rooted) return 'a file path';
+  const last = token.slice(Math.max(token.lastIndexOf('/'), token.lastIndexOf('\\')) + 1);
+  const dot = last.lastIndexOf('.');
+  const extension = dot >= 0 ? last.slice(dot + 1) : '';
+  if (/^[A-Za-z0-9]{1,5}$/.test(extension) && !/^\d+$/.test(extension)) return 'a file path';
+  return null;
+}
 
 /**
  * Business-facing text carries no code: file paths, file names, call syntax and identifiers belong in evidence records,
@@ -164,19 +188,10 @@ export function technicalMarker(value) {
   if (value.includes('`')) return 'inline code';
   if (['::', '=>', '->', '()'].some(syntax => value.includes(syntax))) return 'code syntax';
   for (const raw of value.split(/\s+/)) {
-    const token = raw.replace(EDGE_PUNCTUATION, '');
+    const token = trimEdgePunctuation(raw);
     if (token.length < 2) continue;
-    if (/^[A-Za-z]:[\\/]/.test(token)) return 'a file path';
-    if (token.includes('/') || token.includes('\\')) {
-      const rooted = /^[/\\]/.test(token) || token.startsWith('./') || token.startsWith('../') || token.startsWith('~/') || PATH_ROOTS.some(root => token.startsWith(root));
-      const last = token.split(/[/\\]/).pop() ?? '';
-      const dot = last.lastIndexOf('.');
-      const extension = dot >= 0 ? last.slice(dot + 1) : '';
-      if (rooted || (/^[A-Za-z0-9]{1,5}$/.test(extension) && !/^\d+$/.test(extension))) return 'a file path';
-    } else {
-      const dot = token.lastIndexOf('.');
-      if (dot > 0 && SOURCE_EXTENSIONS.has(token.slice(dot + 1).toLowerCase())) return 'a source file name';
-    }
+    const kind = fileMarker(token);
+    if (kind) return kind;
     if (/[\p{L}\p{N}]_[\p{L}\p{N}]/u.test(token)) return 'a code identifier';
   }
   return null;
@@ -187,6 +202,25 @@ function businessWords(value, max, label, options) {
   const kind = typeof value === 'string' ? technicalMarker(value) : null;
   if (kind) throw new Error(`${label} looks like ${kind}. Describe it in plain business words and cite the repository only through evidenceIds`);
   return value;
+}
+
+function validateHelicopterCycles(nodes) {
+  const parents = new Map(nodes.map(node => [node.id, node.parentId]));
+  for (const node of nodes) {
+    for (let step = node.parentId, count = 0; step !== null; step = parents.get(step), count++) {
+      if (step === node.id || count > parents.size) throw new Error(`node "${node.id}" is part of a containment cycle`);
+    }
+  }
+}
+
+function validateHelicopterParents(nodes, kinds) {
+  for (const node of nodes) {
+    if (node.parentId === null) continue;
+    if (node.parentId === node.id) throw new Error(`node "${node.id}" cannot contain itself`);
+    if (!kinds.has(node.parentId)) throw new Error(`node "${node.id}" has unknown parent "${node.parentId}"`);
+    if (kinds.get(node.parentId) !== 'businessGroup') throw new Error(`node "${node.id}" sits inside "${node.parentId}", which is not a journey grouping; only a businessGroup contains other nodes`);
+  }
+  validateHelicopterCycles(nodes);
 }
 
 export function validateHelicopter(payload, _folder, { request, requestDir, dir }) {
@@ -209,18 +243,7 @@ export function validateHelicopter(payload, _folder, { request, requestDir, dir 
     citations(node.evidenceIds, evidenceIds, label);
     if (node.kind !== 'businessGroup' && node.evidenceIds.length === 0) throw new Error(`${label} cites no evidence; only a journey grouping may stand without it, so name what is unclear as limitations instead of inventing it`);
   });
-  const parents = new Map(payload.nodes.map(node => [node.id, node.parentId]));
-  for (const node of payload.nodes) {
-    if (node.parentId === null) continue;
-    if (node.parentId === node.id) throw new Error(`node "${node.id}" cannot contain itself`);
-    if (!kinds.has(node.parentId)) throw new Error(`node "${node.id}" has unknown parent "${node.parentId}"`);
-    if (kinds.get(node.parentId) !== 'businessGroup') throw new Error(`node "${node.id}" sits inside "${node.parentId}", which is not a journey grouping; only a businessGroup contains other nodes`);
-  }
-  for (const node of payload.nodes) {
-    for (let step = node.parentId, count = 0; step !== null; step = parents.get(step), count++) {
-      if (step === node.id || count > parents.size) throw new Error(`node "${node.id}" is part of a containment cycle`);
-    }
-  }
+  validateHelicopterParents(payload.nodes, kinds);
   const edgeIds = new Set();
   boundedList(payload.edges, LIMITS.edges, 'edges').forEach((edge, index) => {
     const label = `edges[${index}]`;
@@ -319,14 +342,30 @@ const SHAPE = {
   remove: (from, to) => from.length >= 1 && to.length === 0,
 };
 
+function validateStructureBindings(payload, request) {
+  const expected = { sourceId: request.sourceId ?? null, sourceHash: request.sourceHash ?? null, baseRequestId: request.baseRequestId ?? null, supersedesRequestId: request.supersedesRequestId ?? null };
+  for (const [key, value] of Object.entries(expected)) {
+    if (payload[key] === value) continue;
+    const expectedValue = value === null ? 'null' : `"${value}"`;
+    throw new Error(`${key} must be ${expectedValue} (the app derives it from the request)`);
+  }
+}
+
+function validateStructureParents(entries) {
+  const parents = new Map(entries.map(entry => [entry.id, entry.parentId]));
+  for (const entry of entries) {
+    if (entry.parentId !== null && !parents.has(entry.parentId)) throw new Error(`entry "${entry.id}" has unknown parent "${entry.parentId}"`);
+    for (let step = entry.parentId, count = 0; step !== null; step = parents.get(step), count++) {
+      if (step === entry.id || count > parents.size) throw new Error(`entry "${entry.id}" is part of a parent cycle`);
+    }
+  }
+}
+
 export function validateRepositoryStructure(payload, _folder, { request, requestDir, dir }) {
   exactKeys(payload, STRUCTURE_KEYS, 'the repository structure');
   common(payload, request);
   const proposed = request.kind === 'structureProposed';
-  const expected = { sourceId: request.sourceId ?? null, sourceHash: request.sourceHash ?? null, baseRequestId: request.baseRequestId ?? null, supersedesRequestId: request.supersedesRequestId ?? null };
-  for (const [key, value] of Object.entries(expected)) {
-    if (payload[key] !== value) throw new Error(`${key} must be ${value === null ? 'null' : `"${value}"`} (the app derives it from the request)`);
-  }
+  validateStructureBindings(payload, request);
   const cite = citationContext(dir, requestDir, request);
   const evidenceIds = validateEvidence(payload, cite);
   const ids = new Set();
@@ -345,13 +384,7 @@ export function validateRepositoryStructure(payload, _folder, { request, request
     if (!proposed && new Set(entry.members).size !== entry.members.length) throw new Error(`${label}.members repeats an inventory path`);
     citations(entry.evidenceIds, evidenceIds, label);
   });
-  const parents = new Map(payload.entries.map(entry => [entry.id, entry.parentId]));
-  for (const entry of payload.entries) {
-    if (entry.parentId !== null && !parents.has(entry.parentId)) throw new Error(`entry "${entry.id}" has unknown parent "${entry.parentId}"`);
-    for (let step = entry.parentId, count = 0; step !== null; step = parents.get(step), count++) {
-      if (step === entry.id || count > parents.size) throw new Error(`entry "${entry.id}" is part of a parent cycle`);
-    }
-  }
+  validateStructureParents(payload.entries);
   // A "current" revision describes the repository as it is; the target-versus-current fields belong to a proposal.
   if (proposed) distinctDestinations(payload.entries.flatMap(entry => [...(entry.path === null ? [] : [entry.path]), ...entry.members]), 'entries');
   boundedList(payload.conventions, LIMITS.conventions, 'conventions').forEach((item, index) => {
@@ -410,41 +443,98 @@ export function saveRepositoryStructure(dir, payload, actor) {
 const LISTED = 80;
 const more = (items, shown) => (items.length > shown ? [`  ... ${items.length - shown} more in the saved result`] : []);
 
+function nodeRow(node, labels, kind = node.kind) {
+  const parent = node.parentId ? ` (in ${labels.get(node.parentId) ?? node.parentId})` : '';
+  return `  - [${kind}] ${node.label}${parent}`;
+}
+
+function systemEdgeRow(edge, labels) {
+  const label = edge.label ? `: ${edge.label}` : '';
+  return `  - ${labels.get(edge.sourceId) ?? edge.sourceId} -${edge.relation}-> ${labels.get(edge.targetId) ?? edge.targetId} [${edge.certainty}]${label}`;
+}
+
+function coverageRow(item) {
+  const notes = item.notes ? ` - ${item.notes}` : '';
+  return `  - ${item.area}: ${item.status}${notes}`;
+}
+
+function helicopterEdgeRow(edge, labels) {
+  const label = edge.label ? ` (${edge.label})` : '';
+  const certainty = edge.certainty === 'unknown' ? ' [Needs clarification]' : '';
+  return `  - ${labels.get(edge.sourceId) ?? edge.sourceId} -> ${labels.get(edge.targetId) ?? edge.targetId}${label}${certainty}`;
+}
+
+function capabilityRow(item) {
+  const description = item.description ? `: ${item.description}` : '';
+  return `  - ${item.label}${description}`;
+}
+
+function structureEntryRow(entry) {
+  const location = entry.path || entry.pattern;
+  const suffix = location ? ` (${location})` : '';
+  return `  - ${entry.label}${suffix}: ${entry.purpose}`;
+}
+
+function conventionRow(item) {
+  const proposed = item.proposed ? ` -> ${item.proposed}` : '';
+  return `  - ${item.scope}: ${item.current}${proposed}`;
+}
+
+function systemOverviewRows(request, result) {
+  const labels = new Map(result.nodes.map(node => [node.id, node.label]));
+  return [
+    'System overview (Architect analysis of the indexed source; not verified runtime traffic)', `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`, '',
+    `Elements (${result.nodes.length}):`, ...result.nodes.slice(0, LISTED).map(node => nodeRow(node, labels)), ...more(result.nodes, LISTED),
+    '', `Relationships (${result.edges.length}):`, ...result.edges.slice(0, LISTED).map(edge => systemEdgeRow(edge, labels)), ...more(result.edges, LISTED),
+    '', `Coverage (${result.coverage.length}):`, ...result.coverage.slice(0, LISTED).map(coverageRow), ...more(result.coverage, LISTED),
+  ];
+}
+
+function helicopterRows(request, result) {
+  const labels = new Map(result.nodes.map(node => [node.id, node.label]));
+  return [
+    'Helicopter view (Architect analysis of the indexed source, in business terms; observed behavior, not verified runtime behavior)', `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`, '', `Purpose: ${result.purpose}`, '',
+    `Journeys, people and steps (${result.nodes.length}):`, ...result.nodes.slice(0, LISTED).map(node => nodeRow(node, labels, HELICOPTER_KIND_WORDS[node.kind] ?? node.kind)), ...more(result.nodes, LISTED),
+    '', `Flow (${result.edges.length}):`, ...result.edges.slice(0, LISTED).map(edge => helicopterEdgeRow(edge, labels)), ...more(result.edges, LISTED),
+    '', `Business capabilities (${result.capabilities.length}):`, ...result.capabilities.slice(0, LISTED).map(capabilityRow), ...more(result.capabilities, LISTED),
+    '', `Coverage (${result.coverage.length}):`, ...result.coverage.slice(0, LISTED).map(coverageRow), ...more(result.coverage, LISTED),
+  ];
+}
+
+function repositoryStructureRows(request, result) {
+  const proposed = request.kind === 'structureProposed';
+  const out = [
+    proposed
+      ? 'Proposed repository structure (a visualization of the target Markdown; the Markdown remains the source of truth)'
+      : 'Current repository structure and naming (Architect analysis of the indexed source)',
+    `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`,
+    ...(result.sourceId ? [`Target document: ${result.sourceId} (sha256 ${result.sourceHash})`] : []),
+    '', `Groups (${result.entries.length}):`, ...result.entries.slice(0, LISTED).map(structureEntryRow), ...more(result.entries, LISTED),
+    '', `Conventions (${result.conventions.length}):`, ...result.conventions.slice(0, LISTED).map(conventionRow), ...more(result.conventions, LISTED),
+  ];
+  if (proposed) {
+    out.push(
+      '', `Mappings (${result.mappings.length}):`, ...result.mappings.slice(0, LISTED).map(item => `  - ${item.operation}: ${item.fromPaths.join(', ') || '(none)'} -> ${item.toPaths.join(', ') || '(none)'}`), ...more(result.mappings, LISTED),
+      '', 'Target document conflicts:', ...(result.conflicts.length ? result.conflicts.map(item => `  - ${item}`) : ['  - none reported']),
+    );
+  }
+  return out;
+}
+
 /** Replay text of a saved visualization result (a summary: the diagram itself is shown in the app). */
 export function formatVisualizationResult(request, result) {
-  const out = [];
+  let out;
   switch (request.kind) {
-    case 'systemOverview': {
-      out.push('System overview (Architect analysis of the indexed source; not verified runtime traffic)', `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`, '');
-      const label = new Map(result.nodes.map(node => [node.id, node.label]));
-      out.push(`Elements (${result.nodes.length}):`, ...result.nodes.slice(0, LISTED).map(node => `  - [${node.kind}] ${node.label}${node.parentId ? ` (in ${label.get(node.parentId) ?? node.parentId})` : ''}`), ...more(result.nodes, LISTED));
-      out.push('', `Relationships (${result.edges.length}):`, ...result.edges.slice(0, LISTED).map(edge => `  - ${label.get(edge.sourceId) ?? edge.sourceId} -${edge.relation}-> ${label.get(edge.targetId) ?? edge.targetId} [${edge.certainty}]${edge.label ? `: ${edge.label}` : ''}`), ...more(result.edges, LISTED));
-      out.push('', `Coverage (${result.coverage.length}):`, ...result.coverage.slice(0, LISTED).map(item => `  - ${item.area}: ${item.status}${item.notes ? ` - ${item.notes}` : ''}`), ...more(result.coverage, LISTED));
+    case 'systemOverview':
+      out = systemOverviewRows(request, result);
       break;
-    }
-    case 'helicopter': {
-      out.push('Helicopter view (Architect analysis of the indexed source, in business terms; observed behavior, not verified runtime behavior)', `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`, '', `Purpose: ${result.purpose}`, '');
-      const label = new Map(result.nodes.map(node => [node.id, node.label]));
-      out.push(`Journeys, people and steps (${result.nodes.length}):`, ...result.nodes.slice(0, LISTED).map(node => `  - [${HELICOPTER_KIND_WORDS[node.kind] ?? node.kind}] ${node.label}${node.parentId ? ` (in ${label.get(node.parentId) ?? node.parentId})` : ''}`), ...more(result.nodes, LISTED));
-      out.push('', `Flow (${result.edges.length}):`, ...result.edges.slice(0, LISTED).map(edge => `  - ${label.get(edge.sourceId) ?? edge.sourceId} -> ${label.get(edge.targetId) ?? edge.targetId}${edge.label ? ` (${edge.label})` : ''}${edge.certainty === 'unknown' ? ' [Needs clarification]' : ''}`), ...more(result.edges, LISTED));
-      out.push('', `Business capabilities (${result.capabilities.length}):`, ...result.capabilities.slice(0, LISTED).map(item => `  - ${item.label}${item.description ? `: ${item.description}` : ''}`), ...more(result.capabilities, LISTED));
-      out.push('', `Coverage (${result.coverage.length}):`, ...result.coverage.slice(0, LISTED).map(item => `  - ${item.area}: ${item.status}${item.notes ? ` - ${item.notes}` : ''}`), ...more(result.coverage, LISTED));
+    case 'helicopter':
+      out = helicopterRows(request, result);
       break;
-    }
     case 'structureCurrent':
-    case 'structureProposed': {
-      out.push(request.kind === 'structureProposed'
-        ? 'Proposed repository structure (a visualization of the target Markdown; the Markdown remains the source of truth)'
-        : 'Current repository structure and naming (Architect analysis of the indexed source)', `Project: ${request.folder}`, `Source snapshot: ${result.snapshotId}`);
-      if (result.sourceId) out.push(`Target document: ${result.sourceId} (sha256 ${result.sourceHash})`);
-      out.push('', `Groups (${result.entries.length}):`, ...result.entries.slice(0, LISTED).map(entry => `  - ${entry.label}${entry.path ? ` (${entry.path})` : entry.pattern ? ` (${entry.pattern})` : ''}: ${entry.purpose}`), ...more(result.entries, LISTED));
-      out.push('', `Conventions (${result.conventions.length}):`, ...result.conventions.slice(0, LISTED).map(item => `  - ${item.scope}: ${item.current}${item.proposed ? ` -> ${item.proposed}` : ''}`), ...more(result.conventions, LISTED));
-      if (request.kind === 'structureProposed') {
-        out.push('', `Mappings (${result.mappings.length}):`, ...result.mappings.slice(0, LISTED).map(item => `  - ${item.operation}: ${item.fromPaths.join(', ') || '(none)'} -> ${item.toPaths.join(', ') || '(none)'}`), ...more(result.mappings, LISTED));
-        out.push('', 'Target document conflicts:', ...(result.conflicts.length ? result.conflicts.map(item => `  - ${item}`) : ['  - none reported']));
-      }
+    case 'structureProposed':
+      out = repositoryStructureRows(request, result);
       break;
-    }
     default: throw new Error(`no console replay for request kind "${String(request.kind).slice(0, 80)}"`);
   }
   out.push('', 'Limitations:', ...(result.limitations.length ? result.limitations.map(item => `  - ${item}`) : ['  - none stated']));

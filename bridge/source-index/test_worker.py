@@ -269,7 +269,7 @@ class ExtractCoordinator(unittest.TestCase):
         for s in index["symbols"] + index["sites"]:
             self.assertIn(s["fileId"], ids)
         names = {s["name"] for s in index["symbols"] if s["kind"] == "function"}
-        self.assertTrue({"main", "helper", "uncalled", "menu", "s"} <= names)
+        self.assertLessEqual({"main", "helper", "uncalled", "menu", "s"}, names)
         cov = index["coverage"]
         self.assertEqual(cov["admittedFiles"], 8)
         self.assertEqual(cov["parsedFiles"], 5)

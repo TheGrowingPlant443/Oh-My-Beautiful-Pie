@@ -1,0 +1,23 @@
+--- a/kiosk-shell/kiosk-shell.c	2026-11-01 18:31:53.030189052 +0100
++++ b/kiosk-shell/kiosk-shell.c	2026-11-01 18:32:01.194089746 +0100
+@@ -29,6 +29,7 @@
+ #include <linux/input.h>
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "kiosk-shell.h"
+@@ -309,7 +310,11 @@
+ 
+ 	kiosk_shell_surface_set_output(shsurf, shoutput);
+ 
+-	weston_desktop_surface_set_fullscreen(shsurf->desktop_surface, true);
++	/* The launcher's browser display maximizes instead, so browsers keep their address bar. */
++	weston_desktop_surface_set_maximized(shsurf->desktop_surface,
++					     getenv("OMBP_KIOSK_MAXIMIZE") != NULL);
++	weston_desktop_surface_set_fullscreen(shsurf->desktop_surface,
++					      getenv("OMBP_KIOSK_MAXIMIZE") == NULL);
+ 	if (shsurf->output)
+ 		weston_desktop_surface_set_size(shsurf->desktop_surface,
+ 						shsurf->output->output->width,

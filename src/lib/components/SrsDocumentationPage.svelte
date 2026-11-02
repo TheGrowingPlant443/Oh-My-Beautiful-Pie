@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import { knowledge, knowledgeApi, type VaultBinding } from "../knowledge";
-  import { srs, srsApi, activeSrs, resumableSrs, completedSrs, srsDocumentLabel, srsModelLabel, srsStateLabel, srsPhaseLabel, type ResumeMode, type ResumePreparation, type SrsAnswer, type SrsDocument, type SrsDocuments, type SrsJobPage, type SrsPage, type SrsQuestion, type SrsSection, type SrsWork } from "../srs";
+  import { srs, srsApi, activeSrs, resumableSrs, completedSrs, srsDocumentLabel, srsModelLabel, srsPurposeLabel, srsStateLabel, srsPhaseLabel, type ResumeMode, type ResumePreparation, type SrsAnswer, type SrsDocument, type SrsDocuments, type SrsJobPage, type SrsPage, type SrsQuestion, type SrsSection, type SrsWork } from "../srs";
   import VaultView from "./VaultView.svelte";
   import VaultConfiguration from "./VaultConfiguration.svelte";
 
@@ -137,6 +137,7 @@
   <section class="srs-page">
     <header class="bar panel"><button onclick={onBack}>Back to System overview</button><h2>SRS documentation</h2><span class="grow"></span><button disabled={busy} onclick={() => void refresh()}>Check connection / Refresh</button><button onclick={() => onCreate(folder)}>Create SRS</button></header>
     <p class="notice">Jobs continue while OMP Manager is open, including minimized. Navigating does not pause work. Closing checkpoints/pauses it; reopening never automatically starts a model.</p>
+    <p class="notice">Migration jobs specify the full observable system independently of the replacement language or architecture. Exhaustive-insights jobs examine every evidenced detail. Both require UI interaction/business logic and external-service contracts; visual-only and existing-architecture observations are not replacement constraints. Completion covers only reviewed evidence and authenticated stakeholder answers, not unknown production behavior.</p>
     {#if error}<p class="notice err" role="alert">{error}</p>{/if}
     {#if $srs.connectionError}<p class="notice warn" role="alert">Live observation failed: {$srs.connectionError}. This is not completion or cancellation. Check connection / Refresh to reconnect.</p>{/if}
     {#if $srs.actionError}<p class="notice warn" role="status">{$srs.actionError}</p>{/if}
@@ -146,7 +147,7 @@
         {#if listLoading}<p role="status">Reading saved jobs…</p>{/if}
         {#each listing?.items ?? [] as saved (saved.jobId)}
           {@const current = $srs.jobs.get(saved.jobId) ?? saved}
-          <button class="job" class:active={selected === current.jobId} onclick={() => select(current.jobId)}><strong>{new Date(current.createdAt).toLocaleString()}</strong><span>{srsStateLabel(current)}</span><small>{current.jobId}</small></button>
+          <button class="job" class:active={selected === current.jobId} onclick={() => select(current.jobId)}><strong>{new Date(current.createdAt).toLocaleString()}</strong><span>{srsPurposeLabel(current.purpose)}</span><span>{srsStateLabel(current)}</span><small>{current.jobId}</small></button>
         {:else}{#if !listLoading}<p>No saved SRS jobs. Create SRS opens the explanation and scope confirmation; it does not start a model.</p>{/if}{/each}
         <div class="actions"><button disabled={!listing || listing.offset === 0 || listLoading} onclick={() => void loadJobs(Math.max(0, (listing?.offset ?? 0) - 100))}>Previous</button><button disabled={listing?.nextOffset == null || listLoading} onclick={() => void loadJobs(listing!.nextOffset!)}>Next</button></div>
         {#if listing}<p class="dim">{listing.total.toLocaleString()} jobs</p>{/if}
@@ -156,6 +157,7 @@
           <h3 role="status">{srsStateLabel(job)}</h3>
           {#if selected && $srs.observationErrors.has(selected)}<p class="notice warn" role="alert">Could not observe job: {$srs.observationErrors.get(selected)}. Last recorded state is shown; observation keeps retrying without a total deadline.</p>{/if}
           <p><strong>Phase: {srsPhaseLabel(job.phase)}</strong>{job.stage ? ` · Stage ${job.stage.number} (${job.stage.state})` : ""}</p>
+          <p><strong>Purpose: {srsPurposeLabel(job.purpose)}</strong> — saved with the scope; Resume does not change it.</p>
           <p class="dim">{srsModelLabel(job.architectModel)}</p>
           <dl class="counts"><div><dt>Evidence files</dt><dd>{job.counts.evidenceFiles.toLocaleString()}</dd></div><div><dt>Areas</dt><dd>{job.counts.areas.toLocaleString()}</dd></div><div><dt>Work open / recorded</dt><dd>{job.counts.workOpen.toLocaleString()} / {job.counts.work.toLocaleString()}</dd></div><div><dt>Requirements</dt><dd>{job.counts.requirements.toLocaleString()}</dd></div><div><dt>Documents</dt><dd>{job.counts.documents.toLocaleString()}</dd></div><div><dt>Questions open / recorded</dt><dd>{job.counts.questionsOpen.toLocaleString()} / {job.counts.questions.toLocaleString()}</dd></div><div><dt>Blocked</dt><dd>{job.counts.blocked.toLocaleString()}</dd></div><div><dt>Excluded</dt><dd>{job.counts.excluded.toLocaleString()}</dd></div></dl>
           <p class="dim">Work is still being discovered; these are actual counts, not a completion percentage. Tokens: {job.usage.tokens === null ? "not reported" : job.usage.tokens.toLocaleString()} · Observed provider cost: {job.usage.costUsd === null ? "not reported (not zero)" : `$${job.usage.costUsd.toFixed(4)}`}.</p>
@@ -172,7 +174,7 @@
             {#if !job.vaultAvailable}<button disabled={busy} onclick={() => void locate()}>Locate vault…</button>{/if}
           </div>
           {#if job.resumeRequired === "currentConversationFromCheckpoints"}<p class="notice warn">The original native conversation was replaced or deleted. Continuing in the current Architect is an explicit new-context continuation from durable checkpoints, not the same conversation.</p>{/if}
-          {#if resumePreview}<div class="notice"><h4>Resume confirmation</h4><p>{resumePreview.summary}</p>{#each resumePreview.warnings as warning, i (i)}<p class="warn">{warning}</p>{/each}<div class="actions"><button class="primary" disabled={busy} onclick={() => void act(async () => { await srs.resume(resumePreview!.token); resumePreview = null; })}>Resume SRS</button><button disabled={busy} onclick={() => resumePreview = null}>Keep paused</button></div></div>{/if}
+          {#if resumePreview}<div class="notice"><h4>Resume confirmation</h4><p><strong>Purpose: {srsPurposeLabel(resumePreview.purpose)}</strong></p><p>{resumePreview.summary}</p>{#each resumePreview.warnings as warning, i (i)}<p class="warn">{warning}</p>{/each}<div class="actions"><button class="primary" disabled={busy} onclick={() => void act(async () => { await srs.resume(resumePreview!.token); resumePreview = null; })}>Resume SRS</button><button disabled={busy} onclick={() => resumePreview = null}>Keep paused</button></div></div>{/if}
           {#if confirmCancel}<div class="notice warn"><p>Cancel this run? Committed documents and checkpoints remain recorded; cancellation does not mean the SRS is complete.</p><div class="actions"><button disabled={busy} onclick={() => void act(async () => { await srs.cancel(job!.jobId); confirmCancel = false; })}>Cancel SRS job</button><button disabled={busy} onclick={() => confirmCancel = false}>Keep job</button></div></div>{/if}
           {#if locating}<div class="notice"><h4>Locate the recorded documents</h4><p>Pick/register the folder containing this run's existing notes. The backend must verify the recorded committed hashes before rebinding. Unrelated notes are never adopted and this does not regenerate documents.</p><label>Registered vault <select bind:value={candidateVault}><option value="">Select…</option>{#each vaults as vault (vault.vaultId)}<option value={vault.vaultId}>{vault.root}</option>{/each}</select></label><div class="actions"><button onclick={() => configureVault = true}>Locate / register a folder…</button><button disabled={busy || !candidateVault} onclick={() => void rebind()}>Verify hashes and use this vault</button><button onclick={() => locating = false}>Cancel</button></div></div>{/if}
           <div class="tabs" role="tablist" aria-label="SRS job details">{#each sections as item (item.id)}<button role="tab" aria-selected={section === item.id} onclick={() => section = item.id}>{item.label}</button>{/each}</div>

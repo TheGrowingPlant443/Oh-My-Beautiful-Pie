@@ -121,29 +121,32 @@ class _Walker:
         out.sort(key=lambda p: p[1].start_byte)
         return out
 
+    def _typed_param_names(self, param) -> list[tuple[str, Any]]:
+        for sub in param.named_children:
+            if sub.type in ("identifier", "list_splat_pattern", "dictionary_splat_pattern"):
+                return self.pattern_names(sub)
+        return []
+
+    def _param_child_names(self, ch) -> list[tuple[str, Any]]:
+        t = ch.type
+        if t == "identifier":
+            return [(self.text(ch), ch)]
+        if t in ("default_parameter", "typed_default_parameter"):
+            return self.pattern_names(ch.child_by_field_name("name"))
+        if t == "typed_parameter":
+            return self._typed_param_names(ch)
+        if t in ("list_splat_pattern", "tuple_pattern"):
+            return self.pattern_names(ch)
+        if t == "dictionary_splat_pattern" and ch.named_children:
+            return self.pattern_names(ch.named_children[0])
+        return []
+
     def param_names(self, params) -> list[tuple[str, Any]]:
         out: list[tuple[str, Any]] = []
         if params is None:
             return out
         for ch in params.named_children:
-            t = ch.type
-            if t == "identifier":
-                out.append((self.text(ch), ch))
-            elif t in ("default_parameter", "typed_default_parameter"):
-                nm = ch.child_by_field_name("name")
-                out.extend(self.pattern_names(nm))
-            elif t == "typed_parameter":
-                for sub in ch.named_children:
-                    if sub.type in ("identifier", "list_splat_pattern", "dictionary_splat_pattern"):
-                        out.extend(self.pattern_names(sub))
-                        break
-            elif t == "list_splat_pattern":
-                out.extend(self.pattern_names(ch))
-            elif t == "dictionary_splat_pattern":
-                if ch.named_children:
-                    out.extend(self.pattern_names(ch.named_children[0]))
-            elif t == "tuple_pattern":
-                out.extend(self.pattern_names(ch))
+            out.extend(self._param_child_names(ch))
         return out
 
     def in_class_body(self) -> bool:
@@ -219,13 +222,16 @@ class _Walker:
             for fn in reversed(fns):
                 fn()
 
+    def _mark_if(self, node) -> None:
+        self._mark(node.child_by_field_name("consequence"))
+        self._mark(node.child_by_field_name("alternative"))
+        for ch in node.children:
+            if ch.type in ("elif_clause", "else_clause"):
+                self._mark(ch)
+
     def _mark_conditional(self, node, t: str) -> None:
         if t == "if_statement":
-            self._mark(node.child_by_field_name("consequence"))
-            self._mark(node.child_by_field_name("alternative"))
-            for ch in node.children:
-                if ch.type in ("elif_clause", "else_clause"):
-                    self._mark(ch)
+            self._mark_if(node)
         elif t in ("while_statement", "for_statement"):
             self._mark(node.child_by_field_name("body"))
         elif t in ("except_clause", "except_group_clause", "case_clause"):
@@ -235,8 +241,6 @@ class _Walker:
             for ch in node.children:
                 if ch.type == "else_clause":
                     self._mark(ch)
-        elif t == "match_statement":
-            pass
 
     def finish(self) -> None:
         if self.all_names is not None and self.module_id is not None:
@@ -300,6 +304,11 @@ class _Walker:
         return None
 
     # -- definitions -----------------------------------------------------------------
+    def _collect_scope_names(self, stmt, names: set[str]) -> None:
+        for ch in stmt.named_children:
+            if ch.type == "identifier":
+                names.add(self.text(ch))
+
     def _prescan_scope(self, body) -> dict:
         info = {"global": set(), "nonlocal": set(), "first_param": None, "class_method": False}
         if body is None:
@@ -308,15 +317,10 @@ class _Walker:
         while stack:
             n = stack.pop()
             t = n.type
-            if t == "global_statement" or t == "nonlocal_statement":
-                key = "global" if t == "global_statement" else "nonlocal"
-                for ch in n.named_children:
-                    if ch.type == "identifier":
-                        info[key].add(self.text(ch))
-                continue
-            if t in ("function_definition", "class_definition", "lambda"):
-                continue
-            stack.extend(n.named_children)
+            if t in ("global_statement", "nonlocal_statement"):
+                self._collect_scope_names(n, info["global" if t == "global_statement" else "nonlocal"])
+            elif t not in ("function_definition", "class_definition", "lambda"):
+                stack.extend(n.named_children)
         return info
 
     def _decorators_of(self, node) -> list[str]:
@@ -324,6 +328,28 @@ class _Walker:
         if parent is not None and parent.type == "decorated_definition":
             return [self.text(d).lstrip("@").strip() for d in parent.children if d.type == "decorator"]
         return []
+
+    @staticmethod
+    def _function_kind(name: str, in_class: bool, decorators: list[str]) -> str:
+        kind = "method" if in_class else "function"
+        if in_class and name in ("__init__", "__new__"):
+            kind = "constructor"
+        if any(d == "property" or d.endswith("cached_property") or d.endswith(_PROPERTY_SUFFIXES) for d in decorators):
+            kind = "accessor"
+        if any(d == "overload" or d.endswith(".overload") for d in decorators):
+            kind = "signature"
+        return kind
+
+    @staticmethod
+    def _function_bindings(kind: str, decorators: list[str], is_async: bool) -> dict[str, Any]:
+        bindings: dict[str, Any] = {"body": kind != "signature", "static": any(d in ("staticmethod",) for d in decorators)}
+        if decorators:
+            bindings["decorators"] = decorators
+        if any(d == "classmethod" for d in decorators):
+            bindings["classmethod"] = True
+        if is_async:
+            bindings["async"] = True
+        return bindings
 
     def _function(self, node):
         ctx = self.ctx
@@ -334,25 +360,13 @@ class _Walker:
         owner_scope = ctx.current_scope
         in_class = owner_scope is not None and owner_scope.kind == "class"
         decorators = self._decorators_of(node)
-        kind = "method" if in_class else "function"
-        if in_class and name in ("__init__", "__new__"):
-            kind = "constructor"
-        if any(d == "property" or d.endswith("cached_property") or d.endswith(_PROPERTY_SUFFIXES) for d in decorators):
-            kind = "accessor"
-        if any(d == "overload" or d.endswith(".overload") for d in decorators):
-            kind = "signature"
+        kind = self._function_kind(name, in_class, decorators)
         is_async = any(ch.type == "async" and not ch.is_named for ch in node.children)
         info = self._prescan_scope(body)
         names = self.param_names(params)
         info["first_param"] = names[0][0] if names else None
         info["class_method"] = in_class
-        bindings: dict[str, Any] = {"body": kind != "signature", "static": any(d in ("staticmethod",) for d in decorators)}
-        if decorators:
-            bindings["decorators"] = decorators
-        if any(d == "classmethod" for d in decorators):
-            bindings["classmethod"] = True
-        if is_async:
-            bindings["async"] = True
+        bindings = self._function_bindings(kind, decorators, is_async)
         at_module = owner_scope is not None and owner_scope.kind == "module"
         exported = None
         if at_module:
@@ -587,31 +601,43 @@ class _Walker:
         return False
 
     # -- calls ---------------------------------------------------------------------
+    def _identifier_receiver_kind(self, obj) -> str:
+        info = self.scope_info[-1] if self.scope_info else None
+        if info is not None and info.get("class_method") and info.get("first_param") == self.text(obj):
+            return "self"
+        return "identifier"
+
+    def _call_receiver_kind(self, obj) -> str:
+        fn = obj.child_by_field_name("function")
+        if fn is not None and fn.type == "identifier" and self.text(fn) == "super":
+            return "super"
+        return "expression"
+
+    def _attribute_receiver_kind(self, obj) -> str:
+        cur = obj
+        while cur is not None and cur.type == "attribute":
+            cur = cur.child_by_field_name("object")
+        return "path" if cur is not None and cur.type == "identifier" else "expression"
+
     def _receiver_kind(self, obj) -> str | None:
         if obj is None:
             return None
         if obj.type == "identifier":
-            text = self.text(obj)
-            info = self.scope_info[-1] if self.scope_info else None
-            if info is not None and info.get("class_method") and info.get("first_param") == text:
-                return "self"
-            return "identifier"
+            return self._identifier_receiver_kind(obj)
         if obj.type == "call":
-            fn = obj.child_by_field_name("function")
-            if fn is not None and fn.type == "identifier" and self.text(fn) == "super":
-                return "super"
-            return "expression"
+            return self._call_receiver_kind(obj)
         if obj.type == "attribute":
-            cur = obj
-            while cur is not None and cur.type == "attribute":
-                cur = cur.child_by_field_name("object")
-            if cur is not None and cur.type == "identifier":
-                return "path"
+            return self._attribute_receiver_kind(obj)
         return "expression"
 
-    def _callee_parts(self, fn) -> tuple[str | None, str | None, str | None, str]:
+    @staticmethod
+    def _unwrap_parens(fn):
         while fn is not None and fn.type == "parenthesized_expression" and fn.named_children:
             fn = fn.named_children[0]
+        return fn
+
+    def _callee_parts(self, fn) -> tuple[str | None, str | None, str | None, str]:
+        fn = self._unwrap_parens(fn)
         if fn is None:
             return None, None, None, "dynamic"
         t = fn.type
@@ -626,43 +652,44 @@ class _Walker:
             return None, (self.text(val) if val is not None else None), self._receiver_kind(val), "dynamic"
         return None, None, None, "dynamic"
 
-    def _call(self, node):
-        ctx = self.ctx
-        fn = node.child_by_field_name("function")
+    def _dynamic_import_call(self, node) -> None:
         args = node.child_by_field_name("arguments")
-        inner = fn
-        while inner is not None and inner.type == "parenthesized_expression" and inner.named_children:
-            inner = inner.named_children[0]
+        first = None
+        if args is not None:
+            first = next((a for a in args.named_children if a.type != "keyword_argument"), None)
+        spec = self.string_value(first) if first is not None else None
+        relative = spec is not None and spec.startswith(".")
+        if spec is not None:
+            raw = spec
+        else:
+            raw = self.text(first) if first is not None else ""
+        dynamic = spec is None or relative
+        b = self._binding(spec, namespace=True)
+        b["kind"] = "dynamicImport"
+        b["dynamic"] = dynamic
+        if relative:
+            b["relativeTo"] = "package"
+        self.ctx.add_site("imports", raw, node, conditional=True, dynamic=dynamic, binding=b)
+
+    def _call(self, node):
+        fn = node.child_by_field_name("function")
+        inner = self._unwrap_parens(fn)
         name, receiver, rkind, kind = self._callee_parts(fn)
         # dynamic import recipes: __import__("x") / importlib.import_module("x")
-        if name in ("__import__", "import_module") and (kind == "identifier" or (kind == "member" and receiver in ("importlib",))):
-            first = None
-            if args is not None:
-                for a in args.named_children:
-                    if a.type != "keyword_argument":
-                        first = a
-                        break
-            spec = self.string_value(first) if first is not None else None
-            relative = spec is not None and spec.startswith(".")
-            raw = spec if spec is not None else (self.text(first) if first is not None else "")
-            dynamic = spec is None or relative
-            b = self._binding(spec if not dynamic else (spec if relative else None), namespace=True)
-            b["kind"] = "dynamicImport"
-            b["dynamic"] = dynamic
-            if relative:
-                b["relativeTo"] = "package"
-            ctx.add_site("imports", raw, node, conditional=True, dynamic=dynamic, binding=b)
+        if name in ("__import__", "import_module") and (kind == "identifier" or (kind == "member" and receiver == "importlib")):
+            self._dynamic_import_call(node)
             return None
-        binding = {"kind": kind, "name": name, "receiver": receiver, "receiverKind": rkind}
-        dynamic = kind == "dynamic"
         iife = None
         if inner is not None and inner.type == "lambda":
             iife = inner
             binding = {"kind": "iife", "name": None, "receiver": None, "receiverKind": None, "iife": True}
             dynamic = False
-        elif dynamic:
-            binding["dynamic"] = True
-        site = ctx.add_site("calls", self.text(fn), node, conditional=self.cond > 0, dynamic=dynamic, binding=binding)
+        else:
+            binding = {"kind": kind, "name": name, "receiver": receiver, "receiverKind": rkind}
+            dynamic = kind == "dynamic"
+            if dynamic:
+                binding["dynamic"] = True
+        site = self.ctx.add_site("calls", self.text(fn), node, conditional=self.cond > 0, dynamic=dynamic, binding=binding)
         if iife is not None:
             self.pending.setdefault(iife.id, {})["iife"] = site
         return None

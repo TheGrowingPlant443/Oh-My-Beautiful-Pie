@@ -83,7 +83,7 @@ class CRecipeTests(unittest.TestCase):
     def test_declarator_descent_distinguishes_functions_from_function_pointers(self):
         r = self.r
         names = {s["name"] for s in syms(r, "function")}
-        self.assertTrue({"cond", "getfp", "ptr", "main", "shadow", "ping", "pong", "unused", "Größe", "größe"} <= names)
+        self.assertLessEqual({"cond", "getfp", "ptr", "main", "shadow", "ping", "pong", "unused", "Größe", "größe"}, names)
         self.assertNotIn("fp", names)            # int (*fp)(int) is a variable
         self.assertNotIn("cb", names)            # struct field function pointer
         self.assertEqual([s["name"] for s in syms(r, "signature")], ["ex"])
@@ -192,7 +192,7 @@ class CppRecipeTests(unittest.TestCase):
         r = self.r
         self.assertEqual({s["qualifiedName"] for s in syms(r, "constructor")}, {"ns::in::C::C"})
         methods = {s["qualifiedName"] for s in syms(r, "method")}
-        self.assertTrue({"ns::in::C::~C", "ns::in::C::m", "ns::in::C::op", "ns::in::C::operator+", "ns::in::C::inl"} <= methods)
+        self.assertLessEqual({"ns::in::C::~C", "ns::in::C::m", "ns::in::C::op", "ns::in::C::operator+", "ns::in::C::inl"}, methods)
         out_of_class = [s for s in syms(r, "method", "inl") if s["bindings"].get("qualifier") == "C"][0]
         self.assertEqual(out_of_class["bindings"]["qualifierKind"], "class")
         self.assertTrue(syms(r, "method", "~C")[0]["bindings"]["destructor"])

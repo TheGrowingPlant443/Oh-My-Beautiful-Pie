@@ -29,7 +29,7 @@ interface ProbeDependencies {
   changed(snapshot: KindSnapshot): void; admitted?: (admission: KindAdmission) => void; idleTimeoutMs?: number;
 }
 export class KindProbe {
-  private deps: ProbeDependencies;
+  private readonly deps: ProbeDependencies;
   private generation = 0;
   private timer: unknown = null;
   private snapshot: KindSnapshot = { running: false, error: null, warning: null, status: null };

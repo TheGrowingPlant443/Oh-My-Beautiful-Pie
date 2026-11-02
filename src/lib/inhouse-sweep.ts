@@ -7,7 +7,7 @@ interface SweepDependencies {
   changed(snapshot: SweepSnapshot): void; admitted?: (admission: InhouseAdmission) => void; idleTimeoutMs?: number;
 }
 export class InhouseSweep {
-  private deps: SweepDependencies;
+  private readonly deps: SweepDependencies;
   private generation = 0;
   private timer: unknown = null;
   private snapshot: SweepSnapshot = { running: false, error: null, warning: null, status: null };

@@ -7,9 +7,9 @@ import {TestNativeHost} from './native-host.mjs';
 // Loaded as an explicit extension by the real OMP CLI, not a second source SDK.
 export default async function controlPlaneScenario(pi) {
   const root=process.env.BROWSER_TEST_ROOT;
-  let session;
+  const captured={};
   const originalInfos=pi.pi.AgentSession.prototype.getAllToolInfos;
-  function captureInfos(...args){session=this;return originalInfos.apply(this,args);}
+  function captureInfos(...args){captured.session=this;return originalInfos.apply(this,args);}
   pi.pi.AgentSession.prototype.getAllToolInfos=captureInfos;
   const host=new TestNativeHost(root);
   const helper=spawn(process.env.BUN_BIN||'bun',[fileURLToPath(new URL('../omp-browser-service.mjs',import.meta.url)),root,process.env.OMP_SDK_DIR],{env:process.env,stdio:['pipe','pipe','inherit']});
@@ -20,7 +20,11 @@ export default async function controlPlaneScenario(pi) {
   let readyResolve,readyReject;
   const ready=new Promise((resolve,reject)=>{readyResolve=resolve;readyReject=reject;});
   helper.on('error',readyReject);
-  helper.on('exit',()=>{readyReject(new Error('Browser helper exited'));for(const call of pending.values())call.reject(new Error('Browser helper exited'));pending.clear();});
+  helper.on('exit',()=>{
+    readyReject(new Error('Browser helper exited'));
+    for(const call of pending.values()){call.reject(new Error('Browser helper exited'));}
+    pending.clear();
+  });
   helper.stdout.on('data',chunk=>{
     buffered+=chunk;
     for(;;){
@@ -56,8 +60,8 @@ export default async function controlPlaneScenario(pi) {
     let exitCode=0;
     try {
       pi.getAllTools();
-      assert.ok(session,'Main native OMP session was not captured');
-      const tool=session.getToolByName('eval');
+      assert.ok(captured.session,'Main native OMP session was not captured');
+      const tool=captured.session.getToolByName('eval');
       async function cell(code){
         const result=await tool.execute('flow-'+crypto.randomUUID(),{language:'js',code,timeout:15});
         const text=result.content.filter(block=>block.type==='text').map(block=>block.text).join('\n');
@@ -77,7 +81,7 @@ export default async function controlPlaneScenario(pi) {
       console.log('Native URL, tabs, DOM and closed-tab behavior passed with controller replies unavailable');
     } catch(error) {console.error(error);exitCode=1;}
     finally {
-      try {if(session)await session.dispose();}
+      try {if(captured.session)await captured.session.dispose();}
       finally {
         if(pi.pi.AgentSession.prototype.getAllToolInfos===captureInfos)pi.pi.AgentSession.prototype.getAllToolInfos=originalInfos;
         await control('shutdown');helper.stdin.end();

@@ -1,5 +1,5 @@
 import { writable, type Readable } from "svelte/store";
-import type { api, ProjectInsightStatus, StructureApproval, StructureSourceRow } from "./api";
+import type { api, ProjectInsightStatus, StructureApproval, StructureSourcePage, StructureSourceRow } from "./api";
 import type { ArchitectDescriptor, GenerateOutcome, GenerateRequest, StructureHost, VisualizationSink } from "./overview-types";
 import { canApprove, type ApprovalCheck } from "./structure-view";
 
@@ -51,11 +51,37 @@ const initialState = (folder: string, snapshotId: string | null): StructureState
   savedLoading: false, savedError: null, approving: false, approvalError: null, discussError: null,
 });
 
-export const folderKey = (folder: string): string => folder.replace(/^\\\\\?\\/, "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+export function folderKey(folder: string): string {
+  const normalized = folder.replace(/^\\\\\?\\/, "").replaceAll("\\", "/");
+  let end = normalized.length;
+  while (end > 0 && normalized[end - 1] === "/") end--;
+  return normalized.slice(0, end).toLowerCase();
+}
 /** The owner whose captured messages may be shown: Architect id + generation + known session. Null while the session is unknown. */
-const architectKey = (architect: ArchitectDescriptor | null): string | null => architect && architect.sessionId ? `${architect.id}:${architect.generation}:${architect.sessionId}` : null;
+const architectKey = (architect: ArchitectDescriptor | null): string | null => architect?.sessionId ? `${architect.id}:${architect.generation}:${architect.sessionId}` : null;
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
-const stateRank = (state: ProjectInsightStatus["state"]): number => state === "completed" ? 3 : state === "pending" ? 0 : state === "submitted" ? 1 : 2;
+const stateRank = (state: ProjectInsightStatus["state"]): number => {
+  switch (state) {
+    case "completed": return 3;
+    case "pending": return 0;
+    case "submitted": return 1;
+    default: return 2;
+  }
+};
+
+function mergeApproval(incoming: StructureApproval | null, known: StructureApproval | null): StructureApproval | null {
+  if (!known) return incoming;
+  if (!incoming) return known;
+  const unsettled = (value: StructureApproval): boolean => value.delivery === "pending" || value.delivery === "claimed";
+  if (unsettled(incoming) && (!unsettled(known) || (incoming.delivery === "pending" && known.delivery === "claimed"))) return known;
+  return incoming;
+}
+
+function generationError(outcome: GenerateOutcome): string | null {
+  if (outcome.error !== null && outcome.error !== undefined) return outcome.error;
+  if (outcome.uncertain) return UNCERTAIN;
+  return outcome.admitted ? null : NOT_ADMITTED;
+}
 
 // ---------- Derived, pure ----------
 
@@ -162,7 +188,10 @@ export function createStructureStore(): StructureStore {
     const pin = pinned[kind];
     if (pin) {
       const kept = list.find(revision => revision.requestId === pin.id);
-      if (kept && supersededBy(list, kept) === pin.supersededBy) { if (state.selected[kind] !== pin.id) commit({ selected: setKind(state.selected, kind, pin.id) }); return; }
+      if (kept && supersededBy(list, kept) === pin.supersededBy) {
+        if (state.selected[kind] !== pin.id) commit({ selected: setKind(state.selected, kind, pin.id) });
+        return;
+      }
       pinned[kind] = null;
     }
     const score = (revision: ProjectInsightStatus): number => (revision.state === "completed" ? 16 : 0) + (supersededBy(list, revision) ? 0 : 8)
@@ -184,11 +213,7 @@ export function createStructureStore(): StructureStore {
     let next = status;
     if (existing) {
       const base = stateRank(status.state) >= stateRank(existing.state) ? status : existing;
-      const incomingApproval: StructureApproval | null = status.approval ?? null;
-      const knownApproval: StructureApproval | null = existing.approval ?? null;
-      const unsettled = (value: StructureApproval): boolean => value.delivery === "pending" || value.delivery === "claimed";
-      const approval = !knownApproval ? incomingApproval : !incomingApproval ? knownApproval
-        : (unsettled(incomingApproval) && (!unsettled(knownApproval) || (incomingApproval.delivery === "pending" && knownApproval.delivery === "claimed")) ? knownApproval : incomingApproval);
+      const approval = mergeApproval(status.approval ?? null, existing.approval ?? null);
       next = { ...base, supersededBy: status.supersededBy ?? existing.supersededBy ?? null, approval };
     } else arrival.set(status.requestId, ++arrivalSeq);
     const revisions = [...list.filter(revision => revision.requestId !== status.requestId), next]
@@ -200,7 +225,7 @@ export function createStructureStore(): StructureStore {
 
   function loadSaved(): Promise<void> {
     if (!backend || !state.folder) return Promise.resolve();
-    if (savedFlight && savedFlight.epoch === epoch) return savedFlight.promise;
+    if (savedFlight?.epoch === epoch) return savedFlight.promise;
     const api = backend;
     const mine = epoch;
     const folder = state.folder;
@@ -251,6 +276,19 @@ export function createStructureStore(): StructureStore {
     commit({ pages });
   }
 
+  function applyPage(id: string, page: StructureSourcePage, base: SourcePage, empty: SourcePage, more: boolean, offset: number): void {
+    const fresh = state.sources.find(candidate => candidate.sourceId === id);
+    if (!fresh || page.sourceId !== id || page.sha256 !== fresh.sha256 || (more && base.loaded && base.sha256 !== page.sha256)) {
+      setPage(id, { ...empty, error: "The Markdown changed or does not match the listed message; refresh the list." });
+      return;
+    }
+    const stalled = page.nextOffset !== null && page.nextOffset <= offset;
+    setPage(id, {
+      text: base.text + page.text, nextOffset: stalled ? null : page.nextOffset, sha256: page.sha256, loaded: true, loading: false,
+      error: stalled ? "The backend returned a page offset that does not advance; the text may be incomplete." : null,
+    });
+  }
+
   async function readSource(id: string, more = false): Promise<void> {
     const api = backend;
     if (!api || !host) return;
@@ -272,16 +310,7 @@ export function createStructureStore(): StructureStore {
     try {
       const page = await api.readStructureSource(arch.id, arch.generation, id, offset);
       if (!sourceCurrent(mine, arch)) return;
-      const fresh = state.sources.find(candidate => candidate.sourceId === id);
-      if (!fresh || page.sourceId !== id || page.sha256 !== fresh.sha256 || (more && base.loaded && base.sha256 !== page.sha256)) {
-        setPage(id, { ...empty, error: "The Markdown changed or does not match the listed message; refresh the list." });
-        return;
-      }
-      const stalled = page.nextOffset !== null && page.nextOffset <= offset;
-      setPage(id, {
-        text: base.text + page.text, nextOffset: stalled ? null : page.nextOffset, sha256: page.sha256, loaded: true, loading: false,
-        error: stalled ? "The backend returned a page offset that does not advance; the text may be incomplete." : null,
-      });
+      applyPage(id, page, base, empty, more, offset);
     } catch (error) {
       if (sourceCurrent(mine, arch)) setPage(id, { ...base, loading: false, error: errorText(error) });
     }
@@ -301,7 +330,7 @@ export function createStructureStore(): StructureStore {
     if (selectedId && !sources.some(row => row.sourceId === selectedId)) { selectedId = null; sourcePinned = false; }
     if (!sourcePinned || !selectedId) selectedId = sources.find(row => !row.error)?.sourceId ?? null;
     const pages: Record<string, SourcePage> = {};
-    for (const row of sources) { const page = state.pages[row.sourceId]; if (page && page.sha256 === row.sha256) pages[row.sourceId] = page; }
+    for (const row of sources) { const page = state.pages[row.sourceId]; if (page?.sha256 === row.sha256) pages[row.sourceId] = page; }
     const previewId = state.previewId && sources.some(row => row.sourceId === state.previewId) ? state.previewId : selectedId;
     commit({ sources, sessionId, sourcesKey: key, sourcesLoaded: true, sourcesError: null, selectedSourceId: selectedId, previewId, pages });
     reselect("structureProposed");
@@ -322,7 +351,7 @@ export function createStructureStore(): StructureStore {
     }
     if (options.automatic && !arch.ready) return Promise.resolve();
     const flightKey = `${key}:${arch.ready ? "ready" : "notReady"}`;
-    if (sourcesFlight && sourcesFlight.scope === scope && sourcesFlight.key === flightKey && sourcesFlight.promise) return sourcesFlight.promise;
+    if (sourcesFlight?.scope === scope && sourcesFlight.key === flightKey && sourcesFlight.promise) return sourcesFlight.promise;
     const mine = scope;
     const flight: NonNullable<typeof sourcesFlight> = { scope: mine, key: flightKey, promise: null };
     sourcesFlight = flight;
@@ -366,8 +395,8 @@ export function createStructureStore(): StructureStore {
       const row = await api.selectLastStructureSource(arch.id, arch.generation);
       if (!sourceCurrent(mine, arch) || !key) return;
       const sameSession = state.sourcesKey === key;
-      const rows = sameSession ? [row, ...state.sources.filter(other => other.sourceId !== row.sourceId)] : [row];
-      const sources = rows.sort((a, b) => b.capturedAt - a.capturedAt);
+      const sources = sameSession ? [row, ...state.sources.filter(other => other.sourceId !== row.sourceId)] : [row];
+      sources.sort((a, b) => b.capturedAt - a.capturedAt);
       commit({ sources, sourcesKey: key, sourcesLoaded: true, sessionId: arch.sessionId, pages: sameSession ? state.pages : {} });
       await selectSource(row.sourceId);
     } catch (error) {
@@ -413,7 +442,7 @@ export function createStructureStore(): StructureStore {
     if (outcome.status) merge(outcome.status);
     commit({
       busy: setKind(state.busy, kind, false), uncertain: setKind(state.uncertain, kind, outcome.uncertain),
-      errors: setKind(state.errors, kind, outcome.error ?? (outcome.uncertain ? UNCERTAIN : outcome.admitted ? null : NOT_ADMITTED)),
+      errors: setKind(state.errors, kind, generationError(outcome)),
     });
   }
 
@@ -459,7 +488,10 @@ export function createStructureStore(): StructureStore {
 
   function setFolder(folder: string, snapshotId: string | null): void {
     const sameFolder = folderKey(folder) === folderKey(state.folder);
-    if (sameFolder && snapshotId === state.snapshotId) { if (folder !== state.folder) commit({ folder }); return; }
+    if (sameFolder && snapshotId === state.snapshotId) {
+      if (folder !== state.folder) commit({ folder });
+      return;
+    }
     epoch++;
     savedFlight = null;
     if (sameFolder) {

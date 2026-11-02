@@ -30,7 +30,7 @@ const detachDiagnostics = registerLogSink(({ message, context, level }) => { if 
 const FIRST = '11111111-1111-4111-8111-111111111111', SECOND = '22222222-2222-4222-8222-222222222222', THIRD = '33333333-3333-4333-8333-333333333333';
 const SNAPSHOT = 'snap-A', OTHER = 'snap-B';
 let counter = 0;
-const unique = () => Array.from({ length: 40 }, () => `Observation ${counter++} lists row ${Math.random().toString(36).slice(2)}.`).join(' ');
+const unique = () => Array.from({ length: 40 }, () => `Observation ${counter++} lists row ${crypto.randomUUID().replaceAll('-', '').slice(0, 11)}.`).join(' ');
 const script = [];
 const model = createMockModel({
   contextWindow: 12000,
@@ -100,7 +100,10 @@ const settle = async () => {
   throw new Error('session never settled');
 };
 const until = async (predicate, label) => {
-  for (let index = 0; index < 200; index++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 25)); }
+  for (let index = 0; index < 200; index++) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
   assert.fail(label);
 };
 // The exact options omp-workspace.mjs::submitPrompt gives every app-created prompt (no template/command expansion).

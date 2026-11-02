@@ -1,15 +1,19 @@
 # All build inputs are app-owned assets. The host verifies the downloaded binary and each rule.
-FROM ghcr.io/oxsecurity/megalinter:v10.1.0@sha256:b09486c423063200d6f203b63121e0967719eee03c234844f6f1dd658f00a31b
+# MegaLinter v10.1.0, pinned by immutable digest only (a tag next to the digest is rejected by SonarQube).
+FROM ghcr.io/oxsecurity/megalinter@sha256:b09486c423063200d6f203b63121e0967719eee03c234844f6f1dd658f00a31b
 USER root
 COPY opengrep /usr/local/bin/opengrep
-RUN echo '02c9fba481611aa0664bc79ccf7ce59e9e334b76af8921c80b2f738d17fabf9b  /usr/local/bin/opengrep' | sha256sum -c - && chmod 0755 /usr/local/bin/opengrep
+RUN echo '02c9fba481611aa0664bc79ccf7ce59e9e334b76af8921c80b2f738d17fabf9b  /usr/local/bin/opengrep' | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/opengrep
 COPY tools.lock.json megalinter.yml run-alternate.py validate-rules.mjs /opt/omp/
 COPY fallback/ /opt/omp/fallback/
 COPY rules/ /opt/omp/rules/
 ENV SEMGREP_SEND_METRICS=off SEMGREP_ENABLE_VERSION_CHECK=0 DO_NOT_TRACK=1
 # Fail closed on a wrong binary/version, unsupported rules, or unsafe/negative fixture regressions.
 # Save actual versions, help and engine capability output as image provenance.
-RUN node /opt/omp/validate-rules.mjs && mkdir -p /workspace /out /tmp/omp-home && chown -R 1000:1000 /workspace /out /tmp/omp-home
+RUN node /opt/omp/validate-rules.mjs \
+    && mkdir -p /workspace /out /tmp/omp-home \
+    && chown -R 1000:1000 /workspace /out /tmp/omp-home
 USER 1000:1000
 ENV HOME=/tmp/omp-home
 WORKDIR /workspace

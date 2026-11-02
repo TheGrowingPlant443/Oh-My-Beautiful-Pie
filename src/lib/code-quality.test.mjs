@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultQualityConfig, modeSelectors, selectorMode, QualityClient, qualityLocked, QUALITY_BUSY, QualityGeneration, QualityViewEntry, QualityRevealLifetime, setupAction, filterQualityFindings, findingTools, mergeFindingAttribution, qualityPage, scanPresentation, parseQualityPreferences, pageScreen, scanAction, installVisible, featuresVisible, countBySeverity, STARTING_TEXT } from "./code-quality.ts";
+import { defaultQualityConfig, modeSelectors, selectorMode, QualityClient, qualityLocked, QUALITY_BUSY, QualityGeneration, QualityViewEntry, QualityRevealLifetime, setupAction, filterQualityFindings, findingTools, mergeFindingAttribution, qualityPage, scanPresentation, parseQualityPreferences, pageScreen, scanAction, installVisible, featuresVisible, countBySeverity, qualityFolderKey, STARTING_TEXT } from "./code-quality.ts";
 
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
@@ -108,6 +108,13 @@ test("folder generations reject stale results after navigation, revisits and unm
   assert.equal(unix.accepts(upper, "/repo/A"), true);
   assert.equal(unix.accepts(upper, "/repo/a"), false);
   assert.equal(unix.accepts(unix.begin("/repo/a\\b"), "/repo/a/b"), false);
+});
+
+test("folder keys strip every trailing separator in linear time and keep Unix case", () => {
+  assert.equal(qualityFolderKey("C:\\Repo\\One\\\\/"), "c:/repo/one");
+  assert.equal(qualityFolderKey("\\\\Server\\Share\\"), "//server/share");
+  assert.equal(qualityFolderKey("/Repo/A" + "/".repeat(200_000)), "/Repo/A");
+  assert.equal(qualityFolderKey("/"), "");
 });
 
 test("only nonsecret folder and filter preferences are restored", () => {

@@ -93,7 +93,9 @@ export function githubStatusText(status: PackageInsightsStatus, formatTime: (epo
   if (status.githubRemaining !== null && limit !== null) parts.push(`${status.githubRemaining}/${limit} left`);
   else if (limit !== null) parts.push(`${limit}/hour`);
   if (status.githubRemaining !== null && status.githubResetAt !== null) parts.push(`resets ${formatTime(status.githubResetAt)}`);
-  parts.push(status.githubAuthenticated ? `token${status.githubSource ? ` (${status.githubSource})` : ""}` : "anonymous");
+  let credential = "anonymous";
+  if (status.githubAuthenticated) credential = status.githubSource ? `token (${status.githubSource})` : "token";
+  parts.push(credential);
   return `GitHub API: ${parts.join(" · ")}`;
 }
 
@@ -110,7 +112,8 @@ export function rankPackages(nodes: readonly DepNode[], insights: ReadonlyMap<st
     if (starsA !== starsB) return starsA < starsB ? -1 : 1;
     const contributorsA = knownCount(left?.contributors), contributorsB = knownCount(right?.contributors);
     if (contributorsA !== contributorsB) return contributorsA < contributorsB ? -1 : 1;
-    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    if (a.id === b.id) return 0;
+    return a.id < b.id ? -1 : 1;
   });
 }
 export function formatCount(metric: CountMetric | undefined): string {
@@ -126,9 +129,14 @@ export const PAGE_SIZE = 50;
 export function packagePage(nodes: readonly DepNode[], insights: ReadonlyMap<string, PackageInsights>, page: number): DepNode[] {
   return rankPackages(nodes, insights).slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
 }
+const NUMERIC_VERSION = /^v?(0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))?/;
+const PRERELEASE_OR_BUILD = /^[-+][0-9A-Za-z][0-9A-Za-z.-]*$/;
 export function parseNumericMajor(version: string): number | null {
-  const match = /^v?(0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))?(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?$/.exec(version.trim());
+  const trimmed = version.trim();
+  const match = NUMERIC_VERSION.exec(trimmed);
   if (!match) return null;
+  const suffix = trimmed.slice(match[0].length);
+  if (suffix && !PRERELEASE_OR_BUILD.test(suffix)) return null;
   const major = Number(match[1]);
   return Number.isSafeInteger(major) ? major : null;
 }
@@ -142,7 +150,8 @@ export function packageMajorLag(node: DepNode, insights: PackageInsights | undef
     if (used === null) unknown = true;
     else largest = Math.max(largest, newest - used);
   }
-  return largest >= 2 ? largest : unknown ? null : largest;
+  if (largest >= 2) return largest;
+  return unknown ? null : largest;
 }
 export function projectVersionText(node: DepNode): string {
   const label = node.ecosystem === "cargo" ? " (lockfile versions)" : "";
@@ -153,10 +162,12 @@ export function newestText(insights: PackageInsights | undefined, error?: string
   if (error) return "Unknown";
   if (!insights) return "Loading…";
   if (insights.newestStatus === "available" && insights.newestVersion) return insights.newestVersion;
-  return insights.newestStatus === "rateLimited" ? "Rate limited" : insights.newestStatus === "unavailable" ? "Unavailable" : "Unknown";
+  if (insights.newestStatus === "rateLimited") return "Rate limited";
+  return insights.newestStatus === "unavailable" ? "Unavailable" : "Unknown";
 }
 export function ownerText(repository: RepositoryInsights | null | undefined): string {
-  return repository?.ownerType === "user" ? "personal account" : repository?.ownerType === "organization" ? "organization" : "unknown";
+  if (repository?.ownerType === "user") return "personal account";
+  return repository?.ownerType === "organization" ? "organization" : "unknown";
 }
 export function safePublicUrl(value: string): string | null {
   try {
@@ -180,8 +191,8 @@ export class PackageInsightsQueue {
   readonly errors = new Map<string, string>();
   readonly refreshing: ReadonlySet<string> = new Set<string>();
   private queue: { id: string; mode: GithubMode }[] = [];
-  private attempted = new Set<string>();
-  private active = new Set<string>();
+  private readonly attempted = new Set<string>();
+  private readonly active = new Set<string>();
   private inFlight = 0;
   private githubInFlight = 0;
   private generation = 0;
@@ -395,7 +406,9 @@ export class DependencyJobSession<T extends { requestId: string; status: Insight
     const first = await Promise.race([step(), released]);
     if (!current()) return null;
     if (!first) return admitted;
-    const disposition: JobDisposition = first.status === "complete" ? "complete" : first.status === "error" ? "error" : admitted.disposition === "new" ? "new" : "pending";
+    let disposition: JobDisposition = "pending";
+    if (first.status === "complete" || first.status === "error") disposition = first.status;
+    else if (admitted.disposition === "new") disposition = "new";
     const refreshed = { ...admitted, disposition };
     this.update({ ...this.snapshot, admission: refreshed });
     return refreshed;

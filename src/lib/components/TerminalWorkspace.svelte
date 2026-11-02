@@ -51,7 +51,7 @@
       </span>
     {/each}
     <span class="spacer"></span>
-    <button type="button" class:active={ui.follow} aria-pressed={ui.follow} title="Switch to a command's tab when the AI starts it" onclick={() => updateTerminalUi(uiKey, { follow: !ui.follow })}>Follow</button>
+    <button type="button" class:active={ui.follow} aria-pressed={ui.follow} title="Show the terminal pane and switch to a command's tab when the AI starts it" onclick={() => updateTerminalUi(uiKey, { follow: !ui.follow })}>Follow</button>
   </div>
   {#each notices as notice (notice.owner.instanceId)}
     <p class:err={!notice.owner.held} class:warn={notice.owner.held} role="status">{instanceId === null ? `${notice.owner.name}: ` : ""}{notice.text}</p>

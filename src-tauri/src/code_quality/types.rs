@@ -2,6 +2,8 @@
 //! Secrets never appear here: tokens/passwords live in the OS credential store (`secrets.rs`):
 //! Windows Credential Manager, the freedesktop Secret Service on Linux, the Keychain on macOS.
 use serde::{Deserialize, Serialize};
+use std::fmt::{self, Debug, Formatter};
+use std::time::{self, SystemTime};
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
 
@@ -17,15 +19,20 @@ pub enum QualityMode {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum QualityRuntime {
     DockerDesktop,
-    DockerWsl { distro: String },
+    DockerWsl {
+        distro: String,
+    },
     /// Docker Engine running natively on this (Linux) host. Never available on Windows or macOS.
     #[cfg(unix)]
     DockerNative,
-    Podman { connection: String },
+    Podman {
+        connection: String,
+    },
 }
 
 impl QualityRuntime {
     /// Stable identity string used for credential targets, resource names and ownership records.
+    #[must_use]
     pub fn key(&self) -> String {
         match self {
             QualityRuntime::DockerDesktop => "dockerDesktop".into(),
@@ -35,6 +42,7 @@ impl QualityRuntime {
             QualityRuntime::Podman { connection } => format!("podman:{connection}"),
         }
     }
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             QualityRuntime::DockerDesktop => "Docker Desktop",
@@ -61,7 +69,9 @@ impl Default for QualityConfig {
         QualityConfig {
             version: 1,
             mode: QualityMode::SonarqubeCommunity,
-            runtime: QualityRuntime::Podman { connection: String::new() },
+            runtime: QualityRuntime::Podman {
+                connection: String::new(),
+            },
             community_port: 9000,
             enterprise_url: String::new(),
         }
@@ -110,8 +120,8 @@ pub struct QualityCredentialUpdate {
     pub token: Option<String>,
 }
 
-impl std::fmt::Debug for QualityCredentialUpdate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for QualityCredentialUpdate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("QualityCredentialUpdate")
             .field("target", &self.target)
             .field("action", &self.action)
@@ -128,7 +138,7 @@ pub struct CommunityState {
     pub runtime_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialPresence {
     pub community: bool,
@@ -167,7 +177,6 @@ pub struct QualityOptions {
     pub wsl_features_missing: bool,
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SetupStepState {
@@ -203,7 +212,7 @@ pub enum OwnershipStatus {
     HandedOff,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QualityOwnership {
     pub status: OwnershipStatus,
@@ -288,8 +297,12 @@ pub enum QualityScanStatus {
 }
 
 impl QualityScanStatus {
+    #[must_use]
     pub fn is_terminal(self) -> bool {
-        !matches!(self, QualityScanStatus::Running | QualityScanStatus::Cancelling)
+        !matches!(
+            self,
+            QualityScanStatus::Running | QualityScanStatus::Cancelling
+        )
     }
 }
 
@@ -440,9 +453,10 @@ pub const BUSY_MESSAGE: &str = "Code quality is busy; wait for the current opera
 pub const STALE_MESSAGE: &str = "Code quality settings changed; reload and try again.";
 pub const RULES_MESSAGE: &str = "Review and acknowledge the code quality rules license first.";
 
+#[must_use]
 pub fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
@@ -455,7 +469,12 @@ mod tests {
     fn defaults_are_community_on_podman() {
         let c = QualityConfig::default();
         assert_eq!(c.mode, QualityMode::SonarqubeCommunity);
-        assert_eq!(c.runtime, QualityRuntime::Podman { connection: String::new() });
+        assert_eq!(
+            c.runtime,
+            QualityRuntime::Podman {
+                connection: String::new()
+            }
+        );
         assert_eq!(c.community_port, 9000);
         let json = serde_json::to_value(&c).unwrap();
         assert_eq!(json["mode"], "sonarqubeCommunity");
@@ -473,14 +492,24 @@ mod tests {
 
     #[test]
     fn credential_debug_hides_the_token() {
-        let update = QualityCredentialUpdate { target: CredentialTarget::Enterprise, action: CredentialAction::Replace, token: Some("squ_secret".into()) };
+        let update = QualityCredentialUpdate {
+            target: CredentialTarget::Enterprise,
+            action: CredentialAction::Replace,
+            token: Some("squ_secret".into()),
+        };
         assert!(!format!("{update:?}").contains("squ_secret"));
     }
 
     #[test]
     fn wsl_runtime_roundtrips_with_distro() {
-        let rt: QualityRuntime = serde_json::from_str(r#"{"kind":"dockerWsl","distro":"Ubuntu"}"#).unwrap();
-        assert_eq!(rt, QualityRuntime::DockerWsl { distro: "Ubuntu".into() });
+        let rt: QualityRuntime =
+            serde_json::from_str(r#"{"kind":"dockerWsl","distro":"Ubuntu"}"#).unwrap();
+        assert_eq!(
+            rt,
+            QualityRuntime::DockerWsl {
+                distro: "Ubuntu".into()
+            }
+        );
         assert_eq!(rt.key(), "dockerWsl:Ubuntu");
     }
 }

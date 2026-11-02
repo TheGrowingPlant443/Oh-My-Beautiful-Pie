@@ -58,7 +58,7 @@ class JsRecipes(unittest.TestCase):
         self.assertEqual(kit.syms(r, "function", "inner")[0]["qualifiedName"], "top.inner")
         arrow_in_top = [s for s in kit.syms(r, "lambda") if s["ownerId"] == top["id"]]
         self.assertEqual(len(arrow_in_top), 1)
-        self.assertEqual(kit.syms(r, "function", "named")[0]["bindings"]["body"], True)
+        self.assertTrue(kit.syms(r, "function", "named")[0]["bindings"]["body"])
         self.assertTrue(kit.syms(r, "function", "arrow")[0]["bindings"]["arrow"])
         self.assertEqual(len(kit.syms(r, "function", "gen")), 1)
         k = kit.syms(r, "class", "K")[0]
@@ -73,7 +73,7 @@ class JsRecipes(unittest.TestCase):
         self.assertEqual(len(static_block), 1)
         self.assertEqual(kit.sites(r, "calls", "init")[0]["callerId"], static_block[0]["id"])
         names = {s["name"] for s in r["symbols"] if s["kind"] in ("method", "function")}
-        self.assertTrue({"f", "g", "h"} <= names)
+        self.assertLessEqual({"f", "g", "h"}, names)
         self.assertEqual(kit.sites(r, "calls", "dflt")[0]["callerId"], kit.syms(r, "function", "arrow")[0]["id"])
         # no duplicate symbols from keyword tokens
         ids = [s["id"] for s in r["symbols"]]
@@ -97,7 +97,7 @@ class JsRecipes(unittest.TestCase):
             "}\n",
         )
         by = {(s["binding"]["name"], s["binding"]["kind"]): s for s in kit.sites(r, "calls")}
-        self.assertEqual(by[("plain", "identifier")]["binding"]["receiver"], None)
+        self.assertIsNone(by[("plain", "identifier")]["binding"]["receiver"])
         m = by[("m", "member")]["binding"]
         self.assertEqual((m["receiver"], m["receiverKind"]), ("o", "identifier"))
         self.assertEqual(by[("t", "member")]["binding"]["receiverKind"], "this")
@@ -222,7 +222,7 @@ class JsRecipes(unittest.TestCase):
         self.assertTrue(lazy["conditional"])
         mod = kit.syms(r, "module")[0]
         exported = {e["exported"] for e in mod["bindings"]["exports"] if e.get("commonjs") or e["symbolId"]}
-        self.assertTrue({"a", "helper", "inline", "k", "e"} <= exported)
+        self.assertLessEqual({"a", "helper", "inline", "k", "e"}, exported)
         inline = kit.syms(r, "method", "inline")[0]
         self.assertTrue(inline["exported"])
         # require call itself is not double-counted as a call site

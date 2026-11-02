@@ -16,7 +16,8 @@ const PLAIN_ATTRIBUTES = [
 // Table alignment is the only inline style markdown-it emits; anything else (url(), position, ...) is dropped.
 DOMPurify.addHook("uponSanitizeAttribute", (_element, data) => {
   if (data.attrName !== "style") return;
-  if (/^\s*text-align:\s*(left|right|center)\s*;?\s*$/.test(data.attrValue)) data.forceKeepAttr = true;
+  const alignment = data.attrValue.trim().replace(/;$/, "").trimEnd();
+  if (/^text-align:\s*(left|right|center)$/.test(alignment)) data.forceKeepAttr = true;
   else data.keepAttr = false;
 });
 

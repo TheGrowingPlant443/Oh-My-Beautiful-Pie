@@ -53,6 +53,19 @@ function setup(overrides = {}) {
 }
 const count = (calls, name) => calls.filter(call => call[0] === name).length;
 
+test("placeholder application labels trim only trailing path separators", () => {
+  const state = setup().snapshot();
+  for (const [folder, label] of [
+    ["/work/repo/\\/", "repo"],
+    ["C:\\repo\\\\", "C:\\repo"],
+    ["/work/a\\b///", "a\\b"],
+    ["/\\/", "Application"],
+    ["", "Application"],
+  ]) {
+    assert.equal(deriveModel({ ...state, folder }, "system").model.nodes[0].label, label);
+  }
+});
+
 test("opening reads the saved index and saved diagram passively; nothing asks the Architect or starts work", async () => {
   const h = setup();
   await h.store.enter({ folder: "C:/repo" });
@@ -186,6 +199,60 @@ test("levels page the overview, load facts, and become directory aggregates abov
   assert.equal(level.total, 6000);
   const directories = deriveModel(h.snapshot(), "files").model;
   assert.equal(directories.nodes[0].kind, "directory");
+});
+
+test("cycle loading keeps only member edges and rejects responses after a snapshot switch", async () => {
+  const h = setup();
+  const loop = group("loop", "A and B", { cyclic: true, memberCount: 2, members: ["a", "b"] });
+  const neighbor = (source, peer, id) => ({
+    kind: "edge", direction: "out", self: false, peerId: peer, peerLabel: `src/${peer}.ts`,
+    edge: { id, sourceId: source, targetId: peer, relation: "imports", resolution: "resolvedStatic", evidenceIds: [`site:${id}`] },
+    sites: [], sitesTruncated: false,
+  });
+  const rows = new Map([
+    ["a", [
+      neighbor("a", "b", "ab"), neighbor("a", "outside", "external"),
+      { kind: "aggregate", direction: "out", peerId: "b", peerLabel: "src/b.ts", relation: "imports", resolution: "candidate", count: 3, edgeIds: ["sample"], edgeIdsTruncated: true },
+    ]],
+    ["b", [neighbor("b", "a", "ba")]],
+  ]);
+  let deferNeighbors = false;
+  let releaseNeighbor;
+  h.state.selection.latestAttempt = job("partial", { snapshotId: "partial" });
+  h.state.query = (snapshot, query) => {
+    let items = [];
+    if (query.kind === "overview" && query.groupBy === "scc") items = [loop];
+    else if (query.kind === "files") items = [file("a", "src/a.ts"), file("b", "src/b.ts")];
+    else if (query.kind === "neighbors") items = rows.get(query.id) ?? [];
+    const page = { total: items.length, offset: query.offset, nextOffset: null, items };
+    if (query.kind === "neighbors" && deferNeighbors) {
+      return new Promise(resolve => { releaseNeighbor = () => resolve(page); });
+    }
+    return Promise.resolve(page);
+  };
+  await h.store.enter({ folder: "C:/repo" });
+  await h.store.ensureLevel("files");
+  await h.store.loadCycle("files", loop.id);
+  const model = deriveModel(h.snapshot(), "files").model;
+  assert.deepEqual(model.nodes.filter(item => item.parentId === loop.id).map(item => [item.id, item.label, item.path]), [
+    ["a", "a.ts", "src/a.ts"], ["b", "b.ts", "src/b.ts"],
+  ]);
+  assert.deepEqual(h.snapshot().levels.files.extra.edges.map(item => [item.id, item.source, item.target, item.evidenceIds]), [
+    ["ab", "a", "b", ["site:ab"]], ["ba", "b", "a", ["site:ba"]],
+  ]);
+  const queries = count(h.calls, "query");
+  await h.store.loadCycle("files", loop.id);
+  assert.equal(count(h.calls, "query"), queries, "loaded members are reused");
+  h.store.viewPartial(true);
+  await h.store.ensureLevel("files");
+  deferNeighbors = true;
+  const loading = h.store.loadCycle("files", loop.id);
+  h.store.viewPartial(false);
+  releaseNeighbor();
+  await loading;
+  assert.equal(effectiveIndex(h.snapshot()).snapshotId, "snap-1");
+  assert.deepEqual(h.snapshot().levels.files.extra, { nodes: [], edges: [] });
+  assert.equal(h.snapshot().levels.files.error, null);
 });
 
 test("search ignores stale responses; empty text clears results; coverage and neighbours are bounded pages", async () => {

@@ -266,7 +266,10 @@ export interface KnowledgeStore extends Readable<KnowledgeState> {
   adopt(capabilities: KnowledgeCapabilities): void;
 }
 
-const errorText = (error: unknown): string => error instanceof Error ? error.message : typeof error === "string" ? error : JSON.stringify(error);
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === "string" ? error : JSON.stringify(error);
+}
 
 export function createKnowledgeStore(backend: Pick<KnowledgeApi, "getCapabilities">): KnowledgeStore {
   let state: KnowledgeState = { folder: null, capabilities: null, loading: false, error: null, probes: 0 };

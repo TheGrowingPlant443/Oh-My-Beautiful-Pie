@@ -22,7 +22,7 @@ export function toAdmission(status: ProjectInsightStatus): DependencyJobAdmissio
   return {
     requestId: status.requestId, architectId: null, promptSent: status.state === "uncertain" ? null : true,
     error: status.state === "failed" ? status.message : null,
-    disposition: status.state === "completed" ? "complete" : status.state === "failed" ? "error" : "pending",
+    disposition: JOB_STATUS[status.state],
   };
 }
 
@@ -38,7 +38,7 @@ export function insightTransport(api: InsightApi, kind: ProjectInsightKind): Job
     read: async requestId => {
       if (folder === null) throw new Error("No Architect request is open.");
       const status = await api.getProjectInsight(folder, kind);
-      if (!status || status.requestId !== requestId) throw new Error("The saved Architect request changed. Open it again.");
+      if (status?.requestId !== requestId) throw new Error("The saved Architect request changed. Open it again.");
       return toJobState(status);
     },
   };
@@ -46,7 +46,7 @@ export function insightTransport(api: InsightApi, kind: ProjectInsightKind): Job
 
 /** Distinct, known ecosystems of the discovered packages, in a stable order. */
 export function discoveryEcosystems(items: readonly DiscoveredDependency[]): string[] {
-  return [...new Set(items.flatMap(item => (item.ecosystem ? [item.ecosystem] : [])))].sort();
+  return [...new Set(items.flatMap(item => (item.ecosystem ? [item.ecosystem] : [])))].sort((a, b) => a.localeCompare(b));
 }
 
 export function citationText(citation: { path: string; line: number | null }): string {

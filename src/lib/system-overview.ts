@@ -2,14 +2,13 @@ import { writable, type Readable } from "svelte/store";
 import { repoKey } from "./repo-agents";
 import { TicketBook, type TicketClock, type VisualizationTicket } from "./visualization-tickets";
 import {
-  baseName, modelFromDirectories, modelFromNeighbors, modelFromOverview, modelFromSystem, placeholderSystemModel, scopeModel, SIGMA_MAX_NODES,
+  baseName, modelFromDirectories, modelFromNeighbors, modelFromOverview, modelFromSystem, node, placeholderSystemModel, scopeModel, SIGMA_MAX_NODES,
   type GraphModel, type ModelEdge, type ModelNode,
 } from "./system-graph";
 import type {
   CoverageRow, NeighborRow, OverviewGroupRow, ProjectInsightStatus, SourceFileRow, SourceIndexPage, SourceIndexQuery,
-  SourceIndexSelection, SourceIndexStatus, SourceSiteRow, SourceSymbolRow, SystemOverviewPayload, HelicopterPayload,
+  SourceIndexSelection, SourceIndexStatus, SourceSiteRow, SourceSymbolRow, SystemOverviewPayload, HelicopterPayload, api as backend,
 } from "./api";
-import type { api as backend } from "./api";
 import { EMPTY_INVENTORY, type ArchitectDescriptor, type GenerateOutcome, type GenerateRequest, type InventoryState, type StructureHost, type VisualizationSink } from "./overview-types";
 import { modelFromHelicopter } from "./helicopter-graph";
 
@@ -50,9 +49,11 @@ export interface TabView {
   page: number;
 }
 
+type LoadStatus = "idle" | "loading" | "ready" | "error";
+
 export interface LevelData {
   snapshotId: string | null;
-  status: "idle" | "loading" | "ready" | "error";
+  status: LoadStatus;
   /** `nodes`: the per-node strongly connected overview; `directories`: aggregate when the graph exceeds the Sigma bound. */
   mode: "nodes" | "directories";
   total: number;
@@ -79,17 +80,17 @@ export interface Inspector {
 
 export interface SearchResults {
   text: string;
-  status: "idle" | "loading" | "ready" | "error";
+  status: LoadStatus;
   items: (SourceFileRow | SourceSymbolRow)[];
   total: number;
   nextOffset: number | null;
   error: string | null;
 }
 
-export interface CoverageState { status: "idle" | "loading" | "ready" | "error"; snapshotId: string | null; items: CoverageRow[]; total: number; nextOffset: number | null; error: string | null }
+export interface CoverageState { status: LoadStatus; snapshotId: string | null; items: CoverageRow[]; total: number; nextOffset: number | null; error: string | null }
 
 export interface IndexView {
-  phase: "idle" | "loading" | "ready" | "error";
+  phase: LoadStatus;
   selected: SourceIndexStatus | null;
   attempt: SourceIndexStatus | null;
   /** The user chose to view the latest partial attempt instead of the selected complete index. */
@@ -165,13 +166,13 @@ export function effectiveIndex(state: Pick<OverviewState, "index">): SourceIndex
 
 export function selectedSystemResult(state: Pick<OverviewState, "system">): { status: ProjectInsightStatus; result: SystemOverviewPayload } | null {
   const status = state.system.revisions.find(item => item.requestId === state.system.selectedId);
-  if (!status || status.state !== "completed" || status.result?.kind !== "systemOverview") return null;
+  if (status?.state !== "completed" || status.result?.kind !== "systemOverview") return null;
   return { status, result: status.result };
 }
 
 export function selectedHelicopterResult(state: Pick<OverviewState, "helicopter">): { status: ProjectInsightStatus; result: HelicopterPayload } | null {
   const status = state.helicopter.revisions.find(item => item.requestId === state.helicopter.selectedId);
-  if (!status || status.state !== "completed" || status.result?.kind !== "helicopter") return null;
+  if (status?.state !== "completed" || status.result?.kind !== "helicopter") return null;
   return { status, result: status.result };
 }
 
@@ -183,12 +184,24 @@ function inScope(item: ModelNode, scope: Scope): boolean {
   return scope.exact.includes(path) || scope.prefixes.some(prefix => under(path, prefix));
 }
 
+function applicationLabel(folder: string): string {
+  let end = folder.length;
+  while (end > 0 && (folder[end - 1] === "/" || folder[end - 1] === "\\")) end--;
+  return baseName(folder.slice(0, end)) || "Application";
+}
+
+function sourceLevelModel(level: LevelData, tab: SourceTab): GraphModel {
+  if (level.mode === "directories") return modelFromDirectories(level.groups);
+  const base = modelFromOverview({ level: tab, groups: level.groups, files: level.files, symbols: level.symbols, directories: level.directories });
+  return level.extra.nodes.length ? { nodes: [...base.nodes, ...level.extra.nodes], edges: [...base.edges, ...level.extra.edges] } : base;
+}
+
 /** The model a tab draws, derived purely from store state (the page indexes and projects it). */
 export function deriveModel(state: OverviewState, tab: OverviewTab): { model: GraphModel; sites: SourceSiteRow[]; note: string | null } {
   if (tab === "system") {
     const found = selectedSystemResult(state);
     if (found) return { model: modelFromSystem(found.result), sites: [], note: null };
-    return { model: placeholderSystemModel(baseName(state.folder.replace(/[\\/]+$/, "")) || "Application"), sites: [], note: null };
+    return { model: placeholderSystemModel(applicationLabel(state.folder)), sites: [], note: null };
   }
   if (tab === "helicopter") {
     // No generated business view yet: nothing is invented around an empty page.
@@ -199,17 +212,12 @@ export function deriveModel(state: OverviewState, tab: OverviewTab): { model: Gr
   const view = state.views[tab];
   if (view.neighborhood) {
     const hood = state.hood;
-    if (!hood || hood.level !== tab || hood.id !== view.neighborhood.id || hood.status === "loading") return { model: { nodes: [], edges: [] }, sites: [], note: "Loading neighbourhood…" };
+    if (hood?.level !== tab || hood.id !== view.neighborhood.id || hood.status === "loading") return { model: { nodes: [], edges: [] }, sites: [], note: "Loading neighbourhood…" };
     const built = modelFromNeighbors({ level: tab, centerId: view.neighborhood.id, centerLabel: view.neighborhood.label, centerPath: view.neighborhood.path, rows: hood.rows });
     return { model: built.model, sites: built.sites, note: hood.total > hood.rows.length ? `Showing ${hood.rows.length.toLocaleString()} of ${hood.total.toLocaleString()} neighbours.` : null };
   }
   if (level.status !== "ready") return { model: { nodes: [], edges: [] }, sites: [], note: null };
-  let model: GraphModel;
-  if (level.mode === "directories") model = modelFromDirectories(level.groups);
-  else {
-    const base = modelFromOverview({ level: tab, groups: level.groups, files: level.files, symbols: level.symbols, directories: level.directories });
-    model = level.extra.nodes.length ? { nodes: [...base.nodes, ...level.extra.nodes], edges: [...base.edges, ...level.extra.edges] } : base;
-  }
+  let model = sourceLevelModel(level, tab);
   if (view.scope) {
     const scope = view.scope;
     model = scopeModel(model, item => inScope(item, scope));
@@ -269,10 +277,57 @@ export interface SystemOverviewStore extends Readable<OverviewState>, Visualizat
   dispose(): void;
 }
 
+/** Pages a query to its end (or `max` pages); returns null when the caller's scope became stale meanwhile. */
+async function collect<T>(fetch: (offset: number) => Promise<SourceIndexPage<T>>, valid: () => boolean, each?: (items: T[], total: number) => void, max = Infinity): Promise<{ items: T[]; total: number } | null> {
+  const items: T[] = [];
+  let offset: number | null = 0, total = 0;
+  for (let pages = 0; offset !== null && pages < max; pages++) {
+    const page: SourceIndexPage<T> = await fetch(offset);
+    if (!valid()) return null;
+    total = page.total;
+    items.push(...page.items);
+    each?.(page.items, total);
+    offset = page.nextOffset;
+  }
+  return { items, total };
+}
+
+function cycleMemberNode(level: SourceTab, member: string, parentId: string, data: LevelData): ModelNode {
+  const file = data.files.find(item => item.id === member);
+  const symbol = data.symbols.find(item => item.id === member);
+  let kind = symbol?.kind ?? "function";
+  let label = symbol?.qualifiedName || symbol?.name || member;
+  if (level === "files") {
+    kind = "file";
+    label = baseName(file?.path ?? member);
+  }
+  return node({
+    id: member, kind, label, subtitle: file?.path ?? symbol?.path ?? "", parentId, evidence: "parsed", cyclic: true,
+    path: file?.path ?? symbol?.path ?? null, ref: member,
+  });
+}
+
+function addCycleEdges(edges: Map<string, ModelEdge>, members: ReadonlySet<string>, source: string, rows: readonly NeighborRow[]): void {
+  for (const row of rows) {
+    if (row.kind !== "edge" || !members.has(row.peerId)) continue;
+    edges.set(row.edge.id, {
+      id: row.edge.id, source, target: row.peerId, direction: "directed", relation: row.edge.relation, grade: row.edge.resolution,
+      derived: false, label: row.edge.relation, count: 1, evidenceIds: row.edge.evidenceIds, truncated: false,
+    });
+  }
+}
+
+/** The Architect-generated picture a request kind fills, or null for the structure kinds (they have their own store). */
+function slotOf(kind: GenerateRequest["kind"]): ArchitectTab | null {
+  if (kind === "systemOverview") return "system";
+  return kind === "helicopter" ? "helicopter" : null;
+}
+
 export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewStore {
   const api = deps.api;
   const clock: TicketClock = deps.clock ?? { setTimeout: (fn, ms) => window.setTimeout(fn, ms), clearTimeout: timer => window.clearTimeout(timer), now: () => Date.now() };
-  const storage = deps.storage === undefined ? (typeof localStorage === "undefined" ? null : localStorage) : deps.storage;
+  let storage = deps.storage;
+  if (storage === undefined) storage = typeof localStorage === "undefined" ? null : localStorage;
   let state = initialOverviewState();
   const store = writable(state);
   const commit = (patch: Partial<OverviewState>): void => { state = { ...state, ...patch }; store.set(state); };
@@ -294,20 +349,6 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
     try { storage?.setItem(PREFS_KEY, JSON.stringify({ folder: state.folder, tab: state.tab })); } catch { /* Preferences never own results. */ }
   };
 
-  /** Pages a query to its end (or `max` pages); returns null when the caller's scope became stale meanwhile. */
-  async function collect<T>(fetch: (offset: number) => Promise<SourceIndexPage<T>>, valid: () => boolean, each?: (items: T[], total: number) => void, max = Infinity): Promise<{ items: T[]; total: number } | null> {
-    const items: T[] = [];
-    let offset: number | null = 0, total = 0;
-    for (let pages = 0; offset !== null && pages < max; pages++) {
-      const page: SourceIndexPage<T> = await fetch(offset);
-      if (!valid()) return null;
-      total = page.total;
-      items.push(...page.items);
-      each?.(page.items, total);
-      offset = page.nextOffset;
-    }
-    return { items, total };
-  }
 
   // ---- index ------------------------------------------------------------------------------------------------
 
@@ -410,6 +451,13 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
 
   // ---- levels -----------------------------------------------------------------------------------------------
 
+  function setNodeLevel(level: SourceTab, facts: SourceFileRow[] | SourceSymbolRow[], directories: OverviewGroupRow[]): void {
+    setLevel(level, {
+      status: "ready", mode: "nodes", files: level === "files" ? facts as SourceFileRow[] : [], symbols: level === "functions" ? facts as SourceSymbolRow[] : [],
+      directories: directories.map(group => group.path ?? ""),
+    });
+  }
+
   async function ensureLevel(level: SourceTab): Promise<void> {
     const snapshot = snapshotId();
     if (!snapshot) return;
@@ -438,10 +486,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
       if (!facts) return;
       const directories = await collect(overview("directory"), valid, undefined, DIRECTORY_PAGE_CAP);
       if (!directories) return;
-      setLevel(level, {
-        status: "ready", mode: "nodes", files: level === "files" ? facts.items as SourceFileRow[] : [], symbols: level === "functions" ? facts.items as SourceSymbolRow[] : [],
-        directories: directories.items.map(group => group.path ?? ""),
-      });
+      setNodeLevel(level, facts.items, directories.items);
     } catch (error) {
       if (valid()) setLevel(level, { status: "error", error: errorText(error) });
     }
@@ -478,7 +523,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
     const mine = generation, mineEpoch = epoch, sequence = more ? sequences[slot] : ++sequences[slot];
     const valid = (): boolean => mine === generation && mineEpoch === epoch && sequence === sequences[slot];
     const previous = state[slot];
-    let base: Inspector = more && previous && previous.id === id && previous.level === level
+    let base: Inspector = more && previous?.id === id && previous.level === level
       ? { ...previous, status: "loading" } : { level, id, snapshotId: snapshot, status: "loading", rows: [], total: 0, nextOffset: 0, error: null };
     commit({ [slot]: base } as Partial<OverviewState>);
     try {
@@ -505,18 +550,11 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
       const members = new Set(group.members);
       const nodes = new Map<string, ModelNode>();
       const edges = new Map<string, ModelEdge>();
-      const parentNode = group.id;
       for (const member of group.members.slice(0, 60)) {
         const page = await query<NeighborRow>(snapshot, { kind: "neighbors", level, id: member, direction: "out", offset: 0, limit: PAGE });
         if (!valid()) return;
-        const file = levelData.files.find(item => item.id === member);
-        const symbol = levelData.symbols.find(item => item.id === member);
-        const own = nodes.get(member);
-        if (!own) nodes.set(member, { id: member, kind: level === "files" ? "file" : symbol?.kind ?? "function", label: level === "files" ? baseName(file?.path ?? member) : symbol?.qualifiedName || symbol?.name || member, subtitle: file?.path ?? symbol?.path ?? "", description: "", parentId: parentNode, synthetic: false, evidence: "parsed", role: null, evidenceIds: [], memberCount: 1, cyclic: true, selfLoops: 0, selfLoopIds: [], lazyMembers: [], path: file?.path ?? symbol?.path ?? null, ref: member });
-        for (const row of page.items) {
-          if (row.kind !== "edge" || !members.has(row.peerId)) continue;
-          edges.set(row.edge.id, { id: row.edge.id, source: member, target: row.peerId, direction: "directed", relation: row.edge.relation, grade: row.edge.resolution, derived: false, label: row.edge.relation, count: 1, evidenceIds: row.edge.evidenceIds, truncated: false });
-        }
+        if (!nodes.has(member)) nodes.set(member, cycleMemberNode(level, member, group.id, levelData));
+        addCycleEdges(edges, members, member, page.items);
       }
       setLevel(level, { extra: { nodes: [...levelData.extra.nodes, ...nodes.values()], edges: [...levelData.extra.edges, ...edges.values()] } });
     } catch (error) {
@@ -632,8 +670,6 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
     persist();
   }
 
-  /** The Architect-generated picture a request kind fills, or null for the structure kinds (they have their own store). */
-  const slotOf = (kind: GenerateRequest["kind"]): ArchitectTab | null => kind === "systemOverview" ? "system" : kind === "helicopter" ? "helicopter" : null;
 
   async function generate(request: GenerateRequest): Promise<GenerateOutcome> {
     const slot = slotOf(request.kind);
@@ -726,7 +762,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
     loadCoverage,
     async moreNeighbors() {
       const current = state.inspector;
-      if (current && current.status === "ready" && current.nextOffset !== null) await inspect(current.level, current.id, true);
+      if (current?.status === "ready" && current.nextOffset !== null) await inspect(current.level, current.id, true);
     },
     drill(tab, scope, neighborhood = null) {
       commit({ back: [...state.back, { tab: state.tab, area: state.area, view: { ...state.views[state.tab] } }].slice(-20) });
@@ -738,7 +774,7 @@ export function createSystemOverviewStore(deps: OverviewDeps): SystemOverviewSto
     },
     clearScope(tab) { setView(tab, { scope: null, expanded: null, camera: null, selectedNode: null, selectedEdge: null, page: 0 }); },
     back() {
-      const entry = state.back[state.back.length - 1];
+      const entry = state.back.at(-1);
       if (!entry) return false;
       commit({ back: state.back.slice(0, -1), tab: entry.tab, area: entry.area, views: { ...state.views, [entry.tab]: entry.view } });
       persist();

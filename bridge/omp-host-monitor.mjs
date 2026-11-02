@@ -13,8 +13,8 @@ export const MONITOR_TOOL = TOOLS.monitorRead;
 export const MAX_MONITOR_FRAME = 1024 * 1024;
 export const MAX_MONITOR_MESSAGE = 64 * 1024;
 export const MONITOR_SECTIONS = ['processes', 'tcp', 'udp'];
-const CONTROL_FIELDS = ['source', 'generation', 'sessionId', 'ownershipEpoch', 'workspaceEpoch', 'instanceId'];
-const controlBody = payload => Object.fromEntries(Object.entries(payload ?? {}).filter(([key]) => !CONTROL_FIELDS.includes(key)));
+const CONTROL_FIELDS = new Set(['source', 'generation', 'sessionId', 'ownershipEpoch', 'workspaceEpoch', 'instanceId']);
+const controlBody = payload => Object.fromEntries(Object.entries(payload ?? {}).filter(([key]) => !CONTROL_FIELDS.has(key)));
 const bounded = value => {
   if (Buffer.byteLength(JSON.stringify(value)) > MAX_MONITOR_FRAME) throw new Error('monitor_transport_limit: Page exceeds 1 MiB; request a smaller limit.');
   return value;

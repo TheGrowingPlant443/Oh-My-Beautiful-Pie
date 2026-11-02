@@ -33,6 +33,38 @@ export function filterGraphByEcosystem(graph: DependencyGraph, choice: Ecosystem
   return { ...graph, nodes, edges: graph.edges.filter(([from, to]) => kept.has(from) && kept.has(to)) };
 }
 
+function reachableDepths(outgoing: ReadonlyMap<string, string[]>, hasRoot: boolean, removed?: ReadonlySet<string>): { depths: Map<string, number>; maxDepth: number } {
+  const depths = new Map<string, number>();
+  const queue = hasRoot ? [ROOT] : [];
+  if (hasRoot) depths.set(ROOT, 0);
+  let maxDepth = 0;
+  for (const current of queue) {
+    const depth = depths.get(current)! + 1;
+    for (const next of outgoing.get(current) ?? []) {
+      if (removed?.has(next) || depths.has(next)) continue;
+      depths.set(next, depth);
+      maxDepth = Math.max(maxDepth, depth);
+      queue.push(next);
+    }
+  }
+  return { depths, maxDepth };
+}
+
+function removeHiddenNodes(base: readonly DepNode[], hidden: ReadonlySet<string>, removed: Set<string>): void {
+  for (const node of base) {
+    if (node.id !== ROOT && hidden.has(node.id)) removed.add(node.id);
+  }
+}
+
+function outgoingMap(edges: readonly (readonly [string, string])[]): Map<string, string[]> {
+  const outgoing = new Map<string, string[]>();
+  for (const [from, to] of edges) {
+    const list = outgoing.get(from);
+    if (list) list.push(to); else outgoing.set(from, [to]);
+  }
+  return outgoing;
+}
+
 /**
  * Basic direct packages and packages only reachable through them are removed first. A layer cap then
  * uses the shortest surviving path from the project (root 0, direct 1), independently of that count.
@@ -43,28 +75,8 @@ export function visibleGraph(graph: DependencyGraph, classification: Classificat
   const inBase = new Set(base.map(node => node.id));
   const edges = graph.edges.filter(([from, to]) => inBase.has(from) && inBase.has(to));
   const removed = new Set(showAll ? [] : base.filter(node => node.direct && classification.items[node.id]?.basic === true).map(node => node.id));
-  const outgoing = new Map<string, string[]>();
-  for (const [from, to] of edges) {
-    const list = outgoing.get(from);
-    if (list) list.push(to); else outgoing.set(from, [to]);
-  }
-  function reachable(): { depths: Map<string, number>; maxDepth: number } {
-    const depths = new Map<string, number>();
-    const queue = inBase.has(ROOT) ? [ROOT] : [];
-    if (queue.length) depths.set(ROOT, 0);
-    let maxDepth = 0;
-    for (let i = 0; i < queue.length; i++) {
-      const depth = depths.get(queue[i])! + 1;
-      for (const next of outgoing.get(queue[i]) ?? []) {
-        if (removed.has(next) || depths.has(next)) continue;
-        depths.set(next, depth);
-        maxDepth = Math.max(maxDepth, depth);
-        queue.push(next);
-      }
-    }
-    return { depths, maxDepth };
-  }
-  let { depths, maxDepth } = reachable();
+  const outgoing = outgoingMap(edges);
+  let { depths, maxDepth } = reachableDepths(outgoing, inBase.has(ROOT), removed);
   const survivors = () => showAll ? base.length : base.filter(node => depths.has(node.id)).length;
   const afterBasic = survivors();
   // Each extra filter removes its non-root members and whatever is then only reachable through them.
@@ -72,8 +84,8 @@ export function visibleGraph(graph: DependencyGraph, classification: Classificat
   let before = afterBasic;
   for (const set of [hide.known, hide.different, hide.common, hide.owners]) {
     if (!showAll && set?.size) {
-      for (const node of base) if (node.id !== ROOT && set.has(node.id)) removed.add(node.id);
-      ({ depths, maxDepth } = reachable());
+      removeHiddenNodes(base, set, removed);
+      ({ depths, maxDepth } = reachableDepths(outgoing, inBase.has(ROOT), removed));
     }
     const after = survivors();
     counts.push(before - after);
@@ -108,6 +120,28 @@ export function nodeColor(node: DepNode, basic: boolean, majorLag: number | null
 
 export const nodeSize = (inDegree: number): number => Math.min(14, 4 + 2 * Math.log2(1 + inDegree));
 
+function reachableNodes(start: string, adjacency: ReadonlyMap<string, string[]>): Set<string> {
+  const seen = new Set([start]), queue = [start];
+  for (const current of queue) {
+    for (const next of adjacency.get(current) ?? []) {
+      if (!seen.has(next)) { seen.add(next); queue.push(next); }
+    }
+  }
+  return seen;
+}
+
+function includeDescendants(included: Set<string>, target: string, forward: ReadonlyMap<string, string[]>, limit: number | null): void {
+  // Shortest depth from the project decides which descendants fall inside the layer limit.
+  const { depths } = reachableDepths(forward, true);
+  const seen = new Set([target]), pending = [target];
+  for (const current of pending) {
+    for (const next of forward.get(current) ?? []) {
+      if (seen.has(next) || (limit !== null && (depths.get(next) ?? Infinity) > limit)) continue;
+      seen.add(next); pending.push(next); included.add(next);
+    }
+  }
+}
+
 /**
  * The packages on every project-to-target path. `descendants` additionally keeps the target's own transitive packages:
  * undefined none, null all of them, a number only those within that many layers of the project.
@@ -115,43 +149,13 @@ export const nodeSize = (inDegree: number): number => Math.min(14, 4 + 2 * Math.
 export function pathToNode(view: VisibleGraph, target: string, descendants?: number | null): VisibleGraph | null {
   const ids = new Set(view.nodes.map(node => node.id));
   if (target === ROOT || !ids.has(ROOT) || !ids.has(target)) return null;
-  const forward = new Map<string, string[]>(), backward = new Map<string, string[]>();
-  for (const [from, to] of view.edges) {
-    if (!ids.has(from) || !ids.has(to)) continue;
-    const out = forward.get(from);
-    if (out) out.push(to); else forward.set(from, [to]);
-    const incoming = backward.get(to);
-    if (incoming) incoming.push(from); else backward.set(to, [from]);
-  }
-  function reach(start: string, adjacency: Map<string, string[]>): Set<string> {
-    const seen = new Set([start]), queue = [start];
-    for (let index = 0; index < queue.length; index++) {
-      for (const next of adjacency.get(queue[index]) ?? []) {
-        if (!seen.has(next)) { seen.add(next); queue.push(next); }
-      }
-    }
-    return seen;
-  }
-  const fromRoot = reach(ROOT, forward);
+  const edges = view.edges.filter(([from, to]) => ids.has(from) && ids.has(to));
+  const forward = outgoingMap(edges), backward = outgoingMap(edges.map(([from, to]): [string, string] => [to, from]));
+  const fromRoot = reachableNodes(ROOT, forward);
   if (!fromRoot.has(target)) return null;
-  const toTarget = reach(target, backward);
+  const toTarget = reachableNodes(target, backward);
   const included = new Set([...fromRoot].filter(id => toTarget.has(id)));
-  if (descendants !== undefined) {
-    // Shortest depth from the project decides which descendants fall inside the layer limit.
-    const depths = new Map([[ROOT, 0]]), queue = [ROOT];
-    for (let index = 0; index < queue.length; index++) {
-      for (const next of forward.get(queue[index]) ?? []) {
-        if (!depths.has(next)) { depths.set(next, depths.get(queue[index])! + 1); queue.push(next); }
-      }
-    }
-    const seen = new Set([target]), pending = [target];
-    for (let index = 0; index < pending.length; index++) {
-      for (const next of forward.get(pending[index]) ?? []) {
-        if (seen.has(next) || (descendants !== null && (depths.get(next) ?? Infinity) > descendants)) continue;
-        seen.add(next); pending.push(next); included.add(next);
-      }
-    }
-  }
+  if (descendants !== undefined) includeDescendants(included, target, forward, descendants);
   return {
     ...view, nodes: view.nodes.filter(node => included.has(node.id)),
     edges: view.edges.filter(([from, to]) => included.has(from) && included.has(to)),
@@ -199,7 +203,15 @@ export function buildPackageSearchIndex(nodes: readonly DepNode[]): PackageSearc
 function compareEntries(a: PackageSearchEntry, b: PackageSearchEntry): number {
   if (a.searchName !== b.searchName) return a.searchName < b.searchName ? -1 : 1;
   if (a.node.name !== b.node.name) return a.node.name < b.node.name ? -1 : 1;
-  return a.node.id < b.node.id ? -1 : a.node.id > b.node.id ? 1 : 0;
+  if (a.node.id === b.node.id) return 0;
+  return a.node.id < b.node.id ? -1 : 1;
+}
+
+function searchTier(entry: PackageSearchEntry, needle: string): number {
+  if (entry.searchName === needle || entry.searchId === needle) return 0;
+  if (entry.searchName.startsWith(needle) || entry.searchId.startsWith(needle)) return 1;
+  if (entry.searchName.includes(needle) || entry.searchId.includes(needle)) return 2;
+  return -1;
 }
 
 /** Literal, case-insensitive name/id substring search: exact matches, then prefixes, then other substrings. Empty query finds nothing. */
@@ -208,9 +220,7 @@ export function searchPackages(index: readonly PackageSearchEntry[], query: stri
   if (!needle) return [];
   const hits: { entry: PackageSearchEntry; tier: number }[] = [];
   for (const entry of index) {
-    const tier = entry.searchName === needle || entry.searchId === needle ? 0
-      : entry.searchName.startsWith(needle) || entry.searchId.startsWith(needle) ? 1
-      : entry.searchName.includes(needle) || entry.searchId.includes(needle) ? 2 : -1;
+    const tier = searchTier(entry, needle);
     if (tier >= 0) hits.push({ entry, tier });
   }
   hits.sort((a, b) => a.tier - b.tier || compareEntries(a.entry, b.entry));
@@ -243,8 +253,9 @@ export function parseDependencyPrefs(raw: string | null): DependencyPrefs {
   try {
     const value = JSON.parse(raw ?? "null") as Record<string, unknown> | null;
     if (value === null || typeof value !== "object" || Array.isArray(value)) return fallback;
-    const layers = value.layers === null ? null
-      : typeof value.layers === "number" && Number.isSafeInteger(value.layers) && value.layers >= 1 ? value.layers : DEFAULT_LAYERS;
+    let layers: number | null = DEFAULT_LAYERS;
+    if (value.layers === null) layers = null;
+    else if (typeof value.layers === "number" && Number.isSafeInteger(value.layers) && value.layers >= 1) layers = value.layers;
     return {
       folder: typeof value.folder === "string" ? value.folder : "",
       mode: value.mode === "transitive" ? "transitive" : "direct",

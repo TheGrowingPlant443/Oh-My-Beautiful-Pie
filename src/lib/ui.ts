@@ -2,12 +2,13 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import type { InstanceStatus } from "./api";
 
 export function basename(path: string): string {
-  const trimmed = path.replace(/[\\/]+$/, "");
+  let end = path.length;
+  while (end > 0 && (path[end - 1] === "/" || path[end - 1] === "\\")) end--;
+  const trimmed = path.slice(0, end);
   return trimmed.slice(Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\")) + 1);
 }
 export function agentName(path: string): string {
-  const parts = path.split(/[\\/]+/).filter(Boolean);
-  return parts.length >= 2 ? parts[parts.length - 2] : path;
+  return path.split(/[\\/]+/).filter(Boolean).at(-2) ?? path;
 }
 export function statusClass(status: InstanceStatus): string {
   if (status === "running") return "ok";

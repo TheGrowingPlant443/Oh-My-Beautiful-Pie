@@ -1,0 +1,54 @@
+--- a/libweston/backend-wayland/wayland.c
++++ b/libweston/backend-wayland/wayland.c
+@@ -146,6 +146,7 @@
+ 	struct weston_mode native_mode;
+ 
+ 	struct wl_callback *frame_cb;
++	bool fullscreen; /* Without a frame, frame presence no longer encodes windowed state. */
+ };
+ 
+ struct wayland_parent_output {
+@@ -949,24 +950,8 @@
+ static int
+ wayland_output_set_windowed(struct wayland_output *output)
+ {
+-	struct wayland_backend *b = output->backend;
+-
+-	if (output->frame)
+-		return 0;
+-
+-	if (!b->theme) {
+-		b->theme = theme_create();
+-		if (!b->theme)
+-			return -1;
+-	}
+-	output->frame = frame_create(b->theme, 100, 100,
+-	                             FRAME_BUTTON_CLOSE, output->title, NULL);
+-	if (!output->frame)
+-		return -1;
+-
+-	if (output->keyboard_count)
+-		frame_set_flag(output->frame, FRAME_FLAG_ACTIVE);
+-
++	/* The host compositor owns window chrome; the whole allocation is the nested desktop. */
++	output->fullscreen = false;
+ 	wayland_output_resize_surface(output);
+ 
+ 	if (output->parent.xdg_toplevel) {
+@@ -982,6 +967,7 @@
+ wayland_output_set_fullscreen(struct wayland_output *output,
+ 			      uint32_t framerate, struct wl_output *target)
+ {
++	output->fullscreen = true;
+ 	if (output->frame) {
+ 		frame_destroy(output->frame);
+ 		output->frame = NULL;
+@@ -2802,7 +2788,7 @@
+ 	if (!input || !input->output)
+ 		return;
+ 
+-	if (input->output->frame)
++	if (!input->output->fullscreen)
+ 		wayland_output_set_fullscreen(input->output, 0, NULL);
+ 	else
+ 		wayland_output_set_windowed(input->output);

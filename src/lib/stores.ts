@@ -188,7 +188,7 @@ function applySnapshot(list: Instance[]): void {
   const previous = get(allInstances);
   for (const row of list) {
     const old = previous.find(i => i.id === row.id);
-    if (old && old.projectPath !== row.projectPath && row.kind !== "instance") void rememberCoordinatorMove(old.projectPath, row.projectPath);
+    if (old && (old.projectFolder ?? old.projectPath) !== (row.projectFolder ?? row.projectPath) && row.kind !== "instance") void rememberCoordinatorMove(old.projectFolder ?? old.projectPath, row.projectFolder ?? row.projectPath);
     if (old && row.generation !== old.generation) ptyBus.reset(row.id);
     if (row.generation > 0 && streams.get(row.id)?.listeners.size) {
       void ptyBus.ensureAttached(row.id).catch(error => reportError("Terminal attachment", error));

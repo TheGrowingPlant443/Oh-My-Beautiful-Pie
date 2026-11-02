@@ -2,17 +2,22 @@
 //!
 //! Cross-process `SetParent`/`WS_CHILD` hosting paints Chrome but breaks its omnibox and
 //! accelerators, so the real Chrome window stays top-level and follows the pane rectangle.
+//! Win32 window enumeration, placement and style APIs have no standard-library equivalent.
 use crate::browser::{BrowserInfo, BrowserRect, BrowserSupervisor};
 use parking_lot::Mutex;
-use std::{collections::HashMap, sync::Arc, time::Duration};
-use tauri::{AppHandle, Manager};
-use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, POINT, RECT},
-    Graphics::{
-        Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS},
-        Gdi::ClientToScreen,
-    },
-    UI::WindowsAndMessaging::*,
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::AppHandle;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_HWNDPREV, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WS_CAPTION,
+    WS_EX_TOOLWINDOW,
 };
 
 #[derive(Clone)]
@@ -34,38 +39,62 @@ struct Scan {
     windows: Vec<HWND>,
 }
 
+/// # Safety
+/// `data` must point to the unique live `Scan` borrowed for the synchronous `EnumWindows` call.
 unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> i32 {
-    let scan = &mut *(data as *mut Scan);
-    let mut pid = 0;
-    GetWindowThreadProcessId(hwnd, &mut pid);
-    let mut class = [0u16; 64];
-    let length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
-    let is_chrome = String::from_utf16_lossy(&class[..length.max(0) as usize]) == "Chrome_WidgetWin_1";
-    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
-    // Menus, tooltips and other helper surfaces are Chrome_WidgetWin_1 too; browser windows have a caption.
-    if pid == scan.pid && is_chrome && style & WS_CAPTION == WS_CAPTION {
-        scan.windows.push(hwnd);
+    // SAFETY: only windows_of supplies this callback and keeps its exclusive Scan borrow alive until enumeration
+    // returns; Win32 writes only within the class buffer and PID out-parameter.
+    unsafe {
+        let scan = &mut *(data as *mut Scan);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let mut class = [0u16; 64];
+        let length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+        let is_chrome =
+            String::from_utf16_lossy(&class[..length.max(0) as usize]) == "Chrome_WidgetWin_1";
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        // Menus, tooltips and other helper surfaces are Chrome_WidgetWin_1 too; browser windows have a caption.
+        if pid == scan.pid && is_chrome && style & WS_CAPTION == WS_CAPTION {
+            scan.windows.push(hwnd);
+        }
+        1
     }
-    1
 }
 fn windows_of(pid: u32) -> Vec<HWND> {
-    let mut scan = Scan { pid, windows: Vec::new() };
+    let mut scan = Scan {
+        pid,
+        windows: Vec::new(),
+    };
+    // SAFETY: EnumWindows invokes collect synchronously with this uniquely borrowed, live Scan.
     unsafe { EnumWindows(Some(collect), &mut scan as *mut _ as LPARAM) };
     scan.windows
 }
 fn frame_insets(hwnd: HWND) -> (i32, i32, i32, i32) {
     let (mut window, mut frame) = (RECT::default(), RECT::default());
+    // SAFETY: both RECT buffers are fully initialized and writable; stale HWNDs fail in Win32 without dereferencing Rust memory.
     unsafe {
         GetWindowRect(hwnd, &mut window);
-        if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS as u32, &mut frame as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32) != 0 {
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+            &mut frame as *mut _ as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        ) != 0
+        {
             return (0, 0, 0, 0);
         }
     }
-    (frame.left - window.left, frame.top - window.top, window.right - frame.right, window.bottom - frame.bottom)
+    (
+        frame.left - window.left,
+        frame.top - window.top,
+        window.right - frame.right,
+        window.bottom - frame.bottom,
+    )
 }
 fn is_above(main: HWND, window: HWND) -> bool {
     let mut current = main;
     for _ in 0..256 {
+        // SAFETY: HWND is an opaque OS identifier; GetWindow validates it and returns another identifier.
         current = unsafe { GetWindow(current, GW_HWNDPREV) };
         if current.is_null() {
             return false;
@@ -78,19 +107,42 @@ fn is_above(main: HWND, window: HWND) -> bool {
 }
 fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) -> Result<(), String> {
     let (left, top, right, bottom) = frame_insets(hwnd);
-    let target = (x - left, y - top, width + left + right, height + top + bottom);
+    let target = (
+        x - left,
+        y - top,
+        width + left + right,
+        height + top + bottom,
+    );
     let mut current = RECT::default();
+    // SAFETY: current is a writable RECT and HWNDs are OS-validated identifiers; no borrowed Rust data escapes.
     unsafe {
         if IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 {
             ShowWindow(hwnd, SW_RESTORE);
         }
         GetWindowRect(hwnd, &mut current);
-        let moved = (current.left, current.top, current.right - current.left, current.bottom - current.top) != target;
+        let moved = (
+            current.left,
+            current.top,
+            current.right - current.left,
+            current.bottom - current.top,
+        ) != target;
         if !moved && IsWindowVisible(hwnd) != 0 {
             return Ok(());
         }
-        let flags = SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW | if moved { 0 } else { SWP_NOMOVE | SWP_NOSIZE };
-        if SetWindowPos(hwnd, std::ptr::null_mut(), target.0, target.1, target.2, target.3, flags) == 0 {
+        let flags = SWP_NOACTIVATE
+            | SWP_NOZORDER
+            | SWP_SHOWWINDOW
+            | if moved { 0 } else { SWP_NOMOVE | SWP_NOSIZE };
+        if SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            target.0,
+            target.1,
+            target.2,
+            target.3,
+            flags,
+        ) == 0
+        {
             return Err(std::io::Error::last_os_error().to_string());
         }
     }
@@ -117,58 +169,170 @@ impl BrowserHost {
             }
         });
     }
-    fn reconcile(&self, app: &AppHandle, browser: &BrowserSupervisor, rows: &[BrowserInfo], saved: &mut HashMap<isize, Saved>) {
-        let Some(window) = app.get_webview_window("main") else { return };
+    fn reconcile(
+        &self,
+        app: &AppHandle,
+        browser: &BrowserSupervisor,
+        rows: &[BrowserInfo],
+        saved: &mut HashMap<isize, Saved>,
+    ) {
+        use tauri::Manager;
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
         let Ok(main) = window.hwnd() else { return };
         let main = main.0 as HWND;
         let view = self.view.lock().clone();
-        let live: Vec<(&BrowserInfo, Vec<HWND>)> = rows.iter().filter(|row| row.pid.is_some() && !row.headless).map(|row| (row, windows_of(row.pid.unwrap()))).collect();
-        saved.retain(|hwnd, _| live.iter().any(|(_, windows)| windows.contains(&(*hwnd as HWND))));
+        let live: Vec<(&BrowserInfo, Vec<HWND>)> = rows
+            .iter()
+            .filter(|row| !row.headless)
+            .filter_map(|row| row.pid.map(|pid| (row, windows_of(pid))))
+            .collect();
+        saved.retain(|hwnd, _| {
+            live.iter()
+                .any(|(_, windows)| windows.contains(&(*hwnd as HWND)))
+        });
+        let dock = Dock::capture(main, view);
+        for (info, windows) in &live {
+            for &hwnd in windows {
+                if info.embedded {
+                    dock.embed(browser, saved, info, hwnd);
+                } else {
+                    restore_window(saved, hwnd, &dock.origin);
+                }
+            }
+        }
+    }
+}
+
+/// Per-pass host state: the main window, the pane view and the client-area origin.
+struct Dock {
+    main: HWND,
+    foreground: HWND,
+    minimized: bool,
+    origin: POINT,
+    view: Option<View>,
+}
+impl Dock {
+    fn capture(main: HWND, view: Option<View>) -> Self {
+        // SAFETY: main is an opaque HWND; origin is an initialized writable POINT, used only for this synchronous call.
         unsafe {
             let foreground = GetForegroundWindow();
             let minimized = IsIconic(main) != 0;
             let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(main, &mut origin);
-            for (info, windows) in &live {
-                let embedded = info.embedded;
-                for &hwnd in windows {
-                    let key = hwnd as isize;
-                    if embedded {
-                        if !saved.contains_key(&key) {
-                            let mut rect = RECT::default();
-                            GetWindowRect(hwnd, &mut rect);
-                            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                            saved.insert(key, Saved { ex_style, rect });
-                            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOOLWINDOW as isize);
-                        }
-                        let active = view.as_ref().filter(|v| v.instance_id == info.instance_id && v.generation == info.generation && !minimized && v.rect.width >= 1.0 && v.rect.height >= 1.0);
-                        match active {
-                            Some(v) => {
-                                if let Err(error) = place(hwnd, origin.x + v.rect.x as i32, origin.y + v.rect.y as i32, v.rect.width as i32, v.rect.height as i32) {
-                                    browser.report_embedding_error(&info.instance_id, info.generation, &format!("{}: {error}", crate::browser::EMBEDDING_ERROR));
-                                } else if foreground == main && !is_above(main, hwnd) {
-                                    // Reordering our own host works where cross-process HWND_TOP is ignored.
-                                    SetWindowPos(main, hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                                }
-                            }
-                            None => {
-                                if IsWindowVisible(hwnd) != 0 {
-                                    ShowWindow(hwnd, SW_HIDE);
-                                }
-                            }
-                        }
-                    } else if let Some(original) = saved.remove(&key) {
-                        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, original.ex_style & !(WS_EX_TOOLWINDOW as isize));
-                        let (x, y, width, height) = if original.rect.left < -20000 {
-                            (origin.x + 60, origin.y + 60, 1200, 800)
-                        } else {
-                            (original.rect.left, original.rect.top, original.rect.right - original.rect.left, original.rect.bottom - original.rect.top)
-                        };
-                        SetWindowPos(hwnd, std::ptr::null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
-                        ShowWindow(hwnd, SW_SHOWNORMAL);
-                    }
-                }
+            Self {
+                main,
+                foreground,
+                minimized,
+                origin,
+                view,
             }
         }
+    }
+    fn embed(
+        &self,
+        browser: &BrowserSupervisor,
+        saved: &mut HashMap<isize, Saved>,
+        info: &BrowserInfo,
+        hwnd: HWND,
+    ) {
+        let key = hwnd as isize;
+        if !saved.contains_key(&key) {
+            saved.insert(key, take_over_window(hwnd));
+        }
+        let active = self.view.as_ref().filter(|v| {
+            v.instance_id == info.instance_id
+                && v.generation == info.generation
+                && !self.minimized
+                && v.rect.width >= 1.0
+                && v.rect.height >= 1.0
+        });
+        match active {
+            Some(v) => self.dock_into(browser, info, hwnd, v),
+            None => hide_window(hwnd),
+        }
+    }
+    fn dock_into(&self, browser: &BrowserSupervisor, info: &BrowserInfo, hwnd: HWND, v: &View) {
+        if let Err(error) = place(
+            hwnd,
+            self.origin.x + v.rect.x as i32,
+            self.origin.y + v.rect.y as i32,
+            v.rect.width as i32,
+            v.rect.height as i32,
+        ) {
+            browser.report_embedding_error(
+                &info.instance_id,
+                info.generation,
+                &format!("{}: {error}", crate::browser::EMBEDDING_ERROR),
+            );
+        } else if self.foreground == self.main && !is_above(self.main, hwnd) {
+            // Reordering our own host works where cross-process HWND_TOP is ignored.
+            // SAFETY: both HWNDs are opaque OS-validated identifiers; the flags forbid activation, resizing or moving.
+            unsafe {
+                SetWindowPos(
+                    self.main,
+                    hwnd,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+            };
+        }
+    }
+}
+
+/// Records the window's rect and style, then hides it from the taskbar.
+fn take_over_window(hwnd: HWND) -> Saved {
+    // SAFETY: rect is writable storage; the HWND and style values are validated by Win32 and contain no Rust pointers.
+    unsafe {
+        let mut rect = RECT::default();
+        GetWindowRect(hwnd, &mut rect);
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOOLWINDOW as isize);
+        Saved { ex_style, rect }
+    }
+}
+fn hide_window(hwnd: HWND) {
+    // SAFETY: the opaque HWND is validated by Win32; showing/hiding it does not access Rust memory.
+    unsafe {
+        if IsWindowVisible(hwnd) != 0 {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+fn restore_window(saved: &mut HashMap<isize, Saved>, hwnd: HWND, origin: &POINT) {
+    let Some(original) = saved.remove(&(hwnd as isize)) else {
+        return;
+    };
+    // SAFETY: the saved style/rectangle are plain values; Win32 validates the opaque HWND on each call.
+    unsafe {
+        SetWindowLongPtrW(
+            hwnd,
+            GWL_EXSTYLE,
+            original.ex_style & !(WS_EX_TOOLWINDOW as isize),
+        );
+        let (x, y, width, height) = if original.rect.left < -20000 {
+            (origin.x + 60, origin.y + 60, 1200, 800)
+        } else {
+            (
+                original.rect.left,
+                original.rect.top,
+                original.rect.right - original.rect.left,
+                original.rect.bottom - original.rect.top,
+            )
+        };
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+        );
+        ShowWindow(hwnd, SW_SHOWNORMAL);
     }
 }

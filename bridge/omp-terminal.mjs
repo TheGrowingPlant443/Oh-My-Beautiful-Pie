@@ -52,13 +52,104 @@ function exitCodeOf(details) {
   return Number.isSafeInteger(code) ? code : null;
 }
 
+function summary(exec) {
+  return {
+    executionId: exec.id, sessionId: exec.rootSessionId, sourceSessionId: exec.sourceSessionId, toolCallId: exec.toolCallId,
+    agentId: exec.agentId, kind: exec.kind, description: exec.description, preview: exec.preview, cwd: exec.cwd,
+    startedAt: exec.startedAt, endedAt: exec.endedAt, status: exec.status, exitCode: exec.exitCode,
+    tab: LIVE.has(exec.status) ? exec.tab : null, historical: false, hasOutput: exec.hasOutput,
+  };
+}
+
+function setOutput(exec, text) {
+  if (exec.final || typeof text !== 'string' || text === exec.rawText) return;
+  exec.rawText = text;
+  const capped = capTail(text);
+  exec.text = capped.text;
+  exec.truncated = capped.truncated;
+  exec.revision++;
+  exec.dirty = true;
+}
+
+function appendOutput(exec, chunk) {
+  if (exec.final) return;
+  const addition = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+  if (!addition) return;
+  const capped = capTail(exec.text + addition);
+  exec.rawText = capped.text;
+  exec.text = capped.text;
+  exec.truncated = exec.truncated || capped.truncated;
+  exec.revision++;
+  exec.dirty = true;
+}
+
+function interactiveContext(ctx, exec) {
+  const ui = ctx?.ui;
+  if (!ui || typeof ui.custom !== 'function') return ctx;
+  const custom = function(factory, ...rest) {
+    const wrapped = (...args) => {
+      const component = factory(...args);
+      if (component && typeof component.appendOutput === 'function') {
+        const original = component.appendOutput;
+        exec.interactive = true;
+        component.appendOutput = function(chunk) { appendOutput(exec, chunk); return original.call(this, chunk); };
+        exec.restoreOverlay = () => { delete component.appendOutput; exec.restoreOverlay = undefined; };
+      }
+      return component;
+    };
+    return ui.custom(wrapped, ...rest);
+  };
+  return Object.create(ctx, { ui: { value: Object.create(ui, { custom: { value: custom } }) } });
+}
+
+const sameService = (daemon, service) => !!daemon && daemon.id === service.id && daemon.startedAt === service.startedAt && daemon.owner === service.owner;
+
+function serviceOutcome(killRequested, daemon) {
+  const code = Number.isSafeInteger(daemon.exitCode) ? daemon.exitCode : null;
+  if (killRequested) return { status: 'cancelled', code };
+  return { status: daemon.state === 'failed' || (code !== null && code !== 0) ? 'failed' : 'completed', code };
+}
+
+function jobStatus(exec, job) {
+  if (exec.killRequested || job.status === 'cancelled') return 'cancelled';
+  return job.status === 'failed' ? 'failed' : 'completed';
+}
+
+function resultStatus(exec, failed) {
+  if (exec.killRequested) return 'cancelled';
+  return failed ? 'failed' : 'completed';
+}
+
+const savedOutput = (row, read) => (row.hasOutput ? read('output.txt') : null);
+
 const exitNote = row => (row.exitCode !== null && row.exitCode !== undefined && row.exitCode !== 0 ? ` (exit ${row.exitCode})` : '');
 const isoOf = time => new Date(time).toISOString();
 
+function historyLine(row) {
+  const preview = Array.from(row.preview).slice(0, 120).join('');
+  const saved = row.hasOutput ? ' | output saved' : '';
+  return `- ${row.executionId} | ${isoOf(row.startedAt)} | ${row.status}${exitNote(row)} | ${row.kind} | ${row.description ?? ''} | ${preview}${saved}`;
+}
+
 export function formatHistory({ rows, total }) {
   if (!rows.length) return 'No commands recorded in this conversation yet.';
-  const lines = rows.map(row => `- ${row.executionId} | ${isoOf(row.startedAt)} | ${row.status}${exitNote(row)} | ${row.kind} | ${row.description ?? ''} | ${Array.from(row.preview).slice(0, 120).join('')}${row.hasOutput ? ' | output saved' : ''}`);
-  return [`${total} command(s) in this conversation (newest first${total > rows.length ? `, showing ${rows.length}` : ''})`, ...lines].join('\n');
+  const showing = total > rows.length ? `, showing ${rows.length}` : '';
+  return [`${total} command(s) in this conversation (newest first${showing})`, ...rows.map(historyLine)].join('\n');
+}
+
+function endedText(row, running) {
+  if (row.endedAt !== null) return isoOf(row.endedAt);
+  return running ? 'still running' : 'unknown';
+}
+
+function scriptText(script) {
+  if (script === null) return '(script unavailable)';
+  return script.length > SHOW_LIMIT ? `${script.slice(0, SHOW_LIMIT)}\n[script truncated; showing the first ${SHOW_LIMIT} characters]` : script;
+}
+
+function outputText(output) {
+  if (output === null) return '(no output recorded: OMP Manager keeps the output of failed commands only)';
+  return output.length > SHOW_LIMIT ? `[output truncated; showing the last ${SHOW_LIMIT} characters]\n${output.slice(-SHOW_LIMIT)}` : output;
 }
 
 // part: 'script' | 'output' | 'both'. Script is cut to its first SHOW_LIMIT characters, output to its last.
@@ -69,18 +160,12 @@ export function formatEntry({ summary: row, script, output }, part = 'both') {
     `Status: ${row.status}${exitNote(row)}`,
     `Kind: ${row.kind}`,
     `Started: ${isoOf(row.startedAt)}`,
-    `Ended: ${row.endedAt === null ? (running ? 'still running' : 'unknown') : isoOf(row.endedAt)}`,
+    `Ended: ${endedText(row, running)}`,
     `Directory: ${row.cwd}`,
   ];
   if (row.description) lines.push(`Description: ${row.description}`);
-  if (part !== 'output') {
-    lines.push('--- script ---');
-    lines.push(script === null ? '(script unavailable)' : script.length > SHOW_LIMIT ? `${script.slice(0, SHOW_LIMIT)}\n[script truncated; showing the first ${SHOW_LIMIT} characters]` : script);
-  }
-  if (part !== 'script') {
-    lines.push(running ? '--- output (live, still running) ---' : '--- output ---');
-    lines.push(output === null ? '(no output recorded: OMP Manager keeps the output of failed commands only)' : output.length > SHOW_LIMIT ? `[output truncated; showing the last ${SHOW_LIMIT} characters]\n${output.slice(-SHOW_LIMIT)}` : output);
-  }
+  if (part !== 'output') lines.push('--- script ---', scriptText(script));
+  if (part !== 'script') lines.push(running ? '--- output (live, still running) ---' : '--- output ---', outputText(output));
   return lines.join('\n');
 }
 
@@ -162,15 +247,6 @@ export function installTerminalCommands(pi, options) {
     return !!manager && manager === rootManager();
   }
 
-  function summary(exec) {
-    return {
-      executionId: exec.id, sessionId: exec.rootSessionId, sourceSessionId: exec.sourceSessionId, toolCallId: exec.toolCallId,
-      agentId: exec.agentId, kind: exec.kind, description: exec.description, preview: exec.preview, cwd: exec.cwd,
-      startedAt: exec.startedAt, endedAt: exec.endedAt, status: exec.status, exitCode: exec.exitCode,
-      tab: LIVE.has(exec.status) ? exec.tab : null, historical: false, hasOutput: exec.hasOutput,
-    };
-  }
-
   function ledgerDirectory(exec) { return path.join(historyRoot, sha256(exec.rootSessionId), exec.id); }
 
   function writeLedgerFile(exec, name, data) {
@@ -206,28 +282,6 @@ export function installTerminalCommands(pi, options) {
     } catch {}
   }
 
-  function setOutput(exec, text) {
-    if (exec.final || typeof text !== 'string' || text === exec.rawText) return;
-    exec.rawText = text;
-    const capped = capTail(text);
-    exec.text = capped.text;
-    exec.truncated = capped.truncated;
-    exec.revision++;
-    exec.dirty = true;
-  }
-
-  function appendOutput(exec, chunk) {
-    if (exec.final) return;
-    const addition = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
-    if (!addition) return;
-    const capped = capTail(exec.text + addition);
-    exec.rawText = capped.text;
-    exec.text = capped.text;
-    exec.truncated = exec.truncated || capped.truncated;
-    exec.revision++;
-    exec.dirty = true;
-  }
-
   function pollJobs() {
     for (const exec of live.values()) {
       const progress = exec.job?.progressText;
@@ -256,27 +310,27 @@ export function installTerminalCommands(pi, options) {
     return servicesModule;
   }
 
+  async function pollService(exec) {
+    const services = await loadServices();
+    const daemon = await services.findService(exec.service.session, exec.service.name);
+    if (!sameService(daemon, exec.service)) {
+      settle(exec, exec.killRequested ? 'cancelled' : 'interrupted', null);
+      return;
+    }
+    setOutput(exec, await services.serviceLogs(exec.service.session, exec.service.name));
+    if (daemon.state === 'exited' || daemon.state === 'failed') {
+      const { status, code } = serviceOutcome(exec.killRequested, daemon);
+      settle(exec, status, code);
+    }
+  }
+
   async function pollServices() {
     if (servicePolling) return;
     servicePolling = true;
     try {
-      for (const exec of [...live.values()]) {
+      for (const exec of live.values()) {
         if (!exec.service || exec.final) continue;
-        try {
-          const services = await loadServices();
-          const daemon = await services.findService(exec.service.session, exec.service.name);
-          if (!daemon || daemon.id !== exec.service.id || daemon.startedAt !== exec.service.startedAt || daemon.owner !== exec.service.owner) {
-            settle(exec, exec.killRequested ? 'cancelled' : 'interrupted', null);
-            continue;
-          }
-          setOutput(exec, await services.serviceLogs(exec.service.session, exec.service.name));
-          if (daemon.state === 'exited' || daemon.state === 'failed') {
-            const code = Number.isSafeInteger(daemon.exitCode) ? daemon.exitCode : null;
-            settle(exec, exec.killRequested ? 'cancelled' : daemon.state === 'failed' || (code !== null && code !== 0) ? 'failed' : 'completed', code);
-          }
-        } catch (error) {
-          serviceError = String(error?.message ?? error);
-        }
+        try { await pollService(exec); } catch (error) { serviceError = String(error?.message ?? error); }
       }
     } finally { servicePolling = false; }
   }
@@ -347,7 +401,7 @@ export function installTerminalCommands(pi, options) {
     const job = exec.job;
     const code = exitCodeOf(job.latestDetails);
     setOutput(exec, job.resultText ?? job.errorText ?? job.progressText ?? exec.rawText);
-    const status = exec.killRequested || job.status === 'cancelled' ? 'cancelled' : job.status === 'failed' ? 'failed' : 'completed';
+    const status = jobStatus(exec, job);
     settle(exec, status, code ?? (job.status === 'completed' && exec.kind === 'bash' ? 0 : null));
   }
 
@@ -369,25 +423,6 @@ export function installTerminalCommands(pi, options) {
     };
     Object.defineProperty(manager, 'register', { configurable: true, writable: true, enumerable: descriptor?.enumerable ?? false, value: wrapper });
     patchedManagers.set(manager, { descriptor, wrapper });
-  }
-
-  function interactiveContext(ctx, exec) {
-    const ui = ctx?.ui;
-    if (!ui || typeof ui.custom !== 'function') return ctx;
-    const custom = function(factory, ...rest) {
-      const wrapped = (...args) => {
-        const component = factory(...args);
-        if (component && typeof component.appendOutput === 'function') {
-          const original = component.appendOutput;
-          exec.interactive = true;
-          component.appendOutput = function(chunk) { appendOutput(exec, chunk); return original.call(this, chunk); };
-          exec.restoreOverlay = () => { delete component.appendOutput; exec.restoreOverlay = undefined; };
-        }
-        return component;
-      };
-      return ui.custom(wrapped, ...rest);
-    };
-    return Object.create(ctx, { ui: { value: Object.create(ui, { custom: { value: custom } }) } });
   }
 
   async function adoptService(exec, result) {
@@ -437,7 +472,8 @@ export function installTerminalCommands(pi, options) {
         if (kind === 'bash' && await adoptService(exec, result)) return result;
         const failed = result?.isError === true;
         const code = exitCodeOf(result?.details);
-        settle(exec, exec.killRequested ? 'cancelled' : failed ? 'failed' : 'completed', code ?? (kind === 'bash' && !failed ? 0 : null));
+        const status = resultStatus(exec, failed);
+        settle(exec, status, code ?? (kind === 'bash' && !failed ? 0 : null));
         return result;
       }, error => {
         const cancelled = exec.killRequested || signal?.aborted || exec.controller.signal.aborted;
@@ -489,7 +525,7 @@ export function installTerminalCommands(pi, options) {
       try {
         const services = await loadServices();
         const daemon = await services.findService(exec.service.session, exec.service.name);
-        if (daemon && daemon.id === exec.service.id && daemon.startedAt === exec.service.startedAt && daemon.owner === exec.service.owner) await services.stopService(exec.service.session, exec.service.name);
+        if (sameService(daemon, exec.service)) await services.stopService(exec.service.session, exec.service.name);
       } catch (error) { serviceError = String(error?.message ?? error); }
     }
     if (exec.manager && exec.jobId) exec.manager.cancel(exec.jobId, { ownerId: exec.job?.ownerId });
@@ -502,11 +538,16 @@ export function installTerminalCommands(pi, options) {
     return { killed: true };
   }
 
+  function snapshotError(rootReady) {
+    if (disposed) return null;
+    return rootReady ? ledgerError ?? serviceError : TERMINAL_COMPATIBILITY_ERROR;
+  }
+
   function snapshot() {
     const rootReady = !!rootSession();
     return {
       supported: !disposed && rootReady,
-      error: disposed ? null : !rootReady ? TERMINAL_COMPATIBILITY_ERROR : ledgerError ?? serviceError,
+      error: snapshotError(rootReady),
       held,
       active: [...live.values()].map(summary),
     };
@@ -564,7 +605,7 @@ export function installTerminalCommands(pi, options) {
     return {
       summary: row,
       script: liveExec ? liveExec.script : read('script.txt'),
-      output: liveExec ? liveExec.text : row.hasOutput ? read('output.txt') : null,
+      output: liveExec ? liveExec.text : savedOutput(row, read),
     };
   }
 
@@ -578,14 +619,14 @@ export function installTerminalCommands(pi, options) {
     clearHoldForHuman() { setHeld(false); },
     dispose() {
       if (disposed) return;
-      for (const exec of [...live.values()]) settle(exec, 'interrupted', null);
+      for (const exec of live.values()) settle(exec, 'interrupted', null);
       disposed = true;
       clearInterval(flushTimer); clearInterval(serviceTimer);
       for (const [manager, { descriptor, wrapper }] of patchedManagers) {
         if (manager.register === wrapper) { if (descriptor) Object.defineProperty(manager, 'register', descriptor); else delete manager.register; }
       }
       patchedManagers.clear();
-      for (const restore of restorers.reverse()) restore();
+      for (const restore of restorers.toReversed()) restore();
       liveSessions.clear(); intents.clear();
     },
   };
@@ -595,7 +636,7 @@ export function installTerminalCommands(pi, options) {
     patch(BashTool.prototype, 'execute', bashDescriptor, bashWrapper, observer);
     patch(EvalTool.prototype, 'execute', evalDescriptor, evalWrapper);
   } catch {
-    for (const restore of restorers.reverse()) restore();
+    for (const restore of restorers.toReversed()) restore();
     return noop;
   }
 

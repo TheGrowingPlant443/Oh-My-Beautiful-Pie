@@ -28,7 +28,10 @@ export interface GraphifyAccess extends Readable<GraphifyAccessState> {
   invalidate(): void;
 }
 
-const errorText = (error: unknown): string => error instanceof Error ? error.message : typeof error === "string" ? error : JSON.stringify(error);
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === "string" ? error : JSON.stringify(error);
+}
 
 export function createGraphifyAccess(deps: GraphifyAccessDeps): GraphifyAccess {
   let state: GraphifyAccessState = { busy: false, error: null };

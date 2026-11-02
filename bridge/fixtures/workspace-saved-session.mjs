@@ -17,7 +17,16 @@ const destination = path.join(root, 'destination');
 const rejected = path.join(root, 'rejected');
 await Promise.all([source, destination, rejected].map(folder => mkdir(folder, { recursive: true })));
 const manager = SessionManager.create(source);
-manager.appendMessage({ role: 'user', content: 'Native workspace transcript sentinel', timestamp: Date.now() });
+const conversation = [
+  { role: 'user', content: 'Native workspace transcript sentinel', timestamp: Date.now() },
+  { role: 'assistant', content: [{ type: 'text', text: 'Native workspace reply sentinel' }],
+    api: 'openai-responses', provider: 'workspace-fixture', model: 'workspace-fixture',
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: 'stop', timestamp: Date.now() },
+];
+// Native journals stay lazy until the first assistant turn; flush alone does not create one.
+for (const message of conversation) manager.appendMessage(message);
 await manager.flush();
 const sourceFile = manager.getSessionFile();
 const sessionId = manager.getSessionId();
@@ -25,6 +34,16 @@ const artifacts = manager.getArtifactsDir();
 await mkdir(artifacts, { recursive: true });
 await writeFile(path.join(artifacts, 'sentinel.txt'), 'Native artifact sentinel');
 await manager.close();
+async function assertSavedConversation(sessionFile, cwd, messages) {
+  const reopened = await SessionManager.open(sessionFile, undefined, undefined, { throwIfMissing: true });
+  try {
+    assert.equal(reopened.getSessionId(), sessionId);
+    assert.equal(reopened.getCwd(), cwd);
+    assert.deepEqual(reopened.getEntries().filter(entry => entry.type === 'message').map(entry => entry.message), messages);
+    assert.equal(await readFile(path.join(reopened.getArtifactsDir(), 'sentinel.txt'), 'utf8'), 'Native artifact sentinel');
+  } finally { await reopened.close(); }
+}
+await assertSavedConversation(sourceFile, source, conversation);
 let native;
 const moved = await relocateSavedSession({ sdkDir, profile: 'workspace-fixture', sessionFile: sourceFile, targetFolder: destination, cwd: source }, async identity => {
   assert.equal(identity.sessionId, sessionId);
@@ -35,12 +54,7 @@ const moved = await relocateSavedSession({ sdkDir, profile: 'workspace-fixture',
 });
 assert.equal(moved.committed, true);
 assert.notEqual(native.sessionFile, sourceFile);
-let reopened = await SessionManager.open(native.sessionFile, undefined, undefined, { throwIfMissing: true });
-assert.equal(reopened.getSessionId(), sessionId);
-assert.equal(reopened.getCwd(), destination);
-assert.ok(reopened.getEntries().some(entry => entry.type === 'message' && entry.message.content === 'Native workspace transcript sentinel'));
-assert.equal(await readFile(path.join(reopened.getArtifactsDir(), 'sentinel.txt'), 'utf8'), 'Native artifact sentinel');
-await reopened.close();
+await assertSavedConversation(native.sessionFile, destination, conversation);
 const undone = await relocateSavedSession({ sdkDir, profile: 'workspace-fixture', sessionFile: native.sessionFile, targetFolder: rejected, cwd: destination }, async identity => {
   assert.equal(identity.cwd, rejected);
   return false;
@@ -48,14 +62,16 @@ const undone = await relocateSavedSession({ sdkDir, profile: 'workspace-fixture'
 assert.equal(undone.committed, false);
 assert.equal(undone.identity.cwd, destination);
 assert.equal(undone.identity.sessionFile, native.sessionFile);
+await assertSavedConversation(native.sessionFile, destination, conversation);
 await assert.rejects(relocateSavedSession({ sdkDir, profile: 'workspace-fixture', sessionFile: path.join(root, 'missing.jsonl'), targetFolder: rejected, cwd: destination }, async () => true));
 
 // A second OS process, not another manager in the same process: native leases
 // are process-owned and intentionally refcounted for same-process use.
+const leaseMessage = { role: 'user', content: 'Writer lease sentinel', timestamp: Date.now() };
 const holder = spawn(process.env.BUN_BIN || 'bun', ['--eval', `
   const {SessionManager}=await import(${JSON.stringify(pathToFileURL(path.join(sdkDir, 'src/session/session-manager.ts')).href)});
   const manager=await SessionManager.open(${JSON.stringify(native.sessionFile)},undefined,undefined,{throwIfMissing:true});
-  manager.appendMessage({role:'user',content:'Writer lease sentinel',timestamp:Date.now()});
+  manager.appendMessage(${JSON.stringify(leaseMessage)});
   await manager.flush();
   console.log('writer-ready');
   await Bun.stdin.text();
@@ -69,8 +85,5 @@ try {
   holder.stdin.end();
   if (holder.exitCode === null) await once(holder, 'exit');
 }
-reopened = await SessionManager.open(native.sessionFile, undefined, undefined, { throwIfMissing: true });
-assert.equal(reopened.getCwd(), destination);
-assert.equal(reopened.getSessionId(), sessionId);
-await reopened.close();
+await assertSavedConversation(native.sessionFile, destination, [...conversation, leaseMessage]);
 console.log('Native workspace relocation verified');

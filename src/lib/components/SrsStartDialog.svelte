@@ -2,7 +2,7 @@
   import { untrack } from "svelte";
   import { open as pickDirectory } from "@tauri-apps/plugin-dialog";
   import { knowledge, type VaultBinding } from "../knowledge";
-  import { srs, srsApi, srsModelLabel, type ScopePreparation, type SrsJob } from "../srs";
+  import { srs, srsApi, srsModelLabel, srsPurposeLabel, type ScopePreparation, type SrsJob, type SrsPurpose } from "../srs";
   import VaultConfiguration from "./VaultConfiguration.svelte";
 
   let { open, folder, architectModel = null, onClose, onExisting, onStarted, onOpenArchitect }: {
@@ -12,6 +12,7 @@
   let dialog = $state<HTMLDialogElement>();
   let programmaticCloses = 0;
   let step = $state<"explanation" | "scope">("explanation");
+  let purpose = $state<SrsPurpose | "">("");
   let vaultPicker = $state(false);
   let binding = $state<VaultBinding | null>(null);
   let evidence = $state<string[]>([]);
@@ -32,9 +33,10 @@
     if (!open) { openedFor = ""; return; }
     if (openedFor === folder) return;
     openedFor = folder; epoch++;
-    step = "explanation"; binding = null; preview = null; evidence = []; exclusions = []; understood = false; error = null; busy = false;
+    step = "explanation"; purpose = ""; binding = null; preview = null; evidence = []; exclusions = []; understood = false; error = null; busy = false;
   });
   async function configure(): Promise<void> {
+    if (!purpose) return;
     step = "scope"; busy = true; error = null;
     const mine = ++epoch, target = folder;
     try {
@@ -53,9 +55,9 @@
     } catch (failure) { error = String(failure); }
   }
   async function prepare(): Promise<void> {
-    if (!binding) return;
+    if (!binding || !purpose) return;
     const mine = ++epoch; busy = true; preview = null; error = null;
-    try { const result = await srsApi.prepareScope(folder, binding.vaultId, [...evidence], [...exclusions]); if (mine === epoch) preview = result; }
+    try { const result = await srsApi.prepareScope(folder, binding.vaultId, purpose, [...evidence], [...exclusions]); if (mine === epoch) preview = result; }
     catch (failure) { if (mine === epoch) error = String(failure); }
     finally { if (mine === epoch) busy = false; }
   }
@@ -84,9 +86,14 @@
       <p>{srsModelLabel(architectModel)}. <button onclick={() => { onClose(); void onOpenArchitect(); }}>Open Architect to change model</button></p>
       <p class="dim">Uses the existing Architect conversation and its selected model; it never silently switches providers. OMP Manager must stay open (minimized is fine). Closing checkpoints/pauses the job; reopening requires explicit Resume. No background service is installed.</p>
       {#if step === "explanation"}
-        <div class="actions"><button class="primary" disabled={!folder} onclick={() => void configure()}>Create SRS</button><button disabled={!folder} onclick={() => { const target = folder; onClose(); onExisting(target); }}>View existing SRS jobs</button><button onclick={onClose}>Cancel</button></div>
+        <fieldset><legend>What will you use this SRS for? Choose before creating a job.</legend>
+          <label class="choice"><input type="radio" name="srs-purpose" value="migration" bind:group={purpose} onchange={invalidate} /> <span><strong>Migration / system reconstruction</strong> — the main use: reproduce the full observable system in any language or architecture. Preserve UI interactions, business rules, data and external-service contracts, not today's source structure or technology.</span></label>
+          <label class="choice"><input type="radio" name="srs-purpose" value="insights" bind:group={purpose} onchange={invalidate} /> <span><strong>Exhaustive insights</strong> — understand every evidenced detail of the system. Public requirements remain standalone; current architecture and visual context are separate observations, not replacement constraints.</span></label>
+        </fieldset>
+        <div class="actions"><button class="primary" disabled={!folder || !purpose} onclick={() => void configure()}>Create SRS</button><button disabled={!folder} onclick={() => { const target = folder; onClose(); onExisting(target); }}>View existing SRS jobs</button><button onclick={onClose}>Cancel</button></div>
       {:else}
         <h3>Confirm source scope and destination</h3>
+        <p><strong>Purpose: {purpose ? srsPurposeLabel(purpose) : "Not selected"}</strong>. This choice is bound to the reviewed scope and saved job.</p>
         <p>Project: <code>{folder}</code></p>
         {#if binding}
           <p>Destination: <strong>{binding.mode === "obsidian" ? "Obsidian vault" : "Plain Markdown folder"}</strong><br /><code>{binding.root}/SRS/&lt;job ID&gt;/SRS.md</code></p>
@@ -98,15 +105,16 @@
         <button disabled={busy} onclick={() => void addEvidence()}>Add evidence folder…</button>
         <label class="field">Explicit scope exclusion (repository-relative path or absolute path)<span class="row"><input bind:value={exclusion} spellcheck="false" /><button disabled={busy || !exclusion.trim()} onclick={() => { const path = exclusion.trim(); if (!exclusions.includes(path)) exclusions = [...exclusions, path]; exclusion = ""; invalidate(); }}>Add exclusion</button></span></label>
         <ul>{#each exclusions as path (path)}<li><code>{path}</code> <button disabled={busy} onclick={() => { exclusions = exclusions.filter(item => item !== path); invalidate(); }}>Remove</button></li>{/each}</ul>
-        <button disabled={busy || !binding} onclick={() => void prepare()}>{busy ? "Working…" : "Preview recorded scope"}</button>
+        <button disabled={busy || !binding || !purpose} onclick={() => void prepare()}>{busy ? "Working…" : "Preview recorded scope"}</button>
         {#if preview}
           <div class="preview">
             <h4>Recorded scope preview</h4>
+            <p><strong>Purpose: {srsPurposeLabel(preview.purpose)}</strong></p>
             <ul>{#each preview.roots as root (root.path)}<li><code>{root.path}</code> — {root.rationale}</li>{/each}</ul>
             <details><summary>Exclusions ({preview.exclusions.length})</summary><ul>{#each preview.exclusions as item, i (i)}<li><strong>{item.source === "human" ? "Human exclusion" : "Safety exclusion"}:</strong> <code>{item.path}</code> — {item.reason}</li>{/each}</ul></details>
             <p>Destination: <code>{preview.vaultRoot}</code> ({preview.vaultMode}). Pinned template: <code>{preview.template.revision}</code>.</p>
             {#each preview.warnings as warning, i (i)}<p class="warning">{warning}</p>{/each}
-            <label class="choice"><input type="checkbox" bind:checked={understood} /> I confirm this source scope and destination, understand the potentially very large charges and open-ended runtime, and want to start with the Architect's current model.</label>
+            <label class="choice"><input type="checkbox" bind:checked={understood} /> I confirm this purpose, source scope and destination, understand the potentially very large charges and open-ended runtime, and want to start with the Architect's current model.</label>
             <button class="primary" disabled={busy || !understood} onclick={() => void start()}>Start SRS</button>
           </div>
         {/if}
@@ -129,5 +137,6 @@
   .preview { border: 1px solid var(--line); padding: 12px; border-radius: 8px; display: flex; flex-direction: column; gap: 12px; }
   .actions, .row { display: flex; flex-wrap: wrap; gap: 8px; } .row input { flex: 1; min-width: 140px; }
   .field { display: flex; flex-direction: column; gap: 6px; } .choice { display: flex; gap: 8px; align-items: flex-start; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; display: flex; flex-direction: column; gap: 12px; } legend { padding: 0 6px; }
   ul { margin: 0; padding-left: 20px; } li { margin: 5px 0; } .dim { color: var(--text-dim); } .err { color: var(--err); }
 </style>

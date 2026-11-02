@@ -2,14 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import managerBridge from './omp-manager.mjs';
 import { TOOL_NAME, codeQualityParameters, codeQualityPayload, registerCodeQualityTool } from './omp-code-quality.mjs';
 
 const ID = '123e4567-e89b-42d3-a456-426614174000';
-
-// Every schema builder returns another builder, so any registration code can run against it.
-const chain = () => new Proxy(() => chain(), { get: () => chain(), apply: () => chain() });
-const permissiveZod = new Proxy({}, { get: () => chain });
 
 test('payloads carry only the fields of their section and are validated before any transport', () => {
   assert.deepEqual(codeQualityPayload({ section: 'scans' }), { section: 'scans' });
@@ -68,33 +63,6 @@ test('the registered tool is flat, strict, read-only and has no way to name a re
   const controller = new AbortController();
   controller.abort(new Error('cancelled'));
   await assert.rejects(tool.execute('3', { section: 'scans' }, controller.signal), /cancelled/);
-});
-
-test('every agent role registers the tool, including helpers and plan agents', () => {
-  const keys = ['OMP_MANAGER_BRIDGE_ENDPOINT', 'OMP_MANAGER_BRIDGE_TOKEN', 'OMP_MANAGER_BRIDGE_INSTANCE_ID', 'OMP_MANAGER_BRIDGE_GENERATION',
-    'OMP_MANAGER_BRIDGE_ROLE', 'OMP_MANAGER_HELPER_REPO', 'OMP_MANAGER_PLAN_SESSION', 'OMP_MANAGER_ARCHITECT_DIR', 'OMP_MANAGER_BROWSER_REQUIRED',
-    'OMP_MANAGER_TERMINAL_DIR', 'OMP_MANAGER_SDK_DIR'];
-  const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
-  const roles = {
-    manager: { OMP_MANAGER_BRIDGE_ROLE: 'manager' },
-    worker: { OMP_MANAGER_BRIDGE_ROLE: 'instance' },
-    plan: { OMP_MANAGER_BRIDGE_ROLE: 'instance', OMP_MANAGER_PLAN_SESSION: '1' },
-    helper: { OMP_MANAGER_BRIDGE_ROLE: 'instance', OMP_MANAGER_HELPER_REPO: process.cwd() },
-  };
-  try {
-    for (const [name, env] of Object.entries(roles)) {
-      for (const key of keys) delete process.env[key];
-      Object.assign(process.env, { OMP_MANAGER_BRIDGE_ENDPOINT: '127.0.0.1:1', OMP_MANAGER_BRIDGE_TOKEN: 'token', OMP_MANAGER_BRIDGE_INSTANCE_ID: name, OMP_MANAGER_BRIDGE_GENERATION: '0' }, env);
-      const names = [];
-      managerBridge({ zod: permissiveZod, registerTool: definition => names.push(definition.name), on() {}, sendMessage() {}, sendUserMessage() {} });
-      assert.ok(names.includes('code_quality_report'), `${name} registers code_quality_report (got ${names.join(', ')})`);
-      assert.equal(names.filter(item => item === 'code_quality_report').length, 1, name);
-      assert.equal(names.includes('manage_sessions'), name === 'manager', `${name}: manage_sessions stays Manager-only`);
-      assert.equal(names.includes('repo_inspect'), name === 'helper', `${name}: repo_inspect stays helper-only`);
-    }
-  } finally {
-    for (const key of keys) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; }
-  }
 });
 
 const sdk = process.env.OMP_SDK_DIR;

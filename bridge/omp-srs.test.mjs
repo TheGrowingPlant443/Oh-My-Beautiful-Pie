@@ -19,6 +19,11 @@ const NONCE = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
 const HASH = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 const ids = { jobId: JOB, attemptId: ATTEMPT, stageId: STAGE };
 const tick = () => new Promise(resolve => setImmediate(resolve));
+const assertUnsent = async (promise, reason) => {
+  const receipt = await promise;
+  assert.equal(receipt.admitted, false);
+  if (reason) assert.match(receipt.error.message, reason);
+};
 
 // A small structural zod stand-in: strict objects, bounded strings/numbers/arrays. The opt-in real-SDK test below runs the
 // very same schemas through the installed validator.
@@ -157,22 +162,22 @@ test('stage admission records the native entry before the backend marker and nev
   const again = await h.srs.control('srs_stage_prompt', h.stagePayload(), h.ctx);
   assert.deepEqual(again, { admitted: true, duplicate: true, state: 'active', sessionId: 'native-session' });
   assert.equal(h.state.prompts.length, 1, 'a lost acknowledgement is reconciled from the native entry, not resent');
-  await assert.rejects(h.srs.control('srs_stage_prompt', h.stagePayload({ nonce: 'Z'.repeat(32) }), h.ctx), /stale_stage/);
+  await assertUnsent(h.srs.control('srs_stage_prompt', h.stagePayload({ nonce: 'Z'.repeat(32) }), h.ctx), /stale_stage/);
 });
 
 test('admission is refused while the native session is not quiescent, without the native guard, or when the backend denies the stage', async () => {
   const busy = harness({ quiescent: false });
-  await assert.rejects(busy.srs.control('srs_stage_prompt', busy.stagePayload(), busy.ctx), /native_srs_not_quiescent: streaming/);
+  await assertUnsent(busy.srs.control('srs_stage_prompt', busy.stagePayload(), busy.ctx), /native_srs_not_quiescent: streaming/);
   assert.equal(busy.state.prompts.length, 0);
   const unavailable = harness({ guardAvailable: false });
-  await assert.rejects(unavailable.srs.control('srs_stage_prompt', unavailable.stagePayload(), unavailable.ctx), /native_srs_guard_unavailable/);
+  await assertUnsent(unavailable.srs.control('srs_stage_prompt', unavailable.stagePayload(), unavailable.ctx), /native_srs_guard_unavailable/);
   assert.equal(unavailable.state.prompts.length, 0);
   const denied = harness({ handlers: { srs_stage_validate: () => ({ authorized: false }) } });
-  await assert.rejects(denied.srs.control('srs_stage_prompt', denied.stagePayload(), denied.ctx), /srs_stage_not_authorized/);
+  await assertUnsent(denied.srs.control('srs_stage_prompt', denied.stagePayload(), denied.ctx), /srs_stage_not_authorized/);
   assert.equal(denied.state.prompts.length, 0);
   const wrongNonce = harness();
-  await assert.rejects(wrongNonce.srs.control('srs_stage_prompt', wrongNonce.stagePayload({ nonce: 'short' }), wrongNonce.ctx));
-  await assert.rejects(wrongNonce.srs.control('srs_stage_prompt', { ...wrongNonce.stagePayload(), command: 'rm' }, wrongNonce.ctx));
+  await assertUnsent(wrongNonce.srs.control('srs_stage_prompt', wrongNonce.stagePayload({ nonce: 'short' }), wrongNonce.ctx));
+  await assertUnsent(wrongNonce.srs.control('srs_stage_prompt', { ...wrongNonce.stagePayload(), command: 'rm' }, wrongNonce.ctx));
 });
 
 test('an admission the backend did not persist pauses the job and keeps the native stage fenced', async () => {
@@ -183,7 +188,7 @@ test('an admission the backend did not persist pauses the job and keeps the nati
   await assert.rejects(h.callModelGates({ messages: [{ role: 'user', content: h.state.prompts[0], timestamp: 1 }] }));
   const refused = harness();
   refused.workspace.submitPrompt = () => Promise.reject(new Error('native_prompt_unavailable'));
-  await assert.rejects(refused.srs.control('srs_stage_prompt', refused.stagePayload(), refused.ctx), /native_prompt_unavailable/);
+  await assertUnsent(refused.srs.control('srs_stage_prompt', refused.stagePayload(), refused.ctx), /native_prompt_unavailable/);
   assert.equal(refused.srs.guard.srs(refused.ctx), null, 'a prompt the native session never admitted leaves no guard');
 });
 
@@ -236,9 +241,9 @@ test('pause aborts only the active app-created SRS stage and fences every furthe
   assert.equal(h.srs.guard.srs(h.ctx), null, 'the tombstone is released at proven quiescence');
 });
 
-test('tools forward only to srs_tool for the active stage and enforce the per-phase allowlist', async () => {
+test('tools forward only within the active stage and survey can document findings incrementally', async () => {
   const h = harness();
-  assert.deepEqual([...h.tools.keys()], ['monitor_snapshot_read', 'srs_inspect', 'srs_read_evidence', 'srs_write_document_chunk', 'srs_commit_document', 'srs_checkpoint', 'srs_finish_stage']);
+  assert.deepEqual([...h.tools.keys()], ['monitor_snapshot_read', 'srs_inspect', 'srs_read_evidence', 'srs_write_document_chunk', 'srs_commit_document', 'srs_checkpoint', 'srs_finish_stage', 'srs_delegate']);
   const inspect = { ...ids, section: 'work', limit: 50 };
   assert.equal((await h.tools.get('srs_inspect').execute('1', inspect, undefined, undefined, h.ctx)).isError, true, 'no active stage');
   await h.admitActive();
@@ -247,8 +252,8 @@ test('tools forward only to srs_tool for the active stage and enforce the per-ph
   assert.deepEqual(h.state.requests.at(-1), { action: 'srs_tool', payload: { action: 'srs_inspect', ...inspect } });
   const chunk = { ...ids, documentId: 'd', revisionId: 'r', offset: 0, text: '# Doc', expectedPrefixHash: HASH };
   const survey = await h.tools.get('srs_write_document_chunk').execute('2', chunk, undefined, undefined, h.ctx);
-  assert.equal(survey.isError, true, 'survey cannot write documents');
-  assert.equal(h.state.requests.filter(item => item.action === 'srs_tool').length, 1);
+  assert.equal(survey.isError, undefined, 'survey must persist document findings before inspection exhausts context');
+  assert.equal(h.state.requests.filter(item => item.action === 'srs_tool').length, 2);
   const other = await h.tools.get('srs_inspect').execute('3', { ...inspect, stageId: '44444444-4444-4444-8444-444444444444' }, undefined, undefined, h.ctx);
   assert.equal(other.isError, true, 'another stage cannot borrow this authorization');
   for (const tool of ['bash', 'eval', 'read', 'write', 'edit', 'task', 'manage_sessions', 'repo_evidence', 'submit_system_overview']) {
@@ -256,7 +261,7 @@ test('tools forward only to srs_tool for the active stage and enforce the per-ph
   }
   assert.equal(h.srs.guard.toolCall({ toolName: 'ask', input: {} }, h.ctx), undefined);
   assert.deepEqual(SRS_ALLOWLISTS.specify.slice(-2), ['srs_write_document_chunk', 'srs_commit_document']);
-  assert.equal(SRS_ALLOWLISTS.survey.includes('srs_commit_document'), false);
+  assert.equal(SRS_ALLOWLISTS.survey.includes('srs_commit_document'), true);
   const specify = harness();
   await specify.admitActive({ phase: 'specify' });
   assert.equal((await specify.tools.get('srs_write_document_chunk').execute('4', chunk, undefined, undefined, specify.ctx)).isError, undefined);
@@ -355,7 +360,7 @@ test('a committed stage is final: only a summary remains and the next stage is a
   assert.equal(h.srs.guard.toolCall({ toolName: 'ask', input: {} }, h.ctx).block, true);
   h.state.quiescent = false;
   const second = h.stagePayload({ stageId: '55555555-5555-4555-8555-555555555555', nonce: 'f'.repeat(32), phase: 'specify', stageNumber: 2 });
-  await assert.rejects(h.srs.control('srs_stage_prompt', second, h.ctx), /not_quiescent/);
+  await assertUnsent(h.srs.control('srs_stage_prompt', second, h.ctx), /not_quiescent/);
   h.state.quiescent = true;
   assert.equal((await h.srs.control('srs_stage_prompt', second, h.ctx)).admitted, true);
   assert.equal(h.state.prompts.length, 2);
@@ -586,7 +591,7 @@ test('installed SDK compaction, willContinue and automatic continuation keep SRS
     const config = path.relative(os.homedir(), path.join(root, 'config'));
     assert.equal(config.split(path.sep).includes('..'), false);
     const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', [fileURLToPath(new URL('./fixtures/srs-compaction-sdk.mjs', import.meta.url))], {
-      env: { ...process.env, SRS_COMPACTION_TEST_ROOT: root, PI_CODING_AGENT_DIR: path.join(root, 'agent'), PI_CONFIG_DIR: config, PI_NATIVES_DIR: nativeRoot, OMP_PROFILE: 'default', PI_COMPILED: 'false' },
+      env: { ...process.env, SRS_COMPACTION_TEST_ROOT: root, PI_CODING_AGENT_DIR: path.join(root, 'agent'), PI_CONFIG_DIR: config, PI_NATIVES_DIR: nativeRoot, OMP_PROFILE: 'default', PI_COMPILED: '' },
       timeout: 100000, maxBuffer: 1024 * 1024,
     });
     assert.match(stdout, /Installed SDK compaction\/willContinue\/automatic-continuation SRS guard verified/);
@@ -609,7 +614,7 @@ for (const state of ['active', 'submitted']) test(`native settlement retires the
   assert.equal(h.entries.some(entry => entry.customType === 'omp-srs-stage-ended'), false);
   assert.equal(h.srs.guard.toolCall({ toolName: 'bash', input: {} }, h.ctx).block, true);
   const replacement = h.stagePayload({ attemptId: '66666666-6666-4666-8666-666666666666', stageId: '77777777-7777-4777-8777-777777777777', nonce: 'c'.repeat(32) });
-  await assert.rejects(h.srs.control('srs_stage_prompt', replacement, h.ctx), /native_srs_not_quiescent/);
+  await assertUnsent(h.srs.control('srs_stage_prompt', replacement, h.ctx), /native_srs_not_quiescent/);
   // A failed marker append retains the stage and its provider/tool enforcement.
   h.state.quiescent = true;
   const append = h.workspace.appendNativeEntry;
@@ -683,4 +688,207 @@ test('failure to retire a partial Ask pauses the stage rather than pretending th
   await h.admitActive();
   await assert.rejects(h.srs.ask.map('invocation', [{ id: 'q-1', question: 'Q?', options: ['Yes'] }, { id: 'unknown', question: '?', options: ['Yes'] }]), /storage_error/);
   assert.ok(h.state.requests.some(item => item.action === 'srs_stage_yielded' && item.payload.reason === 'guard_failure'));
+});
+
+test('scoped native delegation persists before launch, inherits only stage tools and closes its exact assignment', async () => {
+  let launch, opened, closed;
+  const h = harness({ handlers: {
+    srs_delegate_open: payload => { opened = payload; return { assignmentId: 'assignment', purpose: 'migration' }; },
+    srs_delegate_validate: () => ({ authorized: true }),
+    srs_delegate_close: payload => { closed = payload; return { closed: true }; },
+  } });
+  await h.admitActive({ phase: 'specify' });
+  h.workspace.runSrsDelegate = async options => {
+    launch = options;
+    assert.ok(opened, 'the durable assignment precedes native launch');
+    await options.validate();
+    assert.deepEqual(options.customTools.map(tool => tool.name), ['srs_inspect', 'srs_read_evidence', 'srs_write_document_chunk', 'srs_commit_document', 'srs_checkpoint']);
+    const read = options.customTools.find(tool => tool.name === 'srs_read_evidence');
+    assert.equal((await read.execute('read', { ...ids, evidenceId: 'e-1' })).isError, undefined);
+    assert.deepEqual(h.state.requests.at(-1).payload.delegation, { assignmentId: 'assignment', childId: options.id });
+    const before = h.state.requests.filter(item => item.action === 'srs_tool').length;
+    assert.equal((await read.execute('stale', { ...ids, stageId: '44444444-4444-4444-8444-444444444444', evidenceId: 'e-1' })).isError, true);
+    assert.equal(h.state.requests.filter(item => item.action === 'srs_tool').length, before);
+    assert.equal((await options.customTools.find(tool => tool.name === 'srs_checkpoint').execute('checkpoint', { ...ids, expectedRevision: 0, updates: { updateWork: [{ id: 'w-1', rationale: 'Login rejects expired authorization.', evidenceIds: ['e-1'] }] } })).isError, undefined);
+    assert.equal((await options.customTools.find(tool => tool.name === 'srs_commit_document').execute('commit', { ...ids, documentId: 'd-1', revisionId: 'r-1', expectedHash: HASH, metadata: { type: 'flow', specificity: 'portable', citations: [{ evidenceId: 'e-1' }] } })).isError, undefined);
+    return { exitCode: 0, output: 'The durable notes contain the findings.' };
+  };
+  const result = await h.tools.get('srs_delegate').execute('delegate', { ...ids, assignment: 'Inspect login and commit findings as you inspect.', workIds: ['w-1'], evidenceIds: ['e-1'], documentIds: ['d-1'] }, undefined, undefined, h.ctx);
+  assert.equal(result.isError, undefined);
+  assert.equal(closed.outcome, 'completed');
+  assert.deepEqual(closed.delegation, { assignmentId: 'assignment', childId: launch.id });
+  assert.equal(launch.signal.aborted, true, 'the completed grant is revoked, not parked for arbitrary revival');
+  await assert.rejects(launch.validate(), /closed/);
+});
+
+test('pause revokes native child model and tool gates and an active child prevents root stage declaration', async () => {
+  const started = Promise.withResolvers();
+  let child, closed;
+  const h = harness({ handlers: {
+    srs_delegate_open: () => ({ assignmentId: 'assignment', purpose: 'migration' }),
+    srs_delegate_validate: () => ({ authorized: true }),
+    srs_delegate_close: payload => { closed = payload; return { closed: true }; },
+  } });
+  await h.admitActive();
+  h.workspace.runSrsDelegate = async options => {
+    child = options; started.resolve();
+    await new Promise(resolve => options.signal.addEventListener('abort', resolve, { once: true }));
+    return { exitCode: 1, aborted: true };
+  };
+  const running = h.tools.get('srs_delegate').execute('delegate', { ...ids, assignment: 'Inspect assigned evidence.', workIds: ['w-1'], evidenceIds: ['e-1'], documentIds: ['d-1'] }, undefined, undefined, h.ctx);
+  await started.promise;
+  await h.srs.control('srs_pause', { ...ids, stageId: '44444444-4444-4444-8444-444444444444', reason: 'pause' }, h.ctx);
+  assert.equal(child.signal.aborted, false, 'a late pause for another exact stage must not revoke this child');
+  const finish = await h.tools.get('srs_finish_stage').execute('finish', { ...ids, expectedRevision: 1, review: { phase: 'survey', summary: 'not yet' } }, undefined, undefined, h.ctx);
+  assert.equal(finish.isError, true);
+  assert.match(finish.content[0].text, /delegations_active/);
+  h.state.quiescent = false;
+  await h.srs.control('srs_pause', { ...ids, reason: 'pause' }, h.ctx);
+  assert.equal((await running).isError, true);
+  assert.equal(closed.outcome, 'cancelled');
+  await assert.rejects(child.validate(), /revoked/);
+  const before = h.state.requests.filter(item => item.action === 'srs_tool').length;
+  assert.equal((await child.customTools[0].execute('stale', { ...ids, section: 'checkpoint' })).isError, true);
+  assert.equal(h.state.requests.filter(item => item.action === 'srs_tool').length, before);
+});
+
+test('real CLI admits System/SRS prompts once and runs a constrained native worker with incremental durable commits', {
+  skip: sdk && process.env.OMP_BIN ? false : 'Set OMP_SDK_DIR and OMP_BIN for the offline native CLI proof', timeout: 120000,
+}, async () => {
+  const root = await mkdtemp(path.join(os.homedir(), '.omp-architect-delivery-'));
+  try {
+    const nativeRoot = path.join(root, 'natives');
+    const { version } = JSON.parse(await readFile(path.join(sdk, 'package.json'), 'utf8'));
+    await mkdir(nativeRoot, { recursive: true });
+    await cp(path.join(process.env.PI_NATIVES_DIR || path.join(os.homedir(), '.omp', 'natives'), version), path.join(nativeRoot, version), { recursive: true });
+    const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', [fileURLToPath(new URL('./fixtures/architect-delivery-scenario.mjs', import.meta.url))], {
+      env: { ...process.env, ARCHITECT_DELIVERY_ROOT: root, HOME: root, USERPROFILE: root,
+        PI_CODING_AGENT_DIR: path.join(root, 'agent'), PI_CONFIG_DIR: '.omp', PI_CONFIG_FILES: '', PI_NATIVES_DIR: nativeRoot, OMP_PROFILE: 'default',
+        XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'), XDG_STATE_HOME: path.join(root, 'state'), XDG_CACHE_HOME: path.join(root, 'cache') },
+      timeout: 100000, maxBuffer: 2 * 1024 * 1024,
+    });
+    assert.match(stdout, /Real CLI Architect System\/SRS single admission and scoped native worker durable handoff verified/);
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+});
+
+test('evidence area progress fencing allows same-file pagination but not status-only or undocumented handoffs', async () => {
+  let replayCommit = false;
+  const h = harness({ handlers: { srs_tool: payload => {
+    if (payload.action === 'srs_read_evidence') return { kind: 'text', text: 'An observed contract.', nextOffset: (payload.offset ?? 0) + 8 };
+    return payload.action === 'srs_commit_document' && replayCommit ? { replayed: true } : { saved: true };
+  } } });
+  await h.admitActive();
+  const call = (name, params) => h.tools.get(name).execute(name, { ...ids, ...params }, undefined, undefined, h.ctx);
+  assert.equal((await call('srs_read_evidence', { evidenceId: 'e-1', offset: 0 })).isError, undefined);
+  assert.equal((await call('srs_read_evidence', { evidenceId: 'e-1', offset: 8 })).isError, undefined, 'a contract spanning pages may be understood before publication');
+  assert.equal((await call('srs_read_evidence', { evidenceId: 'e-2' })).isError, true);
+  assert.equal((await call('srs_checkpoint', { expectedRevision: 0, updates: { updateWork: [{ id: 'w-1', status: 'active' }] } })).isError, undefined);
+  const commit = { documentId: 'd-1', revisionId: 'r-1', expectedHash: HASH, metadata: { type: 'flow', specificity: 'portable', citations: [{ evidenceId: 'e-1' }] } };
+  assert.equal((await call('srs_commit_document', commit)).isError, true, 'a reviewed/status flag is not durable discovered facts');
+  assert.equal((await call('srs_checkpoint', { expectedRevision: 1, updates: { updateWork: [{ id: 'w-1', rationale: 'Expired authorization is refused without changing prior state.', evidenceIds: ['e-1'] }] } })).isError, undefined);
+  assert.equal((await call('srs_finish_stage', { expectedRevision: 2, review: { phase: 'survey', summary: 'not documented yet' } })).isError, true);
+  replayCommit = true;
+  assert.equal((await call('srs_commit_document', commit)).isError, undefined);
+  assert.equal((await call('srs_read_evidence', { evidenceId: 'e-2' })).isError, true, 'an old committed revision replay is not new documentation of the inspected area');
+  replayCommit = false;
+  assert.equal((await call('srs_commit_document', commit)).isError, undefined);
+  assert.equal((await call('srs_read_evidence', { evidenceId: 'e-2' })).isError, undefined, 'the next coherent area is admitted after real checkpoint and document progress');
+});
+
+test('a native worker cannot declare its assignment completed without durable findings', async () => {
+  let closed;
+  const h = harness({ handlers: {
+    srs_delegate_open: () => ({ assignmentId: 'assignment', purpose: 'migration' }),
+    srs_delegate_validate: () => ({ authorized: true }),
+    srs_delegate_close: payload => { closed = payload; return { closed: true }; },
+  } });
+  await h.admitActive();
+  h.workspace.runSrsDelegate = async () => ({ exitCode: 0 });
+  const result = await h.tools.get('srs_delegate').execute('delegate', { ...ids, assignment: 'Inspect and record.', workIds: ['w-1'], evidenceIds: ['e-1'], documentIds: ['d-1'] }, undefined, undefined, h.ctx);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /record_findings_first/);
+  assert.equal(closed.outcome, 'failed');
+});
+
+test('an admitted flow rejection without agent_end retires only its exact SRS stage and permits another analysis', async () => {
+  const h = harness();
+  const running = Promise.withResolvers();
+  h.workspace.submitPrompt = (message, callbacks) => { h.state.prompts.push(message); callbacks.onPromptAdmitted(); return running.promise; };
+  const admitted = await h.srs.control('srs_stage_prompt', h.stagePayload(), h.ctx);
+  assert.equal(admitted.admitted, true);
+  h.state.quiescent = false;
+  running.reject(new Error('No credential is configured before native agent_start'));
+  await tick();
+  assert.equal(h.srs.guard.srs(h.ctx).state, 'cancelled');
+  assert.equal(h.entries.some(entry => entry.customType === 'omp-srs-stage-ended'), false, 'native post-prompt work still owns the boundary');
+  assert.equal(h.state.prompts.length, 1);
+  h.state.quiescent = true;
+  for (const callback of h.timers.splice(0)) callback();
+  assert.equal(h.srs.guard.srs(h.ctx), null);
+  const status = await h.srs.control('srs_stage_status', ids, h.ctx);
+  assert.equal(status.admission.found, true, 'admission evidence is never rewritten as unsent');
+  assert.equal(status.admission.state, 'ended');
+  const duplicate = await h.srs.control('srs_stage_prompt', h.stagePayload(), h.ctx);
+  assert.equal(duplicate.admitted, true);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.state, 'ended');
+  assert.equal(h.state.prompts.length, 1, 'the failed stage is never resent');
+  assert.equal(h.srs.guard.admit(h.ctx, { requestId: '88888888-8888-4888-8888-888888888888', kind: 'systemOverview', message: 'Generate the system diagram.' }).duplicate, false);
+});
+
+test('a delayed failed-flow retirement cannot remove a newer SRS stage in the same session', async () => {
+  const h = harness();
+  const running = Promise.withResolvers();
+  h.workspace.submitPrompt = (message, callbacks) => { h.state.prompts.push(message); callbacks.onPromptAdmitted(); return running.promise; };
+  await h.srs.control('srs_stage_prompt', h.stagePayload(), h.ctx);
+  h.state.quiescent = false;
+  running.reject(new Error('Native admission preflight failed'));
+  await tick();
+  h.state.quiescent = true;
+  h.workspace.submitPrompt = (message, callbacks) => { h.state.prompts.push(message); callbacks.onPromptAdmitted(); return Promise.resolve(); };
+  const next = h.stagePayload({ stageId: '77777777-7777-4777-8777-777777777777', nonce: 'b'.repeat(32), stageNumber: 2 });
+  assert.equal((await h.srs.control('srs_stage_prompt', next, h.ctx)).admitted, true);
+  for (const callback of h.timers.splice(0)) callback();
+  assert.equal(h.srs.guard.srs(h.ctx).stageId, next.stageId);
+  assert.equal(h.entries.filter(entry => entry.customType === 'omp-srs-stage-ended' && entry.data.stageId === STAGE).length, 1);
+  assert.equal(h.entries.some(entry => entry.customType === 'omp-srs-stage-ended' && entry.data.stageId === next.stageId), false);
+});
+
+test('an immediate post-admission rejection preserves an admitted ended receipt rather than claiming unsent', async () => {
+  const h = harness();
+  h.workspace.submitPrompt = (message, callbacks) => {
+    h.state.prompts.push(message);
+    callbacks.onPromptAdmitted();
+    return Promise.reject(new Error('Native usage preflight refused the admitted prompt'));
+  };
+  const receipt = await h.srs.control('srs_stage_prompt', h.stagePayload(), h.ctx);
+  assert.equal(receipt.admitted, true);
+  assert.equal(receipt.state, 'ended');
+  assert.equal(h.srs.guard.srs(h.ctx), null);
+  assert.equal(h.entries.filter(entry => entry.customType === SRS_MARKER).length, 1);
+  assert.equal(h.entries.filter(entry => entry.customType === 'omp-srs-stage-ended').length, 1);
+});
+
+test('protected root admission encodes native file mentions before binding its carrying prompt', () => {
+  const ctx = { agent: { kind: 'main' }, sessionManager: { getSessionId: () => 'literal-root-session' } };
+  const message = 'Untrusted evidence: @/outside/admitted-scope.txt and user@example.test must remain literal.';
+  for (const kind of ['systemOverview', 'helicopter', 'structureCurrent', 'structureProposed']) {
+    const guard = createVisualizationGuard();
+    const admitted = guard.admit(ctx, { requestId: JOB, kind, message });
+    assert.equal(admitted.text.includes('@'), false);
+    assert.ok(admitted.text.includes('\\u0040/outside/admitted-scope.txt'));
+    guard.beforeAgentStart({ prompt: admitted.text }, ctx);
+    assert.equal(guard.states()[0].state, 'active', 'literal encoding must not break carrying-prompt attribution');
+    assert.equal(guard.toolCall({ toolName: 'repo_evidence', input: { requestId: JOB, path: 'an@admitted-name.txt' } }, ctx), undefined, 'request-bound tool filenames retain their original spelling');
+  }
+  const srs = createVisualizationGuard();
+  const stage = srs.admitSrs(ctx, { ...ids, nonce: NONCE, phase: 'survey', stageNumber: 1, message });
+  assert.equal(stage.text.includes('@'), false);
+  srs.beforeAgentStart({ prompt: stage.text }, ctx);
+  assert.equal(srs.activeSrs(ctx).stageId, STAGE);
+  const monitor = createVisualizationGuard();
+  const explanation = monitor.admitMonitor(ctx, { requestId: JOB, snapshotId: 'frozen', message });
+  assert.equal(explanation.text.includes('@'), false);
+  monitor.beforeAgentStart({ prompt: explanation.text }, ctx);
+  assert.equal(monitor.activeMonitor(ctx).snapshotId, 'frozen');
 });

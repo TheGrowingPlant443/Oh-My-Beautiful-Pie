@@ -21,6 +21,7 @@ if SCRIPT_DIR not in sys.path:
 import hashlib  # noqa: E402
 import json  # noqa: E402
 import queue  # noqa: E402
+from pathlib import Path  # noqa: E402
 import stat  # noqa: E402
 import subprocess  # noqa: E402
 import threading  # noqa: E402
@@ -309,9 +310,21 @@ def load_resolver():
     return fn
 
 
-def extract_command(manifest_path: str, output_path: str, *, file_timeout: float, max_output_bytes: int) -> int:
-    import profiles
+class _ExtractState:
+    """Mutable accumulation shared by the per-file steps of ``extract_command``."""
 
+    def __init__(self, budget: int) -> None:
+        self.files: list[dict] = []
+        self.symbols: list[dict] = []
+        self.sites: list[dict] = []
+        self.used_languages: set[str] = set()
+        self.budget = budget
+        self.used_bytes = 0
+        self.last_file: str | None = None
+        self.capped = False
+
+
+def _load_manifest(manifest_path: str) -> tuple[dict, str]:
     try:
         with open(manifest_path, "rb") as fh:
             manifest = json.loads(fh.read().decode("utf-8"))
@@ -322,117 +335,124 @@ def extract_command(manifest_path: str, output_path: str, *, file_timeout: float
     root = manifest.get("root")
     if not isinstance(root, str) or not os.path.isdir(root):
         raise WorkerFailure("manifest root is not an existing directory")
-    resolver = load_resolver()  # fail fast before spending parse time
-    entries = manifest.get("files") or []
-    progress_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), "progress.json")
+    return manifest, root
+
+
+def _manifest_row(entry: dict) -> dict:
+    path = entry["path"]
+    if entry.get("id") != common.file_id(path):
+        raise WorkerFailure(f"manifest file id does not match the stable file id for {path!r}")
+    return {
+        "id": entry["id"],
+        "path": path,
+        "sha256": entry["sha256"],
+        "bytes": entry["bytes"],
+        "language": entry.get("language"),
+        "status": entry.get("status", "pending"),
+        "diagnostics": list(entry.get("diagnostics") or []),
+    }
+
+
+def _parse_pending_entry(state: _ExtractState, coordinator: Coordinator, entry: dict, row: dict) -> None:
+    import profiles
+
+    path = row["path"]
+    lang = profiles.language_for_path(path)
+    if lang is None:
+        result = profiles.extract_file(path, b"")
+    else:
+        result = coordinator.parse(path, int(entry["bytes"]), entry["sha256"])
+    size = int(result.pop("_bytes", 0))
+    if state.used_bytes + size > state.budget:
+        state.capped = True
+        row["status"] = "skipped"
+        row["language"] = lang
+        row["diagnostics"].append("serialized fact limit reached; this file's facts were not retained")
+        return
+    state.used_bytes += size
+    row["language"] = result.get("language") or lang
+    row["status"] = result.get("status", "failed")
+    row["diagnostics"].extend(result.get("diagnostics", []))
+    state.symbols.extend(result.get("symbols", []))
+    state.sites.extend(result.get("sites", []))
+    state.last_file = path
+    if row["language"]:
+        state.used_languages.add(row["language"])
+
+
+def _process_entry(state: _ExtractState, coordinator: Coordinator, entry: dict) -> None:
+    import profiles
+
+    row = _manifest_row(entry)
+    state.files.append(row)
+    path = row["path"]
+    if row["status"] != "pending":
+        row["language"] = row["language"] or profiles.language_for_path(path)
+        state.last_file = path
+    elif state.capped:
+        row["status"] = "skipped"
+        row["language"] = profiles.language_for_path(path)
+        row["diagnostics"].append("serialized fact limit reached earlier in this job; file not parsed")
+    else:
+        _parse_pending_entry(state, coordinator, entry, row)
+
+
+def _parse_entries(state: _ExtractState, coordinator: Coordinator, entries: list, progress_path: str) -> None:
     total = len(entries)
-
-    caps = profiles.capabilities()
-    unavailable = {p["language"]: p["error"] for p in caps["profiles"] if not p["available"]}
-    degraded = {p["language"]: p["error"] for p in caps["profiles"] if p["available"] and p["error"]}
-
-    files: list[dict] = []
-    symbols: list[dict] = []
-    sites: list[dict] = []
-    used_languages: set[str] = set()
-    budget = int(max_output_bytes * PARSE_BUDGET_FRACTION)
-    used_bytes = 0
-    last_file: str | None = None
-    capped = False
-    coordinator = Coordinator(root, file_timeout=file_timeout)
     last_progress = 0.0
-    try:
-        for i, entry in enumerate(entries):
-            path = entry["path"]
-            if entry.get("id") != common.file_id(path):
-                raise WorkerFailure(f"manifest file id does not match the stable file id for {path!r}")
-            row = {
-                "id": entry["id"],
-                "path": path,
-                "sha256": entry["sha256"],
-                "bytes": entry["bytes"],
-                "language": entry.get("language"),
-                "status": entry.get("status", "pending"),
-                "diagnostics": list(entry.get("diagnostics") or []),
-            }
-            files.append(row)
-            if row["status"] != "pending":
-                row["language"] = row["language"] or profiles.language_for_path(path)
-                last_file = path
-            elif capped:
-                row["status"] = "skipped"
-                row["language"] = profiles.language_for_path(path)
-                row["diagnostics"].append("serialized fact limit reached earlier in this job; file not parsed")
-            else:
-                lang = profiles.language_for_path(path)
-                if lang is None:
-                    result = profiles.extract_file(path, b"")
-                else:
-                    result = coordinator.parse(path, int(entry["bytes"]), entry["sha256"])
-                size = int(result.pop("_bytes", 0))
-                if used_bytes + size > budget:
-                    capped = True
-                    row["status"] = "skipped"
-                    row["language"] = lang
-                    row["diagnostics"].append("serialized fact limit reached; this file's facts were not retained")
-                else:
-                    used_bytes += size
-                    row["language"] = result.get("language") or lang
-                    row["status"] = result.get("status", "failed")
-                    row["diagnostics"].extend(result.get("diagnostics", []))
-                    symbols.extend(result.get("symbols", []))
-                    sites.extend(result.get("sites", []))
-                    last_file = path
-                    if row["language"]:
-                        used_languages.add(row["language"])
-            now = time.monotonic()
-            if now - last_progress >= PROGRESS_INTERVAL_SECONDS or i + 1 == total:
-                write_progress(progress_path, i + 1, total, last_file)
-                last_progress = now
-    finally:
-        coordinator.close()
+    for i, entry in enumerate(entries):
+        _process_entry(state, coordinator, entry)
+        now = time.monotonic()
+        if now - last_progress >= PROGRESS_INTERVAL_SECONDS or i + 1 == total:
+            write_progress(progress_path, i + 1, total, state.last_file)
+            last_progress = now
     if total == 0:
         write_progress(progress_path, 0, 0, None)
 
+
+def _build_limitations(state: _ExtractState, unavailable: dict, degraded: dict, restarts: int, max_output_bytes: int) -> list[str]:
     limitations = [STATIC_LIMITATION]
-    for lang in sorted(used_languages):
+    for lang in sorted(state.used_languages):
         if lang in unavailable:
             limitations.append(f"{lang}: grammar unavailable ({unavailable[lang]})")
         elif lang in degraded:
             limitations.append(f"{lang}: {degraded[lang]}")
     unavailable_in_repo = sorted(
-        {f["language"] for f in files if f["status"] == "unsupported" and f["language"] in unavailable}
+        {f["language"] for f in state.files if f["status"] == "unsupported" and f["language"] in unavailable}
     )
     for lang in unavailable_in_repo:
         limitations.append(f"{lang}: files present but grammar unavailable ({unavailable[lang]}); inventoried only")
-    if capped:
-        limitations.append(f"Serialized fact limit ({max_output_bytes // (1024 * 1024)} MiB) was reached; coverage is partial after {last_file!r}.")
-    if coordinator.restarts:
-        limitations.append(f"The parser process was restarted {coordinator.restarts} time(s) after hard timeouts or crashes; affected files are marked failed.")
+    if state.capped:
+        limitations.append(f"Serialized fact limit ({max_output_bytes // (1024 * 1024)} MiB) was reached; coverage is partial after {state.last_file!r}.")
+    if restarts:
+        limitations.append(f"The parser process was restarted {restarts} time(s) after hard timeouts or crashes; affected files are marked failed.")
+    return limitations
 
+
+def _build_index(manifest: dict, caps: dict, state: _ExtractState, limitations: list[str]) -> dict:
     versions = {
         "worker": 1,
         "python": caps["runtime"]["python"],
         "treeSitter": caps["runtime"]["treeSitter"],
         "profiles": {p["language"]: p["version"] for p in caps["profiles"]},
     }
-    index = {
+    return {
         "schemaVersion": 1,
         "snapshotId": manifest.get("snapshotId"),
         "folder": manifest.get("folder"),
         "sourceHash": manifest.get("sourceHash"),
         "extractorVersions": versions,
-        "files": files,
+        "files": state.files,
         "directories": list(manifest.get("directories") or []),
-        "symbols": symbols,
-        "sites": sites,
+        "symbols": state.symbols,
+        "sites": state.sites,
         "edges": [],
         "coverage": {},
         "limitations": limitations + [str(x) for x in (manifest.get("limitations") or [])],
     }
 
-    from pathlib import Path
 
+def _resolve_index(resolver, index: dict, root: str) -> dict:
     try:
         resolved = resolver(index, Path(root))
     except Exception as exc:
@@ -445,7 +465,10 @@ def extract_command(manifest_path: str, output_path: str, *, file_timeout: float
     for edge in index["edges"]:
         if edge.get("sourceId") not in ids or edge.get("targetId") not in ids:
             raise WorkerFailure("resolver produced an edge whose endpoint is not an indexed file or symbol")
-    index["coverage"] = compute_coverage(index, last_file, capped)
+    return index
+
+
+def _write_index(index: dict, output_path: str, max_output_bytes: int) -> None:
     payload = dumps(index).encode("utf-8")
     if len(payload) > max_output_bytes:
         raise WorkerFailure(f"serialized index is {len(payload)} bytes, exceeding the {max_output_bytes} byte limit")
@@ -453,6 +476,32 @@ def extract_command(manifest_path: str, output_path: str, *, file_timeout: float
     with open(tmp, "wb") as fh:
         fh.write(payload)
     os.replace(tmp, output_path)
+
+
+def extract_command(manifest_path: str, output_path: str, *, file_timeout: float, max_output_bytes: int) -> int:
+    import profiles
+
+    manifest, root = _load_manifest(manifest_path)
+    resolver = load_resolver()  # fail fast before spending parse time
+    entries = manifest.get("files") or []
+    progress_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), "progress.json")
+
+    caps = profiles.capabilities()
+    unavailable = {p["language"]: p["error"] for p in caps["profiles"] if not p["available"]}
+    degraded = {p["language"]: p["error"] for p in caps["profiles"] if p["available"] and p["error"]}
+
+    state = _ExtractState(int(max_output_bytes * PARSE_BUDGET_FRACTION))
+    coordinator = Coordinator(root, file_timeout=file_timeout)
+    try:
+        _parse_entries(state, coordinator, entries, progress_path)
+    finally:
+        coordinator.close()
+
+    limitations = _build_limitations(state, unavailable, degraded, coordinator.restarts, max_output_bytes)
+    index = _build_index(manifest, caps, state, limitations)
+    index = _resolve_index(resolver, index, root)
+    index["coverage"] = compute_coverage(index, state.last_file, state.capped)
+    _write_index(index, output_path, max_output_bytes)
     return 0
 
 

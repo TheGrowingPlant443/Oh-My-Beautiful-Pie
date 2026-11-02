@@ -17,12 +17,13 @@ function fixture({ install = true } = {}) {
   const nativeUi = installNativeDecisions({ pending, identity: () => current, nativeAnswer,
     emit: (kind, payload) => events.push({ kind, payload }), opportunity() {} });
   const ui = {};
+  const cancellations = new Map([['approve', 'deny'], ['confirm', false]]);
   for (const method of ['approve', 'select', 'confirm', 'input', 'editor', 'askDialog', 'custom']) {
     ui[method] = (...args) => new Promise((resolve, reject) => {
       const options = args[['approve', 'askDialog', 'custom'].includes(method) ? 1 : 2];
       const item = { method, args, options, resolve, reject, aborted: false };
       invocations.push(item);
-      options.signal.addEventListener('abort', () => { item.aborted = true; resolve(['approve', 'confirm'].includes(method) ? false : undefined); }, { once: true });
+      options.signal.addEventListener('abort', () => { item.aborted = true; resolve(cancellations.get(method)); }, { once: true });
     });
   }
   const originals = Object.getOwnPropertyDescriptors(ui);
@@ -38,14 +39,14 @@ test('all raw dialog methods preserve exact prompt data and native-only executab
     const signal = new AbortController();
     const onTimeout = () => {};
     const prompts = [
-      ['approve', [{ full: 'Run\nfull command', compact: 'Run command' }], false],
+      ['approve', [{ full: 'Run\nfull command', compact: 'Run command' }], false, 'deny'],
       ['select', ['Choose', [{ label: 'Safe', description: 'Details', preview: 'diff' }, 'Disabled']], 'Safe'],
       ['confirm', ['Confirm', 'Exact message'], true],
       ['input', ['Name', 'placeholder'], 'typed'],
       ['editor', ['Edit', 'prefill\nverbatim'], 'edited\ntext'],
       ['askDialog', [[{ id: 'q', header: 'Header', question: 'Question?', multi: true, recommended: 1, options: [{ label: 'A', description: 'description', preview: 'preview' }, { label: 'B' }] }]], { kind: 'submit', results: [{ id: 'q', selectedOptions: [], customInput: 'custom', note: 'human note' }] }],
     ];
-    for (const [method, args, answer] of prompts) {
+    for (const [method, args, answer, expected = answer] of prompts) {
       const options = { signal: signal.signal, timeout: 17, onTimeout, disabledIndices: [1], initialIndex: 0, acceptImages: false };
       const value = f.ui[method](...args, options);
       const request = f.target();
@@ -67,7 +68,7 @@ test('all raw dialog methods preserve exact prompt data and native-only executab
       f.respond(answer);
       const result = await value;
       if (method === 'askDialog') { assert.deepEqual(result.results[0].selectedOptions, []); assert.equal(result.results[0].note, 'human note'); }
-      else assert.deepEqual(result, answer);
+      else assert.deepEqual(result, expected);
       assert.equal(invocation.aborted, true);
       assert.equal(f.pending.size, 0);
     }
@@ -122,11 +123,17 @@ test('native, human and Manager races settle and retire once, aborting the nativ
 test('caller cancellation wins synchronously and already-aborted callers never register or open native UI', async () => {
   const f = fixture();
   try {
-    for (const method of ['approve', 'confirm', 'input', 'editor', 'select', 'askDialog']) {
+    for (const [method, args, cancelled] of [
+      ['approve', [{ full: 'F', compact: 'C' }], 'deny'],
+      ['confirm', ['T', 'M'], false],
+      ['input', ['T', 'M']],
+      ['editor', ['T', 'M']],
+      ['select', ['T', ['A']]],
+      ['askDialog', [[]]],
+    ]) {
       const controller = new AbortController();
       controller.abort();
-      const args = method === 'approve' ? [{ full: 'F', compact: 'C' }] : method === 'askDialog' ? [[]] : ['T', method === 'select' ? ['A'] : 'M'];
-      assert.equal(await f.ui[method](...args, { signal: controller.signal }), ['approve', 'confirm'].includes(method) ? false : undefined);
+      assert.equal(await f.ui[method](...args, { signal: controller.signal }), cancelled);
     }
     assert.equal(f.invocations.length, 0);
     assert.equal(f.events.length, 0);
@@ -135,7 +142,7 @@ test('caller cancellation wins synchronously and already-aborted callers never r
     const target = f.target();
     controller.abort();
     assert.throws(() => f.nativeUi.respond({ ...target, source: 'human', response: true }), /already_resolved/);
-    assert.equal(await promise, false);
+    assert.equal(await promise, 'deny');
     await tick();
     assert.equal(f.events.filter(event => event.kind === 'decision_resolved').length, 1);
   } finally { f.nativeUi.dispose(); }
@@ -274,7 +281,7 @@ test('captured host installs raw UI before forwarding and initializes only its o
     const context = f.mode.session.extensionRunner.createContext(undefined, undefined, { kind: 'advisor', id: 'advice' });
     const promise = context.ui.approve({ full: 'Actual raw approve', compact: 'Approve' });
     assert.equal(f.target().agentOrigin.id, 'advice');
-    f.respond(false); assert.equal(await promise, false);
+    f.respond(false); assert.equal(await promise, 'deny');
   } finally { await f.workspace.dispose(); f.nativeUi.dispose(); }
 });
 
@@ -310,7 +317,7 @@ test('human reply route is allowed for every app role without granting Manager h
 test('installed SDK raw controller → handler proxies → real native components settles without a provider', {
   skip: process.env.OMP_SDK_DIR ? false : 'Set OMP_SDK_DIR for the isolated installed-SDK native UI proof', timeout: 90000,
 }, async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'omp-native-ui-'));
+  const root = await mkdtemp(path.join(os.homedir(), '.omp-native-ui-'));
   try {
     await mkdir(path.join(root, 'agent'), { recursive: true });
     const { version } = JSON.parse(await readFile(path.join(process.env.OMP_SDK_DIR, 'package.json'), 'utf8'));
@@ -321,7 +328,7 @@ test('installed SDK raw controller → handler proxies → real native component
     const config = path.relative(os.homedir(), path.join(root, 'config'));
     assert.equal(config.split(path.sep).includes('..'), false, 'scratch config must remain under the real home');
     const { stdout } = await promisify(execFile)(process.env.BUN_BIN || 'bun', [fileURLToPath(new URL('./fixtures/native-ui.mjs', import.meta.url))], {
-      env: { ...process.env, NATIVE_UI_TEST_ROOT: root, PI_CODING_AGENT_DIR: path.join(root, 'agent'), PI_CONFIG_DIR: config, PI_NATIVES_DIR: nativeRoot, OMP_PROFILE: 'default', PI_COMPILED: 'false' },
+      env: { ...process.env, NATIVE_UI_TEST_ROOT: root, PI_CODING_AGENT_DIR: path.join(root, 'agent'), PI_CONFIG_DIR: config, PI_NATIVES_DIR: nativeRoot, OMP_PROFILE: 'default', PI_COMPILED: '' },
       timeout: 80000, maxBuffer: 1024 * 1024,
     });
     assert.match(stdout, /Native raw UI and handler component settlement verified/);

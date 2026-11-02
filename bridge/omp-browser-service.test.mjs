@@ -61,6 +61,15 @@ test('listing tabs never launches a browser and rejects stale or unknown owners'
   await service.dispatch('shutdown');
 });
 
+test('the CDP endpoint admits loopback peers including IPv4-mapped ones and refuses every other peer',()=>{
+  const service=new BrowserService(path.resolve('unused-fixture'),'unavailable-sdk');
+  const capability='a'.repeat(48);
+  service.capabilities.set(capability,{owner:{active:false}});
+  const status=address=>service.fetch(new Request(`http://${capability}.localhost/json/version`),{requestIP:()=>address===undefined?null:{address}}).status;
+  for(const address of ['127.0.0.1','::1','::ffff:127.0.0.1'])assert.equal(status(address),410,address);
+  for(const address of ['10.0.0.1','::ffff:10.0.0.1','::2',undefined])assert.equal(status(address),403,String(address));
+});
+
 test('real Chromium opens one terminal browser visibly without disturbing another', {
   skip: !process.env.OMP_SDK_DIR || !process.env.PUPPETEER_EXECUTABLE_PATH
     ? 'Set OMP_SDK_DIR and PUPPETEER_EXECUTABLE_PATH to run isolated native integration' : false,

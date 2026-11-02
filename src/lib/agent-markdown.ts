@@ -30,7 +30,11 @@ export function canApplyMarkdown(item: AgentMarkdownItem): boolean { return item
 export function unappliedMarkdown(status: AgentMarkdownStatus): AgentMarkdownItem[] {
   return status.items.filter(item => canApplyMarkdown(item) || item.state === "conflict");
 }
-const join = (root: string, path: string): string => `${root.replace(/[\\/]+$/, "")}/${path}`;
+function join(root: string, path: string): string {
+  let end = root.length;
+  while (end > 0 && (root[end - 1] === "/" || root[end - 1] === "\\")) end--;
+  return `${root.slice(0, end)}/${path}`;
+}
 /** Only known Markdown assets move. Settings, extensions and executable skill dependencies retain native destinations. */
 export function agentSetupPreview(item: SetupItem, nativeRoot: string, status: AgentMarkdownStatus | null, globalOmpFolder: string): { nativePath: string; sourcePath: string | null }[] {
   const name = item.name.trim().toLowerCase().replace(/\s+/g, "-");
@@ -42,7 +46,11 @@ export function agentSetupPreview(item: SetupItem, nativeRoot: string, status: A
     case "workflow": files = [`rules/workflow-${name}.md`]; break;
     case "plugin": files = [`extensions/${name}/package.json`, `extensions/${name}/index.ts`]; break;
     case "profile": return [{ nativePath: join(globalOmpFolder, `profiles/${name}/agent/config.yml`), sourcePath: null }];
-    case "tool": files = [`tools/${name}/index.ts`, ...(item.language === "python" ? [`tools/${name}/run.py`] : item.language === "bash" ? [`tools/${name}/run.sh`] : [])]; break;
+    case "tool":
+      files = [`tools/${name}/index.ts`];
+      if (item.language === "python") files.push(`tools/${name}/run.py`);
+      else if (item.language === "bash") files.push(`tools/${name}/run.sh`);
+      break;
   }
   return files.map(file => ({ nativePath: join(nativeRoot, file), sourcePath: status?.enabled && status.sourceRoot && file.toLowerCase().endsWith(".md") ? join(status.sourceRoot, file) : null }));
 }
@@ -60,7 +68,7 @@ export function createAgentMarkdownStore(api: AgentMarkdownApi = agentMarkdownAp
     const mine = ++epoch;
     publish({ busy: true, error: null });
     try { const patch = await operation(); if (!disposed && mine === epoch) publish(patch); }
-    catch (failure) { if (!disposed && mine === epoch) publish({ error: String(failure), review: null }); }
+    catch (error_) { if (!disposed && mine === epoch) publish({ error: String(error_), review: null }); }
     finally { if (!disposed && mine === epoch) publish({ busy: false }); }
   }
   async function refresh(): Promise<void> {
@@ -99,7 +107,11 @@ export function createAgentMarkdownStore(api: AgentMarkdownApi = agentMarkdownAp
     await run(async () => ({ status: review.kind === "import" ? await api.confirmImport(review.preparation.token) : await api.apply(review.preparation.token, review.selectedIds) }));
   }
   return { subscribe: store.subscribe, selectTarget, refresh, prepare, selectApply, confirm,
-    cancel: (): void => { if (disposed) return; ++epoch; publish({ review: null, busy: false, error: null }); },
+    cancel: (): void => {
+      if (disposed) return;
+      ++epoch;
+      publish({ review: null, busy: false, error: null });
+    },
     dispose: (): void => { disposed = true; ++epoch; },
   };
 }

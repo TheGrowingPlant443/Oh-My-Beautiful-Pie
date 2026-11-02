@@ -1,6 +1,7 @@
-import { closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { publishExclusively } from './omp-insight-base.mjs';
 
 // Architect-only dependency-update proposal tool. A proposal is a saved draft that the human reviews; it never
 // reaches The Manager, edits the project or touches a Manager plan. `dir` comes from OMP_MANAGER_ARCHITECT_DIR only.
@@ -27,7 +28,10 @@ export function proposalHash(title, summary, markdown) {
 
 function exists(file) {
   try { lstatSync(file); return true; }
-  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 function readBoundedJson(file, maximum) {
@@ -82,8 +86,6 @@ export function saveDependencyUpdatePlan(dir, payload, producer) {
   const request = readBoundedJson(requestFile, MAX_REQUEST_BYTES);
   validateRequest(request, payload.requestId, producer);
   const file = path.join(folder, 'result.json');
-  const lock = path.join(folder, 'result.lock');
-  const temporary = path.join(folder, `result.${process.pid}.${randomUUID()}.tmp`);
   // Persist only validated fields; identity, source reviews and timestamps never come from the model.
   const result = {
     requestId: payload.requestId, architectInstanceId: producer.instanceId, architectGeneration: producer.generation,
@@ -96,23 +98,14 @@ export function saveDependencyUpdatePlan(dir, payload, producer) {
   const bytes = JSON.stringify(result);
   if (Buffer.byteLength(bytes) > MAX_RESULT_BYTES) throw new Error('proposal file too large');
   // Exclusive publication lock covers the exists checks and the rename. A proposal revision is never overwritten.
-  const fd = openSync(lock, 'wx');
-  try {
+  publishExclusively(folder, bytes, () => {
     if (exists(file)) throw new Error('plan already submitted; ask the user to regenerate it for a new revision');
     // A request already ended by the app (for example producerEnded) must not accept a late proposal.
     if (exists(path.join(folder, 'terminal.json')) && readBoundedJson(path.join(folder, 'terminal.json'), MAX_REQUEST_BYTES)?.status === 'error') {
       throw new Error('this request already ended; ask the user to regenerate the plan');
     }
     validateRequest(readBoundedJson(requestFile, MAX_REQUEST_BYTES), payload.requestId, producer);
-    writeFileSync(temporary, bytes, { flag: 'wx' });
-    renameSync(temporary, file);
-  } finally {
-    try { unlinkSync(temporary); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    finally {
-      try { closeSync(fd); } finally { unlinkSync(lock); }
-    }
-  }
+  });
   return { requestId: payload.requestId, revisionId: result.revisionId, hash: result.hash, saved: true };
 }
 

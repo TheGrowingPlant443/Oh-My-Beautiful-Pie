@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 // Read-only access to one Git repository for OMP Manager's helper agents. There is no shell and no write command:
@@ -17,17 +17,33 @@ const FIELDS = {
   file: { allowed: ['path', 'ref'], required: ['path'] },
 };
 
-function git(repo, args, input) {
+// Only absolute PATH entries count, so a relative or empty entry (the working directory) never supplies `git`.
+function gitProgram() {
+  const name = process.platform === 'win32' ? 'git.exe' : 'git';
+  for (const entry of (process.env.PATH ?? '').split(path.delimiter)) {
+    if (!path.isAbsolute(entry)) continue;
+    const candidate = path.join(entry, name);
+    try {
+      if (!statSync(candidate).isFile()) continue;
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  throw new Error('Git is not installed or is not on PATH');
+}
+
+function git(repo, args) {
   const base = ['-C', repo, '--no-pager', '--no-optional-locks', '--literal-pathspecs', '-c', 'core.quotepath=false', '-c', 'core.fsmonitor=false'];
   const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' };
   for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete env[name];
   return new Promise((resolve, reject) => {
-    const child = execFile('git', [...base, ...args], { maxBuffer: 8 * 1024 * 1024, timeout: 30000, windowsHide: true, env }, (error, stdout, stderr) => {
+    const program = gitProgram();
+    const child = execFile(program, [...base, ...args], { maxBuffer: 8 * 1024 * 1024, timeout: 30000, windowsHide: true, env }, (error, stdout, stderr) => {
       if (!error) return resolve(stdout);
       if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return reject(new Error('The output is too large; narrow it with path, limit or stat'));
       reject(new Error(String(stderr).trim() || error.message));
     });
-    child.stdin.end(input ?? '');
+    child.stdin.end();
   });
 }
 
@@ -55,7 +71,7 @@ async function commitOf(repo, ref) {
 
 async function headOrEmptyTree(repo) {
   try { return (await git(repo, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'])).trim(); }
-  catch { return (await git(repo, ['hash-object', '-t', 'tree', '--stdin'], '')).trim(); }
+  catch { return (await git(repo, ['hash-object', '-t', 'tree', '--stdin'])).trim(); }
 }
 
 function limited(text) {
@@ -99,7 +115,8 @@ const ACTIONS = {
     else if (params.merges === 'exclude') args.push('--no-merges');
     const lines = (await git(repo, [...args, ...tail(params)])).split('\n').filter(Boolean).map(line => {
       const [hash, date, author, refs, subject] = line.split('\x1f');
-      return `- ${hash} ${date} ${author}${refs ? ` [${refs}]` : ''} ${subject}`;
+      const refsText = refs ? ` [${refs}]` : '';
+      return `- ${hash} ${date} ${author}${refsText} ${subject}`;
     });
     return lines.length ? lines.join('\n') : 'No matching commits.';
   },

@@ -6,7 +6,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::tables::{self, RawSocket};
-use super::types::*;
+use super::types::{
+    Availability, Direction, DirectionEvidence, Endpoint, HostMonitorPage, HostMonitorQuery,
+    HostSnapshotSummary, ManagedRoot, Owner, OwnerKind, ProcessRow, Protocol, RootKind,
+    SectionState, Sections, SocketRow, TcpView, DEFAULT_PAGE, MAX_PAGE, MAX_PAGE_BYTES,
+    MAX_SEARCH_CHARS,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawProcess {
@@ -68,14 +73,14 @@ pub struct HostSnapshot {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Canonical<'a> {
+struct Canonical<'snapshot> {
     scope: &'static str,
     started_at: u64,
     completed_at: u64,
-    sections: &'a Sections,
-    processes: &'a [ProcessRow],
-    tcp: &'a [SocketRow],
-    udp: &'a [SocketRow],
+    sections: &'snapshot Sections,
+    processes: &'snapshot [ProcessRow],
+    tcp: &'snapshot [SocketRow],
+    udp: &'snapshot [SocketRow],
 }
 
 fn process_key(pid: u32, creation: Option<u64>, ordinal: usize) -> String {
@@ -88,7 +93,9 @@ fn process_key(pid: u32, creation: Option<u64>, ordinal: usize) -> String {
 }
 
 fn clean(name: &str) -> String {
-    name.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect()
+    name.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
 }
 
 fn process_rows(raw: &[RawProcess]) -> Vec<ProcessRow> {
@@ -126,7 +133,11 @@ fn attribute(rows: &mut [ProcessRow], roots: &[ManagedRoot]) {
     if roots.is_empty() {
         return;
     }
-    let by_pid: HashMap<u32, usize> = rows.iter().enumerate().map(|(index, row)| (row.pid, index)).collect();
+    let by_pid: HashMap<u32, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (row.pid, index))
+        .collect();
     let mut memo = vec![Memo::Pending; rows.len()];
     fn resolve(
         index: usize,
@@ -145,7 +156,9 @@ fn attribute(rows: &mut [ProcessRow], roots: &[ManagedRoot]) {
         let row = &rows[index];
         let found = (|| {
             let creation = row.creation?;
-            if let Some(root) = roots.iter().position(|r| r.identity.pid == row.pid && r.identity.creation_time_100ns == creation) {
+            if let Some(root) = roots.iter().position(|r| {
+                r.identity.pid == row.pid && r.identity.creation_time_100ns == creation
+            }) {
                 return Some((root, false));
             }
             if depth >= 64 {
@@ -158,7 +171,9 @@ fn attribute(rows: &mut [ProcessRow], roots: &[ManagedRoot]) {
         memo[index] = Memo::Done(found);
         found
     }
-    let found: Vec<Option<(usize, bool)>> = (0..rows.len()).map(|i| resolve(i, rows, roots, &by_pid, &mut memo, 0)).collect();
+    let found: Vec<Option<(usize, bool)>> = (0..rows.len())
+        .map(|i| resolve(i, rows, roots, &by_pid, &mut memo, 0))
+        .collect();
     for (row, found) in rows.iter_mut().zip(found) {
         row.owner = found.map(|(root, descendant)| {
             let root = &roots[root];
@@ -193,7 +208,9 @@ fn socket_rows(
             let owner = by_pid.get(&socket.pid).copied().filter(|row| {
                 socket.pid != 0
                     && match row.creation {
-                        Some(creation) => rechecks.get(&socket.pid) == Some(&Recheck::Creation(creation)),
+                        Some(creation) => {
+                            rechecks.get(&socket.pid) == Some(&Recheck::Creation(creation))
+                        }
                         None => socket.pid == 4,
                     }
             });
@@ -204,14 +221,26 @@ fn socket_rows(
             let scope_source = socket.remote.as_ref().unwrap_or(&socket.local);
             let base = format!(
                 "{}:{}:{}:{}",
-                if socket.protocol == Protocol::Tcp { "tcp" } else { "udp" },
+                if socket.protocol == Protocol::Tcp {
+                    "tcp"
+                } else {
+                    "udp"
+                },
                 endpoint_text(&socket.local),
-                socket.remote.as_ref().map(endpoint_text).unwrap_or_default(),
+                socket
+                    .remote
+                    .as_ref()
+                    .map(endpoint_text)
+                    .unwrap_or_default(),
                 socket.pid
             );
             let duplicates = seen.entry(base.clone()).or_insert(0);
             *duplicates += 1;
-            let key = if *duplicates == 1 { base } else { format!("{base}~{duplicates}") };
+            let key = if *duplicates == 1 {
+                base
+            } else {
+                format!("{base}~{duplicates}")
+            };
             let process_name = owner.map(|row| row.name.clone());
             let state = socket.tcp_state.map(tables::tcp_state_name);
             let search = format!(
@@ -219,9 +248,17 @@ fn socket_rows(
                 process_name.as_deref().unwrap_or("").to_lowercase(),
                 socket.pid,
                 endpoint_text(&socket.local),
-                socket.remote.as_ref().map(endpoint_text).unwrap_or_default(),
+                socket
+                    .remote
+                    .as_ref()
+                    .map(endpoint_text)
+                    .unwrap_or_default(),
                 socket.local.address,
-                socket.remote.as_ref().map(|peer| peer.address.as_str()).unwrap_or("")
+                socket
+                    .remote
+                    .as_ref()
+                    .map(|peer| peer.address.as_str())
+                    .unwrap_or("")
             )
             .to_lowercase();
             SocketRow {
@@ -250,7 +287,9 @@ fn sort_sockets(rows: &mut [SocketRow]) {
             row.process_name.as_deref().unwrap_or("").to_lowercase(),
             row.pid,
             row.process_key.clone(),
-            row.remote.as_ref().map(|peer| (peer.address.clone(), peer.port)),
+            row.remote
+                .as_ref()
+                .map(|peer| (peer.address.clone(), peer.port)),
             (row.local.address.clone(), row.local.port),
             row.state.clone(),
             row.key.clone(),
@@ -259,6 +298,7 @@ fn sort_sockets(rows: &mut [SocketRow]) {
 }
 
 impl HostSnapshot {
+    #[must_use]
     pub fn build(
         id: String,
         view_id: String,
@@ -271,21 +311,39 @@ impl HostSnapshot {
         attribute(&mut processes, roots);
         let mut tcp = socket_rows(&raw.tcp, &processes, &raw.rechecks);
         let mut udp = socket_rows(&raw.udp, &processes, &raw.rechecks);
-        processes.sort_by_cached_key(|row| (row.name.to_lowercase(), row.pid, row.creation, row.key.clone()));
+        processes.sort_by_cached_key(|row| {
+            (
+                row.name.to_lowercase(),
+                row.pid,
+                row.creation,
+                row.key.clone(),
+            )
+        });
         sort_sockets(&mut tcp);
         sort_sockets(&mut udp);
         let sections = raw.sections;
-        let available = |a: &SectionState, b: &SectionState| !(a.is_unavailable() && b.is_unavailable());
+        let available =
+            |a: &SectionState, b: &SectionState| !(a.is_unavailable() && b.is_unavailable());
         let tcp_known = available(&sections.tcp4, &sections.tcp6);
         let counts = Counts {
             processes: (!sections.processes.is_unavailable()).then_some(processes.len()),
-            limited: (!sections.processes.is_unavailable())
-                .then(|| processes.iter().filter(|row| row.availability == Availability::Limited).count()),
+            limited: (!sections.processes.is_unavailable()).then(|| {
+                processes
+                    .iter()
+                    .filter(|row| row.availability == Availability::Limited)
+                    .count()
+            }),
             external_tcp: tcp_known.then(|| tcp.iter().filter(|row| row.external).count()),
-            confirmed_outbound: tcp_known
-                .then(|| tcp.iter().filter(|row| row.external && row.direction == Direction::Outbound).count()),
-            unknown_direction: tcp_known
-                .then(|| tcp.iter().filter(|row| row.external && row.direction == Direction::Unknown).count()),
+            confirmed_outbound: tcp_known.then(|| {
+                tcp.iter()
+                    .filter(|row| row.external && row.direction == Direction::Outbound)
+                    .count()
+            }),
+            unknown_direction: tcp_known.then(|| {
+                tcp.iter()
+                    .filter(|row| row.external && row.direction == Direction::Unknown)
+                    .count()
+            }),
             udp: available(&sections.udp4, &sections.udp6).then_some(udp.len()),
         };
         let canonical = Canonical {
@@ -298,7 +356,7 @@ impl HostSnapshot {
             udp: &udp,
         };
         let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
-        let hash = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+        let hash = format!("{:x}", Sha256::digest(&bytes));
         Self {
             id,
             view_id,
@@ -316,6 +374,7 @@ impl HostSnapshot {
         }
     }
 
+    #[must_use]
     pub fn summary(&self) -> HostSnapshotSummary {
         HostSnapshotSummary {
             view_id: self.view_id.clone(),
@@ -337,13 +396,29 @@ impl HostSnapshot {
     }
 
     /// Filter the whole section, then page. Never samples.
+    #[must_use]
     pub fn query(&self, query: &HostMonitorQuery) -> HostMonitorPage {
         match query {
-            HostMonitorQuery::Processes { text, offset, limit } => {
+            HostMonitorQuery::Processes {
+                text,
+                offset,
+                limit,
+            } => {
                 let needle = needle(text);
-                self.page("processes", &self.processes, |row| row.search.contains(&needle), *offset, *limit)
+                self.page(
+                    "processes",
+                    &self.processes,
+                    |row| row.search.contains(&needle),
+                    *offset,
+                    *limit,
+                )
             }
-            HostMonitorQuery::Tcp { view, text, offset, limit } => {
+            HostMonitorQuery::Tcp {
+                view,
+                text,
+                offset,
+                limit,
+            } => {
                 let needle = needle(text);
                 let view = *view;
                 self.page(
@@ -352,8 +427,12 @@ impl HostSnapshot {
                     |row| {
                         let shown = match view {
                             TcpView::External => row.external,
-                            TcpView::ConfirmedOutbound => row.external && row.direction == Direction::Outbound,
-                            TcpView::UnknownDirection => row.external && row.direction == Direction::Unknown,
+                            TcpView::ConfirmedOutbound => {
+                                row.external && row.direction == Direction::Outbound
+                            }
+                            TcpView::UnknownDirection => {
+                                row.external && row.direction == Direction::Unknown
+                            }
                             TcpView::Listeners => row.direction == Direction::Listener,
                             TcpView::All => true,
                         };
@@ -363,9 +442,19 @@ impl HostSnapshot {
                     *limit,
                 )
             }
-            HostMonitorQuery::Udp { text, offset, limit } => {
+            HostMonitorQuery::Udp {
+                text,
+                offset,
+                limit,
+            } => {
                 let needle = needle(text);
-                self.page("udp", &self.udp, |row| row.search.contains(&needle), *offset, *limit)
+                self.page(
+                    "udp",
+                    &self.udp,
+                    |row| row.search.contains(&needle),
+                    *offset,
+                    *limit,
+                )
             }
         }
     }
@@ -378,9 +467,18 @@ impl HostSnapshot {
         offset: usize,
         limit: usize,
     ) -> HostMonitorPage {
-        let matches: Vec<usize> = rows.iter().enumerate().filter(|(_, row)| keep(row)).map(|(index, _)| index).collect();
+        let matches: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| keep(row))
+            .map(|(index, _)| index)
+            .collect();
         let total = matches.len();
-        let limit = if limit == 0 { DEFAULT_PAGE } else { limit.min(MAX_PAGE) };
+        let limit = if limit == 0 {
+            DEFAULT_PAGE
+        } else {
+            limit.min(MAX_PAGE)
+        };
         let start = if total == 0 {
             0
         } else if offset >= total {
@@ -390,7 +488,8 @@ impl HostSnapshot {
         };
         let mut items = Vec::new();
         let mut bytes = 0usize;
-        for &index in matches[start..].iter().take(limit) {
+        let page = matches[start..].iter().take(limit);
+        for &index in page {
             let value = serde_json::to_value(&rows[index]).unwrap_or(serde_json::Value::Null);
             let size = value.to_string().len();
             if !items.is_empty() && bytes + size > MAX_PAGE_BYTES {
@@ -412,5 +511,9 @@ impl HostSnapshot {
 }
 
 fn needle(text: &str) -> String {
-    text.trim().chars().take(MAX_SEARCH_CHARS).collect::<String>().to_lowercase()
+    text.trim()
+        .chars()
+        .take(MAX_SEARCH_CHARS)
+        .collect::<String>()
+        .to_lowercase()
 }

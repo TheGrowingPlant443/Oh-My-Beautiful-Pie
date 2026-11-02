@@ -64,7 +64,7 @@ class Host {
   async init() { this.isInitialized = true; await this.controller.initHooksAndCustomTools(); }
   setToolUIContext(ui, hasUI) { assert.equal(nativeUi.installed(ui), true, 'capture must precede native forwarding'); this.toolUi = ui; this.hasUI = hasUI; }
   getToolUIContext() { return this.controller.getToolUIContext(); }
-  syncComposerShape() {}
+  syncComposerShape() { /* Native composer layout is outside this offline decision proof. */ }
   present(component) { errors.push(component); }
 }
 workspace = installWorkspaceChanges({ pi: { InteractiveMode: Host } }, { nativeUi, hasPendingDecisions: () => pending.size > 0, emit() {}, isLeaseCurrent: () => true });
@@ -97,22 +97,50 @@ try {
   const tool = { name: 'offline_exec', formatApprovalDetails: () => ['First exact line', 'Second exact line'] };
   // Actual native tool approval entrypoint uses runner.getUIContext directly,
   // bypassing handler facades. Its honest origin must remain unattributed.
-  let done = requestApproval(runner.getUIContext(), tool, {}, 'offline fixture');
+  let done = requestApproval(runner.getUIContext(), tool, {}, { reason: 'offline fixture' });
   await waiting(ApprovalDialogComponent);
   let id = target().requestId;
   assert.equal(target().method, 'approve'); assert.equal(target().agentOrigin.kind, 'unattributed');
   assert.match(target().prompt.full, /First exact line\nSecond exact line/);
   assert.notEqual(target().prompt.full, target().prompt.compact);
   reply(true);
-  assert.equal(await done, true);
+  assert.equal(await done, 'once');
   assert.equal(host.focus, host.editor); retiredOnce(id);
+
+  for (const response of [false, { cancelled: true }]) {
+    done = requestApproval(runner.getUIContext(), tool, {});
+    await waiting(ApprovalDialogComponent); id = target().requestId;
+    reply(response);
+    assert.equal(await done, 'deny');
+    assert.equal(host.focus, host.editor); retiredOnce(id);
+  }
 
   // Native Escape wins, retires the card, and does not require synthesized
   // keystrokes for any remote answer. This key is native proof only.
   done = requestApproval(runner.getUIContext(), tool, {});
   await waiting(ApprovalDialogComponent); id = target().requestId;
   host.focus.handleInput('\x1b');
-  assert.equal(await done, false); retiredOnce(id); assert.equal(pending.size, 0);
+  assert.equal(await done, 'deny'); retiredOnce(id); assert.equal(pending.size, 0);
+
+  // Native remembered choices remain SDK answers; remote booleans approve only this call.
+  const approval = {
+    full: 'Native approval choices\nExact target', compact: 'Native approval choices',
+    session: 'Approve this tool for this session',
+    grants: [{ scope: 'target', label: 'Approve File', alwaysLabel: 'Always Approve File' }],
+  };
+  for (const [inputs, expected] of [
+    [[{ type: 'action', act: 'approve' }], 'once'],
+    [[{ type: 'select', key: 'choices', item: 'session' }], 'session'],
+    [[{ type: 'select', key: 'choices', item: 'grant0' }], { grant: 'target', always: false }],
+    [[{ type: 'select', key: 'choices', item: 'remember' }, { type: 'activate', key: 'choices', item: 'grant0' }], { grant: 'target', always: true }],
+  ]) {
+    const running = await handler(ctx => ctx.ui.approve(approval), ApprovalDialogComponent);
+    id = target().requestId;
+    for (const input of inputs) host.focus.handleNativeEvent(input);
+    await running.done;
+    assert.deepEqual(handlerValue, expected);
+    assert.equal(host.focus, host.editor); retiredOnce(id);
+  }
 
   const questions = [{ id: 'design', header: 'Design', question: 'Which exact design?', options: [{ label: 'Simple', description: 'Minimal', preview: 'preview text' }, { label: 'Rich' }], recommended: 1 }];
   let running = await handler(async ctx => { await tick(); return ctx.ui.askDialog(questions, { acceptImages: false }); }, AskDialogComponent);
@@ -133,27 +161,41 @@ try {
 
   // The owning Manager must not bypass plan handoff's explicit human boundary.
   let handoffs = 0;
-  running = await handler(ctx => confirmedPlanHandoff(async action => {
+  const handoff = ctx => confirmedPlanHandoff(async action => {
     if (action === 'plan_handoff_info') return { name: 'Worker', revision: 'r', needsStart: false };
     handoffs++; return { accepted: true };
-  }, ctx, { summary: 'Review native-only permission boundary' }));
+  }, ctx, { summary: 'Review native-only permission boundary' });
+  running = await handler(handoff);
   id = target().requestId;
   assert.equal(target().humanOnly, true);
   assert.throws(() => reply(true, 'manager'), /human_only_decision/);
   assert.equal(handoffs, 0);
   reply(true, 'human'); await running.done;
   assert.equal(handoffs, 1); assert.equal(host.focus, host.editor); retiredOnce(id);
+  for (const response of [false, { cancelled: true }]) {
+    running = await handler(handoff);
+    id = target().requestId;
+    reply(response); await running.done;
+    assert.deepEqual(handlerValue, { accepted: false, cancelled: true });
+    assert.equal(handoffs, 1); assert.equal(host.focus, host.editor); retiredOnce(id);
+  }
+
+  const aborted = new AbortController();
+  done = runner.getUIContext().approve(approval, { signal: aborted.signal });
+  await waiting(ApprovalDialogComponent); id = target().requestId;
+  aborted.abort();
+  assert.equal(await done, 'deny'); retiredOnce(id); assert.equal(host.focus, host.editor);
 
   // Native timeout and native queued steering remain denials, not approvals.
   let timedOut = false;
   done = runner.getUIContext().approve({ full: 'Timeout approval', compact: 'Timeout approval' }, { timeout: 10, onTimeout: () => { timedOut = true; } });
   await waiting(ApprovalDialogComponent); id = target().requestId;
-  assert.equal(await done, false); assert.equal(timedOut, true); retiredOnce(id);
+  assert.equal(await done, 'deny'); assert.equal(timedOut, true); retiredOnce(id);
   done = requestApproval(runner.getUIContext(), tool, {});
   await waiting(ApprovalDialogComponent); id = target().requestId;
   steering.push({ role: 'user', content: 'Stop; human steering wins' });
   for (const listener of sessionListeners) listener({ type: 'queue_update', steering });
-  assert.equal(await done, false); retiredOnce(id);
+  assert.equal(await done, 'deny'); retiredOnce(id);
   assert.equal(host.focus, host.editor);
   assert.equal(pending.size, 0);
 

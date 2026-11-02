@@ -6,8 +6,8 @@
   import { api, type SetupDraft, type SetupAdmission, type PlanSessionAdmission, type Instance, type InsightProducer } from "./lib/api";
   import { connectInstances, instances, instancesById, previewsEnabled, toasts, dismissToast, reportError, managerInstance, architectInstance, appSettings, startInstance, errorText, refreshInstances } from "./lib/stores";
   import { initializeProjectHistory, visibleProjectHistory, computedFolders, rememberProjectFolder } from "./lib/stores";
-  import { coordinatorTemporaryFolders } from "./lib/stores";
-  import { architectEntryFolder } from "./lib/workspace";
+  import { coordinatorTemporaryFolders, workspaceChanges } from "./lib/stores";
+  import { qualityEntryFolder } from "./lib/workspace";
   import { isHiddenComputed } from "./lib/project-history";
   import { projectFolders } from "./lib/repo-agents";
   import Grid from "./lib/components/Grid.svelte";
@@ -91,7 +91,6 @@
     return () => window.removeEventListener("focus", onFocus);
   });
   let configOpen = $state(false);
-  let configMode = $state<"save" | "import">("save");
   let setupDraft = $state<SetupDraft>({ scope: null, kinds: [], items: [], step: 0, instanceId: null, projectInstanceId: null });
   let setupContextId = $state<string | null>(null);
   let setupAdmission = $state<SetupAdmission | null>(null);
@@ -211,7 +210,7 @@
   }
   // A global page, not an agent view: leaving it returns to The Architect's terminal.
   function openDependencyTree(): void {
-    analyzerInitialFolder = architectEntryFolder($architectInstance?.projectPath, temporaryFolders);
+    analyzerInitialFolder = $architectInstance ? qualityFolder($architectInstance) : undefined;
     planChange = null;
     void api.setBrowserView(null, null, null).catch(error => reportError("Hide browser", error));
     view = "dependency_tree";
@@ -229,17 +228,12 @@
     planChange = null;
     view = "graphify";
   }
-  // The repository an agent works on: its own folder; a helper's or plan agent's target project; for the
-  // Manager and Architect their committed folder, or the last remembered real folder when it is a temporary or computed shared folder.
+  // Resolve helper/plan targets before selecting a coordinator's logical project.
   function qualityFolder(source: Instance): string | undefined {
-    const targetId = source.helper?.target ?? source.planTarget;
-    if (targetId) return $instancesById.get(targetId)?.projectPath ?? source.helper?.repo;
-    if (source.kind === "manager" || source.kind === "architect") {
-      const live = projectFolders($instances);
-      const computed = $computedFolders.filter(folder => isHiddenComputed(folder, $computedFolders, live));
-      return architectEntryFolder(source.projectPath, [...temporaryFolders, ...computed]) ?? $visibleProjectHistory[0];
-    }
-    return source.projectPath;
+    const live = projectFolders($instances);
+    const computed = $computedFolders.filter(folder => isHiddenComputed(folder, $computedFolders, live));
+    return qualityEntryFolder(source, $instancesById, $workspaceChanges,
+      [...temporaryFolders, ...computed], $visibleProjectHistory[0]);
   }
   function openCodeQuality(sourceId: string, returnTo: { kind: "agent"; id: string } | { kind: "planChange" } = { kind: "agent", id: sourceId }): void {
     const source = $instancesById.get(sourceId);
@@ -290,7 +284,7 @@
       else focus(id);
     });
   }
-  function openConfig(mode: "save" | "import"): void { configMode = mode; configOpen = true; }
+  function openConfig(): void { configOpen = true; }
   async function provisionCoordinators(): Promise<boolean> {
     try {
       await initializeProjectHistory();
@@ -521,8 +515,7 @@
     {#if !fullscreen}
       <button disabled={initializing} aria-pressed={$previewsEnabled} onclick={() => previewsEnabled.update(value => !value)}>Previews {$previewsEnabled ? "On" : "Off"}</button>
     {/if}
-    {#if fullscreen}<button disabled={initializing} onclick={() => openConfig("save")}>Save as global config</button>{/if}
-    <button disabled={initializing} onclick={() => openConfig("import")}>Import config</button>
+    <button disabled={initializing} onclick={openConfig}>Manage config</button>
     <button disabled={initializing} class:active={view === "agent_setup"} onclick={() => requestNavigation(openAgentSetup)}>Agent setup</button>
     <button disabled={initializing} class:active={view === "terminals"} class:attention={attention} title={attention ? "An agent is waiting for your decision" : "Every agent's history, human decisions and live commands"} aria-label={attention ? `Terminals - ${$humanDecisions.items.length} pending ${$humanDecisions.items.length === 1 ? "decision" : "decisions"}` : undefined} onclick={() => requestNavigation(openTerminalsFromButton)}>Terminals{#if $humanDecisions.items.length}<span class="pill">{$humanDecisions.items.length}</span>{/if}</button>
     {#each $systemOverview.tickets.filter(ticket => ticket.lateResult && ticket.state === "completed").slice(0, 1) as ticket (ticket.key)}
@@ -579,9 +572,9 @@
   </main>
 </div>
 <NewInstanceDialog open={dialogOpen} purpose={dialogPurpose} onclose={() => dialogOpen = false} oncreated={created} />
-<GlobalConfigDialog open={configOpen} mode={configMode} initialSourceId={focused?.id || $managerInstance?.id || null} onclose={() => configOpen = false} />
+<GlobalConfigDialog open={configOpen} initialSourceId={focused?.id || $managerInstance?.id || null} onclose={() => configOpen = false} />
 <SettingsDialog open={settingsOpen} onclose={() => settingsOpen = false} />
-<SrsStartDialog open={srsStartFolder !== null} folder={srsStartFolder ?? ""} architectModel={$architectInstance?.model ?? null}
+<SrsStartDialog open={srsStartFolder !== null} folder={srsStartFolder ?? ""} architectModel={$architectInstance?.configState?.model ?? $architectInstance?.model ?? null}
   onClose={() => srsStartFolder = null} onExisting={folder => openSrsPage(folder)}
   onStarted={() => { srsStartFolder = null; }} onOpenArchitect={() => requestNavigation(openArchitect)} />
 {#if panel && panelOwner}

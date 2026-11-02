@@ -22,7 +22,7 @@ export interface LayoutHooks {
 /** Deterministic distinct start position from an FNV-1a hash (ForceAtlas2 needs distinct positions). */
 export function seededPosition(id: string, index: number): { x: number; y: number } {
   let h = 2166136261;
-  for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); }
+  for (let i = 0; i < id.length; i++) { h ^= id.codePointAt(i)!; h = Math.imul(h, 16777619); }
   const a = (h >>> 0) / 4294967296;
   h = Math.imul(h ^ (h >>> 15), 2246822507);
   h ^= h >>> 13;

@@ -72,7 +72,7 @@ export class LayoutClient {
     }
     const positions = (): LayoutPositions | null => {
       const raw = message.positions;
-      if (!raw || raw.length !== current.ids.length * 2) return null;
+      if (raw?.length !== current.ids.length * 2) return null;
       const x = new Float32Array(current.ids.length), y = new Float32Array(current.ids.length);
       for (let i = 0; i < current.ids.length; i++) { x[i] = raw[2 * i]; y[i] = raw[2 * i + 1]; }
       return { ids: current.ids, x, y };

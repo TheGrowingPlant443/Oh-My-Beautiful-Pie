@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+unset PI_COMPILED OMSP_COMPILED
+exec "${BUN_BIN:-bun}" "${OMP_SDK_DIR:?OMP Manager must supply its bundled OMP SDK}/src/cli.ts" "$@"

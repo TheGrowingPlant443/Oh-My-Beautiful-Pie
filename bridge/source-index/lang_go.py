@@ -152,8 +152,7 @@ class GoVisitor(Visitor):
         return None
 
     def visit_type_alias(self, node):
-        self._type_symbol(node)
-        return None
+        return self.visit_type_spec(node)
 
     def _type_symbol(self, node):
         name_node = node.child_by_field_name("name")
@@ -274,13 +273,7 @@ class GoVisitor(Visitor):
         if t == "identifier":
             return raw, {"kind": "identifier", "name": raw, "receiver": None, "receiverKind": None}, False
         if t == "selector_expression":
-            operand = fn.child_by_field_name("operand")
-            field = fn.child_by_field_name("field")
-            recv = self.text(operand) if operand is not None else None
-            ot = operand.type if operand is not None else None
-            rk = "identifier" if ot == "identifier" else ("path" if ot == "selector_expression" else "expression")
-            return raw, {"kind": "member", "name": self.text(field) if field is not None else None,
-                         "receiver": recv, "receiverKind": rk}, False
+            return raw, self._selector_binding(fn), False
         if t in ("generic_type", "type_instantiation_expression"):
             base = fn.child_by_field_name("type") or fn.child_by_field_name("operand")
             if base is not None and base.type in ("identifier", "type_identifier"):
@@ -293,6 +286,15 @@ class GoVisitor(Visitor):
                              "receiverKind": "identifier", "generic": True}, False
         # parenthesized / call results / index expressions / literals: computed callee
         return raw, {"kind": "dynamic", "name": None, "receiver": None, "receiverKind": None, "dynamic": True}, True
+
+    def _selector_binding(self, fn):
+        operand = fn.child_by_field_name("operand")
+        field = fn.child_by_field_name("field")
+        recv = self.text(operand) if operand is not None else None
+        ot = operand.type if operand is not None else None
+        rk = {"identifier": "identifier", "selector_expression": "path"}.get(ot, "expression")
+        return {"kind": "member", "name": self.text(field) if field is not None else None,
+                "receiver": recv, "receiverKind": rk}
 
     def visit_call_expression(self, node):
         fn = node.child_by_field_name("function")
@@ -310,12 +312,12 @@ class GoVisitor(Visitor):
         t = node.child_by_field_name("type")
         if t is None:
             return None
-        raw, binding, dynamic = self._callee_binding(t)
+        _, binding, dynamic = self._callee_binding(t)
         binding = dict(binding)
         binding["ambiguousConversion"] = True
         self.site("calls", node, self.text(t), binding, dynamic=dynamic, node_kind="type_conversion_expression")
         return None
 
 
-def extract(language: str, source: bytes, ctx: common.Context) -> dict:
+def extract(_language: str, _source: bytes, ctx: common.Context) -> dict:
     return kit_walk.run_extract(ctx, GoVisitor)

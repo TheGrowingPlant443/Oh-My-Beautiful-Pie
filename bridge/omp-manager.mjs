@@ -8,6 +8,7 @@ import { installWorkspaceChanges } from './omp-workspace.mjs';
 import { registerCodeQualityTool } from './omp-code-quality.mjs';
 import { installNativeDecisions } from './omp-native-ui.mjs';
 import { installSrsBridge } from './omp-srs.mjs';
+import { installConfigPolicy } from './omp-config-policy.mjs';
 
 const MAX_FRAME = 64 * 1024 * 1024;
 const ACTIONS = ['list','create','start','stop','restart','remove','send','interrupt','screen','transcript','plan','subagents','respond','keys','subscribe','request_human'];
@@ -49,20 +50,26 @@ export function managerParameters(z) {
   }).strict();
 }
 
-export function managerPayload(params) {
-  const fields = MANAGER_FIELDS[params.action];
-  if (!fields) throw new Error('Unknown manage_sessions action');
+function assertRequiredManagerField(params, field) {
+  if (!Object.hasOwn(params, field) || params[field] === undefined ||
+      (field === 'instanceId' && !params[field].trim())) {
+    throw new Error(`${params.action} requires ${field}; use {action:"${params.action}",${field}:"..."}`);
+  }
+}
+
+function assertManagerParams(params, fields) {
   const required = [...(params.action === 'list' || params.action === 'create' ? [] : ['instanceId']),
     ...(MANAGER_REQUIRED[params.action] ?? [])];
-  for (const field of required) {
-    if (!Object.hasOwn(params, field) || params[field] === undefined ||
-        (field === 'instanceId' && !params[field].trim())) {
-      throw new Error(`${params.action} requires ${field}; use {action:"${params.action}",${field}:"..."}`);
-    }
-  }
+  for (const field of required) assertRequiredManagerField(params, field);
   for (const field of Object.keys(params)) {
     if (field !== 'action' && !fields.includes(field)) throw new Error(`${params.action} does not accept ${field}`);
   }
+}
+
+export function managerPayload(params) {
+  const fields = MANAGER_FIELDS[params.action];
+  if (!fields) throw new Error('Unknown manage_sessions action');
+  assertManagerParams(params, fields);
   const payload = {};
   for (const field of fields) if (Object.hasOwn(params, field)) payload[field] = params[field];
   if (params.action !== 'create') return payload;
@@ -124,7 +131,7 @@ export async function confirmedPlanHandoff(request, ctx, payload, signal) {
 // including The Manager and unowned workers. Manager-originated control still needs an owned instance.
 // Killing a terminal command also interrupts the agent, so it is never available to a model or a Manager.
 export function controlAllowed({ role, owner, action, source }) {
-  if (['agent_hub','terminal_kill','dependency_result','workspace_change','cancel_workspace_change','workspace_plan_prompt','project_visualization_prompt','structure_sources','structure_source_read','structure_source_select_last','srs_stage_prompt','srs_stage_status','srs_pause','monitor_explanation_prompt','setup_markdown_hold','setup_markdown_release'].includes(action)) return source === 'human';
+  if (['agent_hub','terminal_kill','config_switch','dependency_result','workspace_change','cancel_workspace_change','workspace_plan_prompt','project_visualization_prompt','structure_sources','structure_source_read','structure_source_select_last','srs_stage_prompt','srs_stage_status','srs_pause','monitor_explanation_prompt','setup_markdown_hold','setup_markdown_release'].includes(action)) return source === 'human';
   if (source === 'human') return action === 'prompt' || action === 'abort' || action === 'reply_ui';
   return role === 'instance' && !!owner;
 }
@@ -143,58 +150,72 @@ function textPreview(message) {
 function selectLabels(options) { return options.map(option => typeof option === 'string' ? option : option.label); }
 
 // Validate against the actual pending native question, never a model-supplied copy.
-export function nativeAnswer(request, response) {
-  if (!['approve', 'select', 'confirm', 'input', 'editor', 'askDialog'].includes(request.method)) throw new Error('native_terminal_decision');
-  if (response && typeof response === 'object' && response.cancelled === true) return ['approve', 'confirm'].includes(request.method) ? false : undefined;
-  switch (request.method) {
-    case 'select': {
-      if (typeof response !== 'string' || !selectLabels(request.options).includes(response)) throw new Error('invalid native option label');
-      if (request.disabledIndices?.includes(selectLabels(request.options).indexOf(response))) throw new Error('native option is disabled');
-      return response;
-    }
-    case 'approve': case 'confirm':
-      if (typeof response !== 'boolean') throw new Error('confirmation requires a boolean');
-      return response;
-    case 'input': case 'editor':
-      if (typeof response !== 'string') throw new Error('native input requires text');
-      return response;
-    case 'askDialog': {
-      if (response?.kind === 'chat') {
-        if (request.supportsChat === false) throw new Error('native chat is unavailable');
-        return { kind: 'chat' };
-      }
-      if (response?.kind !== 'submit' || !Array.isArray(response.results)) throw new Error('invalid native ask answer');
-      if (response.results.length !== request.questions.length) throw new Error('answer every native question');
-      const results = request.questions.map(question => {
-        const matches = response.results.filter(item => item.id === question.id);
-        if (matches.length !== 1) throw new Error('invalid or duplicate question id');
-        const answer = matches[0];
-        const options = selectLabels(question.options);
-        if (!Array.isArray(answer.selectedOptions) || answer.selectedOptions.some(label => !options.includes(label))) throw new Error('invalid native answer labels');
-        if (answer.selectedOptions.some(label => question.disabledIndices?.includes(options.indexOf(label)))) throw new Error('native option is disabled');
-        if (new Set(answer.selectedOptions).size !== answer.selectedOptions.length || (!question.multi && answer.selectedOptions.length > 1)) throw new Error('invalid native answer selection');
-        const result = { id: question.id, question: question.question, options, multi: question.multi ?? false, selectedOptions: answer.selectedOptions };
-        for (const key of ['customInput','note']) {
-          if (answer[key] !== undefined) {
-            if (typeof answer[key] !== 'string') throw new Error('custom answer and note must be text');
-            result[key] = answer[key];
-          }
-        }
-        for (const key of ['customInputImages','noteImages']) {
-          if (answer[key] !== undefined) {
-            if (!request.acceptImages || !Array.isArray(answer[key]) || answer[key].some(image => image.type !== 'image' || typeof image.data !== 'string' || !image.mimeType?.startsWith('image/'))) throw new Error('invalid native answer image');
-            result[key] = answer[key];
-          }
-        }
-        return result;
-      });
-      return { kind: 'submit', results };
-    }
-    default: throw new Error('native_terminal_decision');
+function nativeSelect(request, response) {
+  const labels = selectLabels(request.options);
+  if (typeof response !== 'string' || !labels.includes(response)) throw new Error('invalid native option label');
+  if (request.disabledIndices?.includes(labels.indexOf(response))) throw new Error('native option is disabled');
+  return response;
+}
+function nativeConfirm(_request, response) {
+  if (typeof response !== 'boolean') throw new Error('confirmation requires a boolean');
+  return response;
+}
+function nativeApprove(request, response) {
+  return nativeConfirm(request, response) ? 'once' : 'deny';
+}
+function nativeText(_request, response) {
+  if (typeof response !== 'string') throw new Error('native input requires text');
+  return response;
+}
+function nativeAnswerSelection(question, answer, options) {
+  if (!Array.isArray(answer.selectedOptions) || answer.selectedOptions.some(label => !options.includes(label))) throw new Error('invalid native answer labels');
+  if (answer.selectedOptions.some(label => question.disabledIndices?.includes(options.indexOf(label)))) throw new Error('native option is disabled');
+  if (new Set(answer.selectedOptions).size !== answer.selectedOptions.length || (!question.multi && answer.selectedOptions.length > 1)) throw new Error('invalid native answer selection');
+}
+const validNativeImages = images => Array.isArray(images) && images.every(image => image.type === 'image' && typeof image.data === 'string' && image.mimeType?.startsWith('image/'));
+function nativeQuestionResult(request, question, answer) {
+  const options = selectLabels(question.options);
+  nativeAnswerSelection(question, answer, options);
+  const result = { id: question.id, question: question.question, options, multi: question.multi ?? false, selectedOptions: answer.selectedOptions };
+  for (const key of ['customInput','note']) {
+    if (answer[key] === undefined) continue;
+    if (typeof answer[key] !== 'string') throw new Error('custom answer and note must be text');
+    result[key] = answer[key];
   }
+  for (const key of ['customInputImages','noteImages']) {
+    if (answer[key] === undefined) continue;
+    if (!request.acceptImages || !validNativeImages(answer[key])) throw new Error('invalid native answer image');
+    result[key] = answer[key];
+  }
+  return result;
+}
+function nativeChat(request) {
+  if (request.supportsChat === false) throw new Error('native chat is unavailable');
+  return { kind: 'chat' };
+}
+function nativeSubmit(request, response) {
+  if (response?.kind !== 'submit' || !Array.isArray(response.results)) throw new Error('invalid native ask answer');
+  if (response.results.length !== request.questions.length) throw new Error('answer every native question');
+  const results = request.questions.map(question => {
+    const matches = response.results.filter(item => item.id === question.id);
+    if (matches.length !== 1) throw new Error('invalid or duplicate question id');
+    return nativeQuestionResult(request, question, matches[0]);
+  });
+  return { kind: 'submit', results };
+}
+const nativeAsk = (request, response) => response?.kind === 'chat' ? nativeChat(request) : nativeSubmit(request, response);
+const NATIVE_ANSWERS = new Map([['select', nativeSelect], ['approve', nativeApprove], ['confirm', nativeConfirm],
+  ['input', nativeText], ['editor', nativeText], ['askDialog', nativeAsk]]);
+
+export function nativeAnswer(request, response) {
+  const answer = NATIVE_ANSWERS.get(request.method);
+  if (!answer) throw new Error('native_terminal_decision');
+  const cancelled = response && typeof response === 'object' && response.cancelled === true;
+  if (!cancelled) return answer(request, response);
+  return request.method === 'approve' || request.method === 'confirm' ? answer(request, false) : undefined;
 }
 
-export default function managerBridge(pi) {
+function bridgeConnection() {
   const endpoint = process.env.OMP_MANAGER_BRIDGE_ENDPOINT ?? '';
   const token = process.env.OMP_MANAGER_BRIDGE_TOKEN;
   const instanceId = process.env.OMP_MANAGER_BRIDGE_INSTANCE_ID;
@@ -202,6 +223,28 @@ export default function managerBridge(pi) {
   const role = process.env.OMP_MANAGER_BRIDGE_ROLE;
   const match = /^127\.0\.0\.1:(\d+)$/.exec(endpoint);
   if (!match || !token || !instanceId || !Number.isSafeInteger(generation) || !['manager','instance'].includes(role)) return;
+  return { token, instanceId, generation, role, port: Number(match[1]) };
+}
+
+function installBridgeTerminal(pi, emit, canSend) {
+  const historyRoot = process.env.OMP_MANAGER_TERMINAL_DIR;
+  const sdkDir = process.env.OMP_MANAGER_SDK_DIR;
+  if (!historyRoot || !sdkDir) return null;
+  return installTerminalCommands(pi, { emit, canSend, historyRoot, sdkDir });
+}
+
+function completionEventKind(reason) {
+  if (reason === 'error') return 'turn_error';
+  if (reason === 'aborted') return 'turn_aborted';
+  return 'completed';
+}
+
+export default function managerBridge(pi) {
+  const connection = bridgeConnection();
+  if (!connection) return;
+  const { token, instanceId, generation, role, port } = connection;
+  // A launch flag keeps native host/tool capture eager even after OMP caches this extension as deferrable.
+  pi.registerFlag('omp-manager-bridge', { type: 'boolean', default: false, description: 'Initialize the desktop host bridge before the native session starts' });
 
   let context;
   let socket;
@@ -225,7 +268,7 @@ export default function managerBridge(pi) {
     return { sessionId: context?.sessionManager.getSessionId(), sessionFile: sessionFile ?? null,
       cwd: context?.sessionManager.getCwd(), materialized: !!sessionFile && existsSync(sessionFile),
       workspaceEpoch: workspace.identity().workspaceEpoch,
-      supported: true, capabilities: workspace.nativeUiCapabilities(), terminal: terminal?.snapshot() ?? null, pendingDecisions: [...pending.values()].map(item => item.request) };
+      supported: true, capabilities: workspace.nativeUiCapabilities(), configState: configPolicy.snapshot(), terminal: terminal?.snapshot() ?? null, pendingDecisions: [...pending.values()].map(item => item.request) };
   }
   function write(frame) {
     if (!socket || socket.destroyed || !authenticated) throw new Error('manager bridge disconnected');
@@ -258,21 +301,24 @@ export default function managerBridge(pi) {
     opportunity: () => workspace.opportunity(),
     srs: () => srs?.ask,
   });
+  const configPolicy = installConfigPolicy(pi, {
+    emit,
+    isQuiescent: (options = {}) => {
+      const state = workspace.quiescence();
+      // A native pre-model hook is paused while its enclosing prompt remains active.
+      return options.modelBoundary
+        ? state.reasons.every(reason => reason === 'streaming' || reason === 'prompt_flow_unsettled')
+        : state.quiescent;
+    },
+  });
   const workspace = installWorkspaceChanges(pi, {
     request, emit, role, nativeUi,
     hasPendingDecisions: () => pending.size > 0,
     isLeaseCurrent: lease => lease.generation === generation && lease.ownershipEpoch === ownershipEpoch,
   });
   const disposeBrowser = process.env.OMP_MANAGER_BROWSER_REQUIRED === '1' ? installTerminalBrowserBridge(pi, request) : () => {};
-  const terminalDir = process.env.OMP_MANAGER_TERMINAL_DIR;
-  const terminal = terminalDir && process.env.OMP_MANAGER_SDK_DIR
-    ? installTerminalCommands(pi, {
-      emit,
-      canSend: () => !!socket && !socket.destroyed && authenticated && socket.writableLength < 1024 * 1024,
-      historyRoot: terminalDir,
-      sdkDir: process.env.OMP_MANAGER_SDK_DIR,
-    })
-    : null;
+  const terminal = installBridgeTerminal(pi, emit,
+    () => !!socket && !socket.destroyed && authenticated && socket.writableLength < 1024 * 1024);
   if (terminal?.supported) registerCommandHistoryTool(pi, terminal);
   // Every role (Manager, Architect, workers, plan agents, helpers) can read the saved Code quality results of its own repository.
   registerCodeQualityTool(pi, request);
@@ -282,7 +328,7 @@ export default function managerBridge(pi) {
   const architectTools = process.env.OMP_MANAGER_ARCHITECT_DIR ? registerClassifyTool(pi, process.env.OMP_MANAGER_ARCHITECT_DIR, { submitPrompt: (message, callbacks) => workspace.submitPrompt(message, callbacks), currentContext: () => context }) : null;
   if (architectTools) srs = installSrsBridge(pi, { request, workspace, currentContext: () => context });
   function resolveTerminalRequests() {
-    for (const item of [...pending.values()]) if (['terminal','custom'].includes(item.request.method) && item.advisory) item.finish('native', undefined);
+    for (const item of pending.values()) if (['terminal','custom'].includes(item.request.method) && item.advisory) item.finish('native', undefined);
   }
   function adoptContext(ctx) {
     if (ctx.agent?.kind !== 'main') return false;
@@ -305,94 +351,122 @@ export default function managerBridge(pi) {
     if (payload.sessionId !== context.sessionManager.getSessionId() || payload.ownershipEpoch !== ownershipEpoch) throw new Error('stale_generation');
     if (frame.action === 'snapshot') return identity();
     if (!controlAllowed({ role, owner, action: frame.action, source: payload.source })) throw new Error('not_controlled');
-    if (frame.action === 'agent_hub') {
-      if (payload.workspaceEpoch !== workspace.identity().workspaceEpoch) throw new Error('stale_generation');
-      return workspace.openAgentHub();
+    if (frame.action === 'abort') {
+      await context.abort();
+      return { interrupted: true };
     }
-    if (['workspace_change','cancel_workspace_change','workspace_plan_prompt'].includes(frame.action)) {
-      if (frame.action === 'workspace_change' && !workspaceChangeRole({ role, architect: !!architectTools, helper: !!process.env.OMP_MANAGER_HELPER_REPO, plan: process.env.OMP_MANAGER_PLAN_SESSION === '1' })) throw new Error('Agent working directory required');
-      return workspace.control(frame.action, payload);
+    return dispatchControl(frame.action, payload);
+  }
+  function promptSession(payload) {
+    if (typeof payload.message !== 'string') throw new Error('message is required');
+    // A prompt typed by the human is the only app-originated input that ends a Kill process hold.
+    if (payload.source === 'human' && payload.message.trim()) terminal?.clearHoldForHuman();
+    const options = { attribution: 'agent' };
+    if (!context.isIdle()) options.deliverAs = payload.delivery === 'steer' ? 'steer' : 'followUp';
+    pi.sendUserMessage(payload.message, options);
+    return { accepted: true };
+  }
+  function architectControl(action, payload) {
+    if (!architectTools) throw new Error('not_controlled');
+    switch (action) {
+      case 'srs_stage_prompt':
+      case 'srs_stage_status':
+      case 'srs_pause':
+        if (!srs) throw new Error('not_controlled');
+        return srs.control(action, payload, context);
+      case 'monitor_explanation_prompt':
+        // The shared guard, not the frozen-snapshot explanation text, restricts the turn.
+        if (!srs) throw new Error('not_controlled');
+        return srs.monitor.control(context, payload);
+      case 'dependency_result':
+        // Display-only replay from the app-owned directory; no path, text or model prompt is accepted.
+        if (typeof payload.requestId !== 'string' || !['security', 'usage', 'project', 'updatePlan', 'dependencyDiscovery', 'requirements', 'systemOverview', 'helicopter', 'structureCurrent', 'structureProposed'].includes(payload.kind)) throw new Error('invalid dependency result request');
+        architectTools.showSaved(context, payload.kind, payload.requestId, payload.replay === true);
+        return { accepted: true };
+      case 'project_visualization_prompt':
+        return architectTools.promptVisualization(context, payload);
+      case 'structure_sources':
+      case 'structure_source_read':
+      case 'structure_source_select_last':
+        return architectTools.structureSources(context, action, payload);
+      default:
+        throw new Error('invalid_action');
     }
-    if (['srs_stage_prompt', 'srs_stage_status', 'srs_pause'].includes(frame.action)) {
-      if (!srs || !architectTools) throw new Error('not_controlled');
-      return srs.control(frame.action, payload, context);
+  }
+  function dispatchControl(action, payload) {
+    switch (action) {
+      case 'agent_hub':
+        if (payload.workspaceEpoch !== workspace.identity().workspaceEpoch) throw new Error('stale_generation');
+        return workspace.openAgentHub();
+      case 'workspace_change':
+      case 'cancel_workspace_change':
+      case 'workspace_plan_prompt':
+        if (action === 'workspace_change' && !workspaceChangeRole({ role, architect: !!architectTools, helper: !!process.env.OMP_MANAGER_HELPER_REPO, plan: process.env.OMP_MANAGER_PLAN_SESSION === '1' })) throw new Error('Agent working directory required');
+        return workspace.control(action, payload);
+      case 'srs_stage_prompt':
+      case 'srs_stage_status':
+      case 'srs_pause':
+      case 'monitor_explanation_prompt':
+      case 'dependency_result':
+      case 'project_visualization_prompt':
+      case 'structure_sources':
+      case 'structure_source_read':
+      case 'structure_source_select_last':
+        return architectControl(action, payload);
+      case 'setup_markdown_hold':
+        return workspace.holdMarkdown(payload.transactionId);
+      case 'setup_markdown_release':
+        return workspace.releaseMarkdown(payload.transactionId);
+      case 'prompt':
+        return promptSession(payload);
+      case 'config_switch':
+        return configPolicy.control(payload);
+      case 'terminal_kill':
+        if (!terminal || typeof payload.executionId !== 'string') throw new Error('terminal integration unavailable');
+        return terminal.kill(payload.executionId);
+      case 'reply_ui':
+        return nativeUi.respond(payload);
+      default:
+        throw new Error('invalid_action');
     }
-    if (frame.action === 'monitor_explanation_prompt') {
-      // Human-only and Architect-only: the app's frozen-snapshot explanation prompt; the shared guard, not this text, restricts the turn.
-      if (!srs || !architectTools) throw new Error('not_controlled');
-      return srs.monitor.control(context, payload);
+  }
+  function receiveResponse(frame) {
+    if (frame.id === 'hello') {
+      if (!frame.ok) { socket?.destroy(); return; }
+      authenticated = true;
+      srs?.reconnect();
+      emit('ready', identity());
+      for (const event of offlineEvents.splice(0)) write(event);
+      terminal?.resync();
+      void workspace.reconnect();
+      return;
     }
-    if (frame.action === 'setup_markdown_hold') return workspace.holdMarkdown(payload.transactionId);
-    if (frame.action === 'setup_markdown_release') return workspace.releaseMarkdown(payload.transactionId);
-    if (frame.action === 'prompt') {
-      if (typeof payload.message !== 'string') throw new Error('message is required');
-      // A prompt typed by the human is the only app-originated input that ends a Kill process hold.
-      if (payload.source === 'human' && payload.message.trim()) terminal?.clearHoldForHuman();
-      const options = { attribution: 'agent' };
-      if (!context.isIdle()) options.deliverAs = payload.delivery === 'steer' ? 'steer' : 'followUp';
-      pi.sendUserMessage(payload.message, options);
-      return { accepted: true };
+    const call = calls.get(frame.id);
+    if (!call) return;
+    calls.delete(frame.id);
+    context.clearTimer(call.timeout);
+    if (frame.ok) call.resolve(frame.data);
+    else { const error = new Error(frame.error ?? 'controller failed'); error.workspaceRejected = true; call.reject(error); }
+  }
+  function receiveNotification(frame) {
+    if (!seen.has(frame.eventId)) {
+      try {
+        pi.sendMessage({ customType: 'omp-manager.notification', content: `Controlled session ${frame.instanceId} (${frame.kind}):\n${JSON.stringify(frame.payload)}`, display: true, attribution: 'agent', details: { eventId: frame.eventId, instanceId: frame.instanceId, generation: frame.generation } }, { deliverAs: 'followUp', triggerTurn: true });
+        seen.add(frame.eventId);
+      } catch { return; }
     }
-    if (frame.action === 'abort') { await context.abort(); return { interrupted: true }; }
-    if (frame.action === 'dependency_result') {
-      // Display-only replay by UUID and kind from the app-owned directory; no path, text or model prompt is accepted.
-      if (!architectTools) throw new Error('not_controlled');
-      if (typeof payload.requestId !== 'string' || !['security', 'usage', 'project', 'updatePlan', 'dependencyDiscovery', 'requirements', 'systemOverview', 'helicopter', 'structureCurrent', 'structureProposed'].includes(payload.kind)) throw new Error('invalid dependency result request');
-      architectTools.showSaved(context, payload.kind, payload.requestId, payload.replay === true);
-      return { accepted: true };
-    }
-    if (frame.action === 'project_visualization_prompt') {
-      // Human-only: the app submits its own backend-built, analysis-only prompt for an admitted request; never a model action.
-      if (!architectTools) throw new Error('not_controlled');
-      return architectTools.promptVisualization(context, payload);
-    }
-    if (['structure_sources', 'structure_source_read', 'structure_source_select_last'].includes(frame.action)) {
-      // Human-only and Architect-only: reads the Markdown the human pasted into the native chat; no path or model argument exists.
-      if (!architectTools) throw new Error('not_controlled');
-      return architectTools.structureSources(context, frame.action, payload);
-    }
-    if (frame.action === 'terminal_kill') {
-      if (!terminal || typeof payload.executionId !== 'string') throw new Error('terminal integration unavailable');
-      return terminal.kill(payload.executionId);
-    }
-    if (frame.action === 'reply_ui') {
-      return nativeUi.respond(payload);
-    }
-    throw new Error('invalid_action');
+    write({ type: 'ack', eventId: frame.eventId });
   }
   function frameReceived(frame) {
-    if (frame.type === 'response') {
-      if (frame.id === 'hello') {
-        if (!frame.ok) { socket?.destroy(); return; }
-        authenticated = true;
-        srs?.reconnect();
-        emit('ready', identity());
-        for (const event of offlineEvents.splice(0)) write(event);
-        terminal?.resync();
-        void workspace.reconnect();
-        return;
-      }
-      const call = calls.get(frame.id);
-      if (!call) return;
-      calls.delete(frame.id); context.clearTimer(call.timeout);
-      if (frame.ok) call.resolve(frame.data);
-      else { const error = new Error(frame.error ?? 'controller failed'); error.workspaceRejected = true; call.reject(error); }
-    } else if (frame.type === 'control') {
+    if (frame.type === 'response') receiveResponse(frame);
+    else if (frame.type === 'control') {
       void control(frame).then(data => write({ type: 'response', id: frame.id, ok: true, data }), error => write({ type: 'response', id: frame.id, ok: false, error: String(error.message ?? error) })).catch(() => {});
-    } else if (frame.type === 'notify' && role === 'manager') {
-      if (!seen.has(frame.eventId)) {
-        try {
-          pi.sendMessage({ customType: 'omp-manager.notification', content: `Controlled session ${frame.instanceId} (${frame.kind}):\n${JSON.stringify(frame.payload)}`, display: true, attribution: 'agent', details: { eventId: frame.eventId, instanceId: frame.instanceId, generation: frame.generation } }, { deliverAs: 'followUp', triggerTurn: true });
-          seen.add(frame.eventId);
-        } catch { return; }
-      }
-      write({ type: 'ack', eventId: frame.eventId });
-    }
+    } else if (frame.type === 'notify' && role === 'manager') receiveNotification(frame);
   }
   function connect() {
     if (closing || !context || (socket && !socket.destroyed)) return;
     authenticated = false;
-    const client = net.createConnection({ host: '127.0.0.1', port: Number(match[1]) });
+    const client = net.createConnection({ host: '127.0.0.1', port });
     socket = client;
     let parts = []; let bytes = 0;
     client.on('connect', () => {
@@ -445,27 +519,44 @@ export default function managerBridge(pi) {
       },
     });
   }
-  pi.on('session_start', (_event, ctx) => {
+  pi.on('session_start', async (_event, ctx) => {
     if (process.env.OMP_MANAGER_LOCAL_AI_SETUP_DIR) {
       const guard = globalThis[Symbol.for('omp-manager.local-ai-guard-ready')];
       const local = process.env.OMP_MANAGER_LOCAL_AI_SETUP_MODE === 'local';
       if (!guard || guard.root !== process.env.OMP_MANAGER_LOCAL_AI_SETUP_DIR || guard.enabled !== local ||
           (local && !pi.pi?.ModelRegistry?.prototype[Symbol.for('omp-manager.local-ai-model-policy')])) {
-        process.stderr.write('OMP Manager Local AI guard is unavailable; startup stopped before bridge readiness.\\n');
+        process.stderr.write(String.raw`OMP Manager Local AI guard is unavailable; startup stopped before bridge readiness.\n`);
         process.exit(78);
       }
       guard.checkSession(ctx);
     }
     if (!adoptContext(ctx)) return;
+    await configPolicy.attachContext(ctx);
     connect();
     if (!timer) timer = ctx.setInterval(connect, 1000);
     if (role === 'manager' && !startupShown) {
       startupShown = true;
-      pi.sendMessage({ customType: 'omp-manager.ready', content: 'The Manager is ready. I can control sessions I create or you hand over, review their work, and handle their decisions. I will ask you when human intervention is needed.', display: true, attribution: 'agent' });
+      if (!ctx.sessionManager.getBranch().some(entry => entry.type === 'custom_message' && entry.customType === 'omp-manager.ready')) {
+        pi.sendMessage({ customType: 'omp-manager.ready', content: 'The Manager is ready. I can control sessions I create or you hand over, review their work, and handle their decisions. I will ask you when human intervention is needed.', display: true, attribution: 'agent' });
+      }
     }
   });
-  pi.on('session_switch', (_event, ctx) => { if (!adoptContext(ctx)) return; completionVersion++; lastStopTurn = undefined; resolveTerminalRequests(); emit('session_changed', identity()); });
-  pi.on('agent_start', (_event, ctx) => { if (!adoptContext(ctx)) return; completionVersion++; resolveTerminalRequests(); sessionTurn++; emit('session_changed', identity()); emit('agent_started', {}); });
+  pi.on('session_switch', async (_event, ctx) => {
+    if (!adoptContext(ctx)) return;
+    await configPolicy.attachContext(ctx);
+    completionVersion++;
+    lastStopTurn = undefined;
+    resolveTerminalRequests();
+    emit('session_changed', identity());
+  });
+  pi.on('agent_start', (_event, ctx) => {
+    if (!adoptContext(ctx)) return;
+    completionVersion++;
+    resolveTerminalRequests();
+    sessionTurn++;
+    emit('session_changed', identity());
+    emit('agent_started', {});
+  });
   pi.on('session_stop', (event, ctx) => { if (ctx.agent?.kind === 'main') { context = ctx; lastStopTurn = event.turn_id; } });
   let completionVersion = 0;
   pi.on('agent_end', (event, ctx) => {
@@ -483,7 +574,7 @@ export default function managerBridge(pi) {
       lastCompleted = key;
       const message = finalMessage;
       const reason = message?.stopReason;
-      const kind = reason === 'error' ? 'turn_error' : reason === 'aborted' ? 'turn_aborted' : 'completed';
+      const kind = completionEventKind(reason);
       emit('session_changed', identity()); emit(kind, { turnId, text: textPreview(message), stopReason: reason ?? 'stop' });
     }
     ctx.setTimeout(settled, 0);
@@ -516,6 +607,7 @@ export default function managerBridge(pi) {
     disposeBrowser();
     nativeUi.dispose();
     srs?.dispose();
+    await configPolicy.dispose();
     socket?.destroy();
   });
 }

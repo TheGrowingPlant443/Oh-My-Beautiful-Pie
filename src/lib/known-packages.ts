@@ -138,7 +138,7 @@ export function githubOwnerFromUrl(url: string | null | undefined): string | nul
   try { parsed = new URL(url); } catch { return null; }
   if (parsed.hostname !== "github.com" && parsed.hostname !== "www.github.com") return null;
   const login = parsed.pathname.split("/").find(part => part.length > 0)?.toLowerCase().replace(/\.git$/, "");
-  return login ? login : null;
+  return login || null;
 }
 
 /** First match wins: npm scope, Maven group, exact name or prefix, then the repository's GitHub login. */

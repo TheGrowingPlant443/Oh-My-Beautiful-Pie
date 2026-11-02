@@ -160,6 +160,26 @@ test("search and inspection results belong to the build they were asked of", asy
   assert.equal(get(store).search.status, "idle");
 });
 
+test("more search results continue from the next offset and are appended", async () => {
+  const api = backend();
+  const store = createGraphifyStore({ api, indexClient: fakeIndex() });
+  await store.open("C:/p");
+  const offsets = [];
+  api.queryGraphify = async (artifactId, query) => {
+    offsets.push(query.offset);
+    const first = query.offset === 0;
+    return { artifactId, artifactHash: "H1", kind: query.kind, total: 2, offset: query.offset, items: [{ kind: "node", node: node(first ? "a" : "b") }], nextOffset: first ? 1 : null };
+  };
+  await store.setSearch(" x ");
+  await store.searchMore();
+  await store.searchMore();
+  const search = get(store).search;
+  assert.deepEqual(offsets, [0, 1], "a finished list asks for nothing more");
+  assert.deepEqual(search.items.map(item => item.node.ref.id), ["a", "b"]);
+  assert.equal(search.text, "x");
+  assert.equal(search.nextOffset, null);
+});
+
 test("suspend during a read stops it and does not leave a half-read graph shown as ready", async () => {
   const gate = Promise.withResolvers();
   const api = backend();

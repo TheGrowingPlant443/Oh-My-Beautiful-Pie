@@ -11,6 +11,19 @@ WORK = Path('/workspace')
 OUT = Path('/out')
 OUT.mkdir(exist_ok=True)
 os.environ.update({'SEMGREP_SEND_METRICS': 'off', 'SEMGREP_ENABLE_VERSION_CHECK': '0', 'DO_NOT_TRACK': '1', 'CHECKOV_SKIP_DOWNLOAD': 'true', 'CKV_SKIP_SECRETS': 'false'})
+ESLINT_FALLBACK = 'eslint.config.cjs'
+RUFF = '.ruff.toml'
+RUFF_CONFIGS = [RUFF, 'ruff.toml']
+PMD = 'java-pmd-ruleset.xml'
+PMD_CONFIGS = [PMD, 'ruleset.xml', '**/pmd*.xml']
+HADOLINT = '.hadolint.yaml'
+HADOLINT_CONFIGS = [HADOLINT, '.hadolint.yml']
+JSCPD = '.jscpd.json'
+JSCPD_CONFIGS = [JSCPD, '.jscpd.yaml', '.jscpd.yml']
+BANDIT = '.bandit.yml'
+SHELLCHECK = '.shellcheckrc'
+CHECKOV = '.checkov.yml'
+CHECKOV_CONFIGS = [CHECKOV, '.checkov.yaml']
 
 def has(patterns):
     return any(list(WORK.glob(pattern)) for pattern in patterns)
@@ -69,31 +82,31 @@ elif action == 'megalinter':
     package = WORK / 'package.json'
     package_config = package.is_file() and 'eslintConfig' in json.loads(package.read_text(encoding='utf8'))
     if not package_config:
-        fallback('eslint.config.cjs', 'eslint.config.cjs', ['eslint.config.*', '.eslintrc*'])
+        fallback(ESLINT_FALLBACK, ESLINT_FALLBACK, ['eslint.config.*', '.eslintrc*'])
     for key in ['JAVASCRIPT_ES', 'TYPESCRIPT_ES', 'JSX_ESLINT', 'TSX_ESLINT']:
-        config_override(key, ['eslint.config.js', 'eslint.config.mjs', 'eslint.config.cjs', 'eslint.config.ts', 'eslint.config.mts', 'eslint.config.cts', '.eslintrc*'])
-    if not has(['.ruff.toml', 'ruff.toml']):
+        config_override(key, ['eslint.config.js', 'eslint.config.mjs', ESLINT_FALLBACK, 'eslint.config.ts', 'eslint.config.mts', 'eslint.config.cts', '.eslintrc*'])
+    if not has(RUFF_CONFIGS):
         pyproject = WORK / 'pyproject.toml'
         if not pyproject.exists() or '[tool.ruff' not in pyproject.read_text(encoding='utf8'):
-            fallback('.ruff.toml', '.ruff.toml', ['.ruff.toml', 'ruff.toml'])
+            fallback(RUFF, RUFF, RUFF_CONFIGS)
         else:
             os.environ['PYTHON_RUFF_CONFIG_FILE'] = str(pyproject)
-    config_override('PYTHON_RUFF', ['.ruff.toml', 'ruff.toml'])
-    fallback('java-pmd-ruleset.xml', 'java-pmd-ruleset.xml', ['java-pmd-ruleset.xml', 'ruleset.xml', '**/pmd*.xml'])
-    config_override('JAVA_PMD', ['java-pmd-ruleset.xml', 'ruleset.xml', '**/pmd*.xml'])
-    fallback('.hadolint.yaml', '.hadolint.yaml', ['.hadolint.yaml', '.hadolint.yml'])
-    config_override('DOCKERFILE_HADOLINT', ['.hadolint.yaml', '.hadolint.yml'])
-    fallback('.jscpd.json', '.jscpd.json', ['.jscpd.json', '.jscpd.yaml', '.jscpd.yml'])
-    config_override('COPYPASTE_JSCPD', ['.jscpd.json', '.jscpd.yaml', '.jscpd.yml'])
+    config_override('PYTHON_RUFF', RUFF_CONFIGS)
+    fallback(PMD, PMD, PMD_CONFIGS)
+    config_override('JAVA_PMD', PMD_CONFIGS)
+    fallback(HADOLINT, HADOLINT, HADOLINT_CONFIGS)
+    config_override('DOCKERFILE_HADOLINT', HADOLINT_CONFIGS)
+    fallback(JSCPD, JSCPD, JSCPD_CONFIGS)
+    config_override('COPYPASTE_JSCPD', JSCPD_CONFIGS)
     pyproject = WORK / 'pyproject.toml'
     if pyproject.is_file() and '[tool.bandit' in pyproject.read_text(encoding='utf8'):
         os.environ['PYTHON_BANDIT_CONFIG_FILE'] = str(pyproject)
     else:
-        fallback('.bandit.yml', '.bandit.yml', ['.bandit', '.bandit.yml', 'bandit.yaml'])
-        config_override('PYTHON_BANDIT', ['.bandit.yml', 'bandit.yaml'])
-    fallback('.shellcheckrc', '.shellcheckrc', ['.shellcheckrc'])
-    fallback('.checkov.yml', '.checkov.yml', ['.checkov.yml', '.checkov.yaml'])
-    config_override('REPOSITORY_CHECKOV', ['.checkov.yml', '.checkov.yaml'])
+        fallback(BANDIT, BANDIT, ['.bandit', BANDIT, 'bandit.yaml'])
+        config_override('PYTHON_BANDIT', [BANDIT, 'bandit.yaml'])
+    fallback(SHELLCHECK, SHELLCHECK, [SHELLCHECK])
+    fallback(CHECKOV, CHECKOV, CHECKOV_CONFIGS)
+    config_override('REPOSITORY_CHECKOV', CHECKOV_CONFIGS)
     os.environ.update({'MEGALINTER_CONFIG': str(ROOT / 'megalinter.yml'), 'DEFAULT_WORKSPACE': str(WORK), 'GITHUB_WORKSPACE': str(WORK), 'APPLY_FIXES': 'none', 'VALIDATE_ALL_CODEBASE': 'true', 'PARALLEL': 'false', 'REPORT_OUTPUT_FOLDER': str(OUT), 'JSON_REPORTER': 'true', 'SARIF_REPORTER': 'true', 'PRE_COMMANDS': '[]', 'POST_COMMANDS': '[]', 'PLUGINS': '[]', 'EXTENDS': '[]'})
     os.chdir('/'); sys.exit(subprocess.call(['python', '-m', 'megalinter.run']))
 elif action in ('opengrep', 'semgrep'):

@@ -93,14 +93,22 @@ export interface HostMonitor {
 
 // ---------- Pure helpers ----------
 
-export const errorText = (error: unknown): string => typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
+export function errorText(error: unknown): string {
+  if (typeof error === "string") return error;
+  return error instanceof Error ? error.message : String(error);
+}
 /** The backend's bare code ("monitor_frozen" or "monitor_frozen: text"), or null for a free-text native message. */
 export function errorCode(error: unknown): string | null {
   const match = /^\s*([a-z][a-z0-9_]*)\s*(?::|$)/.exec(errorText(error));
   return match ? match[1] : null;
 }
 
-const pathKey = (path: string): string => path.replace(/^\\\\\?\\/, "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === "/") end--;
+  return value.slice(0, end);
+}
+const pathKey = (path: string): string => trimTrailingSlashes(path.replace(/^\\\\\?\\/, "").replaceAll("\\", "/")).toLowerCase();
 export function sameContext(a: HostMonitorContext | null, b: HostMonitorContext | null): boolean {
   if (a === null || b === null) return a === b;
   return a.instanceId === b.instanceId && a.generation === b.generation && pathKey(a.projectPath) === pathKey(b.projectPath);
@@ -128,7 +136,9 @@ export function sectionNotes(summary: HostSnapshotSummary): string[] {
   return (Object.keys(names) as (keyof typeof names)[]).flatMap(key => {
     const section = summary.sections[key];
     if (section.status === "ok") return [];
-    return [`${names[key]} ${section.status === "partial" ? "partially read" : "unavailable"}${section.error ? `: ${section.error}` : ""}`];
+    const state = section.status === "partial" ? "partially read" : "unavailable";
+    const detail = section.error ? `: ${section.error}` : "";
+    return [`${names[key]} ${state}${detail}`];
   });
 }
 
@@ -197,7 +207,8 @@ export function createHostMonitor(options: HostMonitorOptions): HostMonitor {
   let blockedOrigin: ExplainOrigin | null = null;
 
   const clearTimer = (): void => { if (timer !== null) { clock.clearTimeout(timer); timer = null; } };
-  const quietly = (call: () => Promise<unknown>): void => { try { void call().catch(() => {}); } catch { /* the backend closes idempotently */ } };
+  // An async wrapper invokes the call immediately and turns a synchronous throw into a rejection; the backend closes idempotently.
+  const quietly = (call: () => Promise<unknown>): void => { void (async () => call())().catch(() => {}); };
   const closeView = (id: string): void => quietly(() => transport.closeHostMonitor(id));
   const delay = (): number => Math.max(0, lastStart + SAMPLE_INTERVAL_MS - clock.now());
   const current = (token: number): boolean => token === epoch && !disposed;
@@ -205,7 +216,8 @@ export function createHostMonitor(options: HostMonitorOptions): HostMonitor {
   function query(): HostMonitorQuery {
     const { section, tcpView, text, offset } = read();
     const common = { text, offset, limit: PAGE_SIZE };
-    return section === "processes" ? { kind: "processes", ...common } : section === "udp" ? { kind: "udp", ...common } : { kind: "tcp", view: tcpView, ...common };
+    if (section === "processes") return { kind: "processes", ...common };
+    return section === "udp" ? { kind: "udp", ...common } : { kind: "tcp", view: tcpView, ...common };
   }
 
   /** Reads the current query from one snapshot; retried if the human changed the query while it loaded. */
@@ -269,8 +281,13 @@ export function createHostMonitor(options: HostMonitorOptions): HostMonitor {
     let pageError: string | null = null;
     if (first) {
       try { page = await pageFor(summary.snapshotId, token); }
-      catch (error) { if (error === FENCED) throw error; pageError = errorText(error); }
-    } else page = await pageFor(summary.snapshotId, token);
+      catch (error) {
+        if (error === FENCED) throw error;
+        pageError = errorText(error);
+      }
+    } else {
+      page = await pageFor(summary.snapshotId, token);
+    }
     if (!current(token) || frozen) throw FENCED;
     displayedId = summary.snapshotId;
     const explain = read().explain;
@@ -372,6 +389,10 @@ export function createHostMonitor(options: HostMonitorOptions): HostMonitor {
       if (current(token)) patch({ explain: { phase: "admitted", snapshotId, requestId: result.requestId, focused } });
       return;
     }
+    settleUnsent(token, origin, mine, snapshotId, result);
+  }
+
+  function settleUnsent(token: number, origin: ExplainOrigin, mine: boolean, snapshotId: string, result: HostExplainResult): void {
     const failure = result.error ?? { code: "not_sent", message: "The Architect did not accept the request." };
     if (result.promptSent === null) {
       if (current(token)) patch({ explain: { phase: "uncertain", snapshotId, requestId: result.requestId, message: failure.message } });
@@ -412,7 +433,11 @@ export function createHostMonitor(options: HostMonitorOptions): HostMonitor {
       void reload();
     },
     setTcpView(view) { patch({ section: "tcp", tcpView: view, offset: 0 }); void reload(); },
-    setText(text) { if (text === read().text) return; patch({ text, offset: 0 }); void reload(); },
+    setText(text) {
+      if (text === read().text) return;
+      patch({ text, offset: 0 });
+      void reload();
+    },
     loadPage(offset) { patch({ offset: Math.max(0, Math.floor(offset)) }); void reload(); },
 
     refresh() {
@@ -428,7 +453,7 @@ export function createHostMonitor(options: HostMonitorOptions): HostMonitor {
     async explainDisplayed(origin) {
       const state = read();
       const snapshotId = displayedId;
-      if (disposed || !visible || !snapshotId || !state.summary || state.summary.snapshotId !== snapshotId) return;
+      if (disposed || !visible || !snapshotId || state.summary?.snapshotId !== snapshotId) return;
       if (state.explain.phase !== "idle" && state.explain.phase !== "failed") return;
       // Freeze locally first so no candidate can replace the snapshot being explained.
       frozen = true;

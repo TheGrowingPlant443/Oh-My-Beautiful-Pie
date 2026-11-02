@@ -30,7 +30,7 @@ const JOB = '11111111-1111-4111-8111-111111111111', ATTEMPT = '22222222-2222-422
 const NONCE = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
 const ids = { jobId: JOB, attemptId: ATTEMPT, stageId: STAGE };
 let counter = 0;
-const unique = () => Array.from({ length: 40 }, () => `Rule ${counter++} covers case ${Math.random().toString(36).slice(2)}.`).join(' ');
+const unique = () => Array.from({ length: 40 }, () => `Rule ${counter++} covers case ${crypto.randomUUID().replaceAll('-', '').slice(0, 11)}.`).join(' ');
 const script = [];
 const model = createMockModel({
   contextWindow: 12000,

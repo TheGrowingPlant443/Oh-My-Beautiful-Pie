@@ -240,7 +240,6 @@ class CVisitor(Visitor):
     def _split_name(self, name_node):
         """(qualifier|None, simple_name, flags) for a declarator name node."""
         t = name_node.type
-        flags = {}
         if t == "qualified_identifier":
             inner = name_node
             while inner.type == "qualified_identifier":
@@ -250,21 +249,21 @@ class CVisitor(Visitor):
                 inner = nxt
             full = self.ctx.source[name_node.start_byte:inner.start_byte].decode("utf-8", "replace")
             qualifier = full.rstrip().removesuffix("::") or None
-            simple = self.text(inner)
-            if inner.type == "destructor_name":
-                flags["destructor"] = True
-            if inner.type == "template_function":
-                nm = inner.child_by_field_name("name")
-                simple = self.text(nm) if nm is not None else simple
-                flags["generic"] = True
+            simple, flags = self._simple_name(inner)
             return qualifier, simple, flags
+        simple, flags = self._simple_name(name_node)
+        return None, simple, flags
+
+    def _simple_name(self, name_node):
+        t = name_node.type
+        flags = {}
         if t == "destructor_name":
             flags["destructor"] = True
         if t == "template_function":
             nm = name_node.child_by_field_name("name")
             flags["generic"] = True
-            return None, self.text(nm) if nm is not None else self.text(name_node), flags
-        return None, self.text(name_node), flags
+            return self.text(nm) if nm is not None else self.text(name_node), flags
+        return self.text(name_node), flags
 
     # -- function definitions -----------------------------------------------------------------------
     def _is_static(self, node) -> bool:
@@ -345,10 +344,7 @@ class CVisitor(Visitor):
                                bindings=bindings, exported=exported)
         rng = (body.start_byte, body.end_byte) if body is not None else (node.end_byte, node.end_byte)
         sym["bindings"]["parameters"] = self._declare_params(fdecl, rng)
-        if kind == "function":
-            start, end = self._container_range(node)
-            self.ctx.declare(simple, "function", start, end, symbol_id=sym["id"], owner=self._outer_owner())
-        elif kind in ("method", "constructor") and qualifier is None:
+        if kind == "function" or (kind in ("method", "constructor") and qualifier is None):
             start, end = self._container_range(node)
             self.ctx.declare(simple, "function", start, end, symbol_id=sym["id"], owner=self._outer_owner())
         return None
@@ -374,47 +370,51 @@ class CVisitor(Visitor):
 
     # -- declarations -------------------------------------------------------------------------------------
     def _declaration(self, node):
-        kids = fields_of(node, "declarator")
         in_class = node.type == "field_declaration"
         cls = self._enclosing_class()
-        for d in kids:
-            value = None
-            target = d
-            if d.type == "init_declarator":
-                value = d.child_by_field_name("value")
-                target = d.child_by_field_name("declarator")
-            if target is None:
-                continue
-            name_node, fdecl, direct = self.descend(target)
-            if name_node is None:
-                continue
-            qualifier, simple, flags = self._split_name(name_node)
-            if fdecl is not None and direct:
-                kind = "signature"
-                bindings = {"body": False, "declarationOnly": True, "static": self._is_static(node)}
-                if flags.get("destructor"):
-                    bindings["destructor"] = True
-                if in_class and cls is not None:
-                    bindings["method"] = True
-                    bindings["className"] = cls.name
-                elif qualifier:
-                    bindings["qualifier"] = qualifier
-                if self.dialect != "cpp" or qualifier is None:
-                    sym = self.add_symbol(node, kind, simple, node_kind=node.type, bindings=bindings,
-                                          span=name_node, exported=None if in_class else not bindings["static"])
-                    start, end = self._container_range(node)
-                    self.ctx.declare(simple, "function", start, end, symbol_id=sym["id"])
-                continue
-            if name_node.type not in ("identifier", "field_identifier"):
-                continue
-            if in_class and cls is not None:
-                start, end = self._container_range(node)
-                self.declare(simple, "variable", start, end, value=value, position=name_node.start_byte)
-            else:
-                start, end = self._local_range(node)
-                self.declare(simple, "variable", start, end, mutable=True, value=value,
-                             position=name_node.start_byte)
+        for d in fields_of(node, "declarator"):
+            self._declarator(node, d, in_class, cls)
         return None
+
+    def _declarator(self, node, decl, in_class, cls):
+        value = None
+        target = decl
+        if decl.type == "init_declarator":
+            value = decl.child_by_field_name("value")
+            target = decl.child_by_field_name("declarator")
+        if target is None:
+            return
+        name_node, fdecl, direct = self.descend(target)
+        if name_node is None:
+            return
+        qualifier, simple, flags = self._split_name(name_node)
+        if fdecl is not None and direct:
+            self._signature(node, name_node, qualifier, simple, flags, in_class, cls)
+            return
+        if name_node.type not in ("identifier", "field_identifier"):
+            return
+        if in_class and cls is not None:
+            start, end = self._container_range(node)
+            self.declare(simple, "variable", start, end, value=value, position=name_node.start_byte)
+        else:
+            start, end = self._local_range(node)
+            self.declare(simple, "variable", start, end, mutable=True, value=value,
+                         position=name_node.start_byte)
+
+    def _signature(self, node, name_node, qualifier, simple, flags, in_class, cls):
+        bindings = {"body": False, "declarationOnly": True, "static": self._is_static(node)}
+        if flags.get("destructor"):
+            bindings["destructor"] = True
+        if in_class and cls is not None:
+            bindings["method"] = True
+            bindings["className"] = cls.name
+        elif qualifier:
+            bindings["qualifier"] = qualifier
+        if self.dialect != "cpp" or qualifier is None:
+            sym = self.add_symbol(node, "signature", simple, node_kind=node.type, bindings=bindings,
+                                  span=name_node, exported=None if in_class else not bindings["static"])
+            start, end = self._container_range(node)
+            self.ctx.declare(simple, "function", start, end, symbol_id=sym["id"])
 
     def visit_declaration(self, node):
         return self._declaration(node)
@@ -517,21 +517,7 @@ class CVisitor(Visitor):
         if t == "identifier":
             return {"kind": "identifier", "name": raw, "receiver": None, "receiverKind": None}, False
         if t == "field_expression":
-            arg = fn.child_by_field_name("argument")
-            field = fn.child_by_field_name("field")
-            if field is None:
-                return dyn, True
-            name = self.text(field)
-            b = {"kind": "member", "name": name, "receiver": self.text(arg) if arg is not None else None,
-                 "receiverKind": self._receiver_kind(arg)}
-            op = next((c for c in fn.children if c.type in (".", "->", ".*", "->*")), None)
-            b["operator"] = op.type if op is not None else "."
-            if field.type == "template_method":
-                nm = field.child_by_field_name("name")
-                b["name"] = self.text(nm) if nm is not None else name
-                b["generic"] = True
-            # C: a call through a struct field is a call through a function pointer
-            return b, self.dialect != "cpp"
+            return self._field_callee(fn, dyn)
         if t == "qualified_identifier":
             qualifier, simple, flags = self._split_name(fn)
             b = {"kind": "path", "name": simple, "receiver": qualifier, "receiverKind": "path"}
@@ -545,6 +531,23 @@ class CVisitor(Visitor):
         if t in ("dependent_name", "operator_name"):
             return {"kind": "identifier", "name": raw, "receiver": None, "receiverKind": None}, False
         return dyn, True
+
+    def _field_callee(self, fn, dyn):
+        arg = fn.child_by_field_name("argument")
+        field = fn.child_by_field_name("field")
+        if field is None:
+            return dyn, True
+        name = self.text(field)
+        binding = {"kind": "member", "name": name, "receiver": self.text(arg) if arg is not None else None,
+                   "receiverKind": self._receiver_kind(arg)}
+        op = next((c for c in fn.children if c.type in (".", "->", ".*", "->*")), None)
+        binding["operator"] = op.type if op is not None else "."
+        if field.type == "template_method":
+            nm = field.child_by_field_name("name")
+            binding["name"] = self.text(nm) if nm is not None else name
+            binding["generic"] = True
+        # C: a call through a struct field is a call through a function pointer
+        return binding, self.dialect != "cpp"
 
     def _receiver_kind(self, node):
         if node is None:
@@ -627,7 +630,7 @@ class CVisitor(Visitor):
         label = f"{sign}[{cname} {selector}]"
         b = {"selector": selector, "instance": sign == "-", "className": cname, "body": defined, "static": sign == "+"}
         if not defined:
-            sym = self.add_symbol(node, "signature", selector, qualified=label, bindings={**b, "declarationOnly": True})
+            self.add_symbol(node, "signature", selector, qualified=label, bindings={**b, "declarationOnly": True})
             return None
         sym = self.open_symbol(node, "method", selector, qualified=label, scope_name=label, bindings=b)
         body = child_of_type(node, "compound_statement")
@@ -705,5 +708,5 @@ def _post(ctx: common.Context, v: CVisitor, root) -> None:
             "not supported and appear as syntax errors")
 
 
-def extract(language: str, source: bytes, ctx: common.Context) -> dict:
+def extract(_language: str, _source: bytes, ctx: common.Context) -> dict:
     return kit_walk.run_extract(ctx, CVisitor, _post)

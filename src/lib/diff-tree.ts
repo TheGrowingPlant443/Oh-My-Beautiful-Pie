@@ -6,6 +6,13 @@ export type TreeNode =
 
 type FolderNode = Extract<TreeNode, { kind: "folder" }>;
 
+/** Folders before files, then by name. */
+function compareNodes(a: TreeNode, b: TreeNode): number {
+  if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
+  if (a.name === b.name) return 0;
+  return a.name < b.name ? -1 : 1;
+}
+
 /** Folder tree for slash-separated paths. `prefix` keeps folder keys of different lists (groups) distinct. */
 export function buildTree(files: DiffFile[], prefix: string): TreeNode[] {
   const roots: TreeNode[] = [];
@@ -26,10 +33,10 @@ export function buildTree(files: DiffFile[], prefix: string): TreeNode[] {
       folder.count++;
       siblings = folder.children;
     }
-    siblings.push({ kind: "file", name: parts[parts.length - 1], depth: parts.length - 1, file });
+    siblings.push({ kind: "file", name: parts.at(-1)!, depth: parts.length - 1, file });
   }
   const order = (nodes: TreeNode[]): void => {
-    nodes.sort((a, b) => (a.kind === b.kind ? (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) : a.kind === "folder" ? -1 : 1));
+    nodes.sort(compareNodes);
     for (const node of nodes) if (node.kind === "folder") order(node.children);
   };
   order(roots);
