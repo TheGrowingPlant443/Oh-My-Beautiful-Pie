@@ -8,16 +8,33 @@
  #include <string.h>
  
  #include "kiosk-shell.h"
-@@ -309,7 +310,11 @@
+@@ -304,12 +305,18 @@
+ kiosk_shell_surface_set_fullscreen(struct kiosk_shell_surface *shsurf,
+ 				   struct kiosk_shell_output *shoutput)
+ {
++	const char *app_id = weston_desktop_surface_get_app_id(shsurf->desktop_surface);
++	bool maximize = getenv("OMBP_KIOSK_MAXIMIZE") != NULL ||
++			(app_id && strcmp(app_id, "zenity") == 0);
++
+ 	if (!shoutput)
+ 		shoutput = kiosk_shell_surface_find_best_output(shsurf);
  
  	kiosk_shell_surface_set_output(shsurf, shoutput);
  
 -	weston_desktop_surface_set_fullscreen(shsurf->desktop_surface, true);
-+	/* The launcher's browser display maximizes instead, so browsers keep their address bar. */
-+	weston_desktop_surface_set_maximized(shsurf->desktop_surface,
-+					     getenv("OMBP_KIOSK_MAXIMIZE") != NULL);
-+	weston_desktop_surface_set_fullscreen(shsurf->desktop_surface,
-+					      getenv("OMBP_KIOSK_MAXIMIZE") == NULL);
++	/* Keep picker controls and browser address bars, but leave OMBP borderless. */
++	weston_desktop_surface_set_maximized(shsurf->desktop_surface, maximize);
++	weston_desktop_surface_set_fullscreen(shsurf->desktop_surface, !maximize);
  	if (shsurf->output)
  		weston_desktop_surface_set_size(shsurf->desktop_surface,
  						shsurf->output->output->width,
+@@ -1018,6 +1025,9 @@
+ 		/* even if we couldn't find an appid set for a particular
+ 		 * output still flag the shsurf as to a avoid changing the
+ 		 * output every time */
++		/* App identity may arrive after the initial fullscreen configure. */
++		if (!shsurf->parent)
++			kiosk_shell_surface_set_fullscreen(shsurf, shoutput);
+ 		shsurf->appid_output_assigned = true;
+ 	}
+ 

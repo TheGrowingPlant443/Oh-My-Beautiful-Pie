@@ -495,8 +495,9 @@ class Runtime:
         socket.unlink(missing_ok=True)
         env = {key: os.environ[key] for key in ("PATH", "LANG", "LOCALE_ARCHIVE") if key in os.environ}
         env.update(HOME=str(directory), XDG_RUNTIME_DIR=str(directory), WAYLAND_DISPLAY=str(host_socket))
-        # Maximized windows keep both dialog Select/Cancel buttons and Chrome's address bar visible.
-        env["OMBP_KIOSK_MAXIMIZE"] = "1"
+        if name == "wayland-browser":
+            # OMBP stays borderless; the kiosk patch independently maximizes Zenity pickers.
+            env["OMBP_KIOSK_MAXIMIZE"] = "1"
         process = subprocess.Popen(
             [sys.executable, str(Path(__file__).parent / "desktop.py"), str(os.getpid()), weston,
              "--backend=wayland", "--renderer=pixman", "--shell=kiosk-shell.so",
