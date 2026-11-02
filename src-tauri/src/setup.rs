@@ -423,7 +423,8 @@ fn scoped_plugin_package(
         .map_err(|e| format!("{role} plugin {name}: package.json is unreadable: {e}"))?;
     let json: Value = serde_json::from_str(&text)
         .map_err(|e| format!("{role} plugin {name}: package.json is invalid: {e}"))?;
-    let declared = ["omp", "pi"]
+    let declared = crate::toolchain::Agent::current()
+        .manifest_keys()
         .iter()
         .find_map(|key| json.get(*key).filter(|v| v.is_object()))
         .and_then(|manifest| manifest.get("extensions"))
@@ -569,7 +570,7 @@ fn repository_folder(root: &Path) -> Result<PathBuf> {
     if !root.is_dir() {
         return Err(format!("Repository is not a directory: {}", root.display()));
     }
-    let folder = root.join(".omp");
+    let folder = root.join(crate::toolchain::Agent::current().dir_name());
     match fs::symlink_metadata(&folder) {
         Ok(_) => {
             let resolved = canonical(&folder)

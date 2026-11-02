@@ -23,7 +23,7 @@ fn program(override_variable: &str, name: &str) -> OsString {
 /// `OMP_BIN`, else `omp` from `PATH` or the per-user install locations.
 #[must_use]
 pub fn omp_program() -> OsString {
-    program("OMP_BIN", "omp")
+    program("OMP_BIN", crate::toolchain::Agent::current().command())
 }
 
 /// `BUN_BIN`, else `bun` from `PATH` or the per-user install locations.

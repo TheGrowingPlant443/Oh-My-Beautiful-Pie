@@ -5,6 +5,8 @@ import { createInterface } from 'node:readline';
 import { NATIVE_UI_CAPTURE_ERROR } from './omp-native-ui.mjs';
 import { configSetupResources, configSetupSettings, registerConfigSetupChild } from './omp-config-policy.mjs';
 import { literalAnalysisPrompt } from './omp-visualization-guard.mjs';
+// OMBP_AGENT=omsp drives the omsp fork, whose packages use their own npm scope.
+const sdkScope = process.env.OMBP_AGENT === 'omsp' ? '@oh-my-striped-pi' : '@oh-my-pi';
 
 const PATCH = Symbol.for('omp-manager.workspace-host');
 export const WORKSPACE_COMPATIBILITY_ERROR = 'OMP workspace integration requires native move, rollback, BTW and removable pre-model hooks';
@@ -617,7 +619,7 @@ export function installWorkspaceChanges(pi, options) {
 
 export async function relocateSavedSession(request, decide) {
   const sdk = path.resolve(request.sdkDir);
-  const dirs = await import(pathToFileURL(Bun.resolveSync('@oh-my-pi/pi-utils/dirs', sdk)).href);
+  const dirs = await import(pathToFileURL(Bun.resolveSync(`${sdkScope}/pi-utils/dirs`, sdk)).href);
   dirs.setProfile(request.profile || 'default');
   const { SessionManager } = await import(pathToFileURL(path.join(sdk, 'src/session/session-manager.ts')).href);
   const manager = await SessionManager.open(request.sessionFile, undefined, undefined, { throwIfMissing: true, initialCwd: request.cwd });

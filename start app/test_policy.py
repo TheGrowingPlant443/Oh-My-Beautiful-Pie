@@ -175,15 +175,18 @@ class PolicyTests(unittest.TestCase):
     def test_folder_write_default_and_auto_start_persist_and_validate(self):
         value = self.policy.snapshot()
         self.assertEqual((value["folder_write_default"], value["auto_start"]), (False, None))
-        launch = {"source": "/src/ombp", "mode": "container", "desktop": True, "gpu": "amd"}
+        launch = {"source": "/src/ombp", "mode": "container", "desktop": True, "gpu": "amd", "agent": "omsp"}
         value.update(folder_write_default=True, auto_start=launch)
         self.policy.replace(value)
         saved = Policy(self.policy.directory).snapshot()
         self.assertEqual((saved["folder_write_default"], saved["auto_start"]), (True, launch))
         self.policy.replace({**value, "auto_start": {**launch, "source": "~/ombp"}})
         self.assertEqual(self.policy.snapshot()["auto_start"]["source"], str(Path.home() / "ombp"))
+        older = {key: launch[key] for key in ("source", "mode", "desktop", "gpu")}
+        self.policy.replace({**value, "auto_start": older})
+        self.assertEqual(self.policy.snapshot()["auto_start"]["agent"], "omp")
         for bad in ({**launch, "mode": "root"}, {**launch, "source": " "}, {**launch, "source": 5},
-                    {**launch, "extra": 1}, {**launch, "gpu": "intel"}, "yes"):
+                    {**launch, "extra": 1}, {**launch, "gpu": "intel"}, {**launch, "agent": "x"}, "yes"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self.policy.replace({**value, "auto_start": bad})
         with self.assertRaises(ValueError):

@@ -7,8 +7,10 @@
     inputs.nixpkgs.follows = "nixpkgs";
   };
   inputs.crane.url = "github:ipetkov/crane";
+  # The omsp fork builds with its own nixpkgs/bun pins; no follows.
+  inputs.omsp.url = "github:TheGrowingPlant443/oh-my-striped-pi";
 
-  outputs = { self, nixpkgs, fenix, crane }:
+  outputs = { self, nixpkgs, fenix, crane, omsp }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
@@ -213,9 +215,39 @@
               platforms = systems;
             };
           });
+          omspSdk = omsp.packages.${stdenv.hostPlatform.system}.sdk;
+          omspSdkDir = "${omspSdk}/packages/coding-agent";
+          omspBun = "${omspSdk.bun}/bin/bun";
+          omspCommand = pkgs.writeShellScript "omsp-manager-cli" ''
+            unset PI_COMPILED OMSP_COMPILED
+            exec "''${BUN_BIN:-${omspBun}}" ${omspSdkDir}/src/cli.ts "$@"
+          '';
+          # Same app, driving the omsp fork. --set-default keeps launcher overrides (container OMP_BIN) working;
+          # this outer wrapper runs first, so its defaults win over the omp ones. The repeated runtimeTools PATH
+          # keeps the bundled tools visible to the sandbox launcher, which scans only this outer wrapper.
+          omspPackage = pkgs.symlinkJoin {
+            name = "omp-manager-omsp";
+            paths = [ package ];
+            nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
+            postBuild = ''
+              wrapProgram "$out/bin/omp-manager" \
+                --suffix PATH : ${lib.makeBinPath runtimeTools} \
+                --set OMBP_AGENT omsp \
+                --set-default OMP_SDK_DIR ${omspSdkDir} \
+                --set-default OMP_BIN ${omspCommand} \
+                --set-default BUN_BIN ${omspBun} \
+                --set-default OMSP_CONFIG_DIR .omp
+            '' + lib.optionalString stdenv.hostPlatform.isLinux ''
+              rm "$out/share/applications/omp-manager.desktop"
+              substitute ${package}/share/applications/omp-manager.desktop "$out/share/applications/omp-manager.desktop" \
+                --replace-fail "Exec=${package}/bin/omp-manager" "Exec=$out/bin/omp-manager"
+            '' + lib.optionalString stdenv.hostPlatform.isDarwin ''
+              ln -sfn "$out/bin/omp-manager" "$out/Applications/OMP Manager.app/Contents/MacOS/omp-manager"
+            '';
+          };
         in
         {
-          inherit package frontend sdk;
+          inherit package frontend sdk omspPackage;
           shell = pkgs.mkShell ({
             packages = [
               coverageRust pkgs.pkg-config pkgs.cmake
@@ -247,6 +279,7 @@
         omp-manager = values.package;
         frontend = values.frontend;
         sdk = values.sdk;
+        omsp = values.omspPackage;
       });
       apps = forAll (pkgs: {
         default = {

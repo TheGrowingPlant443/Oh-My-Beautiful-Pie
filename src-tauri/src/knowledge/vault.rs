@@ -21,8 +21,9 @@ const MAX_PENDING: usize = 32;
 /// Folders OMP Manager creates inside a vault; anything already there is preserved.
 const MANAGED_FOLDERS: [&str; 2] = ["Agent setup", "SRS"];
 /// A destination may not be (or sit inside) a folder with one of these names: credentials, tool caches, VCS internals.
-const DENIED_COMPONENTS: [&str; 11] = [
+const DENIED_COMPONENTS: [&str; 12] = [
     ".omp",
+    ".omsp",
     ".pi",
     ".ssh",
     ".gnupg",
@@ -319,9 +320,17 @@ impl KnowledgeService {
         let mut roots = vec![
             self.app_config.clone(),
             self.home.join(".omp"),
+            self.home.join(".omsp"),
             self.home.join(".pi"),
         ];
-        for variable in ["PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "PI_NATIVES_DIR"] {
+        for variable in [
+            "PI_CODING_AGENT_DIR",
+            "PI_CONFIG_DIR",
+            "PI_NATIVES_DIR",
+            "OMSP_CODING_AGENT_DIR",
+            "OMSP_CONFIG_DIR",
+            "OMSP_NATIVES_DIR",
+        ] {
             if let Some(value) = std::env::var_os(variable).filter(|v| !v.is_empty()) {
                 roots.push(PathBuf::from(value));
             }

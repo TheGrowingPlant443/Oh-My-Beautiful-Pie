@@ -64,16 +64,19 @@ pub fn now_ms() -> u64 {
 
 #[must_use]
 pub fn agent_dir(home: &Path, profile: &str) -> PathBuf {
+    let agent = crate::toolchain::Agent::current();
     let root = home.join(
-        std::env::var_os("PI_CONFIG_DIR")
+        std::env::var_os(agent.config_dir_variable())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| ".omp".into()),
+            .unwrap_or_else(|| agent.dir_name().into()),
     );
     if profile.is_empty() || profile == "default" {
-        let inherited = std::env::var("OMP_PROFILE")
-            .or_else(|_| std::env::var("PI_PROFILE"))
+        let inherited = agent
+            .profile_variables()
+            .iter()
+            .find_map(|name| std::env::var(name).ok())
             .unwrap_or_default();
-        if let Some(path) = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from) {
+        if let Some(path) = std::env::var_os(agent.agent_dir_variable()).map(PathBuf::from) {
             let inherited_path = root.join("profiles").join(&inherited).join("agent");
             if inherited.is_empty() || !same_path(&path, &inherited_path) {
                 return path;
@@ -500,11 +503,13 @@ pub fn render_transcript_file(
     command
         .current_dir(&input.project_path)
         .env("OMP_PROFILE", &input.profile)
-        .env_remove("PI_COMPILED");
-    command.env(
-        "PI_CONFIG_FILES",
-        std::env::join_paths(&utility.configs).map_err(|e| e.to_string())?,
-    );
+        .env("OMSP_PROFILE", &input.profile)
+        .env_remove("PI_COMPILED")
+        .env_remove("OMSP_COMPILED");
+    let configs = std::env::join_paths(&utility.configs).map_err(|e| e.to_string())?;
+    command
+        .env("PI_CONFIG_FILES", &configs)
+        .env("OMSP_CONFIG_FILES", &configs);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

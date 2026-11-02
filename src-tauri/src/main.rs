@@ -76,6 +76,10 @@ pub struct AppState {
 }
 
 fn main() {
+    if let Err(error) = toolchain::Agent::parse(std::env::var("OMBP_AGENT").ok().as_deref()) {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
     // A desktop-launched app inherits a PATH that can lack `~/.local/bin`, `~/.nix-profile/bin` or Homebrew.
     #[cfg(unix)]
     toolchain::extend_path_for_desktop_launch();

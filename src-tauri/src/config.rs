@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::toolchain::Agent;
+
 pub type Result<T, E = String> = std::result::Result<T, E>;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -622,7 +624,9 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 }
 
 #[cfg(unix)]
-const SDK_PACKAGE: &str = "node_modules/@oh-my-pi/pi-coding-agent";
+fn sdk_package_dir() -> String {
+    format!("node_modules/{}", Agent::current().sdk_package())
+}
 
 /// Where the installed OMP SDK (`@oh-my-pi/pi-coding-agent`) may be, most specific first. `OMP_SDK_DIR` is exclusive.
 fn sdk_candidates(
@@ -634,17 +638,20 @@ fn sdk_candidates(
         return vec![PathBuf::from(path)];
     }
     let mut candidates = vec![];
+    let package = Agent::current().sdk_package();
     if let Some(root) = env("BUN_INSTALL") {
         candidates.push(
-            PathBuf::from(root).join("install/global/node_modules/@oh-my-pi/pi-coding-agent"),
+            PathBuf::from(root)
+                .join("install/global/node_modules")
+                .join(package),
         );
     }
-    candidates.push(home.join(".bun/install/global/node_modules/@oh-my-pi/pi-coding-agent"));
+    candidates.push(home.join(".bun/install/global/node_modules").join(package));
     #[cfg(unix)]
     {
         // The app's user-owned Nix SDK directory; see the README "Linux and macOS" setup.
         for data in app_data_dirs(home, env) {
-            candidates.push(data.join("omp-manager/sdk").join(SDK_PACKAGE));
+            candidates.push(data.join("omp-manager/sdk").join(sdk_package_dir()));
         }
         // A package-manager install: `omp` is (a link into) `<prefix>/node_modules/@oh-my-pi/pi-coding-agent/...`.
         if let Some(real) = omp
@@ -653,10 +660,10 @@ fn sdk_candidates(
         {
             let ancestors = real.ancestors().skip(1).filter(|a| a.parent().is_some());
             for ancestor in ancestors {
-                if ancestor.ends_with("@oh-my-pi/pi-coding-agent") {
+                if ancestor.ends_with(package) {
                     candidates.push(ancestor.to_path_buf());
                 }
-                candidates.push(ancestor.join(SDK_PACKAGE));
+                candidates.push(ancestor.join(sdk_package_dir()));
             }
         }
     }
@@ -689,7 +696,7 @@ pub(crate) fn sdk_dir(home: &Path) -> Result<PathBuf> {
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
         if package
             .as_ref()
-            .is_some_and(|p| p["name"] == "@oh-my-pi/pi-coding-agent")
+            .is_some_and(|p| p["name"] == Agent::current().sdk_package())
             && candidate.join("src/config/settings.ts").is_file()
             && candidate.join("src/config/registry.ts").is_file()
         {
@@ -701,9 +708,9 @@ pub(crate) fn sdk_dir(home: &Path) -> Result<PathBuf> {
         }
     }
     let hint = if cfg!(unix) {
-        " On Linux/macOS build the matching SDK with Nix as described in the README section \"Linux and macOS\", then set OMP_SDK_DIR to its @oh-my-pi/pi-coding-agent directory."
+        format!(" On Linux/macOS build the matching SDK with Nix as described in the README section \"Linux and macOS\", then set OMP_SDK_DIR to its {} directory.", Agent::current().sdk_package())
     } else {
-        ""
+        String::new()
     };
     Err(format!("Portable config requires Bun and the installed OMP SDK. Set BUN_BIN / OMP_SDK_DIR if they are not discoverable.{hint}"))
 }
@@ -721,7 +728,9 @@ pub fn check_sdk_version(sdk: &Path) -> Result<()> {
         .output()
         .map_err(|e| format!("Read OMP version: {e}"))?;
     let runtime_version = String::from_utf8_lossy(&version.stdout);
-    if !version.status.success() || runtime_version.trim() != format!("omp/{sdk_version}") {
+    if !version.status.success()
+        || runtime_version.trim() != format!("{}/{sdk_version}", Agent::current().command())
+    {
         return Err(format!("OMP SDK {sdk_version} does not match executable {}. Set OMP_SDK_DIR to its installed SDK.", runtime_version.trim()));
     }
     Ok(())
@@ -740,6 +749,7 @@ pub fn native_request(root: &Path, home: &Path, mut request: Value) -> Result<Va
         .arg(root.join("omp-config.mjs"))
         .current_dir(cwd)
         .env_remove("PI_COMPILED")
+        .env_remove("OMSP_COMPILED")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

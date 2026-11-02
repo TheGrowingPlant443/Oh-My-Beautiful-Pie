@@ -139,6 +139,7 @@ impl Pty {
         let mut cmd = CommandBuilder::new(crate::toolchain::bun_program());
         cmd.arg(cli);
         cmd.env_remove("PI_COMPILED");
+        cmd.env_remove("OMSP_COMPILED");
         cmd.cwd(&definition.input.project_path);
         Self::add_session_args(&mut cmd, definition, &prepared)?;
         Self::add_extensions(&mut cmd, definition, bridge, app_root, local_enabled)?;
@@ -341,6 +342,9 @@ impl Pty {
         cmd.env("PI_BROWSER_RELAY", "0");
         cmd.env("PI_BROWSER_TERN", "0");
         cmd.env("PI_BROWSER_CMUX", "0");
+        cmd.env("OMSP_BROWSER_RELAY", "0");
+        cmd.env("OMSP_BROWSER_TERN", "0");
+        cmd.env("OMSP_BROWSER_CMUX", "0");
         Ok(())
     }
     /// The user's own shell: no OMP arguments, no bridge credentials, nothing from the manager environment.

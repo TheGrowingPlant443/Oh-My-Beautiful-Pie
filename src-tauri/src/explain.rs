@@ -210,6 +210,7 @@ pub fn explain_with(
     let mut cmd = Command::new(program);
     cmd.args(prefix);
     cmd.env_remove("PI_COMPILED");
+    cmd.env_remove("OMSP_COMPILED");
     cmd.args([
         "-p",
         "--no-session",

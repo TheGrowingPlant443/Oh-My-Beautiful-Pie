@@ -161,16 +161,23 @@ class Runtime:
         disabled = self.policy.snapshot()["disabled_requirements"]
         return [{**item, "enabled": item["id"] not in disabled} for item in self.requirements]
 
-    def start(self, source, mode, desktop, gpu):
+    @staticmethod
+    def _launch_source(source, mode, desktop, gpu, agent):
+        """The resolved OMBP checkout, once every launch setting is valid."""
+        source = Path(source).expanduser().resolve(strict=True)
+        if not source.is_dir() or not (source / "flake.nix").is_file():
+            raise ValueError("Choose the OMBP source folder containing flake.nix")
+        if (mode not in ("normal", "container") or gpu not in ("none", "amd", "nvidia")
+                or not isinstance(desktop, bool) or agent not in ("omp", "omsp")):
+            raise ValueError("Invalid launch settings")
+        return source
+
+    def start(self, source, mode, desktop, gpu, agent):
         with self.lock:
             if self.status()["running"]:
                 raise ValueError("Already running")
             self.stop()
-            source = Path(source).expanduser().resolve(strict=True)
-            if not source.is_dir() or not (source / "flake.nix").is_file():
-                raise ValueError("Choose the OMBP source folder containing flake.nix")
-            if mode not in ("normal", "container") or gpu not in ("none", "amd", "nvidia") or not isinstance(desktop, bool):
-                raise ValueError("Invalid launch settings")
+            source = self._launch_source(source, mode, desktop, gpu, agent)
             self.mode = mode
             self.launch = None
             self.last_error = ""
@@ -180,7 +187,8 @@ class Runtime:
                     if self.closing:
                         raise RuntimeError("Launch cancelled: launcher is closing")
                     build = self.build_process = subprocess.Popen(
-                        ["nix", "build", "path:.#default", "--no-link", "--print-out-paths", "--no-write-lock-file"],
+                        ["nix", "build", f"path:.#{'default' if agent == 'omp' else 'omsp'}", "--no-link",
+                         "--print-out-paths", "--no-write-lock-file"],
                         cwd=source, stdout=subprocess.PIPE, stderr=self.log, text=True)
                 try:
                     output, _ = build.communicate()
@@ -198,18 +206,20 @@ class Runtime:
                     executable = str((Path(outputs[0]) / "bin/omp-manager").resolve(strict=True))
                     if not Path(executable).is_file() or not os.access(executable, os.X_OK):
                         raise ValueError("OMBP build has no executable bin/omp-manager")
-                    self.launch = {"source": str(source), "executable": executable, "desktop": desktop, "gpu": gpu}
+                    self.launch = {"source": str(source), "executable": executable, "desktop": desktop, "gpu": gpu,
+                                   "agent": agent}
                     if mode == "normal":
                         self.process = subprocess.Popen([executable], stdout=self.log, stderr=self.log,
+                                                        env={**os.environ, "OMBP_AGENT": agent},
                                                         start_new_session=True)
                     else:
-                        self._container_start(executable, desktop, gpu, source)
+                        self._container_start(executable, desktop, gpu, source, agent)
                     threading.Thread(target=self._watch, args=(self.process,), daemon=True).start()
             except Exception:
                 self.stop()
                 raise
 
-    def _container_start(self, executable, desktop, gpu, source):
+    def _container_start(self, executable, desktop, gpu, source, agent):
         info = json.loads(subprocess.run(["podman", "info", "--format", "json"],
                           check=True, text=True, capture_output=True, timeout=30).stdout)
         if not info["host"]["security"]["rootless"] or info["host"].get("serviceIsRemote"):
@@ -277,7 +287,7 @@ class Runtime:
                "all_proxy": PROXY_URL, "no_proxy": LOOPBACK, "NODE_USE_ENV_PROXY": "1",
                "SSL_CERT_FILE": TRUST_CA, "NODE_EXTRA_CA_CERTS": TRUST_CA,
                "REQUESTS_CA_BUNDLE": TRUST_CA, "CURL_CA_BUNDLE": TRUST_CA,
-               "OMP_BIN": "/launcher/omp",
+               "OMP_BIN": "/launcher/omp", "OMBP_AGENT": agent,
                "START_APP_KEYRING": keyring, "SHELL": shell, "FONTCONFIG_FILE": fonts,
                "GDK_BACKEND": "wayland", "NIXOS_OZONE_WL": "1"}
         browsers = base["tool-chrome"]["programs"]

@@ -156,10 +156,12 @@ class Policy:
         """None, or the launch settings to start with whenever the launcher starts."""
         if value is None:
             return None
-        if (not isinstance(value, dict) or set(value) != {"source", "mode", "desktop", "gpu"}
+        if isinstance(value, dict):
+            value = {"agent": "omp", **value}  # Settings saved before the agent choice existed.
+        if (not isinstance(value, dict) or set(value) != {"source", "mode", "desktop", "gpu", "agent"}
                 or not isinstance(value["source"], str) or not value["source"].strip()
                 or value["mode"] not in ("container", "normal") or not isinstance(value["desktop"], bool)
-                or value["gpu"] not in ("none", "amd", "nvidia")):
+                or value["gpu"] not in ("none", "amd", "nvidia") or value["agent"] not in ("omp", "omsp")):
             raise ValueError("Invalid automatic start settings")
         # Same resolution as Runtime.start, so ~ and relative checkouts keep working at the next launch.
         return {**value, "source": str(Path(value["source"]).expanduser().resolve())}

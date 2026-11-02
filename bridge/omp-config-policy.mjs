@@ -7,6 +7,8 @@ import { pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { assetMetadata, bundleDigest, configPolicyFiles, isAppSetupPath, mergeSetupAsset, noSymlinks, parseBundleJson, requiresAssetExecutionReview, sanitizeConfig, safeSetupName, verifySavedBundle, resolveMcpServer, safeAssetPath } from './config-bundle.mjs';
 export { configPolicyFiles } from './config-bundle.mjs';
+// OMBP_AGENT=omsp drives the omsp fork, whose packages use their own npm scope.
+const sdkScope = process.env.OMBP_AGENT === 'omsp' ? '@oh-my-striped-pi' : '@oh-my-pi';
 
 const own = (value, segments) => segments.reduce((node, key) => node && Object.hasOwn(node, key) ? node[key] : undefined, value);
 const modelId = ctx => ctx?.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
@@ -620,7 +622,7 @@ export function installConfigPolicy(pi, { emit = () => {}, isQuiescent } = {}) {
     const { all } = await fromSdk('src/config/registry.ts');
     const capabilities = await fromSdk('src/capability/index.ts');
     helpers = await fromSdk('src/discovery/helpers.ts');
-    ({ formatModelSelectorValue: formatSelector } = await import(pathToFileURL(Bun.resolveSync('@oh-my-pi/pi-tui/overlays/model-selector', sdk)).href));
+    ({ formatModelSelectorValue: formatSelector } = await import(pathToFileURL(Bun.resolveSync(`${sdkScope}/pi-tui/overlays/model-selector`, sdk)).href));
     if (!registered.has(capabilities)) {
       for (const id of ['skills', 'rules', 'context-files', 'mcps']) capabilities.registerProvider(id, {
         id: 'omp-manager-setup', displayName: 'OMP Manager setup', description: 'Reviewed app-owned setup assets', priority: 1000,

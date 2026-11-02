@@ -21,6 +21,8 @@ Choose **Podman · isolated** or **Normal · unrestricted host access**, then St
 
 **Automatic start** (next to Stop) starts OMBP as soon as the launcher starts, with the settings of your latest Start (source, mode, GPU, desktop); turning it on saves the current settings. A failed automatic start shows its error in the UI. Turning it on in Normal (unrestricted) mode asks for confirmation.
 
+**Agent** chooses which coding agent OMBP drives: **omp** ([Oh My Pi](https://github.com/can1357/oh-my-pi), default; builds OMBP's `.#default`) or **omsp** ([Oh My Striped Pi](https://github.com/TheGrowingPlant443/oh-my-striped-pi), the stripped fork; builds `.#omsp`, which runs OMBP on the fork's source SDK and Bun). OMBP receives the choice as `OMBP_AGENT`. For now omsp shares your `~/.omp` (`OMSP_CONFIG_DIR=.omp`), so both use the same logins, models and sessions. An OMBP checkout without the `omsp` output fails to build with omsp selected.
+
 Container mode sets OMBP's existing `OMP_BIN` hook to this launcher's CLI entrypoint, which runs `src/cli.ts` from OMBP's own `OMP_SDK_DIR` using its bundled Bun. This reuses the same launch pattern as the parent flake; it does not install a second OMP version or run any OMP process on the host. The selected OMBP package must expose its bundled SDK and Bun.
 
 Prerequisites: local rootless Podman, `/dev/fuse`, a host setuid `fusermount`/`fusermount3`, and Nix. The launcher supplies its Python, FUSE library, proxy, nested compositor and session tools through its own pinned flake. It does not change `/etc/fuse.conf`, install drivers, expose an unrestricted engine socket, or use another package manager. A graphical launch requires an existing Wayland session; raw host X11 is deliberately not supported.

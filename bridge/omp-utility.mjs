@@ -2,6 +2,8 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { installLocalModelPolicy, isLocalModel } from './local-ai-models.mjs';
 import { literalAnalysisPrompt } from './omp-visualization-guard.mjs';
+// OMBP_AGENT=omsp drives the omsp fork, whose packages use their own npm scope.
+const sdkScope = process.env.OMBP_AGENT === 'omsp' ? '@oh-my-striped-pi' : '@oh-my-pi';
 
 // This is a source-SDK root, not the CLI: --no-tools alone still discovers MCP.
 export async function runUtility(sdkCli, argv) {
@@ -21,12 +23,12 @@ export async function runUtility(sdkCli, argv) {
       parsed.extensions?.length || parsed.hooks?.length || parsed.trustedExtensions?.length || parsed.tools?.length) {
     throw new Error('Utility generation requires a fixed model and a tool-free, non-persistent print invocation');
   }
-  const dirs = await import(pathToFileURL(Bun.resolveSync('@oh-my-pi/pi-utils/dirs', sdk)).href);
+  const dirs = await import(pathToFileURL(Bun.resolveSync(`${sdkScope}/pi-utils/dirs`, sdk)).href);
   dirs.setProfile(parsed.profile || 'default');
   const cwd = path.resolve(parsed.cwd || process.cwd());
   process.chdir(cwd);
-  process.env.PI_NO_TITLE = '1';
-  process.env.PI_NO_PTY = '1';
+  process.env.PI_NO_TITLE = process.env.OMSP_NO_TITLE = '1';
+  process.env.PI_NO_PTY = process.env.OMSP_NO_PTY = '1';
   const { Settings } = await load('src/config/settings.ts');
   const { createAgentSession, discoverAuthStorage } = await load('src/sdk.ts');
   const { ModelRegistry } = await load('src/config/model-registry.ts');

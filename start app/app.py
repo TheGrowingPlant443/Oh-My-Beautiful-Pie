@@ -94,7 +94,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/policy":
                 self.server.policy.replace(value)
             elif self.path == "/api/start":
-                self.server.runtime.start(value["source"], value["mode"], value["desktop"], value["gpu"])
+                self.server.runtime.start(value["source"], value["mode"], value["desktop"], value["gpu"], value["agent"])
             elif self.path == "/api/stop":
                 self.server.runtime.stop()
             elif self.path == "/api/history/clear":
@@ -115,7 +115,7 @@ class Handler(BaseHTTPRequestHandler):
 def auto_start(runtime, settings):
     """Start OMBP like a Start click; failures show in the UI like a failed run."""
     try:
-        runtime.start(settings["source"], settings["mode"], settings["desktop"], settings["gpu"])
+        runtime.start(settings["source"], settings["mode"], settings["desktop"], settings["gpu"], settings["agent"])
     except Exception as error:  # Any failure must reach the UI instead of dying in this thread.
         with runtime.lock:
             runtime.last_error = f"Automatic start failed: {error}"

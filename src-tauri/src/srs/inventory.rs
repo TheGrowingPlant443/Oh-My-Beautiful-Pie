@@ -374,7 +374,7 @@ fn policy(name: &str, directory: bool) -> Option<&'static str> {
     }
     if matches!(
         name.as_str(),
-        ".ssh" | ".aws" | ".azure" | ".gnupg" | ".omp" | ".pi" | ".obsidian"
+        ".ssh" | ".aws" | ".azure" | ".gnupg" | ".omp" | ".omsp" | ".pi" | ".obsidian"
     ) {
         return Some("Native application configuration or credential directory is excluded");
     }

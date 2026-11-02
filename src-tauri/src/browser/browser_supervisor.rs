@@ -740,6 +740,7 @@ impl BrowserSupervisor {
             .arg(sdk)
             .arg(&session)
             .env_remove("PI_COMPILED")
+            .env_remove("OMSP_COMPILED")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(log)

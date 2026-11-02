@@ -2,6 +2,8 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+// OMBP_AGENT=omsp drives the omsp fork, whose packages use their own npm scope.
+const sdkScope = process.env.OMBP_AGENT === 'omsp' ? '@oh-my-striped-pi' : '@oh-my-pi';
 
 export const MAX_FRAME = 64 * 1024 * 1024;
 // One budget for spawn -> debugging endpoint -> CDP connect -> initialization, inside the supervisor's 30 s request bound.
@@ -378,7 +380,7 @@ export class BrowserService {
   async cachedChromium() {
     try {
       const load = async specifier => import(pathToFileURL(Bun.resolveSync(specifier, this.sdkDir)).href);
-      const [browsers, utils, revisions] = await Promise.all([load('@oh-my-pi/pi-utils/browsers'), load('@oh-my-pi/pi-utils'), load('puppeteer-core/internal/revisions.js')]);
+      const [browsers, utils, revisions] = await Promise.all([load(`${sdkScope}/pi-utils/browsers`), load(`${sdkScope}/pi-utils`), load('puppeteer-core/internal/revisions.js')]);
       const platform = browsers.detectBrowserPlatform();
       return platform ? browsers.computeExecutablePath({ buildId: revisions.PUPPETEER_REVISIONS.chrome, cacheDir: utils.getPuppeteerDir(), platform }) : null;
     } catch { return null; }
@@ -762,7 +764,7 @@ if (import.meta.main) {
   if(!root||!sdkDir)throw new Error('browser service requires app root and SDK directory');
   // SDK cache initialization is private to this helper, not the real ~/.omp.
   const runtime=path.join(root,'terminal-browsers','runtime');await mkdir(runtime,{recursive:true});
-  process.env.USERPROFILE=runtime;process.env.HOME=runtime;process.env.PI_CODING_AGENT_DIR=path.join(runtime,'agent');
+  process.env.USERPROFILE=runtime;process.env.HOME=runtime;process.env.PI_CODING_AGENT_DIR=path.join(runtime,'agent');process.env.OMSP_CODING_AGENT_DIR=process.env.PI_CODING_AGENT_DIR;
   console.log=(...args)=>console.error(...args);
   const output=value=>process.stdout.write(JSON.stringify(value)+'\n');
   // The supervisor keeps this stream in terminal-browsers/browser-service.log for post-mortems.

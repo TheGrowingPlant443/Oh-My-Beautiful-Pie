@@ -2,9 +2,10 @@
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OMBP · Start app</title><link rel="stylesheet" href="/ui.css"><script src="/ui.js" type="module"></script></head>
 <body>
-<header><div><h1>OMBP <span>Start app</span></h1><p>One container. Permissions you control outside the AI.</p></div><output id="status">Connecting…</output></header>
+<header><div><h1>OMBP <span>Start app</span></h1><p>One container. Permissions you control outside the AI.</p></div><div class="header-status"><output id="status">Connecting…</output><a href="https://github.com/can1357/oh-my-pi" target="_blank" rel="noopener noreferrer">omp on GitHub</a><a href="https://github.com/TheGrowingPlant443/oh-my-striped-pi" target="_blank" rel="noopener noreferrer">omsp on GitHub</a></div></header>
 <section class="launch" aria-label="Launch settings">
 <label>OMBP source folder<input id="source" placeholder="/home/you/OMBP" required></label>
+<label>Agent<select id="agent"><option value="omp">omp · Oh My Pi</option><option value="omsp">omsp · Oh My Striped Pi</option></select></label>
 <label>Launch mode<select id="mode"><option value="container">Podman · isolated</option><option value="normal">Normal · unrestricted host access</option></select></label>
 <label>GPU<select id="gpu"><option value="none">None · software rendering</option><option value="amd">AMD · render devices + KFD</option><option value="nvidia">NVIDIA · CDI (not tested)</option></select></label>
 <div class="actions"><button id="start">Start OMBP</button><button id="stop" class="secondary">Stop</button><label class="check" title="Start OMBP with the latest launch settings whenever this launcher starts"><input id="auto-start" type="checkbox">Automatic start</label></div>

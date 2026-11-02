@@ -416,13 +416,14 @@ async function refresh() {
   byId("history-error").textContent = state.history_error ? `Denied history is only in memory: ${state.history_error}` : "";
   const mode = state.runtime.mode === "container" ? "Podman" : "Unrestricted";
   const busy = running || state.runtime.starting;
-  byId("status").textContent = running ? `${mode} · running` : "Stopped";
+  byId("status").textContent = running ? `${mode} · ${state.runtime.launch.agent} · running` : "Stopped";
   if (state.runtime.starting) byId("status").textContent = "Building current OMBP…";
   byId("start").disabled = busy;
   byId("stop").disabled = !running;
-  for (const id of ["mode", "gpu", "desktop", "source"]) byId(id).disabled = busy;
+  for (const id of ["mode", "gpu", "desktop", "source", "agent"]) byId(id).disabled = busy;
   if (running) {
     byId("mode").value = state.runtime.mode;
+    byId("agent").value = state.runtime.launch.agent;
     byId("gpu").value = state.runtime.launch.gpu;
     byId("desktop").checked = state.runtime.launch.desktop;
     byId("source").value = state.runtime.launch.source;
@@ -490,7 +491,7 @@ function renderMode() {
 byId("mode").onchange = renderMode;
 function launchSettings() {
   return {source: byId("source").value.trim(), mode: byId("mode").value,
-    desktop: byId("desktop").checked, gpu: byId("gpu").value};
+    desktop: byId("desktop").checked, gpu: byId("gpu").value, agent: byId("agent").value};
 }
 const UNRESTRICTED = "Start unrestricted on the host? None of these access controls will apply.";
 byId("start").onclick = () => action(async () => {

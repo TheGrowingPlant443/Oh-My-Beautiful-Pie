@@ -4,6 +4,8 @@ import { isLocalModel } from './local-ai-models.mjs';
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { assetFromFile, collectAssets, configPolicyFiles, directoryEntries, exportedSettings, isAppSetupPath, mergeSetupAsset, noSymlinks, parseBundleJson, readBundle, readText, requiresAssetExecutionReview, safeSetupName, sanitizeAssets, sanitizeConfig, validateAssetFiles, verifySavedBundle } from './config-bundle.mjs';
+// OMBP_AGENT=omsp drives the omsp fork, whose packages use their own npm scope.
+const sdkScope = process.env.OMBP_AGENT === 'omsp' ? '@oh-my-striped-pi' : '@oh-my-pi';
 
 const loadSdk = (sdk, file) => import(pathToFileURL(path.join(sdk, file)).href);
 
@@ -258,7 +260,7 @@ async function activeAssets(request, sdk, dirs, settings, nativeSettings, setups
   try {
     const assets = new Map();
     const add = items => { for (const asset of items) mergeSetupAsset(assets, asset); };
-    const nativeRoots = [dirs.getAgentDir(), request.cwd, path.join(request.cwd, '.omp')];
+    const nativeRoots = [dirs.getAgentDir(), request.cwd, path.join(request.cwd, process.env.OMBP_AGENT === 'omsp' ? '.omsp' : '.omp')];
     await addNativeRootAssets(add, nativeRoots);
     const contexts = (await discovery.loadCapability('context-files', { cwd: request.cwd, agentDir: dirs.getAgentDir() })).items.filter(file => path.basename(file.path) === 'AGENTS.md');
     for (const [index, context] of contexts.entries()) {
@@ -309,7 +311,7 @@ async function importSource(request) {
 
 export async function runConfig(request) {
   const sdk = path.resolve(request.sdkDir);
-  const dirsPath = Bun.resolveSync('@oh-my-pi/pi-utils/dirs', sdk);
+  const dirsPath = Bun.resolveSync(`${sdkScope}/pi-utils/dirs`, sdk);
   const dirs = await import(pathToFileURL(dirsPath).href);
   dirs.setProfile(request.profile || 'default');
   if (request.action === 'paths') return { globalOmpFolder: dirs.getBaseConfigRoot(), globalAgentFolder: dirs.getAgentDir() };

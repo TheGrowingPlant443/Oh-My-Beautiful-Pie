@@ -53,7 +53,7 @@ class SourceBuildTests(unittest.TestCase):
             build.return_value.communicate.return_value = ("", None)
             build.return_value.returncode = 1
             with self.assertRaisesRegex(RuntimeError, "OMBP build failed"):
-                self.runtime.start(str(self.source), "normal", False, "none")
+                self.runtime.start(str(self.source), "normal", False, "none", "omp")
         self.assertFalse(self.runtime.status()["running"])
         self.assertIsNone(self.runtime.launch)
         self.assertIsNone(self.runtime.log)
@@ -62,7 +62,7 @@ class SourceBuildTests(unittest.TestCase):
         (self.source / "flake.nix").unlink()
         with patch("runtime.subprocess.Popen") as build:
             with self.assertRaisesRegex(ValueError, "source folder"):
-                self.runtime.start(str(self.source), "container", True, "none")
+                self.runtime.start(str(self.source), "container", True, "none", "omp")
             build.assert_not_called()
 
     def test_ambiguous_build_output_never_launches(self):
@@ -70,8 +70,21 @@ class SourceBuildTests(unittest.TestCase):
             build.return_value.communicate.return_value = ("/nix/store/first\n/nix/store/second\n", None)
             build.return_value.returncode = 0
             with self.assertRaisesRegex(RuntimeError, "one Nix store output"):
-                self.runtime.start(str(self.source), "normal", False, "none")
+                self.runtime.start(str(self.source), "normal", False, "none", "omp")
         self.assertFalse(self.runtime.status()["running"])
+
+    def test_agent_selects_flake_output(self):
+        for agent, attribute in (("omsp", "path:.#omsp"), ("omp", "path:.#default")):
+            with self.subTest(agent=agent), patch("runtime.subprocess.Popen") as build:
+                build.return_value.communicate.return_value = ("", None)
+                build.return_value.returncode = 1
+                with self.assertRaisesRegex(RuntimeError, "OMBP build failed"):
+                    self.runtime.start(str(self.source), "normal", False, "none", agent)
+                self.assertIn(attribute, build.call_args_list[0].args[0])
+        with patch("runtime.subprocess.Popen") as build:
+            with self.assertRaisesRegex(ValueError, "Invalid launch settings"):
+                self.runtime.start(str(self.source), "normal", False, "none", "bad")
+            build.assert_not_called()
 
     def test_close_during_build_reaps_child_and_prevents_launch(self):
         spawned = threading.Event()
@@ -86,7 +99,7 @@ class SourceBuildTests(unittest.TestCase):
 
         def start():
             try:
-                self.runtime.start(str(self.source), "normal", False, "none")
+                self.runtime.start(str(self.source), "normal", False, "none", "omp")
             except RuntimeError as error:
                 errors.append(str(error))
 

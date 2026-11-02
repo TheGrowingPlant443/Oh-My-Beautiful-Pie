@@ -376,7 +376,7 @@ fn declared_report(root: &Path, name: &str) -> Result<Option<PathBuf>> {
     }
     if relative.components().any(|part| {
         part.as_os_str().to_str().is_some_and(|name| {
-            [".git", ".omp", ".ssh"]
+            [".git", ".omp", ".omsp", ".ssh"]
                 .iter()
                 .any(|protected| name.eq_ignore_ascii_case(protected))
         })

@@ -38,7 +38,8 @@ fn check_omp_version(version: &str) -> Result<()> {
         .output()
         .map_err(|error| format!("Read OMP version: {error}"))?;
     if !output.status.success()
-        || String::from_utf8_lossy(&output.stdout).trim() != format!("omp/{version}")
+        || String::from_utf8_lossy(&output.stdout).trim()
+            != format!("{}/{version}", crate::toolchain::Agent::current().command())
     {
         return Err(format!(
             "OMP SDK {version} does not match the executable; set OMP_SDK_DIR to its installed SDK"
@@ -202,6 +203,7 @@ pub(crate) fn relocate<T>(
         .arg(root.join("omp-workspace.mjs"))
         .current_dir(cwd)
         .env_remove("PI_COMPILED")
+        .env_remove("OMSP_COMPILED")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

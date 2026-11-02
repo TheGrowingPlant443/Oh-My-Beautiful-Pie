@@ -779,7 +779,7 @@ impl AgentMarkdownService {
             } => {
                 let root = repository(project_instance_id)?;
                 (
-                    root.join(".omp"),
+                    root.join(crate::toolchain::Agent::current().dir_name()),
                     KnowledgeScope::Project {
                         repository_root: root.to_string_lossy().into_owned(),
                     },
