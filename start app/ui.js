@@ -120,6 +120,44 @@ function openPackageDialog() {
   dialog.showModal();
 }
 
+function showContents(title, note, groups) {
+  byId("contents-title").textContent = title;
+  byId("contents-note").textContent = note;
+  byId("contents-list").replaceChildren(...groups.flatMap(({label, items}) => {
+    const list = document.createElement("ul");
+    list.append(...items.map(item => Object.assign(document.createElement("li"), {textContent: item})));
+    if (!label) return [list];
+    const heading = Object.assign(document.createElement("h3"), {textContent: `${label} (${items.length})`});
+    return [heading, list];
+  }));
+  byId("contents-dialog").dataset.opener = title;
+  byId("contents-dialog").showModal();
+}
+
+// Turns a list row's title into a button that lists what the bundle contains.
+function contentsButton(row, title, note, groups) {
+  const text = row.firstElementChild.firstChild;
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "contents-link";
+  open.textContent = text.textContent;
+  open.setAttribute("aria-haspopup", "dialog");
+  open.title = "Show what this contains";
+  open.dataset.contents = title;
+  open.onclick = () => showContents(title, note, groups);
+  text.replaceWith(open);
+}
+
+const CORE_IDS = new Set(["ombp", "sandbox-python", "sandbox-dbus", "sandbox-keyring", "sandbox-shell",
+  "sandbox-coreutils", "sandbox-fonts", "tool-podman", "sandbox-dialog", "agent-cli", "sandbox-mesa"]);
+const CORE_PARTS = ["Selected OMP/OMSP CLI", "OMBP with Bun, Node, Git and source-index Python", "Sandbox Python",
+  "Bash/sh", "coreutils", "Private D-Bus", "Private keyring", "Fonts", "Podman client", "Zenity file picker",
+  "Mesa (AMD launches)"];
+
+function recordedPrograms(id) {
+  return (state.requirements || []).find(item => item.kind === "program" && item.id === id && item.programs);
+}
+
 function renderRequirementList(kind, installed) {
   const list = byId(`${kind}-requirements`);
   list.replaceChildren();
@@ -129,7 +167,7 @@ function renderRequirementList(kind, installed) {
       entry(list, requirement.label, `${requirement.path} · Required private installed store; read-only`);
       continue;
     }
-    entry(list, requirement.label,
+    const row = entry(list, requirement.label,
       `${requirement.enabled ? "Enabled" : "Disabled"} · ${requirement.path} · ${
         REQUIREMENT_NOTES[requirement.id] || REQUIREMENT_NOTES[kind]}`,
       policy => {
@@ -138,15 +176,29 @@ function renderRequirementList(kind, installed) {
           ? [...new Set([...disabled, requirement.id])]
           : disabled.filter(id => id !== requirement.id);
       }, requirement.enabled);
+    if (requirement.programs?.length > 1) contentsButton(row, requirement.label,
+      `${requirement.programs.length} commands at the last Start`, [{items: requirement.programs}]);
   }
 }
 
 function renderInstalledPrograms() {
   const list = byId("program-requirements");
-  entry(list, "Required installed core", "OMP/OMSP, OMBP and sandbox runtime · always included");
+  const core = entry(list, "Required installed core", "OMP/OMSP, OMBP and sandbox runtime · always included");
+  const recorded = (state.requirements || []).filter(item => item.kind === "program" && item.programs?.length
+    && (CORE_IDS.has(item.id) || item.id.startsWith("bundled-")));
+  contentsButton(core, "Required installed core", recorded.length
+    ? "Commands installed at the last Start, by component"
+    : "Exact commands are listed after the first Start",
+    recorded.length ? recorded.map(item => ({label: item.label, items: item.programs})) : [{items: CORE_PARTS}]);
   const selected = new Set(selectedPackages());
   for (const choice of catalog.packages) {
-    if (selected.has(choice.id)) entry(list, choice.label, `${choice.group} · ${choice.description}`);
+    if (!selected.has(choice.id)) continue;
+    const row = entry(list, choice.label, `${choice.group} · ${choice.description}`);
+    const actual = recordedPrograms(`package-${choice.id}`);
+    const items = actual ? actual.programs : choice.executables || [];
+    if (items.length > 1) contentsButton(row, choice.label, actual
+      ? `${items.length} commands installed at the last Start`
+      : "Main commands; the full list appears after the next Start", [{items}]);
   }
 }
 
@@ -578,6 +630,9 @@ byId("installed-mode").onchange = () => action(() => change(policy => {
 byId("choose-packages").onclick = openPackageDialog;
 byId("package-cancel").onclick = () => byId("package-dialog").close();
 byId("package-dialog").onclose = () => byId("package-groups").replaceChildren();
+// A background refresh may have rebuilt the opener; return focus to its replacement.
+byId("contents-dialog").onclose = () => [...document.querySelectorAll(".contents-link")]
+  .find(button => button.dataset.contents === byId("contents-dialog").dataset.opener)?.focus();
 byId("package-form").onsubmit = event => {
   event.preventDefault();
   if (state.runtime.starting) {

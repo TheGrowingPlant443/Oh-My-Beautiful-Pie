@@ -14,15 +14,15 @@
 <p id="boundary" class="notice">Container mode: OMBP and every OMP child run together. Only approved host resources are exposed. Network requests must pass the website gateway.</p>
 <p id="message" role="alert" aria-live="polite"></p>
 <main>
-<section class="column"><h2>Folder access</h2>
+<section class="column paired"><div><h2>Folder access</h2>
 <details class="info"><summary aria-label="About folder access">i</summary><div><p>Host folders appear at <code>/host/…</code>. Grant a vault directory for Obsidian files; this does not control the host Obsidian app.</p><p class="fine">"Allow write and deletion" sets whether new folders start writable or read-only (remembered). Each folder's Write toggle changes it live; write always includes deletion. Grants include subfolders. Host symlinks, hardlinked files, special files and launcher state are blocked. Broad grants can expose secrets.</p></div></details>
 <form id="folder-form"><label>Common folders<select id="common-folder"><option value="">Choose a folder…</option></select></label><label>Host folder<input id="folder" class="search" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="folder-suggestions" placeholder="Search folders or /home/you/Downloads" required autocomplete="off"></label><select id="folder-suggestions" class="suggestions" size="5" aria-label="Host folder suggestions" hidden></select><label class="check" title="Default for new folders"><input id="write" type="checkbox">Allow write and deletion</label><button>Add folder</button></form>
-<h3>Required private folders</h3><ul id="folder-requirements"></ul><h3>Host folder grants</h3><ul id="folders"></ul></section>
-<section class="column"><h2>Programs &amp; desktop</h2>
+<h3>Required private folders</h3><ul id="folder-requirements"></ul></div><div><h3>Host folder grants</h3><ul id="folders"></ul></div></section>
+<section class="column paired"><div><h2>Programs &amp; desktop</h2>
 <details class="info"><summary aria-label="About programs and desktop">i</summary><div><p>Install into container gives this launcher a private, read-only copy of the required core and selected pinned Nix packages. Choose tools to change optional packages for the next Start; nothing installs when you save. Dependencies can include additional usable programs: this is not a per-binary security boundary.</p><p class="fine">With installation off, inspection mode uses approved host Nix programs. Selecting a suggestion does not grant access until you click Add program. Required bundles are listed after the first build; revoking their primary store roots can break OMBP and cannot take back loaded code. Saved inspection grants are kept when switching modes. Private folder changes require a new launch.</p><p class="fine">A nested Wayland compositor separates OMBP from host screen/input protocols. No host display socket, X11, session bus, portals, Podman socket or host program execution. This is not host-desktop automation.</p><p class="fine">This is a host-resource whitelist, not a ban on arbitrary code inside the container. GPU and display changes require a new launch. GPU selection is detected at UI startup; manual overrides are kept.</p></div></details>
 <form id="program-form"><label>Search installed Nix apps or enter a path<input id="program" class="search" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="program-suggestions" placeholder="Search apps or /nix/store/…" required autocomplete="off"></label><select id="program-suggestions" class="suggestions" size="5" aria-label="Installed program suggestions" hidden></select><button>Add program</button></form>
 <p id="installed-program-note" class="fine" hidden></p><label class="check"><input id="desktop" type="checkbox" checked>Show OMBP in an isolated desktop window</label>
-<h3 id="program-requirements-heading">Required sandbox programs</h3><ul id="program-requirements"></ul><div id="inspection-programs"><h3>Extra programs</h3><ul id="programs"></ul></div>
+<h3 id="program-requirements-heading">Required sandbox programs</h3><ul id="program-requirements"></ul></div><div id="inspection-programs"><h3>Extra programs</h3><ul id="programs"></ul></div>
 </section>
 <section class="column"><h2>Websites &amp; internet</h2>
 <details class="info"><summary aria-label="About websites and internet">i</summary><div><p class="fine">Every subpath is allowed. Subdomains are allowed by default over http or https (a leading www. is ignored); untick Subdomains for exactly the listed origin. Auto-approve: "google.com" lets through any host containing "google" and ending in ".com" (such as update.googleapis.com, but also look-alikes); an entry without a dot matches any host containing it. Settings edits that list. Private networks and direct connections are blocked. HTTPS is inspected using this launcher's local CA; clients must trust it. WebSockets work to allowed sites; certificate-pinned clients fail closed.</p><p class="fine">Optional host-side Authorization injection keeps the stored header outside the container and is sent only to the exact origin. Store it using <code>secret-tool store --label='OMBP API' application ombp-start origin https://api.example.com</code>, then enter the complete header value at its prompt (for example Bearer …). Trust that origin: its responses could echo the credential. Otherwise use the container's private keyring; the AI can read credentials there.</p></div></details>
@@ -39,6 +39,14 @@
 <div id="package-groups"></div>
 <p id="package-error" role="alert"></p>
 <div class="actions"><button id="package-cancel" class="secondary" type="button">Cancel</button><button id="package-save" type="submit">Save selection</button></div>
+</form>
+</dialog>
+<dialog id="contents-dialog" aria-labelledby="contents-title" aria-describedby="contents-note">
+<form method="dialog">
+<h2 id="contents-title" tabindex="-1" autofocus>Contents</h2>
+<p id="contents-note" class="fine"></p>
+<div id="contents-list"></div>
+<div class="actions"><button>Close</button></div>
 </form>
 </dialog>
 <footer>Folder and network permissions apply live in container mode only. Installed packages and private folder changes require a new launch. State and logs stay on the host. This launcher does not modify OMBP.</footer>

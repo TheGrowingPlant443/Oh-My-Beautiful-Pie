@@ -46,7 +46,7 @@ class PolicyTests(unittest.TestCase):
     def test_installed_defaults_and_selection_persist_without_aliasing(self):
         initial = self.policy.snapshot()
         self.assertTrue(initial["installed_mode"])
-        self.assertEqual(initial["selected_packages"], DEFAULT_PACKAGES)
+        self.assertEqual(initial["selected_packages"], ["basic-tools", "chromium", "gh", "ssh"])
         initial["selected_packages"].clear()
         self.assertEqual(self.policy.snapshot()["selected_packages"], DEFAULT_PACKAGES)
         for mode, selection, expected in ((False, ["ssh", "gh", "ssh"], ["gh", "ssh"]),

@@ -253,7 +253,8 @@ class Runtime:
 
     def _record_requirements(self, base, desktop):
         self.requirements = [
-            {"id": key, "label": item["label"], "path": item["path"], "kind": "program"}
+            {"id": key, "label": item["label"], "path": item["path"], "kind": "program",
+             "programs": sorted({Path(program).name for program in item["programs"]})}
             for key, item in base.items()
         ] + [{"id": key, "label": label, "path": path, "kind": "folder"} for key, label, path in FOLDERS]
         if desktop:
