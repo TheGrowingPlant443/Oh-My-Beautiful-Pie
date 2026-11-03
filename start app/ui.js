@@ -7,7 +7,7 @@ let state;
 let busy = false;
 let renderedPolicy = "";
 let renderedHistory = "";
-let catalog = {folders: [], programs: [], packages: []};
+let catalog = {folders: [], programs: [], packages: [], language_servers: []};
 let gpuChosen = false;
 
 async function api(path, value) {
@@ -399,15 +399,22 @@ function eventGroup(site, events) {
 
 function renderHistory() {
   const root = byId("history");
+  const servers = new Set(catalog.language_servers);
+  const hide = state.policy.hide_language_server_denials;
+  // Probes arrive as bare names, or store paths when the binary exists but is unapproved.
+  const history = state.history.filter(event => !(hide && event.kind === "program"
+    && servers.has(event.target.split("/").pop())));
+  const hidden = state.history.length - history.length;
+  byId("history-hidden").textContent = hidden ? `${hidden} language-server denial(s) hidden` : "";
   const groups = new Map();
-  for (const event of state.history) {
+  for (const event of history) {
     if (event.kind === "website" && event.site) {
       if (!groups.has(event.site)) groups.set(event.site, []);
       groups.get(event.site).push(event);
     }
   }
   const rows = [], shown = new Set();
-  for (const event of state.history) {
+  for (const event of history) {
     if (!(event.kind === "website" && event.site)) rows.push(eventRow(event));
     else if (!shown.has(event.site)) {
       shown.add(event.site);
@@ -497,7 +504,8 @@ async function loadCatalog() {
 function renderLists() {
   const effective = [installedMode(), selectedPackages(), !!state.runtime.running];
   const policyKey = JSON.stringify([state.policy, state.requirements, effective]);
-  const historyKey = JSON.stringify([state.history, state.policy.dependencies, effective[0]]);
+  const historyKey = JSON.stringify([state.history, state.policy.dependencies, effective[0],
+    state.policy.hide_language_server_denials, catalog.language_servers]);
   if (renderedPolicy !== policyKey) { renderPermissions(); renderedPolicy = policyKey; }
   if (renderedHistory !== historyKey) { renderHistory(); renderedHistory = historyKey; }
 }
@@ -525,6 +533,7 @@ async function refresh() {
     byId("source").value = state.runtime.launch.source;
   }
   byId("installed-mode").checked = !!state.policy.installed_mode;
+  byId("hide-language-servers").checked = state.policy.hide_language_server_denials;
   renderMode();
   if (!byId("source").value) byId("source").value = state.source;
   renderLists();
@@ -597,6 +606,9 @@ byId("common-folder").onchange = () => {
   }
 };
 byId("clear-history").onclick = () => action(() => api("history/clear", {}));
+byId("hide-language-servers").onchange = () => action(() => change(policy => {
+  policy.hide_language_server_denials = byId("hide-language-servers").checked;
+}));
 byId("allow-all-network").onclick = () => action(async () => {
   const enable = !state.policy.allow_all_network;
   if (enable && !confirm("Allow ALL network traffic from the container?\nThe website whitelist is switched off: " +

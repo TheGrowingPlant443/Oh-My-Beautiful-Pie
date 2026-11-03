@@ -27,7 +27,7 @@ def prepare_workspace(path=Path(WORKSPACE)):
 
 FOLDERS = (
     ("sandbox-home", "Private OMBP home", "/home/sandbox"),
-    ("sandbox-tmp", "Private temporary files", str(Path(WORKSPACE).parent)),
+    ("sandbox-tmp", "Private temporary files (container /tmp, not your host /tmp)", str(Path(WORKSPACE).parent)),
     ("sandbox-run", "Private session sockets", "/run"),
     ("launcher-files", "Sandbox entrypoint and OMP bridge", "/launcher"),
     ("network-socket", "Whitelist gateway socket", "/network"),

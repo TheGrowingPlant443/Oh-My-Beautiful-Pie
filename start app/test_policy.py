@@ -62,6 +62,7 @@ class PolicyTests(unittest.TestCase):
         legacy = self.policy.snapshot()
         del legacy["installed_mode"]
         del legacy["selected_packages"]
+        del legacy["hide_language_server_denials"]
         legacy["folders"] = [{"path": str(self.folder), "write": False}]
         legacy["disabled_requirements"] = ["chromium"]
         legacy["internet"] = False
@@ -70,16 +71,29 @@ class PolicyTests(unittest.TestCase):
         snapshot = migrated.snapshot()
         self.assertTrue(snapshot.pop("installed_mode"))
         self.assertEqual(snapshot.pop("selected_packages"), DEFAULT_PACKAGES)
+        self.assertTrue(snapshot.pop("hide_language_server_denials"))
         self.assertEqual(snapshot, legacy)
         migrated.replace(migrated.snapshot())
         self.assertTrue(json.loads(migrated.path.read_text())["installed_mode"])
         self.assertEqual(Policy(migrated.directory).snapshot(), migrated.snapshot())
 
+    def test_history_visibility_persists_without_granting_or_forgetting(self):
+        before = self.policy.snapshot()
+        self.policy.deny("program", "gopls", "Program is not selected")
+        history = self.policy.events()
+        for hidden in (False, True):
+            expected = {**before, "hide_language_server_denials": hidden}
+            self.policy.replace(expected)
+            loaded = Policy(self.policy.directory)
+            self.assertEqual(loaded.snapshot(), expected)
+            self.assertEqual(loaded.events(), history)
+
     def test_invalid_installed_settings_preserve_saved_policy(self):
         before = self.policy.snapshot()
         for field, bad in (("installed_mode", 1), ("installed_mode", "yes"), ("installed_mode", None),
                            ("selected_packages", "gh"), ("selected_packages", [False]),
-                           ("selected_packages", ["gh", "unknown"])):
+                           ("selected_packages", ["gh", "unknown"]),
+                           ("hide_language_server_denials", "yes"), ("hide_language_server_denials", None)):
             with self.subTest(field=field, bad=bad), self.assertRaises(ValueError):
                 self.policy.replace({**before, field: bad})
             self.assertEqual(self.policy.snapshot(), before)

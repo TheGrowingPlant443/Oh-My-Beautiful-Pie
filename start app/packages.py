@@ -312,6 +312,18 @@ for _choice in PACKAGE_CHOICES:
 DEFAULT_PACKAGES = sorted(choice["id"] for choice in PACKAGE_CHOICES if choice["default"])
 _PACKAGE_IDS = frozenset(choice["id"] for choice in PACKAGE_CHOICES)
 _PACKAGE_SYSTEMS = {choice["id"]: choice["systems"] for choice in PACKAGE_CHOICES if "systems" in choice}
+# Exact LSP command names, excluding bundled compiler/helper commands.
+LANGUAGE_SERVER_COMMANDS = sorted({
+    "rust-analyzer", "tlapm_lsp", "clangd", "zls", "gopls", "typescript-language-server", "tsc", "biome",
+    "vscode-eslint-language-server", "deno", "vscode-html-language-server", "vscode-css-language-server",
+    "vscode-json-language-server", "tailwindcss-language-server", "svelteserver", "vue-language-server",
+    "astro-ls", "pyright-langserver", "basedpyright-langserver", "pylsp", "ty", "ruff", "jdtls", "kotlin-lsp",
+    "metals", "haskell-language-server-wrapper", "ocamllsp", "elixir-ls", "expert", "erlang_ls", "gleam",
+    "solargraph", "ruby-lsp", "rubocop", "bash-language-server", "lua-language-server", "intelephense",
+    "phpactor", "omnisharp", "yaml-language-server", "terraform-ls", "docker-langserver", "helm_ls", "nixd",
+    "nil", "ols", "dart", "marksman", "texlab", "graphql-lsp", "prisma-language-server",
+    "vim-language-server", "emmet-language-server", "sourcekit-lsp", "swiftlint",
+})
 
 
 def validate_packages(value) -> list[str]:

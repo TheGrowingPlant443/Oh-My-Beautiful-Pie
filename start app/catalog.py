@@ -8,7 +8,7 @@ import shlex
 import shutil
 import time
 
-from packages import PACKAGE_CHOICES, SYSTEM
+from packages import LANGUAGE_SERVER_COMMANDS, PACKAGE_CHOICES, SYSTEM
 
 
 DEFAULT_WEBSITES = ["https://github.com", "https://www.google.com", "https://stackoverflow.com", "https://www.atlassian.com"]
@@ -250,4 +250,4 @@ def installed_programs(home=None, environ=None, store_root=Path("/nix/store"),
 
 def catalog():
     return {"gpu": detect_gpu(), "folders": user_folders(), "programs": installed_programs(),
-            "packages": PACKAGE_CHOICES, "system": SYSTEM}
+            "packages": PACKAGE_CHOICES, "system": SYSTEM, "language_servers": LANGUAGE_SERVER_COMMANDS}
