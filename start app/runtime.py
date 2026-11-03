@@ -328,7 +328,7 @@ class Runtime:
                "OMBP_GIT_DISCOVERY_HOME": "/host" + str(Path.home()),
                "START_APP_KEYRING": keyring, "SHELL": shell, "FONTCONFIG_FILE": fonts,
                "GDK_BACKEND": "wayland", "NIXOS_OZONE_WL": "1"}
-        env.update(self._program_environment(installed, agent, browser))
+        env.update(self._program_environment(installed, agent, browser, base))
         if "sonar-engine" not in disabled:
             sonar_port = seed_client(home)
             self.engine = EngineGateway(self.policy, self.policy.directory / "engine",
@@ -349,10 +349,13 @@ class Runtime:
             stream.write((password + "\n").encode())
 
     @staticmethod
-    def _program_environment(installed, agent, browser):
+    def _program_environment(installed, agent, browser, base):
         env = {"OMP_BIN": f"/installed-programs/{agent}" if installed else "/launcher/omp", "OMBP_AGENT": agent}
         if installed and agent == "omsp":
             env["OMSP_CONFIG_DIR"] = ".omp"
+        if installed and "package-js-debug-adapter" in base:
+            env["JS_DEBUG_DAP_SERVER"] = str(Path(base["package-js-debug-adapter"]["path"])
+                                           / "share/ombp/dapDebugServer.js")
         if browser:
             commands = browser["programs"]
             env["START_APP_BROWSER"] = next((path for path in commands if Path(path).name == "google-chrome-stable"),

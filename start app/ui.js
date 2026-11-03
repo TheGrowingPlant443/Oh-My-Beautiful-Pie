@@ -98,15 +98,19 @@ function openPackageDialog() {
     }
     const label = document.createElement("label");
     label.className = "check";
+    label.title = (choice.executables || []).join(", ");
     const input = document.createElement("input");
     input.type = "checkbox";
     input.name = "package";
     input.value = choice.id;
     input.checked = selected.has(choice.id);
+    input.disabled = choice.systems && !choice.systems.includes(catalog.system);
     const text = document.createElement("span");
     text.textContent = choice.label;
     const description = document.createElement("small");
-    description.textContent = choice.description;
+    description.textContent = input.disabled
+      ? `${choice.description} Available on ${choice.systems.join(", ")}.`
+      : choice.description;
     text.append(description);
     label.append(input, text);
     fieldsets.get(choice.group).append(label);

@@ -94,23 +94,19 @@
     });
     packages = each (system: let
       inherit (environment system) pkgs python fusermount source weston fonts browser dialog tools basicTools;
+      unfreePkgs = import nixpkgs {
+        inherit system;
+        config.allowUnfreePredicate = package:
+          pkgs.lib.elem (pkgs.lib.getName package) [ "obsidian" "intelephense" "terraform" "kotlin-lsp" ];
+      };
+      optionalTools = (import ./tool-packages.nix { inherit pkgs unfreePkgs; })
+        // (import ./language-packages.nix { pkgs = unfreePkgs; });
     in {
       package-basic-tools = basicTools;
       package-chromium = pkgs.chromium;
-      package-obsidian = (import nixpkgs {
-        inherit system;
-        config.allowUnfreePredicate = package: nixpkgs.lib.getName package == "obsidian";
-      }).obsidian;
+      package-obsidian = unfreePkgs.obsidian;
       package-gh = pkgs.gh;
       package-ssh = pkgs.openssh;
-      package-marksman = pkgs.marksman;
-      package-emmet = pkgs.emmet-language-server;
-      package-typescript-lsp = pkgs.typescript-language-server;
-      package-typescript = pkgs.typescript;
-      package-html-lsp = pkgs.vscode-langservers-extracted;
-      package-nil = pkgs.nil;
-      package-nixd = pkgs.nixd;
-      package-java-lsp = pkgs.jdt-language-server;
       default = pkgs.writeShellApplication {
         name = "ombp-start";
         runtimeInputs = [ python fusermount pkgs.nix pkgs.podman pkgs.dbus pkgs.gnome-keyring pkgs.libsecret ];
@@ -135,7 +131,7 @@
           exec ${python}/bin/python3 ${source}/app.py "$@"
         '';
       };
-    });
+    } // pkgs.lib.mapAttrs' (id: package: pkgs.lib.nameValuePair ("package-" + id) package) optionalTools);
     devShells = each (system: let inherit (environment system) pkgs python testPython fusermount weston fonts browser dialog tools; in {
       default = pkgs.mkShell {
         packages = [ testPython fusermount pkgs.nix pkgs.podman pkgs.dbus pkgs.gnome-keyring pkgs.libsecret ];

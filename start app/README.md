@@ -53,7 +53,40 @@ The initial Nix build/package realization can download dependencies on the host 
 
 Turn **Install into container** off to use the original **inspection mode**. Saved host-program grants and Revoke/Restore selections are retained for that mode, not applied to installed package files. Its filtered Nix-store and `/allowed-programs` views keep recording denied program lookups. In installed mode a program's **+** opens Choose tools; it neither installs immediately nor clears the unresolved denial.
 
-For another machine, share this repository—not your state directory, `~/.omp`, caches, tokens or profiles. The friend still needs the Linux/Nix/rootless-Podman/FUSE/Wayland prerequisites above, chooses their own source folder and tool selection, and supplies their own provider login/model configuration. Installed mode uses pinned Chromium and optionally pinned Obsidian rather than discovering your personal host Chrome/Obsidian. Optional Obsidian is unfree and off by default. The launcher may already cache tools for inspection mode, but only the selected package closures and mandatory runtime are copied into an installed generation.
+For another machine, share this repository—not your state directory, `~/.omp`, caches, tokens or profiles. The friend still needs the Linux/Nix/rootless-Podman/FUSE/Wayland prerequisites above, chooses their own source folder and tool selection, and supplies their own provider login/model configuration. Installed mode uses pinned Chromium and optionally pinned Obsidian rather than discovering your personal host Chrome/Obsidian. Unfree-license choices are marked and off by default. The launcher may already cache tools for inspection mode, but only the selected package closures and mandatory runtime are copied into an installed generation.
+
+### Local tool catalog
+
+The chooser covers all 55 language-server definitions shipped by OMP 18.12.6 and OMSP 18.13.3, including their CLI-based linters. Some share one package, such as the VS Code HTML/CSS/JSON/ESLint servers. It also offers the agents' diagnostic/checker commands, toolchains, debugger adapters, FFmpeg/ffprobe, web-extraction helpers and local terminal tools. Hover a choice for its executable names. The original defaults and saved selections are preserved; new choices are opt-in. Select the tools your project needs rather than enabling several competing servers unnecessarily.
+
+Server packages include their required runtime dependencies and essential analysis toolchains. TypeScript's native compiler is packaged so the SDK discovers its native LSP; the JavaScript-based server remains available for older project SDKs. Selected Python with debugpy takes precedence over the core Python command; selecting Flutter takes precedence over standalone Dart. JavaScript debugging receives the packaged adapter path. ElixirLS is compiled during the Nix build, not installed by Mix at startup; Ruby LSP inherits its packaged gems and leaves server-gem updates to Nix.
+
+These installations do not supply every project's libraries, compiler version or platform SDK. Project lockfiles, ESLint plugins, gems, NuGet/Maven dependencies, schemas and similar inputs still belong to the project; downloads remain subject to network permissions. Ruby LSP still validates the project's Gemfile/lockfile and dependencies. Installing an adapter does not configure its debug target or install PHP Xdebug into a target project. Arbitrary shell/MCP commands, host clipboard/FUSE/desktop integration and public tunnel services are not added or granted by the catalog.
+
+Known package constraints:
+
+- Swift/SourceKit's matching toolchain is supported on x86_64 Linux; the pinned compiler is broken on ARM Linux, so those choices are disabled there and rejected by the API. Linux does not supply Xcode/macOS SDKs.
+- JetBrains Kotlin LSP, Intelephense, Terraform and Obsidian have unfree licenses. Intelephense premium features still require a separate license.
+- Erlang LS is the final archived upstream release, with its matching OTP runtime.
+- TLA+ includes its actual language server, matching proof manager, pinned CommunityModules and Z3. Isabelle/TLA+, Zenon, LS4 and SANY remain additional proof-backend requirements.
+
+The shipped CodeLLDB and Ruby debugger definitions need project transport/target settings. For example, a project `dap.json` can contain the following; replace `./main.rb` with that project's Ruby entry point:
+
+```json
+{
+  "adapters": {
+    "codelldb": {
+      "args": ["--port", "${port}"],
+      "connectMode": "tcp"
+    },
+    "rdbg": {
+      "args": ["--open", "--port", "${port}", "--host", "127.0.0.1", "--command", "--", "ruby", "./main.rb"],
+      "connectMode": "tcp"
+    }
+  }
+}
+```
+
 
 ## Four columns
 

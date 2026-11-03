@@ -61,7 +61,9 @@ def _optional_entries(selected):
         from packages import PACKAGE_CHOICES
         labels = {item["id"]: item["label"] for item in PACKAGE_CHOICES}
         entries = [browser] if "chromium" in selected else []
-        entries.extend(("package-" + key, labels[key], path) for key, path in selected.items())
+        # Flutter's Dart SDK also implements OMP's Flutter debugger defaults.
+        entries.extend(("package-" + key, labels[key], selected[key])
+                       for key in sorted(selected, key=lambda key: key != "flutter"))
         return entries
     entries = [
         ("sandbox-tools", "Basic tools (gdbus, ps/pgrep/pkill, grep, sed, find, curl, jq, rg…)",
@@ -101,7 +103,9 @@ def bundles(executable, gpu, resolve_closure, *, selected=None, agent_cli=None):
         ("sandbox-fonts", "Sandbox fonts", os.environ.get("START_APP_FONTCONFIG")),
         ("tool-podman", "Podman client (Code quality)", os.environ.get("START_APP_PODMAN")),
     ))
-    entries.extend(_optional_entries(selected))
+    optional = _optional_entries(selected)
+    # Explicit tool environments (for example Python with debugpy) win command collisions.
+    entries = entries + optional if selected is None else optional + entries
     if selected is not None:
         entries.extend((
             ("sandbox-dialog", "Sandbox file and folder picker", os.environ.get("START_APP_ZENITY")),

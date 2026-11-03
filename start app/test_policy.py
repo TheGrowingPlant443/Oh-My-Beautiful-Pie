@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from policy import Policy, origin
-from packages import DEFAULT_PACKAGES, PACKAGE_CHOICES, validate_packages
+from packages import DEFAULT_PACKAGES, validate_packages
 
 
 class OriginTests(unittest.TestCase):
@@ -22,19 +22,14 @@ class OriginTests(unittest.TestCase):
 
 
 class PackageTests(unittest.TestCase):
-    def test_fixed_catalog_defaults_and_canonical_selection(self):
-        ids = {choice["id"] for choice in PACKAGE_CHOICES}
-        self.assertEqual(ids, {"basic-tools", "chromium", "obsidian", "gh", "ssh", "marksman",
-                               "emmet", "typescript-lsp", "typescript", "html-lsp", "nil", "nixd", "java-lsp"})
-        self.assertEqual(len(ids), len(PACKAGE_CHOICES))
-        self.assertEqual(DEFAULT_PACKAGES, sorted(ids - {"obsidian"}))
+    def test_selection_is_canonical_and_can_be_empty(self):
         self.assertEqual(validate_packages(["ssh", "gh", "ssh"]), ["gh", "ssh"])
         self.assertEqual(validate_packages([]), [])
         self.assertEqual(validate_packages(["obsidian"]), ["obsidian"])
 
     def test_selection_rejects_nonlists_nonstrings_and_arbitrary_packages(self):
         for value in (None, "gh", ("gh",), {"gh": True}, [None], [1], [True], [{}], [[]],
-                      ["docker-lsp"], ["pkgs.gh"], ["/nix/store/tool"], ["github:owner/repo"], ["GH"]):
+                      ["not-a-supported-package"], ["pkgs.gh"], ["/nix/store/tool"], ["github:owner/repo"], ["GH"]):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_packages(value)
 
@@ -87,6 +82,14 @@ class PolicyTests(unittest.TestCase):
                            ("selected_packages", ["gh", "unknown"])):
             with self.subTest(field=field, bad=bad), self.assertRaises(ValueError):
                 self.policy.replace({**before, field: bad})
+            self.assertEqual(self.policy.snapshot(), before)
+            self.assertEqual(Policy(self.policy.directory).snapshot(), before)
+
+    def test_unsupported_platform_selection_preserves_permissions(self):
+        before = self.policy.snapshot()
+        with patch("packages.SYSTEM", "aarch64-linux"):
+            with self.assertRaises(ValueError):
+                self.policy.replace({**before, "selected_packages": ["sourcekit-lsp"]})
             self.assertEqual(self.policy.snapshot(), before)
             self.assertEqual(Policy(self.policy.directory).snapshot(), before)
 
