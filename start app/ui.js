@@ -7,7 +7,7 @@ let state;
 let busy = false;
 let renderedPolicy = "";
 let renderedHistory = "";
-let catalog = {folders: [], programs: []};
+let catalog = {folders: [], programs: [], packages: []};
 let gpuChosen = false;
 
 async function api(path, value) {
@@ -45,12 +45,15 @@ function entry(list, label, detail, remove, enabled = true) {
   const small = document.createElement("small");
   small.textContent = detail;
   text.append(small);
-  const button = document.createElement("button");
-  button.className = "remove";
-  button.textContent = enabled ? "−" : "Restore";
-  button.setAttribute("aria-label", `${enabled ? "Revoke" : "Restore"} ${label}`);
-  button.onclick = () => action(() => change(remove));
-  row.append(text, button);
+  row.append(text);
+  if (remove) {
+    const button = document.createElement("button");
+    button.className = "remove";
+    button.textContent = enabled ? "−" : "Restore";
+    button.setAttribute("aria-label", `${enabled ? "Revoke" : "Restore"} ${label}`);
+    button.onclick = () => action(() => change(remove));
+    row.append(button);
+  }
   list.append(row);
   return row;
 }
@@ -63,24 +66,100 @@ const REQUIREMENT_NOTES = {
   folder: "Private sandbox files; restart to revoke",
 };
 
-function renderPermissions() {
-  for (const name of ["folders", "programs", "websites"]) byId(name).replaceChildren();
-  for (const kind of ["folder", "program"]) {
-    const list = byId(`${kind}-requirements`);
-    list.replaceChildren();
-    for (const requirement of state.requirements || []) {
-      if (requirement.kind !== kind) continue;
-      entry(list, requirement.label,
-        `${requirement.enabled ? "Enabled" : "Disabled"} · ${requirement.path} · ${
-          REQUIREMENT_NOTES[requirement.id] || REQUIREMENT_NOTES[kind]}`,
-        policy => {
-          const disabled = policy.disabled_requirements || [];
-          policy.disabled_requirements = requirement.enabled
-            ? [...new Set([...disabled, requirement.id])]
-            : disabled.filter(id => id !== requirement.id);
-        }, requirement.enabled);
+function activeLaunch() {
+  return state.runtime.running || state.runtime.starting;
+}
+
+function installedMode() {
+  return activeLaunch() && state.runtime.launch
+    ? state.runtime.mode === "container" && !!state.runtime.launch.installed_mode
+    : byId("mode").value === "container" && state.policy.installed_mode;
+}
+
+function selectedPackages() {
+  return activeLaunch() && state.runtime.launch ? state.runtime.launch.selected_packages : state.policy.selected_packages;
+}
+
+function openPackageDialog() {
+  const dialog = byId("package-dialog");
+  if (dialog.open) return;
+  const groups = byId("package-groups");
+  groups.replaceChildren();
+  const selected = new Set(state.policy.selected_packages);
+  const fieldsets = new Map();
+  for (const choice of catalog.packages) {
+    if (!fieldsets.has(choice.group)) {
+      const fieldset = document.createElement("fieldset");
+      const legend = document.createElement("legend");
+      legend.textContent = choice.group;
+      fieldset.append(legend);
+      fieldsets.set(choice.group, fieldset);
+      groups.append(fieldset);
     }
+    const label = document.createElement("label");
+    label.className = "check";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.name = "package";
+    input.value = choice.id;
+    input.checked = selected.has(choice.id);
+    const text = document.createElement("span");
+    text.textContent = choice.label;
+    const description = document.createElement("small");
+    description.textContent = choice.description;
+    text.append(description);
+    label.append(input, text);
+    fieldsets.get(choice.group).append(label);
   }
+  byId("package-error").textContent = catalog.packages.length ? "" : "Package catalog unavailable. Reload the launcher to try again.";
+  byId("package-save").disabled = !catalog.packages.length;
+  dialog.showModal();
+}
+
+function renderRequirementList(kind, installed) {
+  const list = byId(`${kind}-requirements`);
+  list.replaceChildren();
+  for (const requirement of state.requirements || []) {
+    if (requirement.kind !== kind || installed && kind === "program") continue;
+    if (installed && requirement.id === "nix-store") {
+      entry(list, requirement.label, `${requirement.path} · Required private installed store; read-only`);
+      continue;
+    }
+    entry(list, requirement.label,
+      `${requirement.enabled ? "Enabled" : "Disabled"} · ${requirement.path} · ${
+        REQUIREMENT_NOTES[requirement.id] || REQUIREMENT_NOTES[kind]}`,
+      policy => {
+        const disabled = policy.disabled_requirements || [];
+        policy.disabled_requirements = requirement.enabled
+          ? [...new Set([...disabled, requirement.id])]
+          : disabled.filter(id => id !== requirement.id);
+      }, requirement.enabled);
+  }
+}
+
+function renderInstalledPrograms() {
+  const list = byId("program-requirements");
+  entry(list, "Required installed core", "OMP/OMSP, OMBP and sandbox runtime · always included");
+  const selected = new Set(selectedPackages());
+  for (const choice of catalog.packages) {
+    if (selected.has(choice.id)) entry(list, choice.label, `${choice.group} · ${choice.description}`);
+  }
+}
+
+function renderPermissions() {
+  const installed = installedMode();
+  byId("program-form").hidden = installed;
+  byId("inspection-programs").hidden = installed;
+  byId("installed-program-note").hidden = !installed;
+  byId("installed-program-note").textContent = state.runtime.running
+    ? "Current installed packages are read-only. Choose tools and restart to change them; saved selections may differ."
+    : "Required core and selected tools will be installed privately on Start. Choose tools to change optional packages.";
+  let programsHeading = "Required sandbox programs";
+  if (installed) programsHeading = state.runtime.running ? "Current installed programs" : "Programs for next Start";
+  byId("program-requirements-heading").textContent = programsHeading;
+  for (const name of ["folders", "programs", "websites"]) byId(name).replaceChildren();
+  for (const kind of ["folder", "program"]) renderRequirementList(kind, installed);
+  if (installed) renderInstalledPrograms();
   for (const folder of state.policy.folders) {
     const row = entry(byId("folders"), folder.path, folder.write ? "Read + write + delete" : "Read only",
       policy => { policy.folders = policy.folders.filter(item => item.path !== folder.path); });
@@ -226,6 +305,10 @@ function subdomainToggle(website) {
 }
 
 async function allowEvent(event) {
+  if (event.kind === "program" && installedMode()) {
+    openPackageDialog();
+    return;
+  }
   const folderAccess = state.policy.folder_write_default ? "with write AND deletion" : "read-only";
   if (!confirm(`Allow ${event.kind}: ${event.target}?\nFolders are granted ${folderAccess}. Website subpaths are all allowed. Internet must also be enabled.`)) return;
   await change(policy => {
@@ -250,7 +333,8 @@ function eventRow(event) {
   const allow = document.createElement("button");
   allow.className = "allow";
   allow.textContent = "+";
-  allow.setAttribute("aria-label", `Allow ${event.target}`);
+  allow.setAttribute("aria-label", event.kind === "program" && installedMode()
+    ? `Choose tools for the next Start; ${event.target} remains denied` : `Allow ${event.target}`);
   allow.onclick = () => action(() => allowEvent(event));
   row.append(detail, allow);
   return row;
@@ -406,6 +490,14 @@ async function loadCatalog() {
     .map(item => ({name: item.name, value: item.path})), 200);
 }
 
+function renderLists() {
+  const effective = [installedMode(), selectedPackages(), !!state.runtime.running];
+  const policyKey = JSON.stringify([state.policy, state.requirements, effective]);
+  const historyKey = JSON.stringify([state.history, state.policy.dependencies, effective[0]]);
+  if (renderedPolicy !== policyKey) { renderPermissions(); renderedPolicy = policyKey; }
+  if (renderedHistory !== historyKey) { renderHistory(); renderedHistory = historyKey; }
+}
+
 async function refresh() {
   state = await api("status");
   const running = state.runtime.running;
@@ -427,13 +519,11 @@ async function refresh() {
     byId("gpu").value = state.runtime.launch.gpu;
     byId("desktop").checked = state.runtime.launch.desktop;
     byId("source").value = state.runtime.launch.source;
-    renderMode();
   }
+  byId("installed-mode").checked = !!state.policy.installed_mode;
+  renderMode();
   if (!byId("source").value) byId("source").value = state.source;
-  const policyKey = JSON.stringify([state.policy, state.requirements]);
-  const historyKey = JSON.stringify([state.history, state.policy.dependencies]);
-  if (renderedPolicy !== policyKey) { renderPermissions(); renderedPolicy = policyKey; }
-  if (renderedHistory !== historyKey) { renderHistory(); renderedHistory = historyKey; }
+  renderLists();
   if (state.runtime.error) message(state.runtime.error);
 }
 
@@ -469,6 +559,33 @@ byId("website-form").onsubmit = event => {
 };
 byId("internet").onchange = () => action(() => change(policy => { policy.internet = byId("internet").checked; }));
 byId("write").onchange = () => action(() => change(policy => { policy.folder_write_default = byId("write").checked; }));
+byId("installed-mode").onchange = () => action(() => change(policy => {
+  policy.installed_mode = byId("installed-mode").checked;
+}));
+byId("choose-packages").onclick = openPackageDialog;
+byId("package-cancel").onclick = () => byId("package-dialog").close();
+byId("package-dialog").onclose = () => byId("package-groups").replaceChildren();
+byId("package-form").onsubmit = event => {
+  event.preventDefault();
+  if (state.runtime.starting) {
+    byId("package-error").textContent = "Wait for this Start to finish before saving packages for the next launch.";
+    return;
+  }
+  action(async () => {
+    const selected = [...byId("package-groups").querySelectorAll("input:checked")].map(input => input.value);
+    byId("package-save").disabled = true;
+    byId("package-error").textContent = "";
+    try {
+      await change(policy => { policy.selected_packages = selected; });
+      byId("package-dialog").close();
+    } catch (error) {
+      byId("package-error").textContent = error.message || error;
+      throw error;
+    } finally {
+      byId("package-save").disabled = false;
+    }
+  });
+};
 byId("common-folder").onchange = () => {
   if (byId("common-folder").value) {
     byId("folder").value = byId("common-folder").value;
@@ -484,11 +601,17 @@ byId("allow-all-network").onclick = () => action(async () => {
 });
 byId("gpu").onchange = () => { gpuChosen = true; };
 function renderMode() {
+  const normal = byId("mode").value === "normal";
+  byId("installed-controls").hidden = normal;
+  byId("installed-mode").disabled = normal || !state || !!activeLaunch();
+  byId("choose-packages").disabled = normal || !state || state.runtime.starting
+    || !state.policy.installed_mode || !catalog.packages.length;
+  byId("package-save").disabled = !state || state.runtime.starting || !catalog.packages.length;
   byId("boundary").textContent = byId("mode").value === "normal"
     ? "Unrestricted host launch: folder, program and website permissions below DO NOT APPLY. OMBP uses your normal host configuration and credentials."
     : "Container mode: OMBP and every OMP child run together. Only approved host resources are exposed. Network requests must pass the website gateway.";
 }
-byId("mode").onchange = renderMode;
+byId("mode").onchange = () => { renderMode(); if (state) renderLists(); };
 function launchSettings() {
   return {source: byId("source").value.trim(), mode: byId("mode").value,
     desktop: byId("desktop").checked, gpu: byId("gpu").value, agent: byId("agent").value};

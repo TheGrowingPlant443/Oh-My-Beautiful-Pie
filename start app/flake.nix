@@ -62,19 +62,27 @@
         exec ${pkgs.zenity}/bin/zenity "$@"
       '';
       # Everyday CLI tools for the AI inside the sandbox; files and network still pass the gateways.
-      tools = pkgs.buildEnv {
-        name = "ombp-sandbox-tools";
-        paths = with pkgs; [
+      basicToolPaths = with pkgs; [
           glib.bin procps psmisc util-linux findutils gnugrep gnused gawk diffutils patch file which less
           gnutar gzip bzip2 xz zstd unzip zip curl wget jq ripgrep fd rsync tree gnumake bc strace lsof
           # zenity: OMBP's file/folder pickers fall back to it without a desktop portal.
           ncurses libnotify dialog
-          marksman emmet-language-server typescript-language-server typescript
-          vscode-langservers-extracted nil nixd jdt-language-server
-        ];
+      ];
+      languageServerPaths = with pkgs; [
+        marksman emmet-language-server typescript-language-server typescript
+        vscode-langservers-extracted nil nixd jdt-language-server
+      ];
+      basicTools = pkgs.buildEnv {
+        name = "ombp-sandbox-basic-tools";
+        paths = basicToolPaths;
         pathsToLink = [ "/bin" ];
       };
-    in { inherit pkgs python testPython fusermount source weston fonts browser tools; };
+      tools = pkgs.buildEnv {
+        name = "ombp-sandbox-tools";
+        paths = basicToolPaths ++ languageServerPaths;
+        pathsToLink = [ "/bin" ];
+      };
+    in { inherit pkgs python testPython fusermount source weston fonts browser dialog tools basicTools; };
   in {
     checks = each (system: let inherit (environment system) pkgs python source; in {
       syntax = pkgs.runCommand "ombp-start-syntax" { nativeBuildInputs = [ python pkgs.nodejs_24 ]; } ''
@@ -85,8 +93,24 @@
       '';
     });
     packages = each (system: let
-      inherit (environment system) pkgs python fusermount source weston fonts browser tools;
+      inherit (environment system) pkgs python fusermount source weston fonts browser dialog tools basicTools;
     in {
+      package-basic-tools = basicTools;
+      package-chromium = pkgs.chromium;
+      package-obsidian = (import nixpkgs {
+        inherit system;
+        config.allowUnfreePredicate = package: nixpkgs.lib.getName package == "obsidian";
+      }).obsidian;
+      package-gh = pkgs.gh;
+      package-ssh = pkgs.openssh;
+      package-marksman = pkgs.marksman;
+      package-emmet = pkgs.emmet-language-server;
+      package-typescript-lsp = pkgs.typescript-language-server;
+      package-typescript = pkgs.typescript;
+      package-html-lsp = pkgs.vscode-langservers-extracted;
+      package-nil = pkgs.nil;
+      package-nixd = pkgs.nixd;
+      package-java-lsp = pkgs.jdt-language-server;
       default = pkgs.writeShellApplication {
         name = "ombp-start";
         runtimeInputs = [ python fusermount pkgs.nix pkgs.podman pkgs.dbus pkgs.gnome-keyring pkgs.libsecret ];
@@ -107,11 +131,12 @@
           export START_APP_CHROMIUM=${pkgs.chromium}/bin/chromium
           export START_APP_BROWSER_NAMES=${browser}/bin
           export START_APP_TOOLS=${tools}/bin
+          export START_APP_ZENITY=${dialog}/bin/zenity
           exec ${python}/bin/python3 ${source}/app.py "$@"
         '';
       };
     });
-    devShells = each (system: let inherit (environment system) pkgs python testPython fusermount weston fonts browser tools; in {
+    devShells = each (system: let inherit (environment system) pkgs python testPython fusermount weston fonts browser dialog tools; in {
       default = pkgs.mkShell {
         packages = [ testPython fusermount pkgs.nix pkgs.podman pkgs.dbus pkgs.gnome-keyring pkgs.libsecret ];
         FUSE_LIBRARY_PATH = "${pkgs.lib.getLib pkgs.fuse}/lib/libfuse.so.2";
@@ -130,6 +155,7 @@
         START_APP_CHROMIUM = "${pkgs.chromium}/bin/chromium";
         START_APP_BROWSER_NAMES = "${browser}/bin";
         START_APP_TOOLS = "${tools}/bin";
+        START_APP_ZENITY = "${dialog}/bin/zenity";
       };
     });
   };

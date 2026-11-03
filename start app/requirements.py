@@ -54,7 +54,32 @@ def _programs(path):
     return [str(item) for item in candidates if item.is_file() and os.access(item, os.X_OK)]
 
 
-def bundles(executable, gpu, resolve_closure):
+def _optional_entries(selected):
+    browser = ("sandbox-browser", "Sandbox browser window (Chrome/Chromium/Brave names)",
+               os.environ.get("START_APP_BROWSER_NAMES"))
+    if selected is not None:
+        from packages import PACKAGE_CHOICES
+        labels = {item["id"]: item["label"] for item in PACKAGE_CHOICES}
+        entries = [browser] if "chromium" in selected else []
+        entries.extend(("package-" + key, labels[key], path) for key, path in selected.items())
+        return entries
+    entries = [
+        ("sandbox-tools", "Basic tools (gdbus, ps/pgrep/pkill, grep, sed, find, curl, jq, rg…)",
+         os.environ.get("START_APP_TOOLS")),
+        ("tool-gh", "GitHub CLI (gh)", os.environ.get("START_APP_GH")),
+        ("tool-ssh", "SSH client", os.environ.get("START_APP_OPENSSH")),
+        browser,
+    ]
+    chrome = host_program(("google-chrome-stable", "google-chrome"))
+    entries.append(("tool-chrome", "Google Chrome", str(Path(chrome).parent)) if chrome else
+                   ("tool-chrome", "Chromium (Google Chrome not installed)", os.environ.get("START_APP_CHROMIUM")))
+    obsidian = host_program(("obsidian",))
+    if obsidian:
+        entries.append(("tool-obsidian", "Obsidian", obsidian))
+    return entries
+
+
+def bundles(executable, gpu, resolve_closure, *, selected=None, agent_cli=None):
     entries = [("ombp", "OMBP", executable)]
     # Nix's script and binary wrappers both contain their literal bundled PATH directories.
     directories = dict.fromkeys(re.findall(rb"/nix/store/[a-z0-9]{32}-[^/\x00:\s\"']+/bin", Path(executable).read_bytes()))
@@ -74,21 +99,14 @@ def bundles(executable, gpu, resolve_closure):
         ("sandbox-shell", "Sandbox shell (sh, bash)", shell and str(Path(shell).parent)),
         ("sandbox-coreutils", "Sandbox core utilities", os.environ.get("START_APP_COREUTILS")),
         ("sandbox-fonts", "Sandbox fonts", os.environ.get("START_APP_FONTCONFIG")),
-        ("sandbox-tools", "Basic tools (gdbus, ps/pgrep/pkill, grep, sed, find, curl, jq, rg…)",
-         os.environ.get("START_APP_TOOLS")),
         ("tool-podman", "Podman client (Code quality)", os.environ.get("START_APP_PODMAN")),
-        ("tool-gh", "GitHub CLI (gh)", os.environ.get("START_APP_GH")),
-        ("tool-ssh", "SSH client", os.environ.get("START_APP_OPENSSH")),
-        # Before tool-chrome: the first bundle wins a program name, so OMBP launches the window wrapper.
-        ("sandbox-browser", "Sandbox browser window (Chrome/Chromium/Brave names)",
-         os.environ.get("START_APP_BROWSER_NAMES")),
     ))
-    chrome = host_program(("google-chrome-stable", "google-chrome"))
-    entries.append(("tool-chrome", "Google Chrome", str(Path(chrome).parent)) if chrome else
-                   ("tool-chrome", "Chromium (Google Chrome not installed)", os.environ.get("START_APP_CHROMIUM")))
-    obsidian = host_program(("obsidian",))
-    if obsidian:
-        entries.append(("tool-obsidian", "Obsidian", obsidian))
+    entries.extend(_optional_entries(selected))
+    if selected is not None:
+        entries.extend((
+            ("sandbox-dialog", "Sandbox file and folder picker", os.environ.get("START_APP_ZENITY")),
+            ("agent-cli", "Selected agent command", agent_cli),
+        ))
     if gpu == "amd":
         entries.append(("sandbox-mesa", "AMD Mesa drivers", os.environ.get("START_APP_MESA")))
     result = {}

@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from policy import Policy, origin
+from packages import DEFAULT_PACKAGES, PACKAGE_CHOICES, validate_packages
 
 
 class OriginTests(unittest.TestCase):
@@ -20,6 +21,24 @@ class OriginTests(unittest.TestCase):
                 origin(value)
 
 
+class PackageTests(unittest.TestCase):
+    def test_fixed_catalog_defaults_and_canonical_selection(self):
+        ids = {choice["id"] for choice in PACKAGE_CHOICES}
+        self.assertEqual(ids, {"basic-tools", "chromium", "obsidian", "gh", "ssh", "marksman",
+                               "emmet", "typescript-lsp", "typescript", "html-lsp", "nil", "nixd", "java-lsp"})
+        self.assertEqual(len(ids), len(PACKAGE_CHOICES))
+        self.assertEqual(DEFAULT_PACKAGES, sorted(ids - {"obsidian"}))
+        self.assertEqual(validate_packages(["ssh", "gh", "ssh"]), ["gh", "ssh"])
+        self.assertEqual(validate_packages([]), [])
+        self.assertEqual(validate_packages(["obsidian"]), ["obsidian"])
+
+    def test_selection_rejects_nonlists_nonstrings_and_arbitrary_packages(self):
+        for value in (None, "gh", ("gh",), {"gh": True}, [None], [1], [True], [{}], [[]],
+                      ["docker-lsp"], ["pkgs.gh"], ["/nix/store/tool"], ["github:owner/repo"], ["GH"]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_packages(value)
+
+
 class PolicyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -28,6 +47,48 @@ class PolicyTests(unittest.TestCase):
         self.policy = Policy(self.root / "state")
         self.folder = self.root / "vault"
         self.folder.mkdir()
+
+    def test_installed_defaults_and_selection_persist_without_aliasing(self):
+        initial = self.policy.snapshot()
+        self.assertTrue(initial["installed_mode"])
+        self.assertEqual(initial["selected_packages"], DEFAULT_PACKAGES)
+        initial["selected_packages"].clear()
+        self.assertEqual(self.policy.snapshot()["selected_packages"], DEFAULT_PACKAGES)
+        for mode, selection, expected in ((False, ["ssh", "gh", "ssh"], ["gh", "ssh"]),
+                                           (True, [], []), (True, ["obsidian"], ["obsidian"])):
+            with self.subTest(mode=mode, selection=selection):
+                self.policy.replace({**self.policy.snapshot(), "installed_mode": mode,
+                                     "selected_packages": selection})
+                loaded = Policy(self.policy.directory).snapshot()
+                self.assertEqual((loaded["installed_mode"], loaded["selected_packages"]), (mode, expected))
+                self.assertEqual(json.loads(self.policy.path.read_text())["selected_packages"], expected)
+
+    def test_legacy_policy_defaults_to_installed_without_losing_grants(self):
+        legacy = self.policy.snapshot()
+        del legacy["installed_mode"]
+        del legacy["selected_packages"]
+        legacy["folders"] = [{"path": str(self.folder), "write": False}]
+        legacy["disabled_requirements"] = ["chromium"]
+        legacy["internet"] = False
+        self.policy.save("policy.json", legacy)
+        migrated = Policy(self.policy.directory)
+        snapshot = migrated.snapshot()
+        self.assertTrue(snapshot.pop("installed_mode"))
+        self.assertEqual(snapshot.pop("selected_packages"), DEFAULT_PACKAGES)
+        self.assertEqual(snapshot, legacy)
+        migrated.replace(migrated.snapshot())
+        self.assertTrue(json.loads(migrated.path.read_text())["installed_mode"])
+        self.assertEqual(Policy(migrated.directory).snapshot(), migrated.snapshot())
+
+    def test_invalid_installed_settings_preserve_saved_policy(self):
+        before = self.policy.snapshot()
+        for field, bad in (("installed_mode", 1), ("installed_mode", "yes"), ("installed_mode", None),
+                           ("selected_packages", "gh"), ("selected_packages", [False]),
+                           ("selected_packages", ["gh", "unknown"])):
+            with self.subTest(field=field, bad=bad), self.assertRaises(ValueError):
+                self.policy.replace({**before, field: bad})
+            self.assertEqual(self.policy.snapshot(), before)
+            self.assertEqual(Policy(self.policy.directory).snapshot(), before)
 
     def test_rejected_update_keeps_last_permission_set(self):
         value = self.policy.snapshot()

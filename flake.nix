@@ -265,7 +265,7 @@
           };
         in
         {
-          inherit package frontend sdk omspPackage;
+          inherit package frontend sdk omspPackage sdkCommand omspCommand;
           shell = pkgs.mkShell ({
             packages = [
               coverageRust pkgs.pkg-config pkgs.cmake
@@ -298,6 +298,14 @@
         frontend = values.frontend;
         sdk = values.sdk;
         omsp = values.omspPackage;
+        agent-omp = pkgs.runCommand "ombp-agent-omp" { } ''
+          mkdir -p "$out/bin"
+          ln -s ${values.sdkCommand} "$out/bin/omp"
+        '';
+        agent-omsp = pkgs.runCommand "ombp-agent-omsp" { } ''
+          mkdir -p "$out/bin"
+          ln -s ${values.omspCommand} "$out/bin/omsp"
+        '';
       });
       apps = forAll (pkgs: {
         default = {

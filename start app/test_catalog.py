@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import sys
 
 import catalog
@@ -28,6 +29,27 @@ class CatalogTests(unittest.TestCase):
         path.write_text("#!/bin/sh\nexit 99\n")
         path.chmod(0o755)
         return path
+
+    def test_catalog_exposes_portable_package_choices_alongside_host_suggestions(self):
+        folders = [{"name": "Home", "path": str(self.home)}]
+        programs = [{"name": "Editor", "path": "/nix/store/editor/bin/editor"}]
+        with patch.object(catalog, "detect_gpu", return_value="amd"), \
+                patch.object(catalog, "user_folders", return_value=folders), \
+                patch.object(catalog, "installed_programs", return_value=programs):
+            result = catalog.catalog()
+        self.assertEqual(result["gpu"], "amd")
+        self.assertEqual(result["folders"], folders)
+        self.assertEqual(result["programs"], programs)
+        choices = result["packages"]
+        self.assertTrue(choices)
+        self.assertEqual(len({choice["id"] for choice in choices}), len(choices))
+        for choice in choices:
+            self.assertEqual(set(choice), {"id", "label", "group", "description", "default"})
+            self.assertRegex(choice["id"], r"^[a-z][a-z0-9-]*$")
+            self.assertIsInstance(choice["default"], bool)
+            self.assertIn(choice["group"], {"Tools", "Apps", "Language servers"})
+            self.assertTrue(choice["label"])
+            self.assertTrue(choice["description"])
 
     def test_gpu_prefers_boot_card_and_falls_back_deterministically(self):
         self.gpu("card0", "0x10de", 1)
