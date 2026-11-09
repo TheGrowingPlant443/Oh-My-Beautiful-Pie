@@ -39,6 +39,32 @@ class SourceBuildTests(unittest.TestCase):
         self.runtime = Runtime(Policy(self.root / "state"))
         self.addCleanup(self.runtime.stop)
 
+    def test_installed_mounts_keep_host_gateway_without_exposing_host_store(self):
+        self.runtime.gateway = SimpleNamespace(socket_path=self.root / "network/proxy.sock",
+                                               ca_path=self.root / "network/ca.pem")
+        self.addCleanup(setattr, self.runtime, "gateway", None)
+        profile = self.root / "private-install"
+        self.runtime.installed_profile = profile
+        args = []
+        with patch.object(self.runtime, "_host_omp", return_value=None):
+            self.runtime._mount_resources(args, self.root / "home", ["nix-store"])
+        mounts = [args[i + 1] for i, value in enumerate(args) if value == "--volume"]
+        self.assertIn(f"{profile}/store:/nix/store:ro", mounts)
+        self.assertIn(f"{profile}/programs:/installed-programs:ro", mounts)
+        self.assertIn(f"{self.runtime.mount}/host:/host:rw", mounts)
+        self.assertNotIn(f"{self.runtime.mount}/store:/nix/store:ro", mounts)
+        self.assertFalse(any(value.startswith("/nix/store:") for value in mounts))
+        self.assertFalse(any(":/allowed-programs:" in value for value in mounts))
+        self.runtime.installed_profile = None
+        args = []
+        with patch.object(self.runtime, "_host_omp", return_value=None):
+            self.runtime._mount_resources(args, self.root / "home", [])
+        mounts = [args[i + 1] for i, value in enumerate(args) if value == "--volume"]
+        self.assertIn(f"{self.runtime.mount}/store:/nix/store:ro", mounts)
+        self.assertIn(f"{self.runtime.mount}/programs:/allowed-programs:ro", mounts)
+        self.assertIn(f"{self.runtime.mount}/host:/host:rw", mounts)
+        self.runtime.gateway = None
+
     def test_rootfs_preparation_does_not_delete_existing_temporary_data(self):
         temporary = self.runtime.policy.directory / "rootfs/var/tmp"
         temporary.mkdir(parents=True)

@@ -27,7 +27,7 @@ def prepare_workspace(path=Path(WORKSPACE)):
 
 FOLDERS = (
     ("sandbox-home", "Private OMBP home", "/home/sandbox"),
-    ("sandbox-tmp", "Private temporary files", str(Path(WORKSPACE).parent)),
+    ("sandbox-tmp", "Private temporary files (container /tmp, not your host /tmp)", str(Path(WORKSPACE).parent)),
     ("sandbox-run", "Private session sockets", "/run"),
     ("launcher-files", "Sandbox entrypoint and OMP bridge", "/launcher"),
     ("network-socket", "Whitelist gateway socket", "/network"),
@@ -54,7 +54,34 @@ def _programs(path):
     return [str(item) for item in candidates if item.is_file() and os.access(item, os.X_OK)]
 
 
-def bundles(executable, gpu, resolve_closure):
+def _optional_entries(selected):
+    browser = ("sandbox-browser", "Sandbox browser window (Chrome/Chromium/Brave names)",
+               os.environ.get("START_APP_BROWSER_NAMES"))
+    if selected is not None:
+        from packages import PACKAGE_CHOICES
+        labels = {item["id"]: item["label"] for item in PACKAGE_CHOICES}
+        entries = [browser] if "chromium" in selected else []
+        # Flutter's Dart SDK also implements OMP's Flutter debugger defaults.
+        entries.extend(("package-" + key, labels[key], selected[key])
+                       for key in sorted(selected, key=lambda key: key != "flutter"))
+        return entries
+    entries = [
+        ("sandbox-tools", "Basic tools (gdbus, ps/pgrep/pkill, grep, sed, find, curl, jq, rg…)",
+         os.environ.get("START_APP_TOOLS")),
+        ("tool-gh", "GitHub CLI (gh)", os.environ.get("START_APP_GH")),
+        ("tool-ssh", "SSH client", os.environ.get("START_APP_OPENSSH")),
+        browser,
+    ]
+    chrome = host_program(("google-chrome-stable", "google-chrome"))
+    entries.append(("tool-chrome", "Google Chrome", str(Path(chrome).parent)) if chrome else
+                   ("tool-chrome", "Chromium (Google Chrome not installed)", os.environ.get("START_APP_CHROMIUM")))
+    obsidian = host_program(("obsidian",))
+    if obsidian:
+        entries.append(("tool-obsidian", "Obsidian", obsidian))
+    return entries
+
+
+def bundles(executable, gpu, resolve_closure, *, selected=None, agent_cli=None):
     entries = [("ombp", "OMBP", executable)]
     # Nix's script and binary wrappers both contain their literal bundled PATH directories.
     directories = dict.fromkeys(re.findall(rb"/nix/store/[a-z0-9]{32}-[^/\x00:\s\"']+/bin", Path(executable).read_bytes()))
@@ -65,29 +92,25 @@ def bundles(executable, gpu, resolve_closure):
             entries.append(("bundled-" + package, "OMBP bundled " + package, path))
     python = os.environ.get("START_APP_PYTHON", sys.executable)
     dbus = os.environ.get("START_APP_DBUS")
-    # Bin directories expose python/python3 and dbus-daemon under /allowed-programs, not only the entrypoints.
+    shell = os.environ.get("START_APP_SHELL")
+    # Bin directories expose python/python3, dbus-daemon and sh/bash under /allowed-programs, not only the entrypoints.
     entries.extend((
         ("sandbox-python", "Sandbox Python", str(Path(python).parent)),
         ("sandbox-dbus", "Private D-Bus", dbus and str(Path(dbus).parent)),
         ("sandbox-keyring", "Private keyring", os.environ.get("START_APP_KEYRING")),
-        ("sandbox-shell", "Sandbox shell", os.environ.get("START_APP_SHELL")),
+        ("sandbox-shell", "Sandbox shell (sh, bash)", shell and str(Path(shell).parent)),
         ("sandbox-coreutils", "Sandbox core utilities", os.environ.get("START_APP_COREUTILS")),
         ("sandbox-fonts", "Sandbox fonts", os.environ.get("START_APP_FONTCONFIG")),
-        ("sandbox-tools", "Basic tools (gdbus, ps/pgrep/pkill, grep, sed, find, curl, jq, rg…)",
-         os.environ.get("START_APP_TOOLS")),
         ("tool-podman", "Podman client (Code quality)", os.environ.get("START_APP_PODMAN")),
-        ("tool-gh", "GitHub CLI (gh)", os.environ.get("START_APP_GH")),
-        ("tool-ssh", "SSH client", os.environ.get("START_APP_OPENSSH")),
-        # Before tool-chrome: the first bundle wins a program name, so OMBP launches the window wrapper.
-        ("sandbox-browser", "Sandbox browser window (Chrome/Chromium/Brave names)",
-         os.environ.get("START_APP_BROWSER_NAMES")),
     ))
-    chrome = host_program(("google-chrome-stable", "google-chrome"))
-    entries.append(("tool-chrome", "Google Chrome", str(Path(chrome).parent)) if chrome else
-                   ("tool-chrome", "Chromium (Google Chrome not installed)", os.environ.get("START_APP_CHROMIUM")))
-    obsidian = host_program(("obsidian",))
-    if obsidian:
-        entries.append(("tool-obsidian", "Obsidian", obsidian))
+    optional = _optional_entries(selected)
+    # Explicit tool environments (for example Python with debugpy) win command collisions.
+    entries = entries + optional if selected is None else optional + entries
+    if selected is not None:
+        entries.extend((
+            ("sandbox-dialog", "Sandbox file and folder picker", os.environ.get("START_APP_ZENITY")),
+            ("agent-cli", "Selected agent command", agent_cli),
+        ))
     if gpu == "amd":
         entries.append(("sandbox-mesa", "AMD Mesa drivers", os.environ.get("START_APP_MESA")))
     result = {}

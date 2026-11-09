@@ -25,6 +25,7 @@ _DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _PATH = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
 _SYSTEM = ("/proc", "/sys", "/dev", "/run", "/nix")
 # Lookups of files that never exist, not user actions; Python's startup probes beside its executable included.
+# A leading "-" is a login shell's argv[0] (bash looks up "-bash"), never a program name.
 _PROBES = {".DS_Store", ".directory", ".hidden", "desktop.ini", "autorun.inf", "pyvenv.cfg"}
 
 
@@ -86,7 +87,8 @@ class AccessFS(Operations):
         return path
 
     def _deny(self, kind, target, reason):
-        if posixpath.basename(target) in _PROBES or target.endswith("._pth"):
+        name = posixpath.basename(target)
+        if name in _PROBES or name.endswith("._pth") or (kind == "program" and name.startswith("-")):
             return
         key = kind, target, reason
         with self._lock:
@@ -203,7 +205,13 @@ class AccessFS(Operations):
         raise FuseOSError(errno.EACCES)
 
     def _store_entry(self, target, write, snapshot):
-        if _store_root(target) not in self._roots(snapshot):
+        root = _store_root(target)
+        if root not in self._roots(snapshot):
+            # Node searches parent directories for optional package metadata; absence is not a denied grant.
+            try:
+                os.lstat(root)
+            except FileNotFoundError:
+                raise FuseOSError(errno.ENOENT) from None
             if "/bin/" in target and self._unapproved_executable(target):
                 self._deny("program", target, "Nix executable is not approved")
             raise FuseOSError(errno.EACCES)

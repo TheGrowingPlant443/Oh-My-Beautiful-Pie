@@ -81,9 +81,26 @@
               npmRebuildFlags = [ "--ignore-scripts" ];
             };
           };
-          coverageCargoVendor = pkgs.rustPlatform.importCargoLock {
+          ignoreLock = lib.findFirst (p: p.name == "ignore")
+            (throw "Cargo.lock has no ignore dependency")
+            (builtins.fromTOML (builtins.readFile ./src-tauri/Cargo.lock)).package;
+          boundedIgnore = (craneLib.downloadCargoPackage ignoreLock).overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [ ./nix/ignore-nearest-repository.patch ];
+          });
+          cargoVendor = craneLib.vendorCargoDeps {
+            cargoLock = ./src-tauri/Cargo.lock;
+            overrideVendorCargoPackage = p: drv: if p.name == "ignore" then boundedIgnore else drv;
+          };
+          baseCoverageVendor = pkgs.rustPlatform.importCargoLock {
             lockFile = ./src-tauri/Cargo.lock;
           };
+          # Coverage and packaged builds must use the same bounded repository discovery.
+          coverageCargoVendor = pkgs.runCommand "omp-coverage-cargo-vendor" { } ''
+            mkdir -p "$out"
+            ln -s ${baseCoverageVendor}/* "$out/"
+            rm "$out/ignore-${ignoreLock.version}"
+            ln -s ${boundedIgnore} "$out/ignore-${ignoreLock.version}"
+          '';
           # Keep coverage's compiler, profiler runtime and readers from one upstream toolchain.
           coverageRust = fenix.packages.${stdenv.hostPlatform.system}.stable.withComponents [
             "cargo" "rustc" "rust-std" "rustfmt" "clippy" "llvm-tools-preview"
@@ -156,6 +173,7 @@
             src = source;
             postUnpack = ''sourceRoot="$sourceRoot/src-tauri"'';
             cargoLock = pkgs.writeText "Cargo.lock" (builtins.readFile ./src-tauri/Cargo.lock);
+            cargoVendorDir = cargoVendor;
             # Both cache and application must enable the same embedded-asset feature.
             cargoExtraArgs = "--locked --features tauri/custom-protocol";
             nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake pkgs.makeWrapper ]
@@ -247,7 +265,7 @@
           };
         in
         {
-          inherit package frontend sdk omspPackage;
+          inherit package frontend sdk omspPackage sdkCommand omspCommand;
           shell = pkgs.mkShell ({
             packages = [
               coverageRust pkgs.pkg-config pkgs.cmake
@@ -280,6 +298,14 @@
         frontend = values.frontend;
         sdk = values.sdk;
         omsp = values.omspPackage;
+        agent-omp = pkgs.runCommand "ombp-agent-omp" { } ''
+          mkdir -p "$out/bin"
+          ln -s ${values.sdkCommand} "$out/bin/omp"
+        '';
+        agent-omsp = pkgs.runCommand "ombp-agent-omsp" { } ''
+          mkdir -p "$out/bin"
+          ln -s ${values.omspCommand} "$out/bin/omsp"
+        '';
       });
       apps = forAll (pkgs: {
         default = {

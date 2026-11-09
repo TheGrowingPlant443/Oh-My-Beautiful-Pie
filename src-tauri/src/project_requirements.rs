@@ -1593,7 +1593,7 @@ fn engine_state(
     tools: &BTreeMap<&'static str, ToolProbe>,
     prereq: Option<&Prerequisites>,
 ) -> Detected {
-    for name in ["docker", "podman"] {
+    for name in ["podman", "docker"] {
         if let Some(ToolProbe::Found { path, version }) = tools.get(name) {
             return Detected {
                 state: DetectedState::Found,
@@ -1677,14 +1677,15 @@ fn detect(
 fn resolve(drafts: Drafts, host: &dyn Host) -> Vec<RequirementItem> {
     let mut needed: BTreeSet<&'static str> = BTreeSet::new();
     let mut need_prereq = false;
+    let mut engine = false;
     for draft in drafts.map.values() {
         match &draft.probe {
             Probe::Tool(tool) => {
                 needed.insert(*tool);
             }
             Probe::Engine => {
-                needed.insert("docker");
                 needed.insert("podman");
+                engine = true;
                 need_prereq = true;
             }
             Probe::Wsl => {
@@ -1717,6 +1718,13 @@ fn resolve(drafts: Drafts, host: &dyn Host) -> Vec<RequirementItem> {
             prereq = handle.join().ok();
         }
     });
+    // Podman first: Docker is only looked up when no Podman client was found.
+    if engine
+        && !tools.contains_key("docker")
+        && !matches!(tools.get("podman"), Some(ToolProbe::Found { .. }))
+    {
+        tools.insert("docker", host.tool("docker"));
+    }
     let mut items: Vec<RequirementItem> = drafts
         .map
         .into_iter()
@@ -2122,6 +2130,37 @@ mod tests {
         assert_eq!(
             item(&result, "containerEngine:engine").detected.state,
             DetectedState::Found
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn docker_is_looked_up_only_when_podman_is_missing() {
+        let root = temp();
+        put(&root, "Dockerfile", "FROM scratch\n");
+        let host = FakeHost::new(&[("podman", found("5.0.0"))]);
+        let result = analyze(&root, &host).unwrap();
+        assert_eq!(
+            item(&result, "containerEngine:engine").detected.state,
+            DetectedState::Found
+        );
+        assert!(
+            !host.calls().contains(&"docker".to_string()),
+            "{:?}",
+            host.calls()
+        );
+        let host = FakeHost::new(&[("docker", found("27.0.0"))]);
+        let result = analyze(&root, &host).unwrap();
+        assert_eq!(
+            item(&result, "containerEngine:engine").detected.state,
+            DetectedState::Found
+        );
+        assert_eq!(
+            host.calls()
+                .iter()
+                .filter(|name| *name == "podman" || *name == "docker")
+                .collect::<Vec<_>>(),
+            ["podman", "docker"]
         );
         fs::remove_dir_all(root).unwrap();
     }

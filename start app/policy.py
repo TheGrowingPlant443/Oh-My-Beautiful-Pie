@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from catalog import DEFAULT_WEBSITES
 from network import allowed_by_policy, auto_approved, covering_site
+from packages import DEFAULT_PACKAGES, validate_packages
 from requirements import WORKSPACE, prepare_workspace
 
 DENIED_HISTORY = "denied.json"
@@ -60,6 +61,8 @@ class Policy:
         self.data = {"folders": [], "programs": [], "websites": [], "credential_origins": [],
                      "internet": True, "allow_all_network": False, "disabled_requirements": [],
                      "folder_write_default": False, "auto_start": None,
+                     "installed_mode": True, "selected_packages": list(DEFAULT_PACKAGES),
+                     "hide_language_server_denials": True,
                      **copy.deepcopy(SITE_OPTIONS), "auto_approve": copy.deepcopy(AUTO_APPROVE)}
         self.history = []
         self.history_error = ""
@@ -123,10 +126,14 @@ class Policy:
         if not isinstance(value, dict):
             raise ValueError("Invalid permission fields")
         value = {"disabled_requirements": [], "allow_all_network": False, **copy.deepcopy(SITE_OPTIONS),
-                 "auto_approve": copy.deepcopy(AUTO_APPROVE), "folder_write_default": False, "auto_start": None, **value}
+                 "auto_approve": copy.deepcopy(AUTO_APPROVE), "folder_write_default": False, "auto_start": None,
+                 "installed_mode": True, "selected_packages": list(DEFAULT_PACKAGES),
+                 "hide_language_server_denials": True, **value}
         if set(value) != set(self.data):
             raise ValueError("Invalid permission fields")
-        if not all(isinstance(value[key], bool) for key in ("internet", "allow_all_network", "folder_write_default")):
+        if not all(isinstance(value[key], bool) for key in (
+                "internet", "allow_all_network", "folder_write_default", "installed_mode",
+                "hide_language_server_denials")):
             raise ValueError("Switches must be booleans")
         if any(not isinstance(value[key], list) for key in ("folders", "programs", "websites", "credential_origins")):
             raise ValueError("Permission lists are required")
@@ -148,6 +155,9 @@ class Policy:
                 "websites": websites, "credential_origins": credentials, "internet": value["internet"],
                 "allow_all_network": value["allow_all_network"], "folder_write_default": value["folder_write_default"],
                 "auto_start": self._auto_start(value["auto_start"]),
+                "installed_mode": value["installed_mode"],
+                "selected_packages": validate_packages(value["selected_packages"]),
+                "hide_language_server_denials": value["hide_language_server_denials"],
                 "disabled_requirements": sorted(set(disabled)), **self._site_options(value, websites),
                 "auto_approve": self._auto_approve(value["auto_approve"])}
 

@@ -17,6 +17,7 @@ import uuid
 
 from access_fs import AccessFS
 from engine import EngineGateway, pinned_images, seed_client
+from installed import build_packages, install_profile
 from network import NetworkGateway
 from requirements import DISPLAY_SOCKET, FOLDERS, WORKSPACE, bundles, prepare_workspace
 
@@ -122,6 +123,8 @@ class Runtime:
         self.last_error = ""
         self.mode = None
         self.launch = None
+        self.pending_launch = None
+        self.installed_profile = None
         self.lock = threading.RLock()
         self.build_lock = threading.Lock()
         self.build_process = None
@@ -150,7 +153,8 @@ class Runtime:
     def status(self):
         # start() holds the lock for the whole build; report that instead of stalling the UI.
         if not self.lock.acquire(blocking=False):
-            return {"running": False, "starting": True, "mode": None, "launch": None, "container": None, "error": ""}
+            return {"running": False, "starting": True, "mode": self.mode,
+                    "launch": self.pending_launch or self.launch, "container": self.container, "error": ""}
         try:
             return {"running": self.process is not None and self.process.poll() is None, "starting": False,
                     "mode": self.mode, "launch": self.launch, "container": self.container, "error": self.last_error}
@@ -158,8 +162,11 @@ class Runtime:
             self.lock.release()
 
     def requirements_status(self):
-        disabled = self.policy.snapshot()["disabled_requirements"]
-        return [{**item, "enabled": item["id"] not in disabled} for item in self.requirements]
+        snapshot = self.policy.snapshot()
+        active = self.pending_launch or (self.launch if self.process is not None else None)
+        installed = active["installed_mode"] if active else snapshot["installed_mode"]
+        return [{**item, "enabled": (installed and (item["kind"] == "program" or item["id"] == "nix-store"))
+                 or item["id"] not in snapshot["disabled_requirements"]} for item in self.requirements]
 
     @staticmethod
     def _launch_source(source, mode, desktop, gpu, agent):
@@ -172,6 +179,26 @@ class Runtime:
             raise ValueError("Invalid launch settings")
         return source
 
+    def _check_closing(self):
+        if self.closing:
+            raise RuntimeError("Launch cancelled: launcher is closing")
+
+    def _run_prepare(self, command, cwd=None, label="OMBP build"):
+        """All package builds/copies share the same cancellable child tracked by close()."""
+        with self.build_lock:
+            self._check_closing()
+            child = self.build_process = subprocess.Popen(
+                command, cwd=cwd, stdout=subprocess.PIPE, stderr=self.log, text=True)
+        try:
+            output, _ = child.communicate()
+        finally:
+            with self.build_lock:
+                self.build_process = None
+        self._check_closing()
+        if child.returncode:
+            raise RuntimeError(f"{label} failed; see {self.policy.directory / 'launch.log'}")
+        return output
+
     def start(self, source, mode, desktop, gpu, agent):
         with self.lock:
             if self.status()["running"]:
@@ -180,46 +207,62 @@ class Runtime:
             source = self._launch_source(source, mode, desktop, gpu, agent)
             self.mode = mode
             self.launch = None
+            settings = self.policy.snapshot()
+            self.pending_launch = {
+                "source": str(source), "desktop": desktop, "gpu": gpu, "agent": agent,
+                "installed_mode": mode == "container" and settings["installed_mode"],
+                "selected_packages": settings["selected_packages"] if mode == "container" else [],
+            }
             self.last_error = ""
             self.log = open(self.policy.directory / "launch.log", "ab", buffering=0)
             try:
-                with self.build_lock:
-                    if self.closing:
-                        raise RuntimeError("Launch cancelled: launcher is closing")
-                    build = self.build_process = subprocess.Popen(
-                        ["nix", "build", f"path:.#{'default' if agent == 'omp' else 'omsp'}", "--no-link",
-                         "--print-out-paths", "--no-write-lock-file"],
-                        cwd=source, stdout=subprocess.PIPE, stderr=self.log, text=True)
-                try:
-                    output, _ = build.communicate()
-                finally:
+                output = self._run_prepare(
+                    ["nix", "build", f"path:.#{'default' if agent == 'omp' else 'omsp'}", "--no-link",
+                     "--print-out-paths", "--no-write-lock-file"], cwd=source)
+                outputs = output.splitlines()
+                if len(outputs) != 1 or not outputs[0].startswith("/nix/store/"):
+                    raise RuntimeError("OMBP build did not return one Nix store output")
+                executable = str((Path(outputs[0]) / "bin/omp-manager").resolve(strict=True))
+                if not Path(executable).is_file() or not os.access(executable, os.X_OK):
+                    raise ValueError("OMBP build has no executable bin/omp-manager")
+                self.launch = {**self.pending_launch, "executable": executable}
+                if mode == "normal":
                     with self.build_lock:
-                        self.build_process = None
-                with self.build_lock:
-                    if self.closing:
-                        raise RuntimeError("Launch cancelled: launcher is closing")
-                    if build.returncode:
-                        raise RuntimeError(f"OMBP build failed; see {self.policy.directory / 'launch.log'}")
-                    outputs = output.splitlines()
-                    if len(outputs) != 1 or not outputs[0].startswith("/nix/store/"):
-                        raise RuntimeError("OMBP build did not return one Nix store output")
-                    executable = str((Path(outputs[0]) / "bin/omp-manager").resolve(strict=True))
-                    if not Path(executable).is_file() or not os.access(executable, os.X_OK):
-                        raise ValueError("OMBP build has no executable bin/omp-manager")
-                    self.launch = {"source": str(source), "executable": executable, "desktop": desktop, "gpu": gpu,
-                                   "agent": agent}
-                    if mode == "normal":
+                        self._check_closing()
                         self.process = subprocess.Popen([executable], stdout=self.log, stderr=self.log,
                                                         env={**os.environ, "OMBP_AGENT": agent},
                                                         start_new_session=True)
-                    else:
-                        self._container_start(executable, desktop, gpu, source, agent)
-                    threading.Thread(target=self._watch, args=(self.process,), daemon=True).start()
+                else:
+                    self._container_start(executable, desktop, gpu, source, agent, self.pending_launch)
+                threading.Thread(target=self._watch, args=(self.process,), daemon=True).start()
             except Exception:
                 self.stop()
                 raise
+            finally:
+                self.pending_launch = None
 
-    def _container_start(self, executable, desktop, gpu, source, agent):
+    def _container_bundles(self, executable, gpu, source, agent, installation):
+        selected = agent_cli = None
+        prepare = lambda command, cwd=None: self._run_prepare(command, cwd, "Container installation")
+        if installation["installed_mode"]:
+            agent_cli, selected = build_packages(installation["selected_packages"], agent, source, prepare)
+        base = bundles(executable, gpu, closure, selected=selected, agent_cli=agent_cli)
+        if installation["installed_mode"]:
+            self.installed_profile = install_profile(self.policy.directory, base, prepare, self._check_closing)
+        return base
+
+    def _record_requirements(self, base, desktop):
+        self.requirements = [
+            {"id": key, "label": item["label"], "path": item["path"], "kind": "program",
+             "programs": sorted({Path(program).name for program in item["programs"]})}
+            for key, item in base.items()
+        ] + [{"id": key, "label": label, "path": path, "kind": "folder"} for key, label, path in FOLDERS]
+        if desktop:
+            self.requirements.append({"id": "desktop-socket", "label": "Isolated desktop socket",
+                                      "path": DISPLAY_SOCKET, "kind": "folder"})
+        self.policy.save("requirements.json", self.requirements)
+
+    def _container_start(self, executable, desktop, gpu, source, agent, installation):
         info = json.loads(subprocess.run(["podman", "info", "--format", "json"],
                           check=True, text=True, capture_output=True, timeout=30).stdout)
         if not info["host"]["security"]["rootless"] or info["host"].get("serviceIsRemote"):
@@ -232,15 +275,9 @@ class Runtime:
         fonts = os.environ.get("START_APP_FONTCONFIG")
         if not all((dbus, keyring, shell, coreutils, fonts)):
             raise ValueError("Start through the supplied Nix environment for container runtime support")
-        base = bundles(executable, gpu, closure)
-        self.requirements = [
-            {"id": key, "label": item["label"], "path": item["path"], "kind": "program"}
-            for key, item in base.items()
-        ] + [{"id": key, "label": label, "path": path, "kind": "folder"} for key, label, path in FOLDERS]
-        if desktop:
-            self.requirements.append({"id": "desktop-socket", "label": "Isolated desktop socket",
-                                      "path": DISPLAY_SOCKET, "kind": "folder"})
-        self.policy.save("requirements.json", self.requirements)
+        installed = installation["installed_mode"]
+        base = self._container_bundles(executable, gpu, source, agent, installation)
+        self._record_requirements(base, desktop)
         mesa = os.environ.get("START_APP_MESA")
         snapshot = self.policy.snapshot()
         disabled = snapshot["disabled_requirements"]
@@ -248,13 +285,14 @@ class Runtime:
         if workspace:
             prepare_workspace()
         password = self._keyring_password()
-        self._access_start(base)
+        self._access_start({} if installed else base)
         self.gateway = NetworkGateway(self.policy, self.policy.directory / "network")
         self.gateway.start()
         root = self._rootfs(shell, coreutils)
         home = self.policy.directory / "home"
         home.mkdir(exist_ok=True, mode=0o700)
-        if "sandbox-home" not in disabled and "proxy-ca" not in disabled:
+        browser = base.get("package-chromium" if installed else "tool-chrome")
+        if browser and "sandbox-home" not in disabled and "proxy-ca" not in disabled:
             self._browser_trust_start(home)
         self.container = f"ombp-start-{uuid.uuid4().hex[:12]}"
         # Leave container root unmapped: crun then sets up FUSE mounts as their host owner.
@@ -279,7 +317,8 @@ class Runtime:
             self._mount(args, self.mount / "host" / WORKSPACE.lstrip("/"), WORKSPACE, True)
         env = {"HOME": "/home/sandbox", "USER": "sandbox", "LOGNAME": "sandbox",
                "XDG_RUNTIME_DIR": "/run/ombp", "XDG_CONFIG_HOME": "/home/sandbox/.config",
-               "PATH": ":".join(("/allowed-programs", str(Path(python).parent), str(Path(shell).parent),
+               "PATH": ":".join(("/installed-programs" if installed else "/allowed-programs",
+                                 str(Path(python).parent), str(Path(shell).parent),
                                  coreutils, str(Path(dbus).parent), str(Path(keyring).parent))),
                "HTTP_PROXY": PROXY_URL, "HTTPS_PROXY": PROXY_URL,
                "ALL_PROXY": PROXY_URL, "NO_PROXY": LOOPBACK,
@@ -287,34 +326,53 @@ class Runtime:
                "all_proxy": PROXY_URL, "no_proxy": LOOPBACK, "NODE_USE_ENV_PROXY": "1",
                "SSL_CERT_FILE": TRUST_CA, "NODE_EXTRA_CA_CERTS": TRUST_CA,
                "REQUESTS_CA_BUNDLE": TRUST_CA, "CURL_CA_BUNDLE": TRUST_CA,
-               "OMP_BIN": "/launcher/omp", "OMBP_AGENT": agent,
+               "OMBP_GIT_DISCOVERY_HOME": "/host" + str(Path.home()),
                "START_APP_KEYRING": keyring, "SHELL": shell, "FONTCONFIG_FILE": fonts,
                "GDK_BACKEND": "wayland", "NIXOS_OZONE_WL": "1"}
-        browsers = base["tool-chrome"]["programs"]
-        env["START_APP_BROWSER"] = next((path for path in browsers if Path(path).name == "google-chrome-stable"),
-                                        browsers[0])
+        env.update(self._program_environment(installed, agent, browser, base))
         if "sonar-engine" not in disabled:
             sonar_port = seed_client(home)
             self.engine = EngineGateway(self.policy, self.policy.directory / "engine",
                                         pinned_images(source), sonar_port, self.log).start()
             self._mount(args, self.engine.api_dir, "/engine")
             env["START_APP_SONAR_PORT"] = str(sonar_port)
-        if desktop and "desktop-socket" not in disabled:
-            socket = self._desktop_start()
-            self._mount(args, socket, DISPLAY_SOCKET)
-            env["WAYLAND_DISPLAY"] = DISPLAY_SOCKET
-            env["XDG_SESSION_TYPE"] = "wayland"
-            self.browser_display = BrowserDisplay(self.policy.directory / "browser-display", self._weston)
-            self._mount(args, self.browser_display.directory, BROWSER_DISPLAY)
+        self._mount_displays(args, env, desktop, disabled, browser)
         self._gpu_access(args, env, gpu, mesa)
         for key, value in env.items():
             args.extend(["--env", f"{key}={value}"])
         args.extend(["--rootfs", str(root), dbus, "--config-file=/etc/session.conf", "--",
                      python, "/launcher/session.py", executable])
-        self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=self.log, stderr=self.log,
-                                        start_new_session=True)
+        with self.build_lock:
+            self._check_closing()
+            self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=self.log, stderr=self.log,
+                                            start_new_session=True)
         with self.process.stdin as stream:
             stream.write((password + "\n").encode())
+
+    @staticmethod
+    def _program_environment(installed, agent, browser, base):
+        env = {"OMP_BIN": f"/installed-programs/{agent}" if installed else "/launcher/omp", "OMBP_AGENT": agent}
+        if installed and agent == "omsp":
+            env["OMSP_CONFIG_DIR"] = ".omp"
+        if installed and "package-js-debug-adapter" in base:
+            env["JS_DEBUG_DAP_SERVER"] = str(Path(base["package-js-debug-adapter"]["path"])
+                                           / "share/ombp/dapDebugServer.js")
+        if browser:
+            commands = browser["programs"]
+            env["START_APP_BROWSER"] = next((path for path in commands if Path(path).name == "google-chrome-stable"),
+                                            commands[0])
+        return env
+
+    def _mount_displays(self, args, env, desktop, disabled, browser):
+        if not desktop or "desktop-socket" in disabled:
+            return
+        socket = self._desktop_start()
+        self._mount(args, socket, DISPLAY_SOCKET)
+        env["WAYLAND_DISPLAY"] = DISPLAY_SOCKET
+        env["XDG_SESSION_TYPE"] = "wayland"
+        if browser:
+            self.browser_display = BrowserDisplay(self.policy.directory / "browser-display", self._weston)
+            self._mount(args, self.browser_display.directory, BROWSER_DISPLAY)
 
     @staticmethod
     def _mount(args, source, target, writable=False):
@@ -324,13 +382,16 @@ class Runtime:
         args.extend(["--volume", f"{source}:{target}:{'rw' if writable else 'ro'}"])
 
     def _mount_resources(self, args, home, disabled):
+        if self.installed_profile:
+            self._mount(args, self.installed_profile / "store", "/nix/store")
+            self._mount(args, self.installed_profile / "programs", "/installed-programs")
         for key, source, target, writable in (
                 ("nix-store", self.mount / "store", "/nix/store", False),
                 ("sandbox-home", home, "/home/sandbox", True),
                 ("launcher-files", Path(__file__).parent.resolve(), "/launcher", False),
                 ("network-socket", Path(self.gateway.socket_path).parent, "/network", False),
                 ("proxy-ca", self.gateway.ca_path, TRUST_CA, False)):
-            if key not in disabled:
+            if key not in disabled and not (key == "nix-store" and self.installed_profile):
                 self._mount(args, source, target, writable)
         if self.browser_trust:
             # Chrome uses NSS_InitReadWrite and silently drops local trust on a read-only database.
@@ -340,7 +401,8 @@ class Runtime:
             # User-approved direct bind: SQLite locks, mmap and hardlinks behave exactly as for host OMP.
             self._mount(args, host_omp, "/home/sandbox/.omp", True)
         self._mount(args, self.mount / "host", "/host", True)
-        self._mount(args, self.mount / "programs", "/allowed-programs")
+        if not self.installed_profile:
+            self._mount(args, self.mount / "programs", "/allowed-programs")
 
     def _host_omp(self, disabled):
         path = Path.home() / ".omp"
@@ -435,7 +497,7 @@ class Runtime:
 
     def _rootfs(self, shell, coreutils):
         root = self.policy.directory / "rootfs"
-        for directory in ("etc", "nix/store", "host", "allowed-programs", "launcher", "network", "engine", "trust", "home/sandbox", "tmp", "run", "proc", "dev"):
+        for directory in ("etc", "nix/store", "host", "allowed-programs", "installed-programs", "launcher", "network", "engine", "trust", "home/sandbox", "tmp", "run", "proc", "dev"):
             (root / directory).mkdir(parents=True, exist_ok=True)
         (root / "etc/passwd").write_text(f"sandbox:x:{os.getuid()}:{os.getgid()}:Sandbox:/home/sandbox:/bin/sh\n")
         (root / "etc/group").write_text(f"sandbox:x:{os.getgid()}:\n")
@@ -496,7 +558,7 @@ class Runtime:
         env = {key: os.environ[key] for key in ("PATH", "LANG", "LOCALE_ARCHIVE") if key in os.environ}
         env.update(HOME=str(directory), XDG_RUNTIME_DIR=str(directory), WAYLAND_DISPLAY=str(host_socket))
         if name == "wayland-browser":
-            # Patched kiosk-shell maximizes instead of fullscreening, so Chrome keeps its address bar.
+            # OMBP stays borderless; the kiosk patch independently maximizes Zenity pickers.
             env["OMBP_KIOSK_MAXIMIZE"] = "1"
         process = subprocess.Popen(
             [sys.executable, str(Path(__file__).parent / "desktop.py"), str(os.getpid()), weston,
@@ -552,6 +614,7 @@ class Runtime:
                 self.container = None
                 (self.policy.directory / CONTAINER_RECORD).unlink(missing_ok=True)
             self.process = None
+            self.installed_profile = None
             _terminate(self.desktop_process, 5)
             self.desktop_process = None
             if self.browser_display:

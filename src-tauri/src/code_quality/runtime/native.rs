@@ -497,10 +497,20 @@ pub(crate) fn probe_prerequisites(
     } else {
         QualityRuntime::DockerNative
     };
+    // Podman first: Docker is only looked up when Podman is missing or Docker is the selected runtime.
+    let podman_installed = podman_program().is_some();
+    let docker_selected = matches!(
+        selected,
+        QualityRuntime::DockerNative | QualityRuntime::DockerDesktop
+    );
+    let mut runtimes = vec![podman];
+    if !podman_installed || docker_selected {
+        runtimes.push(docker);
+    }
     let mut result = Vec::new();
-    for runtime in [podman, docker] {
+    for runtime in runtimes {
         let installed = match &runtime {
-            QualityRuntime::Podman { .. } => podman_program().is_some(),
+            QualityRuntime::Podman { .. } => podman_installed,
             QualityRuntime::DockerDesktop => {
                 docker_program().is_some() && Path::new("/Applications/Docker.app").exists()
             }

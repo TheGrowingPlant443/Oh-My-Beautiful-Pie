@@ -47,17 +47,42 @@
           ln -s "$out/libexec/ombp-browser" "$out/bin/$name"
         done
       '';
+      # rfd's Zenity fallback drops the directory; start unspecified sandbox pickers at the host gateway.
+      dialog = pkgs.writeShellScriptBin "zenity" ''
+        file_selection=false
+        for arg in "$@"; do
+          case "$arg" in
+            --file-selection) file_selection=true ;;
+            --filename|--filename=*) exec ${pkgs.zenity}/bin/zenity "$@" ;;
+          esac
+        done
+        if "$file_selection"; then
+          exec ${pkgs.zenity}/bin/zenity --filename=/host/ "$@"
+        fi
+        exec ${pkgs.zenity}/bin/zenity "$@"
+      '';
       # Everyday CLI tools for the AI inside the sandbox; files and network still pass the gateways.
-      tools = pkgs.buildEnv {
-        name = "ombp-sandbox-tools";
-        paths = with pkgs; [
+      basicToolPaths = with pkgs; [
           glib.bin procps psmisc util-linux findutils gnugrep gnused gawk diffutils patch file which less
           gnutar gzip bzip2 xz zstd unzip zip curl wget jq ripgrep fd rsync tree gnumake bc strace lsof
-          ncurses libnotify
-        ];
+          # zenity: OMBP's file/folder pickers fall back to it without a desktop portal.
+          ncurses libnotify dialog
+      ];
+      languageServerPaths = with pkgs; [
+        marksman emmet-language-server typescript-language-server typescript
+        vscode-langservers-extracted nil nixd jdt-language-server
+      ];
+      basicTools = pkgs.buildEnv {
+        name = "ombp-sandbox-basic-tools";
+        paths = basicToolPaths;
         pathsToLink = [ "/bin" ];
       };
-    in { inherit pkgs python testPython fusermount source weston fonts browser tools; };
+      tools = pkgs.buildEnv {
+        name = "ombp-sandbox-tools";
+        paths = basicToolPaths ++ languageServerPaths;
+        pathsToLink = [ "/bin" ];
+      };
+    in { inherit pkgs python testPython fusermount source weston fonts browser dialog tools basicTools; };
   in {
     checks = each (system: let inherit (environment system) pkgs python source; in {
       syntax = pkgs.runCommand "ombp-start-syntax" { nativeBuildInputs = [ python pkgs.nodejs_24 ]; } ''
@@ -68,8 +93,20 @@
       '';
     });
     packages = each (system: let
-      inherit (environment system) pkgs python fusermount source weston fonts browser tools;
+      inherit (environment system) pkgs python fusermount source weston fonts browser dialog tools basicTools;
+      unfreePkgs = import nixpkgs {
+        inherit system;
+        config.allowUnfreePredicate = package:
+          pkgs.lib.elem (pkgs.lib.getName package) [ "obsidian" "intelephense" "terraform" "kotlin-lsp" ];
+      };
+      optionalTools = (import ./tool-packages.nix { inherit pkgs unfreePkgs; })
+        // (import ./language-packages.nix { pkgs = unfreePkgs; });
     in {
+      package-basic-tools = basicTools;
+      package-chromium = pkgs.chromium;
+      package-obsidian = unfreePkgs.obsidian;
+      package-gh = pkgs.gh;
+      package-ssh = pkgs.openssh;
       default = pkgs.writeShellApplication {
         name = "ombp-start";
         runtimeInputs = [ python fusermount pkgs.nix pkgs.podman pkgs.dbus pkgs.gnome-keyring pkgs.libsecret ];
@@ -90,11 +127,12 @@
           export START_APP_CHROMIUM=${pkgs.chromium}/bin/chromium
           export START_APP_BROWSER_NAMES=${browser}/bin
           export START_APP_TOOLS=${tools}/bin
+          export START_APP_ZENITY=${dialog}/bin/zenity
           exec ${python}/bin/python3 ${source}/app.py "$@"
         '';
       };
-    });
-    devShells = each (system: let inherit (environment system) pkgs python testPython fusermount weston fonts browser tools; in {
+    } // pkgs.lib.mapAttrs' (id: package: pkgs.lib.nameValuePair ("package-" + id) package) optionalTools);
+    devShells = each (system: let inherit (environment system) pkgs python testPython fusermount weston fonts browser dialog tools; in {
       default = pkgs.mkShell {
         packages = [ testPython fusermount pkgs.nix pkgs.podman pkgs.dbus pkgs.gnome-keyring pkgs.libsecret ];
         FUSE_LIBRARY_PATH = "${pkgs.lib.getLib pkgs.fuse}/lib/libfuse.so.2";
@@ -113,6 +151,7 @@
         START_APP_CHROMIUM = "${pkgs.chromium}/bin/chromium";
         START_APP_BROWSER_NAMES = "${browser}/bin";
         START_APP_TOOLS = "${tools}/bin";
+        START_APP_ZENITY = "${dialog}/bin/zenity";
       };
     });
   };
